@@ -1,0 +1,23 @@
+{
+  "name": "herald-cli",
+  "version": "0.1.0",
+  "description": "Send rich, actionable iPhone notifications to a human and block until they answer. Built for AI agents.",
+  "keywords": ["herald", "notifications", "agent", "cli", "push", "ai"],
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "herald": "bin/herald.js"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thiagoc77/herald-cli.git"
+  }
+}
