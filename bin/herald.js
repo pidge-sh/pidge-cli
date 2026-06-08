@@ -31,6 +31,7 @@ function die(msg, code = 1) { console.error(msg); process.exit(code); }
 if (!TOKEN) die('herald: set HERALD_TOKEN');
 
 const OPTIONS = {
+  help: { type: 'boolean', short: 'h' },
   title: { type: 'string' },
   body: { type: 'string' },
   'body-markdown': { type: 'string' },
@@ -46,21 +47,56 @@ const OPTIONS = {
   interval: { type: 'string' },
 };
 
-const USAGE =
-  'Usage: herald notify|ask [options]\n' +
-  '       herald wait <correlation_id> [--timeout N] [--interval N]\n' +
-  'Options: --title --body --body-markdown --subtitle --urgency --actions\n' +
-  '         --custom-action "id:label[:destructive][:confirm][:biometric][:terminal]" (repeatable)\n' +
-  '         --deliver-at --reply-to --correlation-id --collapse-key --timeout --interval';
+const USAGE = `herald — send an iPhone notification to a human and block until they answer.
+
+USAGE
+  herald ask    [options]                  send AND wait for the answer (prints chosen_action JSON)
+  herald notify [options]                  send only (prints the 201 JSON)
+  herald wait   <correlation_id> [options] block on an already-sent notification
+  herald --help
+
+OPTIONS (notify / ask)
+  --title TEXT             (required) the headline
+  --body TEXT              message shown on the banner
+  --body-markdown MD       rich body for the tap-through detail screen
+  --subtitle TEXT
+  --urgency LEVEL          normal | persistent | alarm
+  --actions LIST           comma list: yes,no,approve,reject,accept,decline,later,
+                           done,snooze,reschedule,reply,mute
+  --custom-action SPEC     "id:label[:destructive][:confirm][:biometric][:terminal]" (repeatable)
+  --deliver-at ISO8601     schedule for later
+  --reply-to URL           also POST the answer to your webhook (HMAC-signed)
+  --correlation-id ID      idempotency + routing key (auto-generated if omitted)
+  --collapse-key KEY       replace/update a prior notification
+  --timeout SECONDS        ask: 600 · wait: 300
+  --interval SECONDS       poll cadence — ask: 10 · wait: 5
+
+ENV
+  HERALD_URL    your Herald server (default http://localhost:3000)
+  HERALD_TOKEN  your channel's bearer key (required)
+
+OUTPUT
+  stdout is machine-readable (notify→201 JSON; ask/wait→chosen_action JSON);
+  human notices go to stderr. Exit: 0 answered · 3 timed out (no answer yet,
+  not a failure) · 2 error · 1 usage.
+
+Responses are one-and-done EXCEPT snooze/reschedule (they re-fire); ask/wait keep
+polling through a snooze and print snooze_until. Follow-up = a NEW notification.
+
+Full spec: GET $HERALD_URL/api/v1/manifest`;
 
 let parsed;
 try {
   parsed = parseArgs({ options: OPTIONS, allowPositionals: true });
 } catch (e) {
-  die(`herald: ${e.message}\n${USAGE}`, 1);
+  die(`herald: ${e.message}\n\n${USAGE}`, 1);
 }
 const v = parsed.values;
 const command = parsed.positionals[0];
+
+// `herald --help` / `-h` / `help` → full help on stdout, exit 0. No command → stderr, exit 1.
+if (v.help || command === 'help') { console.log(USAGE); process.exit(0); }
+if (!command) { console.error(USAGE); process.exit(1); }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
