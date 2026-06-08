@@ -14,7 +14,7 @@ export HERALD_URL=https://your-herald-host         # your Herald server
 export HERALD_TOKEN=hld_xxx                          # your channel's bearer key
 
 # Send AND wait for the answer (the one an agent wants):
-npx github:thiagoc77/herald-cli ask \
+npx github:thiagoc7/herald-cli ask \
   --title "Aprovar deploy?" --actions yes,no,reply --timeout 600
 ```
 
