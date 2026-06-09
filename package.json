@@ -1,12 +1,12 @@
 {
-  "name": "herald-cli",
-  "version": "0.1.0",
+  "name": "pidge-cli",
+  "version": "0.2.0",
   "description": "Send rich, actionable iPhone notifications to a human and block until they answer. Built for AI agents.",
-  "keywords": ["herald", "notifications", "agent", "cli", "push", "ai"],
+  "keywords": ["pidge", "notifications", "agent", "cli", "push", "ai"],
   "license": "MIT",
   "type": "commonjs",
   "bin": {
-    "herald": "bin/herald.js"
+    "pidge": "bin/pidge.js"
   },
   "files": [
     "bin",
@@ -18,6 +18,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/thiagoc7/herald-cli.git"
+    "url": "git+https://github.com/thiagoc7/pidge-cli.git"
   }
 }
