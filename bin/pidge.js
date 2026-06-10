@@ -217,7 +217,15 @@ async function uploadFile(filePath) {
 async function resolveMedia(body) {
   for (const key of ['image', 'file']) {
     if (v[key] === undefined) continue;
-    body[key] = fs.existsSync(v[key]) ? await uploadFile(v[key]) : v[key];
+    if (fs.existsSync(v[key])) {
+      body[key] = await uploadFile(v[key]);
+    } else if (key === 'file' && (/^[./~]/.test(v[key]) || v[key].includes('/'))) {
+      // --file is PATH-only (no URL form) — fail fast on a typo'd path; the remote
+      // 422 ("ref invalid — re-upload") would misdirect the agent's self-heal.
+      die(`pidge: --file: no such file: ${v[key]}`, 1);
+    } else {
+      body[key] = v[key];
+    }
   }
 }
 
