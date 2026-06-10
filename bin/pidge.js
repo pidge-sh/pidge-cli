@@ -21,7 +21,10 @@
 //   pidge notify --title "Reunião com o time" --profile event --event-at "2026-06-10T15:00:00"
 //
 //   # block on an already-sent notification (by correlation_id)
-//   pidge wait order-7 --timeout 300 --interval 5
+//   pidge wait order-7 --timeout 300
+//
+//   # cancel a still-scheduled notification before it fires (#56)
+//   pidge cancel med-ozempic-qui
 //
 // stdout is ALWAYS machine-readable: `notify` prints the raw 201 JSON; `ask`/`wait`
 // print the chosen_action JSON. Everything human (warnings, the correlation_id,
@@ -36,6 +39,7 @@ const { parseArgs } = require('node:util');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 
 // #57 token hygiene: when the env vars are unset, fall back to
 // ~/.config/pidge/env (KEY=VALUE lines the HUMAN writes once in THEIR terminal)
@@ -76,6 +80,8 @@ const OPTIONS = {
   urgency: { type: 'string' },                 // normal | persistent | alarm (low-level — prefer --profile)
   image: { type: 'string' },                   // banner+feed image: local path → uploaded; URL → as-is
   file: { type: 'string' },                    // real artifact (xlsx/pdf/csv…): local path → uploaded
+  url: { type: 'string' },                     // deep link the app opens on tap (#45)
+  copy: { type: 'string' },                    // tap-to-copy value on the detail (#45)
   actions: { type: 'string' },                 // comma list from the catalog
   'custom-action': { type: 'string', multiple: true }, // id:label[:destructive][:confirm][:biometric][:terminal]
   'deliver-at': { type: 'string' },
@@ -93,6 +99,7 @@ USAGE
   pidge ask    [options]                  send AND wait for the answer (prints chosen_action JSON)
   pidge notify [options]                  send only (prints the 201 JSON)
   pidge wait   <correlation_id> [options] block on an already-sent notification
+  pidge cancel <correlation_id>           cancel a still-scheduled notification (#56)
   pidge --help
 
 OPTIONS (notify / ask)
@@ -111,6 +118,8 @@ OPTIONS (notify / ask)
                            you (your machine has no public URL); an https URL is sent as-is
   --file PATH              a real artifact (xlsx, pdf, csv…) the human previews,
                            shares and saves on the phone; uploaded automatically (≤25 MB)
+  --url URL                deep link the app opens when the user taps (PR, dashboard, log)
+  --copy TEXT              value offered as tap-to-copy on the detail (code, token)
   --actions LIST           comma list: yes,no,approve,reject,accept,decline,later,
                            done,snooze,reschedule,reply,mute
   --custom-action SPEC     "id:label[:destructive][:confirm][:biometric][:terminal]" (repeatable)
@@ -121,7 +130,8 @@ OPTIONS (notify / ask)
   --param KEY=VALUE        pass ANY raw /notify field (repeatable) — future server
                            fields work without a CLI update; the manifest is the contract
   --timeout SECONDS        ask: 600 · wait: 300
-  --interval SECONDS       poll cadence — ask: 10 · wait: 5
+  --interval SECONDS       FALLBACK poll cadence (default 30) — normally unused: the
+                           server long-polls each GET (?wait=55), answers are ~instant
 
 ENV
   PIDGE_URL     your Pidge server (default http://localhost:3000; HERALD_URL honored)
@@ -161,7 +171,7 @@ const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 2;
+const KNOWN_MANIFEST_VERSION = 5;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
@@ -182,6 +192,8 @@ function buildBody() {
   if (v['event-at'] !== undefined) body.event_at = v['event-at'];
   if (v['lead-minutes'] !== undefined) body.lead_minutes = parseInt(v['lead-minutes'], 10);
   if (v.urgency !== undefined) body.urgency = v.urgency;
+  if (v.url !== undefined) body.url = v.url;
+  if (v.copy !== undefined) body.copy = v.copy;
   if (v['deliver-at'] !== undefined) body.deliver_at = v['deliver-at'];
   if (v['reply-to'] !== undefined) body.reply_to = v['reply-to'];
   if (v['correlation-id'] !== undefined) body.correlation_id = v['correlation-id'];
@@ -288,6 +300,9 @@ async function doNotify() {
   let info = {};
   try { info = JSON.parse(raw); } catch { /* leave {} */ }
   if (ok) {
+    // #56: the same correlation_id while still scheduled EDITS in place.
+    if (info.updated)
+      console.error('pidge: updated scheduled notification (same correlation_id, nothing fires twice)');
     if (info.registered_devices === 0)
       console.error('pidge: 0 registered devices — nobody will receive this');
     if (info.render_mode === 'detail_only')
@@ -308,11 +323,16 @@ async function doNotify() {
 // Poll GET /notifications/:cid until a TERMINAL answer, print chosen_action JSON to
 // stdout, exit 0. A snooze (snooze / reschedule-to-a-time) is non-terminal — it
 // re-fires — so keep waiting through it. Exits 3 on timeout.
+// Long-poll (#45): each GET carries ?wait=N (≤55 s) and the SERVER holds it until
+// the user acts — answer latency ~instant, ~1 request/min. --interval is only the
+// fallback pace against an old server that ignores `wait` (returns immediately).
 async function doWait(cid, { timeout, interval }) {
   const deadline = Date.now() + timeout * 1000;
-  const url = `${BASE}/api/v1/notifications/${encodeURIComponent(cid)}`;
   let firedNotice = false;
   for (;;) {
+    const waitS = Math.max(0, Math.min(55, Math.ceil((deadline - Date.now()) / 1000)));
+    const url = `${BASE}/api/v1/notifications/${encodeURIComponent(cid)}?wait=${waitS}`;
+    const askedAt = Date.now();
     try {
       const res = await fetch(url, { headers });
       checkManifestNews(res);
@@ -344,7 +364,9 @@ async function doWait(cid, { timeout, interval }) {
       console.error(`pidge: timed out after ${timeout}s waiting on ${cid} (= 'no answer yet', not a failure)`);
       process.exit(3);
     }
-    await sleep(interval * 1000);
+    // A server WITH long-poll just held us for waitS — loop right back. One that
+    // ignored `wait` (or a network error) returned fast: pace with --interval.
+    if (Date.now() - askedAt < 2000) await sleep(interval * 1000);
   }
 }
 
@@ -366,18 +388,47 @@ const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback
       // would block the full timeout believing the human is deciding.
       if (v.profile === 'tracking')
         die('pidge: `ask --profile tracking` makes no sense — tracking never produces an answer (use the live_activities API; need a decision? send a real profile)', 1);
+      if (!v.title) die('pidge: --title is required', 1);
+      // The cid is minted CLIENT-side when not given, and printed as the FIRST
+      // stderr line (greppable) — a killed/crashed ask always leaves the handle
+      // behind, so the agent can `pidge wait <cid>` instead of re-sending.
+      const cid = v['correlation-id'] || crypto.randomUUID();
+      v['correlation-id'] = cid;
+      console.error(`pidge: correlation_id=${cid}`);
       const { ok, info } = await doNotify();
       if (!ok) process.exit(2);
-      const cid = info.correlation_id || v['correlation-id'];
-      if (!cid) die('pidge: notify did not return a correlation_id', 2);
       console.error(`pidge: sent (${info.registered_devices} device(s)) — waiting on ${cid}`);
-      await doWait(cid, { timeout: num(v.timeout, 600), interval: num(v.interval, 10) });
+      await doWait(cid, { timeout: num(v.timeout, 600), interval: num(v.interval, 30) });
       break;
     }
     case 'wait': {
       const cid = parsed.positionals[1];
       if (!cid) die('pidge: usage: pidge wait <correlation_id> [--timeout N] [--interval N]', 1);
-      await doWait(cid, { timeout: num(v.timeout, 300), interval: num(v.interval, 5) });
+      await doWait(cid, { timeout: num(v.timeout, 300), interval: num(v.interval, 30) });
+      break;
+    }
+    case 'cancel': {
+      // #56: withdraw a still-scheduled notification (also kills a snooze re-fire).
+      // Exit 0 cancelled (idempotent) · 2 otherwise (404 unknown, 409 too late).
+      const cid = parsed.positionals[1];
+      if (!cid) die('pidge: usage: pidge cancel <correlation_id>', 1);
+      let res, raw;
+      try {
+        res = await fetch(`${BASE}/api/v1/notifications/${encodeURIComponent(cid)}`, {
+          method: 'DELETE', headers,
+        });
+        raw = await res.text();
+      } catch (e) {
+        die(`pidge: cancel failed (network): ${e.message}`, 2);
+      }
+      checkManifestNews(res);
+      console.log(raw);
+      if (res.status >= 200 && res.status < 300) {
+        console.error(`pidge: cancelled ${cid} — nothing will fire`);
+        process.exit(0);
+      }
+      console.error(`pidge: cancel failed (${res.status}) — ${res.status === 409 ? 'too late, it already reached the phone' : 'unknown correlation_id?'}`);
+      process.exit(2);
       break;
     }
     default:
