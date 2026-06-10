@@ -132,6 +132,19 @@ if (!command) { console.error(USAGE); process.exit(1); }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
 
+// The server advertises its manifest version on every response. When it's newer
+// than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
+// the manifest (whats_new) and learns the new capabilities without polling.
+const KNOWN_MANIFEST_VERSION = 2;
+let newsWarned = false;
+function checkManifestNews(res) {
+  const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
+  if (v > KNOWN_MANIFEST_VERSION && !newsWarned) {
+    newsWarned = true;
+    console.error(`pidge: the server has NEW capabilities (manifest v${v}; this CLI knows v${KNOWN_MANIFEST_VERSION}) — re-read GET $PIDGE_URL/api/v1/manifest (see whats_new) and consider updating the CLI`);
+  }
+}
+
 // Map CLI flags → the /notify JSON body, including only what was provided.
 function buildBody() {
   if (!v.title) die('pidge: --title is required', 1);
@@ -244,6 +257,7 @@ async function doNotify() {
   } catch (e) {
     die(`pidge: send failed (network): ${e.message}`, 2);
   }
+  checkManifestNews(res);
   const ok = res.status >= 200 && res.status < 300;
   let info = {};
   try { info = JSON.parse(raw); } catch { /* leave {} */ }
@@ -275,6 +289,7 @@ async function doWait(cid, { timeout, interval }) {
   for (;;) {
     try {
       const res = await fetch(url, { headers });
+      checkManifestNews(res);
       if (res.status === 200) {
         const data = await res.json().catch(() => ({}));
         if (data.responded) {
