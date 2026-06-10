@@ -28,6 +28,12 @@ npx github:thiagoc7/pidge-cli ask \
 # A thing with a known time — push at T−lead + a lock-screen countdown to the event:
 npx github:thiagoc7/pidge-cli notify \
   --title "Reunião com o time" --profile event --event-at "2026-06-10T15:00:00"
+
+# A chart you generated — uploaded for you, shown on the banner + feed:
+npx github:thiagoc7/pidge-cli notify --title "Gráfico pronto" --image ./chart.png
+
+# A real artifact — the human previews it on the phone, shares it, saves to Files:
+npx github:thiagoc7/pidge-cli notify --title "Relatório" --file ./relatorio.xlsx
 ```
 
 `ask` prints the chosen action as JSON to **stdout** and exits `0`:
@@ -59,6 +65,10 @@ npx github:thiagoc7/pidge-cli notify \
 --event-at ISO8601      WHEN the thing happens (a FACT; required by profile event)
 --lead-minutes N        notify/start the countdown N min before event_at (5–240)
 --urgency LEVEL         normal | persistent | alarm (low-level — prefer --profile)
+--image PATH_OR_URL     image on the banner + feed: a local path is uploaded for you
+                        (your machine has no public URL); an https URL is sent as-is
+--file PATH             a real artifact (xlsx, pdf, csv…) the human previews, shares
+                        and saves on the phone; uploaded automatically (≤25 MB)
 --actions LIST          comma list: yes,no,approve,reject,accept,decline,later,
                         done,snooze,reschedule,reply,mute
 --custom-action SPEC    "id:label[:destructive][:confirm][:biometric][:terminal]"
