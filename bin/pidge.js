@@ -7,7 +7,9 @@
 //
 //   export PIDGE_URL=https://pidge.sh              # default http://localhost:3000
 //   export PIDGE_TOKEN=hld_xxx                     # the channel's bearer key
-//   (HERALD_URL / HERALD_TOKEN are honored as a fallback)
+//   (HERALD_URL / HERALD_TOKEN are honored as a fallback; with no env vars set,
+//    ~/.config/pidge/env — KEY=VALUE — is read instead, so the key can live
+//    OUTSIDE the agent's chat/context entirely, #57)
 //
 //   # send AND block until the human answers, then print the chosen action as JSON
 //   pidge ask --title "Aprovar deploy?" --actions yes,no,reply --timeout 600
@@ -33,12 +35,34 @@
 const { parseArgs } = require('node:util');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 
-const BASE = process.env.PIDGE_URL || process.env.HERALD_URL || 'http://localhost:3000';
-const TOKEN = process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN;
+// #57 token hygiene: when the env vars are unset, fall back to
+// ~/.config/pidge/env (KEY=VALUE lines the HUMAN writes once in THEIR terminal)
+// so the raw hld_… key never has to ride the agent's chat/context. Explicit env
+// vars always win; `export ` prefixes, quotes and #comments are tolerated.
+function configEnv() {
+  try {
+    const file = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'pidge', 'env');
+    const out = {};
+    for (let line of fs.readFileSync(file, 'utf8').split('\n')) {
+      line = line.trim().replace(/^export\s+/, '');
+      if (!line || line.startsWith('#')) continue;
+      const i = line.indexOf('=');
+      if (i < 1) continue;
+      const value = line.slice(i + 1).replace(/^["']|["']$/g, '');
+      if (value) out[line.slice(0, i)] = value;
+    }
+    return out;
+  } catch { return {}; }
+}
+const FILE_ENV = configEnv();
+
+const BASE = process.env.PIDGE_URL || process.env.HERALD_URL || FILE_ENV.PIDGE_URL || 'http://localhost:3000';
+const TOKEN = process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN || FILE_ENV.PIDGE_TOKEN;
 
 function die(msg, code = 1) { console.error(msg); process.exit(code); }
-if (!TOKEN) die('pidge: set PIDGE_TOKEN');
+if (!TOKEN) die('pidge: set PIDGE_TOKEN (env var, or put PIDGE_TOKEN=… in ~/.config/pidge/env)');
 
 const OPTIONS = {
   help: { type: 'boolean', short: 'h' },
@@ -102,6 +126,8 @@ OPTIONS (notify / ask)
 ENV
   PIDGE_URL     your Pidge server (default http://localhost:3000; HERALD_URL honored)
   PIDGE_TOKEN   your channel's bearer key (required; HERALD_TOKEN honored)
+                with neither set, ~/.config/pidge/env (KEY=VALUE) is read — the
+                key-free path: the human writes the file once, no secret in chat
 
 OUTPUT
   stdout is machine-readable (notify→201 JSON; ask/wait→chosen_action JSON);
