@@ -74,6 +74,7 @@ const OPTIONS = {
   body: { type: 'string' },
   'body-markdown': { type: 'string' },
   subtitle: { type: 'string' },
+  template: { type: 'string' },                // content/action pattern (manifest `templates`)
   profile: { type: 'string' },                 // delivery profile id (manifest `profiles`)
   'event-at': { type: 'string' },              // WHEN the thing happens (profile event)
   'lead-minutes': { type: 'string' },          // notify/countdown lead before event_at
@@ -107,6 +108,9 @@ OPTIONS (notify / ask)
   --body TEXT              message shown on the banner
   --body-markdown MD       rich body for the tap-through detail screen
   --subtitle TEXT
+  --template ID            content/action pattern — WHAT you're asking: context (FYI,
+                           no buttons) · decision (yes/no/reply) · approval · reminder ·
+                           nudge · sensitive (gated, Face ID). Composes with --profile.
   --profile ID             delivery profile (the HUMAN owns what it does): default ·
                            event (needs --event-at; countdown Live Activity) ·
                            escalating (alarm if unanswered minutes after delivery) ·
@@ -171,7 +175,7 @@ const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 5;
+const KNOWN_MANIFEST_VERSION = 7;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
@@ -188,6 +192,7 @@ function buildBody() {
   if (v.body !== undefined) body.body = v.body;
   if (v['body-markdown'] !== undefined) body.body_markdown = v['body-markdown'];
   if (v.subtitle !== undefined) body.subtitle = v.subtitle;
+  if (v.template !== undefined) body.template = v.template;
   if (v.profile !== undefined) body.profile = v.profile;
   if (v['event-at'] !== undefined) body.event_at = v['event-at'];
   if (v['lead-minutes'] !== undefined) body.lead_minutes = parseInt(v['lead-minutes'], 10);
