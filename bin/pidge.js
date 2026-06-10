@@ -31,6 +31,8 @@
 // New /notify fields work without a CLI release via --param key=value.
 
 const { parseArgs } = require('node:util');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const BASE = process.env.PIDGE_URL || process.env.HERALD_URL || 'http://localhost:3000';
 const TOKEN = process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN;
@@ -48,6 +50,8 @@ const OPTIONS = {
   'event-at': { type: 'string' },              // WHEN the thing happens (profile event)
   'lead-minutes': { type: 'string' },          // notify/countdown lead before event_at
   urgency: { type: 'string' },                 // normal | persistent | alarm (low-level — prefer --profile)
+  image: { type: 'string' },                   // banner+feed image: local path → uploaded; URL → as-is
+  file: { type: 'string' },                    // real artifact (xlsx/pdf/csv…): local path → uploaded
   actions: { type: 'string' },                 // comma list from the catalog
   'custom-action': { type: 'string', multiple: true }, // id:label[:destructive][:confirm][:biometric][:terminal]
   'deliver-at': { type: 'string' },
@@ -79,6 +83,10 @@ OPTIONS (notify / ask)
   --event-at ISO8601       WHEN the thing happens (a FACT; required by profile event)
   --lead-minutes N         notify/start countdown N min before event_at (5–240)
   --urgency LEVEL          normal | persistent | alarm (low-level — prefer --profile)
+  --image PATH_OR_URL      image on the banner + feed: a local path is uploaded for
+                           you (your machine has no public URL); an https URL is sent as-is
+  --file PATH              a real artifact (xlsx, pdf, csv…) the human previews,
+                           shares and saves on the phone; uploaded automatically (≤25 MB)
   --actions LIST           comma list: yes,no,approve,reject,accept,decline,later,
                            done,snooze,reschedule,reply,mute
   --custom-action SPEC     "id:label[:destructive][:confirm][:biometric][:terminal]" (repeatable)
@@ -169,14 +177,60 @@ function buildBody() {
   return body;
 }
 
+const MIME = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic',
+  '.pdf': 'application/pdf', '.csv': 'text/csv', '.txt': 'text/plain',
+  '.md': 'text/markdown', '.json': 'application/json', '.zip': 'application/zip',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+};
+const guessMime = (p) => MIME[path.extname(p).toLowerCase()] || 'application/octet-stream';
+
+// Multipart upload of a local file to POST /api/v1/uploads → the opaque `ref`
+// /notify accepts as `image`/`file`. This is how a LOCALLY-generated artifact
+// reaches the phone: the agent's machine has no public URL and the push payload
+// is far too small to carry a file.
+async function uploadFile(filePath) {
+  const fd = new FormData();
+  fd.append('file', new Blob([fs.readFileSync(filePath)], { type: guessMime(filePath) }),
+            path.basename(filePath));
+  let res, raw;
+  try {
+    res = await fetch(`${BASE}/api/v1/uploads`, {
+      method: 'POST', headers: { authorization: `Bearer ${TOKEN}` }, body: fd,
+    });
+    raw = await res.text();
+  } catch (e) {
+    die(`pidge: upload failed (network): ${e.message}`, 2);
+  }
+  if (!(res.status >= 200 && res.status < 300)) die(`pidge: upload failed (${res.status}): ${raw}`, 2);
+  let ref;
+  try { ref = JSON.parse(raw).ref; } catch { /* fall through */ }
+  if (!ref) die('pidge: upload returned no ref', 2);
+  return ref;
+}
+
+// --image / --file: an existing local path is uploaded and swapped for its ref;
+// anything else (an https URL on --image, or an already-minted ref) passes through
+// untouched — the server 422s self-describingly on an invalid value.
+async function resolveMedia(body) {
+  for (const key of ['image', 'file']) {
+    if (v[key] === undefined) continue;
+    body[key] = fs.existsSync(v[key]) ? await uploadFile(v[key]) : v[key];
+  }
+}
+
 // POST /notify. Returns { ok, info, raw }. Emits to STDERR what an agent most
 // needs to KNOW (0 devices / no banner buttons / an armed alarm / a policy
 // degrade), so stdout stays free for machine output.
 async function doNotify() {
+  const payload = buildBody();
+  await resolveMedia(payload);
   let res, raw;
   try {
     res = await fetch(`${BASE}/api/v1/notify`, {
-      method: 'POST', headers, body: JSON.stringify(buildBody()),
+      method: 'POST', headers, body: JSON.stringify(payload),
     });
     raw = await res.text();
   } catch (e) {
