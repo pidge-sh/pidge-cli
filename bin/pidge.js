@@ -89,10 +89,16 @@ const OPTIONS = {
   'deliver-at': { type: 'string' },
   'reply-to': { type: 'string' },
   'correlation-id': { type: 'string' },
+  thread: { type: 'string' },                  // conversation handle (#49) — same id ⇒ one strand on the phone
   'collapse-key': { type: 'string' },
   param: { type: 'string', multiple: true },   // key=value escape hatch → raw /notify field
   timeout: { type: 'string' },
   interval: { type: 'string' },
+  // inbox flags (#83)
+  pending: { type: 'boolean' },
+  summary: { type: 'boolean' },
+  all: { type: 'boolean' },
+  limit: { type: 'string' },
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -102,6 +108,8 @@ USAGE
   pidge notify [options]                  send only (prints the 201 JSON)
   pidge wait   <correlation_id> [options] block on an already-sent notification
   pidge cancel <correlation_id>           cancel a still-scheduled notification (#56)
+  pidge inbox  [--pending|--summary|--all|--limit N]   what you sent: list, pending slice, or counts+latency (#83)
+  pidge listen [--timeout N]              block until the human MESSAGES you from the app, print + ack + exit (#48)
   pidge --help
 
 OPTIONS (notify / ask)
@@ -131,6 +139,8 @@ OPTIONS (notify / ask)
   --deliver-at ISO8601     schedule for later
   --reply-to URL           also POST the answer to your webhook (HMAC-signed)
   --correlation-id ID      idempotency + routing key (auto-generated if omitted)
+  --thread ID              conversation handle (#49): sends sharing it group as ONE
+                           strand on the phone — use it for follow-ups
   --collapse-key KEY       replace/update a prior notification
   --param KEY=VALUE        pass ANY raw /notify field (repeatable) — future server
                            fields work without a CLI update; the manifest is the contract
@@ -177,7 +187,7 @@ const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 7;
+const KNOWN_MANIFEST_VERSION = 11;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
@@ -204,6 +214,7 @@ function buildBody() {
   if (v['deliver-at'] !== undefined) body.deliver_at = v['deliver-at'];
   if (v['reply-to'] !== undefined) body.reply_to = v['reply-to'];
   if (v['correlation-id'] !== undefined) body.correlation_id = v['correlation-id'];
+  if (v.thread !== undefined) body.thread_id = v.thread;
   if (v['collapse-key'] !== undefined) body.collapse_key = v['collapse-key'];
   if (v.actions !== undefined) body.actions = v.actions.split(',').filter(Boolean);
 
@@ -321,6 +332,9 @@ async function doNotify() {
     }
     if (info.degraded)
       console.error(`pidge: DEGRADED by channel policy — ${info.degrade_reason} (delivered anyway, quieter; the human's setting, don't retry harder)`);
+    // #49: threads — remind the agent how to keep the conversation grouped.
+    if (info.thread_id)
+      console.error(`pidge: thread=${info.thread_id} — send follow-ups with the same --thread to group them on the phone`);
   } else {
     console.error(`pidge: send failed (${res.status}): ${raw}`);
   }
@@ -355,7 +369,9 @@ async function doWait(cid, { timeout, interval }) {
           }
         } else if (!firedNotice && data.escalation && data.escalation.state === 'fired') {
           firedNotice = true;
-          console.error('pidge: the escalation alarm FIRED and there is still no answer — the human may have stopped the alarm on-device (that is not reported back); keep waiting or back off');
+          // #70: stopping the ring on-device now reports `seen` (seen_at flips);
+          // snoozing it is a real snoozed event this loop narrates.
+          console.error('pidge: the escalation alarm FIRED and there is still no answer — seen_at tells you if the human at least silenced it; keep waiting or back off');
         }
       } else if (res.status === 404) {
         console.error(`pidge: no notification for correlation_id=${cid}`);
@@ -436,6 +452,90 @@ const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback
       }
       console.error(`pidge: cancel failed (${res.status}) — ${res.status === 409 ? 'too late, it already reached the phone' : 'unknown correlation_id?'}`);
       process.exit(2);
+      break;
+    }
+    case 'inbox': {
+      // #83: what this channel sent — the list (default), the pending slice
+      // (--pending = delivered + still unanswered) or the one-call summary
+      // (--summary = counts + answer latency). stdout = raw server JSON.
+      const qs = new URLSearchParams();
+      if (v.all) qs.set('all', 'true');
+      let inboxPath = '/api/v1/inbox/summary';
+      if (!v.summary) {
+        inboxPath = '/api/v1/notifications';
+        if (v.pending) qs.set('pending', 'true');
+        if (v.limit !== undefined) qs.set('limit', v.limit);
+      }
+      let res, raw;
+      try {
+        res = await fetch(`${BASE}${inboxPath}${qs.size ? `?${qs}` : ''}`, { headers });
+        raw = await res.text();
+      } catch (e) {
+        die(`pidge: inbox failed (network): ${e.message}`, 2);
+      }
+      checkManifestNews(res);
+      console.log(raw);
+      if (!(res.status >= 200 && res.status < 300)) die(`pidge: inbox failed (${res.status})`, 2);
+      let data = {};
+      try { data = JSON.parse(raw); } catch { /* leave {} */ }
+      if (v.summary) {
+        const latency = data.avg_response_seconds != null
+          ? `, human answers in ~${Math.round(data.avg_response_seconds / 60)} min` : '';
+        console.error(`pidge: ${data.total} sent (${data.scope}) — ${data.pending} pending${latency}`);
+      } else {
+        const rows = data.notifications || [];
+        const pendingCount = rows.filter((r) => r.status === 'delivered' && !r.responded).length;
+        console.error(`pidge: ${rows.length} notification(s)${v.pending ? ' pending' : ` — ${pendingCount} pending`} (add --summary for counts+latency)`);
+      }
+      process.exit(0);
+      break;
+    }
+    case 'listen': {
+      // #48: block until the human messages this channel (the app's composer),
+      // print the messages as JSON, ACK them, exit 0. One-shot by design (loop
+      // it, don't daemonize) — same contract as `wait`. Exit 3 on timeout.
+      // At-least-once: the ack happens AFTER the print — a crash re-serves them;
+      // dedupe by id if you've seen one before.
+      const timeout = num(v.timeout, 600);
+      const deadline = Date.now() + timeout * 1000;
+      for (;;) {
+        const waitS = Math.max(0, Math.min(55, Math.ceil((deadline - Date.now()) / 1000)));
+        const askedAt = Date.now();
+        try {
+          const res = await fetch(`${BASE}/api/v1/messages?wait=${waitS}`, { headers });
+          checkManifestNews(res);
+          if (res.status === 200) {
+            const data = await res.json().catch(() => ({}));
+            const msgs = data.messages || [];
+            if (msgs.length) {
+              console.log(JSON.stringify(msgs, null, 2));
+              const upTo = Math.max(...msgs.map((m) => m.id));
+              try {
+                const ack = await fetch(`${BASE}/api/v1/messages/ack`, {
+                  method: 'POST', headers, body: JSON.stringify({ up_to: upTo }),
+                });
+                if (ack.status >= 200 && ack.status < 300) {
+                  console.error(`pidge: ${msgs.length} message(s) from the human — acked (answer via notify; reuse thread_id when present)`);
+                } else {
+                  console.error(`pidge: WARNING — ack failed (${ack.status}); these messages will be re-served next listen`);
+                }
+              } catch (e) {
+                console.error(`pidge: WARNING — ack failed (network: ${e.message}); these messages will be re-served next listen`);
+              }
+              process.exit(0);
+            }
+          } else {
+            console.error(`pidge: listen error ${res.status}`);
+          }
+        } catch (e) {
+          console.error(`pidge: listen error (network): ${e.message}`);
+        }
+        if (Date.now() >= deadline) {
+          console.error(`pidge: timed out after ${timeout}s — no message from the human (not a failure)`);
+          process.exit(3);
+        }
+        if (Date.now() - askedAt < 2000) await sleep(num(v.interval, 5) * 1000);
+      }
       break;
     }
     default:
