@@ -66,7 +66,8 @@ const BASE = process.env.PIDGE_URL || process.env.HERALD_URL || FILE_ENV.PIDGE_U
 const TOKEN = process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN || FILE_ENV.PIDGE_TOKEN;
 
 function die(msg, code = 1) { console.error(msg); process.exit(code); }
-if (!TOKEN) die('pidge: set PIDGE_TOKEN (env var, or put PIDGE_TOKEN=… in ~/.config/pidge/env)');
+// NB: the TOKEN requirement is enforced AFTER help/usage handling (below) — a
+// first-time `npx pidge-cli --help` must work without any setup.
 
 const OPTIONS = {
   help: { type: 'boolean', short: 'h' },
@@ -168,6 +169,7 @@ const command = parsed.positionals[0];
 // `pidge --help` / `-h` / `help` → full help on stdout, exit 0. No command → stderr, exit 1.
 if (v.help || command === 'help') { console.log(USAGE); process.exit(0); }
 if (!command) { console.error(USAGE); process.exit(1); }
+if (!TOKEN) die('pidge: set PIDGE_TOKEN (env var, or put PIDGE_TOKEN=… in ~/.config/pidge/env)');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };

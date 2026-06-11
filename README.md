@@ -20,22 +20,22 @@ export PIDGE_TOKEN=hld_xxx                          # your channel's bearer key
 #  key never has to appear in an agent's chat; explicit env vars win)
 
 # Send AND wait for the answer (the one an agent wants):
-npx pidge ask \
+npx pidge-cli ask \
   --title "Aprovar deploy?" --actions yes,no,reply --timeout 600
 
 # Urgent — escalates to an AlarmKit alarm if the human doesn't answer in minutes:
-npx pidge ask \
+npx pidge-cli ask \
   --title "Posso rodar a migration?" --profile escalating --actions yes,no
 
 # A thing with a known time — push at T−lead + a lock-screen countdown to the event:
-npx pidge notify \
+npx pidge-cli notify \
   --title "Reunião com o time" --profile event --event-at "2026-06-10T15:00:00"
 
 # A chart you generated — uploaded for you, shown on the banner + feed:
-npx pidge notify --title "Gráfico pronto" --image ./chart.png
+npx pidge-cli notify --title "Gráfico pronto" --image ./chart.png
 
 # A real artifact — the human previews it on the phone, shares it, saves to Files:
-npx pidge notify --title "Relatório" --file ./relatorio.xlsx
+npx pidge-cli notify --title "Relatório" --file ./relatorio.xlsx
 ```
 
 `ask` prints the chosen action as JSON to **stdout** and exits `0`:
