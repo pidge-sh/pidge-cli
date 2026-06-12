@@ -90,6 +90,7 @@ const OPTIONS = {
   'reply-to': { type: 'string' },
   'correlation-id': { type: 'string' },
   thread: { type: 'string' },                  // conversation handle (#49) — same id ⇒ one strand on the phone
+  after: { type: 'string' },                   // decision queue (#157): held until this cid resolves
   'collapse-key': { type: 'string' },
   param: { type: 'string', multiple: true },   // key=value escape hatch → raw /notify field
   timeout: { type: 'string' },
@@ -170,6 +171,9 @@ OPTIONS (notify / ask)
   --correlation-id ID      idempotency + routing key (auto-generated if omitted)
   --thread ID              conversation handle (#49): sends sharing it group as ONE
                            strand on the phone — use it for follow-ups
+  --after CID              decision queue (#157): HELD until that notification is
+                           answered — chain N decisions so the human sees one at a
+                           time ("Decisão 2/3" --after <cid-da-1>); snooze doesn't advance
   --collapse-key KEY       replace/update a prior notification
   --param KEY=VALUE        pass ANY raw /notify field (repeatable) — future server
                            fields work without a CLI update; the manifest is the contract
@@ -387,6 +391,7 @@ function buildBody() {
   if (v['reply-to'] !== undefined) body.reply_to = v['reply-to'];
   if (v['correlation-id'] !== undefined) body.correlation_id = v['correlation-id'];
   if (v.thread !== undefined) body.thread_id = v.thread;
+  if (v.after !== undefined) body.after = v.after;
   if (v['collapse-key'] !== undefined) body.collapse_key = v['collapse-key'];
   if (v.actions !== undefined) body.actions = v.actions.split(',').filter(Boolean);
 
