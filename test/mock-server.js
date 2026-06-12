@@ -19,6 +19,8 @@ function createMock() {
     notifications: {},     // cid → body for GET /api/v1/notifications/:cid
     acks: [],
     notifies: [],
+    claimCode: 'claim-ok',   // #110: POST /api/v1/claim exchanges this once
+    devices: 1,
   };
   let server = null;
   let wss = null;
@@ -35,6 +37,42 @@ function createMock() {
     if (held && state.waitMode === '502') return json(res, 502, { error: 'bad gateway' });
     if (held && state.waitMode === 'destroy') return setTimeout(() => res.destroy(), 300);
 
+    // Onboarding v2 (#110): claim exchange (public, single-use) + whoami.
+    if (req.method === 'POST' && url.pathname === '/api/v1/claim') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let code = null;
+        try { code = JSON.parse(body).code; } catch { /* keep null */ }
+        if (state.claimCode && code === state.claimCode) {
+          state.claimCode = null; // single-use
+          return json(res, 200, {
+            key: 'hld_minted_by_claim', channel: { id: 1, name: 'mock' },
+            user: 'Thiago', base_url: `http://127.0.0.1:${port}`,
+          });
+        }
+        json(res, 404, { error: 'not_found' });
+      });
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/api/v1/whoami') {
+      const auth = req.headers.authorization || '';
+      if (!/^Bearer hld_/.test(auth)) return json(res, 401, { error: 'unauthorized' });
+      return json(res, 200, {
+        channel: { id: 1, name: 'mock', icon: 'bot', color: 'violet' },
+        user: { name: 'Thiago', timezone: 'America/Sao_Paulo' },
+        devices: state.devices ?? 1, manifest_version: 16,
+      });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/v1/manifest') {
+      return json(res, 200, {
+        manifest_version: 16,
+        templates: { decision_table: ['need a decision → template decision'] },
+        profiles: { decision_table: ['no answer needed → profile omitted'] },
+        notes: ['trust the echo'],
+        cli: { output: 'exit 0 answered · 3 timed out' },
+      });
+    }
     if (req.method === 'GET' && url.pathname === '/api/v1/messages') {
       return json(res, 200, { messages: state.messages });
     }

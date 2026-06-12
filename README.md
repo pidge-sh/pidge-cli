@@ -11,6 +11,19 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > current spec (fields, profiles, guarantees). This CLI is a thin pipe over it — any
 > new server field works without a CLI update via `--param key=value`.
 
+## Setup in one command (v0.7.0 — the claim flow)
+
+```bash
+# The human copies a setup prompt from the Pidge app (Canais → the channel) —
+# it carries a SINGLE-USE claim code (15 min TTL), never the key:
+npx pidge-cli setup --claim <code> --url https://pidge.sh
+# → exchanges the code for the real key, writes ~/.config/pidge/env (chmod 600)
+#   and runs `pidge doctor`. The secret never appears on screen or in any chat.
+
+npx pidge-cli doctor   # validate anytime: env source, server, key, "canal X · N devices"
+npx pidge-cli whoami   # which channel does this key speak for (JSON)
+```
+
 ## Use it (no install — via npx)
 
 ```bash
@@ -55,6 +68,10 @@ npx pidge-cli notify --title "Relatório" --file ./relatorio.xlsx
 | `cancel <correlation_id>` | Cancel a **still-scheduled** notification before it fires (idempotent; 409 once it reached the phone). |
 | `inbox` | What you sent: list, `--pending` slice, or `--summary` (counts + answer latency). |
 | `listen` | Block until the human **messages you** from the app; prints the messages, ACKs them, exits `0`. One-shot — loop it. |
+| `setup --claim <code>` | One-shot onboarding (v0.7.0): exchange the single-use code for the key, store it in `~/.config/pidge/env` (600), run doctor. |
+| `doctor` | Validate the setup **without exposing secrets**: env source, server reachable, key valid, channel + device count. Exit 0/2. |
+| `whoami` | Which channel does this key speak for (JSON). |
+| `skill install` | Write `.claude/skills/pidge/SKILL.md` generated from the live manifest — persistent Pidge knowledge for Claude Code agents; re-run to update. |
 
 ## Realtime (v0.6.0)
 
