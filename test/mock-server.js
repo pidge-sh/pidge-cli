@@ -97,6 +97,9 @@ function createMock() {
           id: 1, status: 'pending',
           correlation_id: parsed.correlation_id || 'mock-cid',
           registered_devices: 1, render_mode: 'banner',
+          template: parsed.template || null,
+          // #132: per-template suggestion the real server echoes
+          suggested_ask_timeout: parsed.template === 'approval' ? 3600 : null,
         });
       });
       return;

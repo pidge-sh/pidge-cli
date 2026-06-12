@@ -330,3 +330,45 @@ test('listen WITHOUT --all keeps the composer-only contract (answers not served)
 
   assert.equal(code, 3, 'composer-only listen must time out — the answer is not its stream');
 });
+
+// --- #132: ask obeys the template's suggested timeout -------------------------
+
+test('ask without --timeout obeys the 201 suggested_ask_timeout and narrates it', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // answer immediately so the (1h) timeout never actually elapses
+  mock.state.notifications['tpl-1'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'approve', label: 'Aprovar', text: null },
+  };
+
+  const { result } = runCli(
+    ['ask', '--no-realtime', '--template', 'approval', '--title', 'Aprovar?', '--correlation-id', 'tpl-1'],
+    port,
+  );
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stderr, /timeout 60 min — suggested by template approval/);
+  assert.equal(JSON.parse(stdout).action_id, 'approve');
+});
+
+test('an explicit --timeout always beats the template suggestion', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['tpl-2'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'approve', label: 'Aprovar', text: null },
+  };
+
+  const { result } = runCli(
+    ['ask', '--no-realtime', '--template', 'approval', '--title', 'Aprovar?', '--correlation-id', 'tpl-2', '--timeout', '30'],
+    port,
+  );
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0);
+  assert.doesNotMatch(stderr, /suggested by template/);
+});
