@@ -41,6 +41,7 @@ function createMock() {
     if (req.method === 'POST' && url.pathname === '/api/v1/messages/ack') {
       state.acks.push(req.url);
       state.messages = [];
+      if (state.hangAck) return; // simulate a wedged proxy stalling the ack POST
       return json(res, 200, { acked: 1 });
     }
     if (req.method === 'POST' && url.pathname === '/api/v1/notify') {

@@ -124,7 +124,9 @@ REALTIME (#118)
   --realtime      force WS (warns + falls back to polling if unavailable)
   --no-realtime   polling only (the ?wait= long-poll, capped 25 s server-side)
   Degrade ladder, narrated on stderr: WS → ?wait= long-poll → plain GETs every
-  ~45 s after 3 consecutive failures on held polls (#119).
+  ~45 s after 3 consecutive failures on held polls (#119). Degrade is STICKY for
+  the session (we can't probe held-poll health without re-paying the failure) —
+  re-invoke the command to retry the fast path.
 
 OPTIONS (notify / ask)
   --title TEXT             (required) the headline
@@ -199,6 +201,18 @@ if (!TOKEN) die('pidge: set PIDGE_TOKEN (env var, or put PIDGE_TOKEN=… in ~/.c
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
+
+// fetch with a hard timeout (#119 review): a wedged edge proxy can stall even a
+// short POST forever, and a hung ack on the realtime listen path would pin the
+// process past its deadline — worse than going deaf. NOTHING in this CLI should
+// await a fetch that can't time out. A held long-poll passes its own (larger)
+// timeout; everything else uses the 30 s default.
+function fetchT(url, opts = {}, timeoutMs = 30000) {
+  const ms = parseInt(process.env.PIDGE_FETCH_TIMEOUT || '', 10) || timeoutMs; // test/ops hook
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(new Error(`timeout after ${ms}ms`)), ms);
+  return fetch(url, { ...opts, signal: ctl.signal }).finally(() => clearTimeout(t));
+}
 
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
@@ -331,9 +345,10 @@ async function cableSession({ channel, deadline, onUp, onFrame }) {
     if (outcome === 'deadline') return 'deadline';
     if (!outcome.startsWith('down: ')) return outcome; // caller-driven finish (e.g. 'answered')
     wsFails++;
-    if (wsFails >= 4) return 'ws-unavailable';
+    const MAX_WS_FAILS = 4; // then fall back to polling for the rest of the session
+    if (wsFails >= MAX_WS_FAILS) return 'ws-unavailable';
     const backoff = Math.min(2000 * wsFails, 10000);
-    console.error(`pidge: realtime socket ${outcome.replace('down: ', '')} — reconnecting in ${Math.round(backoff / 1000)}s (attempt ${wsFails}/3)`);
+    console.error(`pidge: realtime socket ${outcome.replace('down: ', '')} — reconnecting in ${Math.round(backoff / 1000)}s (attempt ${wsFails}/${MAX_WS_FAILS})`);
     await sleep(backoff);
   }
   return 'deadline';
@@ -499,7 +514,7 @@ async function doWait(cid, { timeout, interval }) {
     const url = `${BASE}/api/v1/notifications/${encodeURIComponent(cid)}${waitS > 0 ? `?wait=${waitS}` : ''}`;
     const askedAt = Date.now();
     try {
-      const res = await fetch(url, { headers });
+      const res = await fetchT(url, { headers }, (waitS + 10) * 1000);
       checkManifestNews(res);
       if (res.status === 200) {
         health.ok();
@@ -552,7 +567,7 @@ async function realtimeWait(cid, { timeout, interval }) {
   const deadline = Date.now() + timeout * 1000;
   const answered = async () => {
     try {
-      const res = await fetch(`${BASE}/api/v1/notifications/${encodeURIComponent(cid)}`, { headers });
+      const res = await fetchT(`${BASE}/api/v1/notifications/${encodeURIComponent(cid)}`, { headers });
       if (res.status !== 200) return false;
       const data = await res.json().catch(() => ({}));
       return !!(data.responded && data.chosen_action && data.chosen_action.kind !== 'snoozed');
@@ -708,7 +723,11 @@ const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback
         console.log(JSON.stringify(msgs, null, 2));
         const upTo = Math.max(...msgs.map((m) => m.id));
         try {
-          const ack = await fetch(`${BASE}/api/v1/messages/ack`, {
+          // fetchT, not fetch: a wedged proxy stalling this ack would otherwise
+          // pin the process forever (the WS drain path awaits printAndAck's exit
+          // with no deadline) — messages are already printed, so a timeout here
+          // just re-serves them next listen (at-least-once).
+          const ack = await fetchT(`${BASE}/api/v1/messages/ack`, {
             method: 'POST', headers, body: JSON.stringify({ up_to: upTo }),
           });
           if (ack.status >= 200 && ack.status < 300) {
@@ -731,7 +750,7 @@ const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback
           if (draining) return;
           draining = true;
           try {
-            const res = await fetch(`${BASE}/api/v1/messages`, { headers });
+            const res = await fetchT(`${BASE}/api/v1/messages`, { headers });
             checkManifestNews(res);
             if (res.status === 200) {
               health.ok();
@@ -769,7 +788,7 @@ const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback
         const waitS = health.degraded ? 0 : Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
         const askedAt = Date.now();
         try {
-          const res = await fetch(`${BASE}/api/v1/messages${waitS > 0 ? `?wait=${waitS}` : ''}`, { headers });
+          const res = await fetchT(`${BASE}/api/v1/messages${waitS > 0 ? `?wait=${waitS}` : ''}`, { headers }, (waitS + 10) * 1000);
           checkManifestNews(res);
           if (res.status === 200) {
             health.ok();
