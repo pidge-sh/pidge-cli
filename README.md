@@ -53,6 +53,30 @@ npx pidge-cli notify --title "Relatório" --file ./relatorio.xlsx
 | `notify` | Send only. Prints the raw 201 JSON; the `correlation_id` + warnings go to stderr. |
 | `wait <correlation_id>` | Block on an already-sent notification until it's answered. |
 | `cancel <correlation_id>` | Cancel a **still-scheduled** notification before it fires (idempotent; 409 once it reached the phone). |
+| `inbox` | What you sent: list, `--pending` slice, or `--summary` (counts + answer latency). |
+| `listen` | Block until the human **messages you** from the app; prints the messages, ACKs them, exits `0`. One-shot — loop it. |
+
+## Realtime (v0.6.0)
+
+`listen`/`ask`/`wait` hold a **WebSocket** to the server (ActionCable at `/cable`)
+whenever the runtime has one (**Node ≥22**): answers and messages land in **<1 s**,
+an idle hours-long `listen` **survives server deploys by reconnecting**, and while
+you listen the human sees **"ouvindo agora"** in the app — they type more when the
+light is on.
+
+Everything durable still goes over HTTP (backlog reads + acks), so a dropped
+socket costs latency, never data. The degrade ladder narrates itself on stderr:
+
+```
+WebSocket  →  ?wait= long-poll (capped 25 s server-side)  →  plain GETs every ~45 s
+              (automatic after repeated WS failures)         (after 3 consecutive
+                                                              failures on held polls)
+```
+
+- `--realtime` forces WS (warns + falls back if unavailable) · `--no-realtime` = polling only.
+- **Deafness exits LOUD**: a session that times out with **zero** healthy round-trips
+  exits `4` (≠ `3`, "the human didn't answer") — the channel itself looks broken;
+  surface it instead of retrying blindly.
 
 ## Options (for `notify` / `ask`)
 
@@ -85,8 +109,9 @@ npx pidge-cli notify --title "Relatório" --file ./relatorio.xlsx
 --param KEY=VALUE       pass ANY raw /notify field (repeatable) — future server
                         fields work day-one, no CLI update needed
 --timeout SECONDS       ask: default 600 · wait: default 300
---interval SECONDS      FALLBACK poll cadence (default 30) — normally unused: the
-                        server long-polls each GET (?wait=55), answers are ~instant
+--interval SECONDS      FALLBACK poll cadence (default 30) — normally unused: WS or
+                        the server-held long-poll (?wait=25) make answers ~instant
+--realtime              force the WebSocket (Node ≥22); --no-realtime = polling only
 ```
 
 ## Contract (important for agents)
@@ -98,7 +123,9 @@ npx pidge-cli notify --title "Relatório" --file ./relatorio.xlsx
   the `chosen_action` JSON. Everything human (warnings, the correlation_id, snooze
   notices, armed-escalation and policy-degrade narration) goes to **stderr**.
 - **Exit codes:** `0` answered · `3` timed out (= *no answer yet*, NOT a failure —
-  back off and retry later) · `2` error · `1` usage.
+  back off and retry later) · `4` timed out **without one healthy round-trip all
+  session** (the CHANNEL looks broken — server/network — tell your human) ·
+  `2` error · `1` usage.
 - **Responses are one-and-done.** Every answer closes the notification EXCEPT a
   **snooze** (or a reschedule that set a new time), which re-fires later. `ask`/`wait`
   keep polling through a snooze and print `snooze_until` so you can schedule a re-check.
