@@ -835,7 +835,20 @@ ${notes.map((n) => `- ${n}`).join('\n')}
       const { ok, info } = await doNotify();
       if (!ok) process.exit(2);
       console.error(`pidge: sent (${info.registered_devices} device(s)) — waiting on ${cid}`);
-      await waitForAnswer(cid, { timeout: num(v.timeout, 600), interval: num(v.interval, 30) });
+      // #132: no --timeout ⇒ obey the template's suggestion from the 201 echo
+      // (human decisions take 30-40 min in the wild; a 600 s default misread
+      // them as silence). Explicit --timeout always wins.
+      let timeout = num(v.timeout, NaN);
+      if (!Number.isFinite(timeout)) {
+        if (info.suggested_ask_timeout) {
+          timeout = info.suggested_ask_timeout;
+          const mins = Math.round(timeout / 60);
+          console.error(`pidge: timeout ${mins} min — suggested by template ${info.template || v.template} (override with --timeout)`);
+        } else {
+          timeout = 600;
+        }
+      }
+      await waitForAnswer(cid, { timeout, interval: num(v.interval, 30) });
       break;
     }
     case 'wait': {
