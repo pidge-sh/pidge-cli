@@ -74,7 +74,11 @@ function createMock() {
       });
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/messages') {
-      return json(res, 200, { messages: state.messages });
+      // #131: notification_reply rows are served only on the unified queue.
+      const all = url.searchParams.get('all') === 'true';
+      const rows = all ? state.messages
+        : state.messages.filter((m) => !m.kind || m.kind === 'message');
+      return json(res, 200, { messages: rows });
     }
     if (req.method === 'POST' && url.pathname === '/api/v1/messages/ack') {
       state.acks.push(req.url);

@@ -120,7 +120,10 @@ USAGE
   pidge wait   <correlation_id> [options] block on an already-sent notification
   pidge cancel <correlation_id>           cancel a still-scheduled notification (#56)
   pidge inbox  [--pending|--summary|--all|--limit N]   what you sent: list, pending slice, or counts+latency (#83)
-  pidge listen [--timeout N]              block until the human MESSAGES you from the app, print + ack + exit (#48)
+  pidge listen [--timeout N] [--all]      block until the human MESSAGES you from the app, print + ack + exit (#48)
+                                          --all (#131) = the SINGLE EAR: also hear notification ANSWERS
+                                          (kind notification_reply + self-contained ref) — nothing the human
+                                          says can be missed by a looped listen --all
   pidge skill install                     write .claude/skills/pidge/SKILL.md generated from the
                                           live manifest (persistent Pidge knowledge for Claude Code)
   pidge --help
@@ -908,12 +911,25 @@ ${notes.map((n) => `- ${n}`).join('\n')}
       // the whole session never had a healthy round-trip (#119).
       // At-least-once: the ack happens AFTER the print — a crash re-serves them;
       // dedupe by id if you've seen one before.
+      // --all (#131): the SINGLE EAR — the queue also serves notification
+      // ANSWERS (kind notification_reply, with a self-contained ref), so a
+      // fire-and-forget notify can't lose its reply. Without --all the original
+      // composer-only contract stands (no double-consumption for ask/wait users).
       const timeout = num(v.timeout, 600);
       let deadline = Date.now() + timeout * 1000;
+      const queueQs = v.all ? '?all=true' : '';
 
       // Print + ack + exit 0 — shared by the WS and polling paths.
       const printAndAck = async (msgs) => {
         console.log(JSON.stringify(msgs, null, 2));
+        // #131: narrate answers so the agent knows WHICH notification spoke back.
+        for (const m of msgs) {
+          if (m.kind === 'notification_reply' && m.ref) {
+            const said = m.text ? `: ${String(m.text).slice(0, 120)}` : '';
+            console.error(`pidge: reply to your notification ${m.ref.correlation_id} ("${m.ref.title}") — ${m.action_id || m.ref.event_kind}${said}`);
+            if (m.truncated) console.error('pidge: that reply hit the server cap (truncated:true) — tell your human the tail was lost');
+          }
+        }
         const upTo = Math.max(...msgs.map((m) => m.id));
         try {
           // fetchT, not fetch: a wedged proxy stalling this ack would otherwise
@@ -943,7 +959,7 @@ ${notes.map((n) => `- ${n}`).join('\n')}
           if (draining) return;
           draining = true;
           try {
-            const res = await fetchT(`${BASE}/api/v1/messages`, { headers });
+            const res = await fetchT(`${BASE}/api/v1/messages${queueQs}`, { headers });
             checkManifestNews(res);
             if (res.status === 200) {
               health.ok();
@@ -959,15 +975,27 @@ ${notes.map((n) => `- ${n}`).join('\n')}
           }
         };
         let announced = false;
-        const outcome = await cableSession({
+        const sessions = [cableSession({
           channel: 'ConversationChannel',
           deadline,
           onUp: (finish) => {
-            if (!announced) { announced = true; console.error('pidge: listening over the realtime socket (the human sees "ouvindo agora")'); }
+            if (!announced) { announced = true; console.error(`pidge: listening over the realtime socket${v.all ? ' — single ear: composer + notification answers (#131)' : ''} (the human sees "ouvindo agora")`); }
             drain(finish);
           },
           onFrame: (m, finish) => { if (m.type === 'message') drain(finish); },
-        });
+        })];
+        // --all (#131): answers broadcast on InboxChannel, not Conversation — a
+        // second subscription wakes the same HTTP drain (the queue is the ledger;
+        // the loser session leaks until exit, harmless in a one-shot process).
+        if (v.all) {
+          sessions.push(cableSession({
+            channel: 'InboxChannel',
+            deadline,
+            onUp: (finish) => drain(finish),
+            onFrame: (m, finish) => { if (m.type === 'event' && m.responded) drain(finish); },
+          }));
+        }
+        const outcome = await Promise.race(sessions);
         if (outcome === 'deadline') {
           health.exitTimeout(`timed out after ${timeout}s — no message from the human`);
         }
@@ -981,7 +1009,10 @@ ${notes.map((n) => `- ${n}`).join('\n')}
         const waitS = health.degraded ? 0 : Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
         const askedAt = Date.now();
         try {
-          const res = await fetchT(`${BASE}/api/v1/messages${waitS > 0 ? `?wait=${waitS}` : ''}`, { headers }, (waitS + 10) * 1000);
+          const qs = new URLSearchParams();
+          if (waitS > 0) qs.set('wait', String(waitS));
+          if (v.all) qs.set('all', 'true');
+          const res = await fetchT(`${BASE}/api/v1/messages${qs.size ? `?${qs}` : ''}`, { headers }, (waitS + 10) * 1000);
           checkManifestNews(res);
           if (res.status === 200) {
             health.ok();
