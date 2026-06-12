@@ -153,6 +153,24 @@ test('ask over the realtime socket resolves from the InboxChannel frame', async 
   assert.match(stdout, /"action_id": "approve"/);
 });
 
+test('a wedged ack does NOT hang the process forever — it times out, exits (messages were printed)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.hangAck = true; // the ack POST never responds
+  mock.state.messages = [{ id: 5, channel_id: 1, body: 'msg + ack travado', created_at: 'x', consumed_at: null }];
+
+  // PIDGE_FETCH_TIMEOUT keeps the test fast; default in prod is 30 s.
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '20'], port, { PIDGE_FETCH_TIMEOUT: '1500' });
+  const started = Date.now();
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `must still exit 0 after printing; stderr: ${stderr}`);
+  assert.match(stdout, /ack travado/, 'the messages are printed before the ack');
+  assert.match(stderr, /ack failed/);
+  assert.ok(Date.now() - started < 10000, 'must not hang to the 20s deadline waiting on a dead ack');
+});
+
 test('listen without a WebSocket-capable runtime quietly uses polling (no crash)', async () => {
   const mock = createMock();
   const port = await mock.start();
