@@ -294,3 +294,39 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   assert.match(skill, /template decision/);
   assert.match(skill, /manifest v16/);
 });
+
+// --- #131: listen --all — the single ear --------------------------------------
+
+test('listen --all hears a notification answer and narrates which notification spoke back', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{
+    id: 9, channel_id: 1, kind: 'notification_reply',
+    body: 'sim, manda', text: 'sim, manda', action_id: 'reply',
+    ref: { correlation_id: 'pricing-2', title: 'Aprovar preço?', thread_id: 'pricing', notification_status: 'completed', event_kind: 'replied' },
+    created_at: 'x', consumed_at: null,
+  }];
+
+  const { result } = runCli(['listen', '--all', '--no-realtime', '--timeout', '10'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stdout, /notification_reply/);
+  assert.match(stderr, /reply to your notification pricing-2 \("Aprovar preço\?"\)/);
+});
+
+test('listen WITHOUT --all keeps the composer-only contract (answers not served)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{
+    id: 9, channel_id: 1, kind: 'notification_reply', body: 'sim',
+    ref: { correlation_id: 'x', title: 'y' }, created_at: 'x', consumed_at: null,
+  }];
+
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '6'], port);
+  const { code } = await result;
+  await mock.stop();
+
+  assert.equal(code, 3, 'composer-only listen must time out — the answer is not its stream');
+});
