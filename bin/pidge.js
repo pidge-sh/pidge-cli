@@ -102,17 +102,27 @@ const OPTIONS = {
   // realtime (#118): WS by default when the runtime has a WebSocket (Node ≥22)
   realtime: { type: 'boolean' },               // force WS (warn+fallback if unavailable)
   'no-realtime': { type: 'boolean' },          // polling only
+  // onboarding v2 (#110)
+  claim: { type: 'string' },                   // setup --claim <single-use code>
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
 
 USAGE
+  pidge setup --claim CODE [--url BASE]   one-shot onboarding (#110): exchange the single-use
+                                          code for the channel key, store it in
+                                          ~/.config/pidge/env (chmod 600), run doctor
+  pidge doctor                            validate the setup WITHOUT exposing secrets:
+                                          env source, server, key, "canal X · N devices"
+  pidge whoami                            which channel does this key speak for (JSON)
   pidge ask    [options]                  send AND wait for the answer (prints chosen_action JSON)
   pidge notify [options]                  send only (prints the 201 JSON)
   pidge wait   <correlation_id> [options] block on an already-sent notification
   pidge cancel <correlation_id>           cancel a still-scheduled notification (#56)
   pidge inbox  [--pending|--summary|--all|--limit N]   what you sent: list, pending slice, or counts+latency (#83)
   pidge listen [--timeout N]              block until the human MESSAGES you from the app, print + ack + exit (#48)
+  pidge skill install                     write .claude/skills/pidge/SKILL.md generated from the
+                                          live manifest (persistent Pidge knowledge for Claude Code)
   pidge --help
 
 REALTIME (#118)
@@ -197,7 +207,9 @@ const command = parsed.positionals[0];
 // `pidge --help` / `-h` / `help` → full help on stdout, exit 0. No command → stderr, exit 1.
 if (v.help || command === 'help') { console.log(USAGE); process.exit(0); }
 if (!command) { console.error(USAGE); process.exit(1); }
-if (!TOKEN) die('pidge: set PIDGE_TOKEN (env var, or put PIDGE_TOKEN=… in ~/.config/pidge/env)');
+// `setup` is the command that CREATES the token config — it must run without one.
+if (!TOKEN && command !== 'setup')
+  die('pidge: set PIDGE_TOKEN (env var, or put PIDGE_TOKEN=… in ~/.config/pidge/env) — or onboard with: pidge setup --claim <code> (ask your human for the code: Pidge app → Canais → o canal → copiar prompt de setup)');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
@@ -217,7 +229,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 16;
+const KNOWN_MANIFEST_VERSION = 19;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
@@ -613,8 +625,189 @@ async function waitForAnswer(cid, { timeout, interval }) {
 
 const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback);
 
+// ---------------------------------------------------------------------------
+// Onboarding v2 (#110): setup --claim / doctor / whoami / skill install.
+// ---------------------------------------------------------------------------
+
+const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'pidge');
+const CONFIG_FILE = path.join(CONFIG_DIR, 'env');
+
+// Where the token came from — doctor narrates it, setup respects precedence.
+function tokenSource() {
+  if (process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN) return 'env var';
+  if (FILE_ENV.PIDGE_TOKEN) return CONFIG_FILE;
+  return null;
+}
+
+// GET /whoami — which channel does this key speak for. Returns {res, data}.
+async function fetchWhoami(base = BASE, token = TOKEN) {
+  const res = await fetchT(`${base}/api/v1/whoami`, {
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+  });
+  let data = {};
+  try { data = await res.json(); } catch { /* leave {} */ }
+  return { res, data };
+}
+
+// doctor: validate the setup WITHOUT exposing secrets. Narration on stderr,
+// a compact machine-readable line on stdout. Exit 0 healthy / 2 broken.
+async function runDoctor(base = BASE, token = TOKEN) {
+  const source = token === TOKEN ? tokenSource() : CONFIG_FILE; // post-setup call passes the fresh token
+  if (!token) {
+    console.error('pidge doctor: NO TOKEN — set PIDGE_TOKEN, or onboard with `pidge setup --claim <code>` (the human copies the code from the Pidge app)');
+    process.exit(2);
+  }
+  console.error(`pidge doctor: token found (${source || 'passed in'}) — never displayed`);
+  console.error(`pidge doctor: server ${base}`);
+  let out;
+  try {
+    out = await fetchWhoami(base, token);
+  } catch (e) {
+    console.error(`pidge doctor: server UNREACHABLE — ${e.message} (check the URL; is it ${base}?)`);
+    process.exit(2);
+  }
+  const { res, data } = out;
+  checkManifestNews(res);
+  if (res.status === 401) {
+    console.error('pidge doctor: server reachable but the key is INVALID/REVOKED — re-onboard: ask your human for a fresh claim code (Pidge app → Canais → o canal → copiar prompt de setup)');
+    process.exit(2);
+  }
+  if (res.status === 404) {
+    // pre-#110 server: no /whoami yet — the key may still be fine; prove it on the manifest.
+    const m = await fetchT(`${base}/api/v1/manifest`, { headers: { authorization: `Bearer ${token}` } }).catch(() => null);
+    if (m && m.status === 200) {
+      console.error('pidge doctor: key VALID (server predates /whoami — channel/device detail unavailable; update the server to see it)');
+      console.log(JSON.stringify({ ok: true, base_url: base, channel: null, devices: null }));
+      process.exit(0);
+    }
+    console.error(`pidge doctor: unexpected ${m ? m.status : 'network error'} on the manifest — server looks broken`);
+    process.exit(2);
+  }
+  if (res.status !== 200) {
+    console.error(`pidge doctor: unexpected ${res.status} from /whoami — ${JSON.stringify(data)}`);
+    process.exit(2);
+  }
+  const devices = data.devices ?? 0;
+  console.error(`pidge doctor: key valid — canal "${data.channel && data.channel.name}" · ${devices} device(s)`);
+  if (devices === 0)
+    console.error('pidge doctor: WARNING — 0 devices: sends will reach NOBODY until the human installs/opens the Pidge app on their iPhone');
+  console.error('pidge doctor: all good — try: pidge ask --template decision --title "Pidge funcionando?"');
+  console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version }));
+  process.exit(0);
+}
+
+// setup --claim: exchange the single-use code for the key, store it ourselves
+// (the secret never appears on screen or in the chat the prompt was pasted in),
+// then prove the loop with doctor.
+async function runSetup() {
+  const code = v.claim;
+  if (!code) die('pidge: usage: pidge setup --claim <code> [--url <base>]   (the human copies the code from the Pidge app)', 1);
+  const base = (v.url || process.env.PIDGE_URL || FILE_ENV.PIDGE_URL || 'https://pidge.sh').replace(/\/+$/, '');
+  let res, data = {};
+  try {
+    res = await fetchT(`${base}/api/v1/claim`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    try { data = await res.json(); } catch { /* leave {} */ }
+  } catch (e) {
+    die(`pidge: claim failed (network): ${e.message} — is the server URL right? (${base})`, 2);
+  }
+  if (res.status === 404)
+    die('pidge: claim code unknown, EXPIRED (15 min TTL) or already used — ask your human for a fresh one (Pidge app → Canais → o canal → copiar prompt de setup)', 2);
+  if (!(res.status >= 200 && res.status < 300) || !data.key)
+    die(`pidge: claim failed (${res.status}): ${JSON.stringify(data)}`, 2);
+
+  const finalBase = (data.base_url || base).replace(/\/+$/, '');
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(CONFIG_FILE, `PIDGE_URL=${finalBase}\nPIDGE_TOKEN=${data.key}\n`, { mode: 0o600 });
+  try { fs.chmodSync(CONFIG_FILE, 0o600); } catch { /* mode set on create */ }
+  console.error(`pidge: configured for canal "${data.channel && data.channel.name}" — key stored in ${CONFIG_FILE} (chmod 600, never displayed)`);
+  await runDoctor(finalBase, data.key);
+}
+
+// skill install (#110e): persistent Pidge knowledge for Claude Code agents —
+// a skill generated FROM the live manifest (so it can't drift), versioned with
+// manifest_version (re-run to update; whats_new is the changelog).
+async function runSkillInstall() {
+  let res, m;
+  try {
+    res = await fetchT(`${BASE}/api/v1/manifest`, { headers });
+    m = await res.json();
+  } catch (e) {
+    die(`pidge: could not read the manifest: ${e.message}`, 2);
+  }
+  if (res.status !== 200) die(`pidge: manifest read failed (${res.status})`, 2);
+  const table = (m.templates && m.templates.decision_table) || [];
+  const profileTable = (m.profiles && m.profiles.decision_table) || [];
+  const notes = m.notes || [];
+  const exits = (m.cli && m.cli.output) || '';
+  const skill = `---
+name: pidge
+description: Send rich, actionable iPhone notifications to your human and get their decision back (Pidge). Use when finishing long tasks (report), needing a decision/approval, sending FYIs with substance, or anything time-anchored. Also covers reading the human's replies/messages back.
+---
+
+# Pidge — notify your human, get answers back
+
+Generated from manifest v${m.manifest_version} of ${BASE} — re-run \`pidge skill install\` to update (any API response header X-Pidge-Manifest-Version > ${m.manifest_version} means there's news).
+
+All commands: \`npx pidge-cli …\` (Node ≥18; reads ~/.config/pidge/env — no token in context). Not set up? \`pidge doctor\` tells you; onboard with \`pidge setup --claim <code>\` (the human copies the code from the Pidge app).
+
+## Pick the right send (decision table)
+
+${table.map((r) => `- ${r}`).join('\n')}
+
+## How it intrudes (profiles — the human owns them)
+
+${profileTable.map((r) => `- ${r}`).join('\n')}
+
+## The contract
+
+${notes.map((n) => `- ${n}`).join('\n')}
+
+## Getting answers
+
+- \`pidge ask …\` blocks and prints chosen_action JSON; \`pidge wait <cid>\` blocks on an existing send.
+- \`pidge listen\` blocks until the human MESSAGES you from the app (composer) — run it when idle.
+- ${exits}
+
+## Full spec
+
+\`curl $PIDGE_URL/api/v1/manifest -H "Authorization: Bearer $PIDGE_TOKEN"\` — the always-current contract (fields, templates, custom actions, media, threads, realtime).
+`;
+  const dir = path.join(process.cwd(), '.claude', 'skills', 'pidge');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'SKILL.md');
+  fs.writeFileSync(file, skill);
+  console.error(`pidge: skill written to ${file} (manifest v${m.manifest_version}) — your future sessions in this project know Pidge now`);
+  console.log(JSON.stringify({ ok: true, file, manifest_version: m.manifest_version }));
+  process.exit(0);
+}
+
 (async () => {
   switch (command) {
+    case 'setup': {
+      await runSetup(); // exits via runDoctor
+      break;
+    }
+    case 'doctor': {
+      await runDoctor();
+      break;
+    }
+    case 'whoami': {
+      const { res, data } = await fetchWhoami().catch((e) => { die(`pidge: whoami failed (network): ${e.message}`, 2); });
+      checkManifestNews(res);
+      if (res.status !== 200) die(`pidge: whoami failed (${res.status}): ${JSON.stringify(data)}`, 2);
+      console.log(JSON.stringify(data, null, 2));
+      console.error(`pidge: you are canal "${data.channel && data.channel.name}" · ${data.devices ?? '?'} device(s)`);
+      process.exit(0);
+      break;
+    }
+    case 'skill': {
+      if (parsed.positionals[1] !== 'install') die('pidge: usage: pidge skill install', 1);
+      await runSkillInstall();
+      break;
+    }
     case 'notify': {
       const { ok, info, raw } = await doNotify();
       console.log(raw);

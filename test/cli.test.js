@@ -183,3 +183,114 @@ test('listen without a WebSocket-capable runtime quietly uses polling (no crash)
   assert.equal(code, 0);
   assert.match(stdout, /polling puro/);
 });
+
+// --- Onboarding v2 (#110): setup --claim / doctor / whoami ------------------
+
+const fs = require('node:fs');
+const os = require('node:os');
+
+test('setup --claim exchanges the code, writes the env file (600) and runs doctor — secret never printed', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-setup-'));
+
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home },
+  );
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const file = path.join(home, 'pidge', 'env');
+  const written = fs.readFileSync(file, 'utf8');
+  assert.match(written, /PIDGE_TOKEN=hld_minted_by_claim/);
+  assert.match(written, new RegExp(`PIDGE_URL=http://127.0.0.1:${port}`));
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600, 'env file must be chmod 600');
+  // the key must NEVER hit the terminal — only the file
+  assert.ok(!stdout.includes('hld_minted_by_claim'), 'key leaked to stdout');
+  assert.ok(!stderr.includes('hld_minted_by_claim'), 'key leaked to stderr');
+  assert.match(stderr, /canal "mock"/);
+  assert.match(stderr, /doctor: all good/);
+});
+
+test('setup with a used/expired code fails LOUD with the re-mint recipe', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimCode = null; // already claimed
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-setup-'));
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home },
+  );
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 2);
+  assert.match(stderr, /EXPIRED|already used/);
+  assert.match(stderr, /copiar prompt de setup/, 'must tell the agent how the human re-mints');
+});
+
+test('doctor narrates source + channel + devices and exits 0', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  const { result } = runCli(['doctor'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stderr, /canal "mock" · 1 device/);
+  assert.ok(!stderr.includes('hld_test'), 'doctor must not display the key');
+  assert.deepEqual(JSON.parse(stdout).ok, true);
+});
+
+test('doctor warns LOUD on 0 devices (sends reach nobody)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.devices = 0;
+
+  const { result } = runCli(['doctor'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0);
+  assert.match(stderr, /0 devices.*NOBODY/);
+});
+
+test('whoami prints the channel identity JSON', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  const { result } = runCli(['whoami'], port);
+  const { code, stdout } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0);
+  assert.equal(JSON.parse(stdout).channel.name, 'mock');
+});
+
+test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-skill-'));
+
+  const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
+    cwd: dir,
+    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test' },
+  });
+  const out = await new Promise((resolve) => {
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    child.on('exit', (code) => resolve({ code, stdout, stderr }));
+  });
+  await mock.stop();
+
+  assert.equal(out.code, 0, `stderr: ${out.stderr}`);
+  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  assert.match(skill, /name: pidge/);
+  assert.match(skill, /template decision/);
+  assert.match(skill, /manifest v16/);
+});
