@@ -99,6 +99,9 @@ const OPTIONS = {
   summary: { type: 'boolean' },
   all: { type: 'boolean' },
   limit: { type: 'string' },
+  // realtime (#118): WS by default when the runtime has a WebSocket (Node ≥22)
+  realtime: { type: 'boolean' },               // force WS (warn+fallback if unavailable)
+  'no-realtime': { type: 'boolean' },          // polling only
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -111,6 +114,17 @@ USAGE
   pidge inbox  [--pending|--summary|--all|--limit N]   what you sent: list, pending slice, or counts+latency (#83)
   pidge listen [--timeout N]              block until the human MESSAGES you from the app, print + ack + exit (#48)
   pidge --help
+
+REALTIME (#118)
+  listen/ask/wait hold a WebSocket to the server (ActionCable at /cable) when the
+  runtime has one (Node ≥22): answers/messages land in <1 s, an idle hours-long
+  listen survives server deploys by RECONNECTING, and while you listen the human
+  sees "ouvindo agora" in the app. Everything durable still goes over HTTP
+  (backlog GET + ack), so a dropped socket costs latency, never data.
+  --realtime      force WS (warns + falls back to polling if unavailable)
+  --no-realtime   polling only (the ?wait= long-poll, capped 25 s server-side)
+  Degrade ladder, narrated on stderr: WS → ?wait= long-poll → plain GETs every
+  ~45 s after 3 consecutive failures on held polls (#119).
 
 OPTIONS (notify / ask)
   --title TEXT             (required) the headline
@@ -145,8 +159,8 @@ OPTIONS (notify / ask)
   --param KEY=VALUE        pass ANY raw /notify field (repeatable) — future server
                            fields work without a CLI update; the manifest is the contract
   --timeout SECONDS        ask: 600 · wait: 300
-  --interval SECONDS       FALLBACK poll cadence (default 30) — normally unused: the
-                           server long-polls each GET (?wait=55), answers are ~instant
+  --interval SECONDS       FALLBACK poll cadence (default 30) — normally unused: WS or
+                           the server-held long-poll (?wait=25) make answers ~instant
 
 ENV
   PIDGE_URL     your Pidge server (default http://localhost:3000; HERALD_URL honored)
@@ -157,7 +171,9 @@ ENV
 OUTPUT
   stdout is machine-readable (notify→201 JSON; ask/wait→chosen_action JSON);
   human notices go to stderr. Exit: 0 answered · 3 timed out (no answer yet,
-  not a failure) · 2 error · 1 usage.
+  not a failure) · 4 timed out WITHOUT ONE healthy round-trip all session (the
+  CHANNEL looks broken — server/network — not the human ignoring you: surface
+  it instead of retrying blindly, #119) · 2 error · 1 usage.
 
 Responses are one-and-done EXCEPT snooze/reschedule (they re-fire); ask/wait keep
 polling through a snooze and print snooze_until. Follow-up = a NEW notification.
@@ -187,14 +203,140 @@ const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 11;
+const KNOWN_MANIFEST_VERSION = 16;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
   if (v > KNOWN_MANIFEST_VERSION && !newsWarned) {
     newsWarned = true;
-    console.error(`pidge: the server has NEW capabilities (manifest v${v}; this CLI knows v${KNOWN_MANIFEST_VERSION}) — re-read GET $PIDGE_URL/api/v1/manifest (see whats_new) and consider updating the CLI`);
+    // #119: a pinned npx ref never updates itself — give the CONCRETE command.
+    console.error(`pidge: the server has NEW capabilities (manifest v${v}; this CLI knows v${KNOWN_MANIFEST_VERSION}) — re-read GET $PIDGE_URL/api/v1/manifest (see whats_new) and UPDATE the CLI: npm i -g pidge-cli@latest  (npx users: run npx pidge-cli@latest, a pinned ref never self-updates)`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// #119: the health ledger of one blocking session (wait/ask/listen). Drives
+//   (a) automatic DEGRADE from held ?wait= polls to plain GETs after
+//       DEGRADE_AFTER consecutive failures (an edge that kills held responses
+//       leaves short requests fine — the channel stays alive, less instant),
+//   (b) ONE aggregated deafness line per minute instead of a line per failure,
+//   (c) exit code 4 when the session ends with ZERO healthy round-trips —
+//       deafness must exit LOUD, not masked as "the human didn't answer".
+// ---------------------------------------------------------------------------
+const DEGRADE_AFTER = 3;
+// env override = a test/ops hook, not a documented knob
+const DEGRADED_INTERVAL_S = parseInt(process.env.PIDGE_DEGRADED_INTERVAL || '45', 10);
+const health = {
+  okEver: false, fails: 0, firstFailAt: 0, lastNoteAt: 0, degraded: false,
+  ok() {
+    if (this.fails > 0) console.error(`pidge: channel recovered after ${this.fails} consecutive failure(s)`);
+    this.okEver = true; this.fails = 0; this.firstFailAt = 0; this.lastNoteAt = 0;
+  },
+  fail(what) {
+    this.fails++;
+    if (!this.firstFailAt) { this.firstFailAt = Date.now(); this.lastNoteAt = Date.now(); }
+    if (!this.degraded && this.fails >= DEGRADE_AFTER) {
+      this.degraded = true;
+      console.error(`pidge: ${this.fails} consecutive failures on held polls — degraded to plain GETs every ~${DEGRADED_INTERVAL_S}s (channel stays ALIVE, just less instant). Latest: ${what}`);
+    } else if (this.fails === 1 || Date.now() - this.lastNoteAt >= 60000) {
+      this.lastNoteAt = Date.now();
+      const mins = Math.round((Date.now() - this.firstFailAt) / 60000);
+      console.error(`pidge: deaf for ${mins} min — ${this.fails} consecutive failure(s) (latest: ${what})`);
+    }
+  },
+  exitTimeout(message) {
+    if (this.okEver) { console.error(`pidge: ${message} (= 'no answer yet', not a failure)`); process.exit(3); }
+    console.error(`pidge: ${message} — and NOT ONE healthy round-trip all session: the CHANNEL looks broken (server/network), not the human ignoring you. Surface this to your human.`);
+    process.exit(4);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Realtime (#118): a minimal ActionCable client over the runtime's native
+// WebSocket (Node ≥22). The token rides an extra Sec-WebSocket-Protocol entry
+// (the browser-style API can't set headers). The WS is a WAKE-UP + payload
+// channel only — every durable read (message backlog, chosen_action) still
+// goes over HTTP, so a dropped socket costs latency, never data.
+// ---------------------------------------------------------------------------
+function wantRealtime() {
+  if (v['no-realtime']) return false;
+  if (typeof WebSocket !== 'function') {
+    if (v.realtime) console.error('pidge: --realtime needs a native WebSocket (Node ≥22) — falling back to polling');
+    return false;
+  }
+  return true;
+}
+
+// Speak just enough of the protocol: welcome → subscribe → confirm → frames.
+// The server pings every ~3 s — that heartbeat is the liveness check (silence
+// >15 s ⇒ the socket is dead even if TCP hasn't noticed; close → caller
+// reconnects). Returns {close()} or null if the constructor itself failed.
+function cableSubscribe({ channel, onUp, onFrame, onDown }) {
+  let ws;
+  try {
+    ws = new WebSocket(BASE.replace(/^http/, 'ws') + '/cable', ['actioncable-v1-json', TOKEN]);
+  } catch (e) { onDown(e.message); return null; }
+  const identifier = JSON.stringify({ channel });
+  let lastBeat = Date.now();
+  let closed = false;
+  const die = (why) => {
+    if (closed) return; closed = true;
+    clearInterval(beatCheck);
+    try { ws.close(); } catch { /* already closing */ }
+    onDown(why);
+  };
+  const beatCheck = setInterval(() => {
+    if (Date.now() - lastBeat > 15000) die('heartbeat lost (server gone?)');
+  }, 5000);
+  ws.onopen = () => ws.send(JSON.stringify({ command: 'subscribe', identifier }));
+  ws.onmessage = (e) => {
+    lastBeat = Date.now();
+    let f; try { f = JSON.parse(e.data); } catch { return; }
+    if (f.type === 'ping' || f.type === 'welcome') return;
+    if (f.type === 'confirm_subscription') { onUp && onUp(); return; }
+    if (f.type === 'reject_subscription') { die('subscription rejected (bad token?)'); return; }
+    if (f.identifier === identifier && f.message) onFrame(f.message);
+  };
+  ws.onerror = () => { /* onclose follows with the code */ };
+  ws.onclose = (e) => die(`socket closed (${e.code})`);
+  return { close: () => { closed = true; clearInterval(beatCheck); try { ws.close(); } catch { /* noop */ } } };
+}
+
+// Run one WS subscription session until the deadline / an unrecoverable WS
+// problem, reconnecting with backoff in between (a deploy = seconds of gap; the
+// criterion: hours-long listens must SURVIVE it, #119). onUp/onFrame get a
+// `finish(reason)` to end the session (e.g. when the answer landed over HTTP).
+// Resolves 'deadline' | 'ws-unavailable'.
+async function cableSession({ channel, deadline, onUp, onFrame }) {
+  let wsFails = 0;
+  while (Date.now() < deadline) {
+    const outcome = await new Promise((resolve) => {
+      let sub = null;
+      let settled = false;
+      const finish = (reason) => {
+        if (settled) return; settled = true;
+        clearTimeout(guard);
+        if (sub) sub.close();
+        resolve(reason);
+      };
+      const guard = setTimeout(() => finish('deadline'), Math.max(0, deadline - Date.now()));
+      sub = cableSubscribe({
+        channel,
+        onUp: () => { wsFails = 0; onUp(finish); },
+        onFrame: (frame) => onFrame(frame, finish),
+        onDown: (why) => finish(`down: ${why}`),
+      });
+      if (!sub) finish('down: no socket');
+    });
+    if (outcome === 'deadline') return 'deadline';
+    if (!outcome.startsWith('down: ')) return outcome; // caller-driven finish (e.g. 'answered')
+    wsFails++;
+    if (wsFails >= 4) return 'ws-unavailable';
+    const backoff = Math.min(2000 * wsFails, 10000);
+    console.error(`pidge: realtime socket ${outcome.replace('down: ', '')} — reconnecting in ${Math.round(backoff / 1000)}s (attempt ${wsFails}/3)`);
+    await sleep(backoff);
+  }
+  return 'deadline';
 }
 
 // Map CLI flags → the /notify JSON body, including only what was provided.
@@ -351,13 +493,16 @@ async function doWait(cid, { timeout, interval }) {
   const deadline = Date.now() + timeout * 1000;
   let firedNotice = false;
   for (;;) {
-    const waitS = Math.max(0, Math.min(55, Math.ceil((deadline - Date.now()) / 1000)));
-    const url = `${BASE}/api/v1/notifications/${encodeURIComponent(cid)}?wait=${waitS}`;
+    // Degraded (#119): a held poll keeps dying behind some edge — switch to
+    // PLAIN GETs (the requests that kept working in the wild) on a slow pace.
+    const waitS = health.degraded ? 0 : Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
+    const url = `${BASE}/api/v1/notifications/${encodeURIComponent(cid)}${waitS > 0 ? `?wait=${waitS}` : ''}`;
     const askedAt = Date.now();
     try {
       const res = await fetch(url, { headers });
       checkManifestNews(res);
       if (res.status === 200) {
+        health.ok();
         const data = await res.json().catch(() => ({}));
         if (data.responded) {
           const chosen = data.chosen_action || {};
@@ -374,23 +519,81 @@ async function doWait(cid, { timeout, interval }) {
           console.error('pidge: the escalation alarm FIRED and there is still no answer — seen_at tells you if the human at least silenced it; keep waiting or back off');
         }
       } else if (res.status === 404) {
+        health.ok(); // the server ANSWERED — the channel is fine, the cid isn't known (yet)
         console.error(`pidge: no notification for correlation_id=${cid}`);
         // keep polling — the agent may call wait/ask before the send round-trips
+      } else if (res.status >= 500) {
+        health.fail(`poll error ${res.status}`); // aggregated — no line per failure
       } else {
+        health.ok();
         console.error(`pidge: poll error ${res.status}`);
       }
     } catch (e) {
-      console.error(`pidge: poll error (network): ${e.message}`);
+      health.fail(`network: ${e.message}`);
     }
 
     if (Date.now() >= deadline) {
-      console.error(`pidge: timed out after ${timeout}s waiting on ${cid} (= 'no answer yet', not a failure)`);
-      process.exit(3);
+      health.exitTimeout(`timed out after ${timeout}s waiting on ${cid}`);
     }
     // A server WITH long-poll just held us for waitS — loop right back. One that
-    // ignored `wait` (or a network error) returned fast: pace with --interval.
-    if (Date.now() - askedAt < 2000) await sleep(interval * 1000);
+    // ignored `wait`, an error, or degraded mode returned fast: pace ourselves.
+    const pace = health.degraded ? DEGRADED_INTERVAL_S : interval;
+    if (Date.now() - askedAt < 2000) {
+      await sleep(Math.min(pace, Math.max(1, Math.ceil((deadline - Date.now()) / 1000))) * 1000);
+    }
   }
+}
+
+// Realtime wait (#118): hold an InboxChannel subscription and treat every frame
+// for OUR cid as a wake-up; the durable answer is always re-read over HTTP
+// (doWait prints + exits). A safety re-check every 60 s covers a frame lost in
+// a reconnect gap. Returns only when WS can't carry us — caller falls back.
+async function realtimeWait(cid, { timeout, interval }) {
+  const deadline = Date.now() + timeout * 1000;
+  const answered = async () => {
+    try {
+      const res = await fetch(`${BASE}/api/v1/notifications/${encodeURIComponent(cid)}`, { headers });
+      if (res.status !== 200) return false;
+      const data = await res.json().catch(() => ({}));
+      return !!(data.responded && data.chosen_action && data.chosen_action.kind !== 'snoozed');
+    } catch { return false; }
+  };
+  let safety = null;
+  const outcome = await cableSession({
+    channel: 'InboxChannel',
+    deadline,
+    onUp: (finish) => {
+      health.ok();
+      // catch an answer that landed while we were connecting/offline
+      answered().then((done) => done && finish('answered'));
+      clearInterval(safety);
+      safety = setInterval(() => answered().then((done) => done && finish('answered')), 60000);
+    },
+    onFrame: (m, finish) => {
+      if (m.type !== 'event' || m.correlation_id !== cid) return;
+      if (m.kind === 'delivered') console.error('pidge: delivered to the phone');
+      else if (m.kind === 'seen') console.error('pidge: the human OPENED it (no answer yet)');
+      else if (m.kind === 'snoozed') console.error(`pidge: snoozed until ${m.snooze_until || m.at} — re-fires then, still waiting`);
+      else if (m.responded) finish('answered');
+    },
+  });
+  clearInterval(safety);
+  if (outcome === 'answered') {
+    // fetch + print + exit via the poller (one quick authoritative read)
+    await doWait(cid, { timeout: Math.max(10, Math.ceil((deadline - Date.now()) / 1000)), interval });
+  }
+  if (outcome === 'deadline') {
+    health.exitTimeout(`timed out after ${timeout}s waiting on ${cid}`);
+  }
+  console.error('pidge: realtime unavailable — falling back to HTTP polling (same contract, less instant)');
+  return Math.max(1, Math.ceil((deadline - Date.now()) / 1000)); // remaining budget
+}
+
+// wait/ask entry: WS when we can, polling as the universal fallback (#118/#119).
+async function waitForAnswer(cid, { timeout, interval }) {
+  let budget = timeout;
+  if (wantRealtime()) budget = await realtimeWait(cid, { timeout, interval });
+  await doWait(cid, { timeout: budget, interval });
 }
 
 const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback);
@@ -421,13 +624,13 @@ const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback
       const { ok, info } = await doNotify();
       if (!ok) process.exit(2);
       console.error(`pidge: sent (${info.registered_devices} device(s)) — waiting on ${cid}`);
-      await doWait(cid, { timeout: num(v.timeout, 600), interval: num(v.interval, 30) });
+      await waitForAnswer(cid, { timeout: num(v.timeout, 600), interval: num(v.interval, 30) });
       break;
     }
     case 'wait': {
       const cid = parsed.positionals[1];
       if (!cid) die('pidge: usage: pidge wait <correlation_id> [--timeout N] [--interval N]', 1);
-      await doWait(cid, { timeout: num(v.timeout, 300), interval: num(v.interval, 30) });
+      await waitForAnswer(cid, { timeout: num(v.timeout, 300), interval: num(v.interval, 30) });
       break;
     }
     case 'cancel': {
@@ -493,48 +696,102 @@ const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback
     case 'listen': {
       // #48: block until the human messages this channel (the app's composer),
       // print the messages as JSON, ACK them, exit 0. One-shot by design (loop
-      // it, don't daemonize) — same contract as `wait`. Exit 3 on timeout.
+      // it, don't daemonize) — same contract as `wait`. Exit 3 on timeout, 4 if
+      // the whole session never had a healthy round-trip (#119).
       // At-least-once: the ack happens AFTER the print — a crash re-serves them;
       // dedupe by id if you've seen one before.
       const timeout = num(v.timeout, 600);
-      const deadline = Date.now() + timeout * 1000;
+      let deadline = Date.now() + timeout * 1000;
+
+      // Print + ack + exit 0 — shared by the WS and polling paths.
+      const printAndAck = async (msgs) => {
+        console.log(JSON.stringify(msgs, null, 2));
+        const upTo = Math.max(...msgs.map((m) => m.id));
+        try {
+          const ack = await fetch(`${BASE}/api/v1/messages/ack`, {
+            method: 'POST', headers, body: JSON.stringify({ up_to: upTo }),
+          });
+          if (ack.status >= 200 && ack.status < 300) {
+            console.error(`pidge: ${msgs.length} message(s) from the human — acked (answer via notify; reuse thread_id when present)`);
+          } else {
+            console.error(`pidge: WARNING — ack failed (${ack.status}); these messages will be re-served next listen`);
+          }
+        } catch (e) {
+          console.error(`pidge: WARNING — ack failed (network: ${e.message}); these messages will be re-served next listen`);
+        }
+        process.exit(0);
+      };
+
+      // Realtime path (#118): hold ConversationChannel — the human sees "ouvindo
+      // agora" — and treat frames as wake-ups: the BACKLOG is always re-read over
+      // a plain GET (at-least-once; also catches messages sent while offline).
+      if (wantRealtime()) {
+        let draining = false;
+        const drain = async (finish) => {
+          if (draining) return;
+          draining = true;
+          try {
+            const res = await fetch(`${BASE}/api/v1/messages`, { headers });
+            checkManifestNews(res);
+            if (res.status === 200) {
+              health.ok();
+              const msgs = (await res.json().catch(() => ({}))).messages || [];
+              if (msgs.length) { finish('got-messages'); await printAndAck(msgs); }
+            } else if (res.status >= 500) {
+              health.fail(`backlog read ${res.status}`);
+            }
+          } catch (e) {
+            health.fail(`backlog read (network: ${e.message})`);
+          } finally {
+            draining = false;
+          }
+        };
+        let announced = false;
+        const outcome = await cableSession({
+          channel: 'ConversationChannel',
+          deadline,
+          onUp: (finish) => {
+            if (!announced) { announced = true; console.error('pidge: listening over the realtime socket (the human sees "ouvindo agora")'); }
+            drain(finish);
+          },
+          onFrame: (m, finish) => { if (m.type === 'message') drain(finish); },
+        });
+        if (outcome === 'deadline') {
+          health.exitTimeout(`timed out after ${timeout}s — no message from the human`);
+        }
+        if (outcome === 'got-messages') {
+          await new Promise(() => {}); // printAndAck is in flight and exits the process
+        }
+        console.error('pidge: realtime unavailable — falling back to HTTP polling (same contract, less instant)');
+      }
+
       for (;;) {
-        const waitS = Math.max(0, Math.min(55, Math.ceil((deadline - Date.now()) / 1000)));
+        const waitS = health.degraded ? 0 : Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
         const askedAt = Date.now();
         try {
-          const res = await fetch(`${BASE}/api/v1/messages?wait=${waitS}`, { headers });
+          const res = await fetch(`${BASE}/api/v1/messages${waitS > 0 ? `?wait=${waitS}` : ''}`, { headers });
           checkManifestNews(res);
           if (res.status === 200) {
+            health.ok();
             const data = await res.json().catch(() => ({}));
             const msgs = data.messages || [];
-            if (msgs.length) {
-              console.log(JSON.stringify(msgs, null, 2));
-              const upTo = Math.max(...msgs.map((m) => m.id));
-              try {
-                const ack = await fetch(`${BASE}/api/v1/messages/ack`, {
-                  method: 'POST', headers, body: JSON.stringify({ up_to: upTo }),
-                });
-                if (ack.status >= 200 && ack.status < 300) {
-                  console.error(`pidge: ${msgs.length} message(s) from the human — acked (answer via notify; reuse thread_id when present)`);
-                } else {
-                  console.error(`pidge: WARNING — ack failed (${ack.status}); these messages will be re-served next listen`);
-                }
-              } catch (e) {
-                console.error(`pidge: WARNING — ack failed (network: ${e.message}); these messages will be re-served next listen`);
-              }
-              process.exit(0);
-            }
+            if (msgs.length) await printAndAck(msgs);
+          } else if (res.status >= 500) {
+            health.fail(`listen error ${res.status}`); // aggregated (#119) — no line per attempt
           } else {
+            health.ok();
             console.error(`pidge: listen error ${res.status}`);
           }
         } catch (e) {
-          console.error(`pidge: listen error (network): ${e.message}`);
+          health.fail(`network: ${e.message}`);
         }
         if (Date.now() >= deadline) {
-          console.error(`pidge: timed out after ${timeout}s — no message from the human (not a failure)`);
-          process.exit(3);
+          health.exitTimeout(`timed out after ${timeout}s — no message from the human`);
         }
-        if (Date.now() - askedAt < 2000) await sleep(num(v.interval, 5) * 1000);
+        const pace = health.degraded ? DEGRADED_INTERVAL_S : num(v.interval, 5);
+        if (Date.now() - askedAt < 2000) {
+          await sleep(Math.min(pace, Math.max(1, Math.ceil((deadline - Date.now()) / 1000))) * 1000);
+        }
       }
       break;
     }
