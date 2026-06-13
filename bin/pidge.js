@@ -107,6 +107,7 @@ const OPTIONS = {
   claim: { type: 'string' },                   // setup --claim <single-use code>
   // #157 P2: listen keeps going after a batch (supervisor loop, one process)
   follow: { type: 'boolean' },
+  force: { type: 'boolean' },                  // setup: overwrite a config owned by ANOTHER channel
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -241,7 +242,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 24;
+const KNOWN_MANIFEST_VERSION = 25;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
@@ -721,6 +722,28 @@ async function runSetup() {
   const code = v.claim;
   if (!code) die('pidge: usage: pidge setup --claim <code> [--url <base>]   (the human copies the code from the Pidge app)', 1);
   const base = (v.url || process.env.PIDGE_URL || FILE_ENV.PIDGE_URL || 'https://pidge.sh').replace(/\/+$/, '');
+
+  // THE SHARED-CONFIG GUARD (real incident, 2026-06-13): ~/.config/pidge/env is
+  // MACHINE-GLOBAL — every agent on this machine without its own $PIDGE_TOKEN
+  // reads it. One agent's setup overwrote it and a DIFFERENT agent's nightly
+  // cron silently started sending as the new channel. Refuse to clobber a
+  // config that still authenticates as some channel unless --force — and check
+  // BEFORE the exchange, so the single-use code survives the refusal.
+  if (!v.force && FILE_ENV.PIDGE_TOKEN) {
+    let owner = null;
+    try {
+      const { res: wres, data: wdata } = await fetchWhoami(base, FILE_ENV.PIDGE_TOKEN);
+      if (wres.status === 200 && wdata.channel) owner = wdata.channel.name;
+      else if (wres.status !== 401) owner = 'um canal (servidor não confirmou)';
+      // 401 ⇒ the stored key is dead — overwriting a corpse needs no --force.
+    } catch {
+      owner = 'um canal (servidor inalcançável para confirmar)';
+    }
+    if (owner) {
+      die(`pidge: ${CONFIG_FILE} já guarda a chave de "${owner}" — esse arquivo é POR MÁQUINA: todo agente sem $PIDGE_TOKEN próprio lê dele, e sobrescrever faz TODOS enviarem como o canal novo (incidente real: o cron de um agente foi sequestrado assim). Para isolar agentes, dê a cada um seu PIDGE_TOKEN (env var vence o arquivo) ou um XDG_CONFIG_HOME próprio. Quer substituir mesmo? Re-rode com --force (o claim code continua válido — nada foi consumido).`, 2);
+    }
+  }
+
   let res, data = {};
   try {
     res = await fetchT(`${base}/api/v1/claim`, {

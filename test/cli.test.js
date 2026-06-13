@@ -409,3 +409,49 @@ test('an invalid --custom-action id fails fast locally with the spelled-out rule
   assert.match(stderr, /lowercase letters, digits and underscore only/);
   assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
 });
+
+// --- shared-config guard (incidente 2026-06-13: cron do Javier sequestrado) ---
+
+test('setup REFUSES to overwrite a config owned by another live channel — and does not burn the claim code', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-guard-'));
+  fs.mkdirSync(path.join(home, 'pidge'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'pidge', 'env'),
+    `PIDGE_URL=http://127.0.0.1:${port}\nPIDGE_TOKEN=hld_existing_live\n`);
+
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home },
+  );
+  const { code, stderr } = await result;
+
+  assert.equal(code, 2);
+  assert.match(stderr, /já guarda a chave de "mock"/);
+  assert.match(stderr, /--force/);
+  assert.equal(mock.state.claimCode, 'claim-ok', 'the single-use code must SURVIVE the refusal');
+  const kept = fs.readFileSync(path.join(home, 'pidge', 'env'), 'utf8');
+  assert.match(kept, /hld_existing_live/, 'the existing config must be untouched');
+  await mock.stop();
+});
+
+test('setup --force overwrites; a REVOKED stored key needs no --force', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-guard-'));
+  fs.mkdirSync(path.join(home, 'pidge'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'pidge', 'env'),
+    `PIDGE_URL=http://127.0.0.1:${port}\nPIDGE_TOKEN=hld_revoked\n`);
+
+  // dead key in the file ⇒ proceeds without --force
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home },
+  );
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const written = fs.readFileSync(path.join(home, 'pidge', 'env'), 'utf8');
+  assert.match(written, /hld_minted_by_claim/);
+});
