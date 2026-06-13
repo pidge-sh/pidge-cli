@@ -11,18 +11,47 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > current spec (fields, profiles, guarantees). This CLI is a thin pipe over it — any
 > new server field works without a CLI update via `--param key=value`.
 
-## Setup in one command (v0.7.0 — the claim flow)
+## Setup in one command (v0.8.0 — the claim flow)
 
 ```bash
 # The human copies a setup prompt from the Pidge app (Canais → the channel) —
 # it carries a SINGLE-USE claim code (15 min TTL), never the key:
 npx pidge-cli setup --claim <code> --url https://pidge.sh
-# → exchanges the code for the real key, writes ~/.config/pidge/env (chmod 600)
-#   and runs `pidge doctor`. The secret never appears on screen or in any chat.
+# → exchanges the code for the real key, stores it (chmod 600), runs `pidge doctor`.
+#   The secret never appears on screen or in any chat (the CLI writes it).
 
 npx pidge-cli doctor   # validate anytime: env source, server, key, "canal X · N devices"
 npx pidge-cli whoami   # which channel does this key speak for (JSON)
 ```
+
+### Many agents on one machine — isolate them (read this)
+
+`~/.config/pidge/env` is **one slot per machine-user**: every agent without its
+own identity reads the same key, so one agent's `setup` makes another agent send
+as the wrong channel (this bit us for real — a cron got hijacked). Each agent
+must have its **own** identity. Cheapest correct setups, in order:
+
+```bash
+# A. per-agent env var — the cleanest; the human sets it at the agent's launch
+#    (systemd unit / launcher / profile). Env var always wins over any file.
+export PIDGE_TOKEN=hld_…        # this agent only
+
+# B. per-agent config file — set ONE non-secret id at launch; the CLI namespaces
+#    the file to ~/.config/pidge/agents/<id>/env and still writes the key for you
+#    (no secret in the agent's chat). setup/doctor/everything follow it.
+export PIDGE_AGENT=javier
+npx pidge-cli setup --claim <code>
+
+# C. you're at YOUR terminal and want the env var hygienically from a claim:
+npx pidge-cli setup --claim <code> --print   # prints `export …`; writes nothing
+#    paste the two lines into THAT agent's launcher. NEVER run --print as an agent
+#    (the key would land in its context) — that's what A/B are for.
+```
+
+The bare `~/.config/pidge/env` (no `PIDGE_AGENT`) is fine for a **single** agent;
+`pidge doctor` warns loudly when you're on that shared file. Lost the local key?
+Just re-claim — `POST /claim` returns the channel's **same** key, so re-running
+setup restores the exact identity.
 
 ## Use it (no install — via npx)
 

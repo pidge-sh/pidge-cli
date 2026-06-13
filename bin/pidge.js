@@ -41,13 +41,28 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 
-// #57 token hygiene: when the env vars are unset, fall back to
-// ~/.config/pidge/env (KEY=VALUE lines the HUMAN writes once in THEIR terminal)
-// so the raw hld_… key never has to ride the agent's chat/context. Explicit env
-// vars always win; `export ` prefixes, quotes and #comments are tolerated.
+// Per-agent isolation (incident 2026-06-13): ~/.config/pidge/env is one slot
+// per machine-user, so N agents sharing a HOME share an identity — one agent's
+// setup hijacked another's cron. The fix is a NON-secret namespacing var the
+// human sets ONCE at each agent's launch: PIDGE_AGENT=<id> → the config lives
+// at ~/.config/pidge/agents/<id>/env, isolated by construction. The CLI still
+// WRITES the key (the agent never sees it — #57 hygiene intact), it's just
+// per-agent now. No PIDGE_AGENT ⇒ the legacy shared file (single-agent only).
+// (An explicit PIDGE_TOKEN env var still wins over any file — the purest
+// per-agent path.)
+const AGENT_ID = (process.env.PIDGE_AGENT || '').trim().replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 64);
+function pidgeConfigDir() {
+  const base = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'pidge');
+  return AGENT_ID ? path.join(base, 'agents', AGENT_ID) : base;
+}
+
+// #57 token hygiene: when the env vars are unset, fall back to the config file
+// (KEY=VALUE the CLI writes during setup, or the HUMAN writes once) so the raw
+// hld_… key never rides the agent's chat/context. Explicit env vars always win;
+// `export ` prefixes, quotes and #comments are tolerated.
 function configEnv() {
   try {
-    const file = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'pidge', 'env');
+    const file = path.join(pidgeConfigDir(), 'env');
     const out = {};
     for (let line of fs.readFileSync(file, 'utf8').split('\n')) {
       line = line.trim().replace(/^export\s+/, '');
@@ -108,14 +123,20 @@ const OPTIONS = {
   // #157 P2: listen keeps going after a batch (supervisor loop, one process)
   follow: { type: 'boolean' },
   force: { type: 'boolean' },                  // setup: overwrite a config owned by ANOTHER channel
+  print: { type: 'boolean' },                  // setup: print export lines instead of writing a file (per-agent, human runs it)
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
 
 USAGE
   pidge setup --claim CODE [--url BASE]   one-shot onboarding (#110): exchange the single-use
-                                          code for the channel key, store it in
-                                          ~/.config/pidge/env (chmod 600), run doctor
+                                          code for the channel key, store it, run doctor.
+                                          MULTI-AGENT: set PIDGE_AGENT=<id> at each agent's launch
+                                          → isolated config ~/.config/pidge/agents/<id>/env.
+                                          --print  emit 'export PIDGE_TOKEN=…' instead of a file
+                                                   (you run it in YOUR terminal; paste into the
+                                                   agent's launcher — never run --print as an agent)
+                                          --force  overwrite a shared file owned by another channel
   pidge doctor                            validate the setup WITHOUT exposing secrets:
                                           env source, server, key, "canal X · N devices"
   pidge whoami                            which channel does this key speak for (JSON)
@@ -189,9 +210,13 @@ OPTIONS (notify / ask)
 
 ENV
   PIDGE_URL     your Pidge server (default http://localhost:3000; HERALD_URL honored)
-  PIDGE_TOKEN   your channel's bearer key (required; HERALD_TOKEN honored)
-                with neither set, ~/.config/pidge/env (KEY=VALUE) is read — the
-                key-free path: the human writes the file once, no secret in chat
+  PIDGE_TOKEN   your channel's bearer key (required; HERALD_TOKEN honored). Setting
+                this per agent at launch is the cleanest multi-agent isolation —
+                env var always wins over any file.
+  PIDGE_AGENT   <id> namespacing the config file to ~/.config/pidge/agents/<id>/env
+                so N agents on one machine never share an identity (the CLI still
+                writes the key — no secret in the agent's chat). Unset ⇒ the legacy
+                shared ~/.config/pidge/env (single-agent only).
 
 OUTPUT
   stdout is machine-readable (notify→201 JSON; ask/wait→chosen_action JSON);
@@ -648,13 +673,16 @@ const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback
 // Onboarding v2 (#110): setup --claim / doctor / whoami / skill install.
 // ---------------------------------------------------------------------------
 
-const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'pidge');
+const CONFIG_DIR = pidgeConfigDir();
 const CONFIG_FILE = path.join(CONFIG_DIR, 'env');
+// True when we're reading the LEGACY shared file (no PIDGE_AGENT, no env var) —
+// the multi-agent footgun. doctor warns on it.
+const ON_SHARED_FILE = !AGENT_ID && !process.env.PIDGE_TOKEN && !process.env.HERALD_TOKEN && !!FILE_ENV.PIDGE_TOKEN;
 
 // Where the token came from — doctor narrates it, setup respects precedence.
 function tokenSource() {
-  if (process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN) return 'env var';
-  if (FILE_ENV.PIDGE_TOKEN) return CONFIG_FILE;
+  if (process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN) return 'env var (per-agent)';
+  if (FILE_ENV.PIDGE_TOKEN) return CONFIG_FILE + (AGENT_ID ? ` (PIDGE_AGENT=${AGENT_ID})` : ' (shared)');
   return null;
 }
 
@@ -710,6 +738,8 @@ async function runDoctor(base = BASE, token = TOKEN) {
   console.error(`pidge doctor: key valid — canal "${data.channel && data.channel.name}" · ${devices} device(s)`);
   if (devices === 0)
     console.error('pidge doctor: WARNING — 0 devices: sends will reach NOBODY until the human installs/opens the Pidge app on their iPhone');
+  if (ON_SHARED_FILE)
+    console.error(`pidge doctor: WARNING — reading the SHARED file ${CONFIG_FILE}. If another agent runs on this machine, it reads the SAME key and you'll send as each other (the 2026-06-13 incident). Isolate: set PIDGE_AGENT=<id> at this agent's launch (config → ~/.config/pidge/agents/<id>/env) or give it its own PIDGE_TOKEN.`);
   console.error('pidge doctor: all good — try: pidge ask --template decision --title "Pidge funcionando?"');
   console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version }));
   process.exit(0);
@@ -723,13 +753,13 @@ async function runSetup() {
   if (!code) die('pidge: usage: pidge setup --claim <code> [--url <base>]   (the human copies the code from the Pidge app)', 1);
   const base = (v.url || process.env.PIDGE_URL || FILE_ENV.PIDGE_URL || 'https://pidge.sh').replace(/\/+$/, '');
 
-  // THE SHARED-CONFIG GUARD (real incident, 2026-06-13): ~/.config/pidge/env is
-  // MACHINE-GLOBAL — every agent on this machine without its own $PIDGE_TOKEN
-  // reads it. One agent's setup overwrote it and a DIFFERENT agent's nightly
-  // cron silently started sending as the new channel. Refuse to clobber a
-  // config that still authenticates as some channel unless --force — and check
-  // BEFORE the exchange, so the single-use code survives the refusal.
-  if (!v.force && FILE_ENV.PIDGE_TOKEN) {
+  // THE SHARED-CONFIG GUARD (real incident, 2026-06-13). Only the FILE path can
+  // collide; --print writes nothing, so skip it there. CONFIG_FILE is now
+  // per-agent when PIDGE_AGENT is set (no collision by construction), but on the
+  // legacy shared file two agents still share it — refuse to clobber a file that
+  // still authenticates as some channel unless --force. Checked BEFORE the
+  // exchange so the single-use code survives the refusal.
+  if (!v.print && !v.force && FILE_ENV.PIDGE_TOKEN) {
     let owner = null;
     try {
       const { res: wres, data: wdata } = await fetchWhoami(base, FILE_ENV.PIDGE_TOKEN);
@@ -740,7 +770,7 @@ async function runSetup() {
       owner = 'um canal (servidor inalcançável para confirmar)';
     }
     if (owner) {
-      die(`pidge: ${CONFIG_FILE} já guarda a chave de "${owner}" — esse arquivo é POR MÁQUINA: todo agente sem $PIDGE_TOKEN próprio lê dele, e sobrescrever faz TODOS enviarem como o canal novo (incidente real: o cron de um agente foi sequestrado assim). Para isolar agentes, dê a cada um seu PIDGE_TOKEN (env var vence o arquivo) ou um XDG_CONFIG_HOME próprio. Quer substituir mesmo? Re-rode com --force (o claim code continua válido — nada foi consumido).`, 2);
+      die(`pidge: ${CONFIG_FILE} já guarda a chave de "${owner}". Sobrescrever faria qualquer agente que lê esse arquivo enviar como o canal novo (incidente real: um cron foi sequestrado assim). O jeito certo de rodar VÁRIOS agentes na mesma máquina: dê a cada um um PIDGE_AGENT=<id> no launch (cada um ganha ~/.config/pidge/agents/<id>/env isolado), ou um PIDGE_TOKEN próprio, ou rode com --print e cole o export no launcher DESTE agente. Substituir mesmo assim? --force (o claim code continua válido — nada foi consumido).`, 2);
     }
   }
 
@@ -760,10 +790,29 @@ async function runSetup() {
     die(`pidge: claim failed (${res.status}): ${JSON.stringify(data)}`, 2);
 
   const finalBase = (data.base_url || base).replace(/\/+$/, '');
+  const channelName = data.channel && data.channel.name;
+
+  // --print: the pure per-agent path — emit the export lines (the HUMAN runs
+  // this in THEIR terminal and pastes them into the agent's launcher). Stores
+  // nothing; the key shows on screen, so DON'T let an agent run --print (the
+  // key would land in its context — that's what the file path is for). stdout
+  // is eval-able; the guidance goes to stderr.
+  if (v.print) {
+    console.log(`export PIDGE_URL=${finalBase}`);
+    console.log(`export PIDGE_TOKEN=${data.key}`);
+    console.error(`pidge: canal "${channelName}" — modo POR-AGENTE (nada gravado em disco). Cole as duas linhas no ambiente de lançamento DESTE agente (systemd/launcher/cron/profile). Cada agente tem a SUA chave; perdeu, é só pegar outro código no app e re-rodar (a chave do canal é a MESMA). NÃO rode --print de dentro de um agente — a chave apareceria no contexto dele.`);
+    await runDoctor(finalBase, data.key);
+    return;
+  }
+
+  // File path (default): the CLI writes the key — the agent never sees it
+  // (#57). Per-agent when PIDGE_AGENT is set; otherwise the legacy shared file.
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(CONFIG_FILE, `PIDGE_URL=${finalBase}\nPIDGE_TOKEN=${data.key}\n`, { mode: 0o600 });
   try { fs.chmodSync(CONFIG_FILE, 0o600); } catch { /* mode set on create */ }
-  console.error(`pidge: configured for canal "${data.channel && data.channel.name}" — key stored in ${CONFIG_FILE} (chmod 600, never displayed)`);
+  console.error(`pidge: canal "${channelName}" configurado — chave em ${CONFIG_FILE} (chmod 600, nunca exibida)`);
+  if (!AGENT_ID)
+    console.error('pidge: este é o arquivo COMPARTILHADO (single-agent). Vai rodar 2+ agentes nesta máquina? Dê a cada um PIDGE_AGENT=<id> no launch (arquivo isolado por agente) — senão eles enviam como o mesmo canal.');
   await runDoctor(finalBase, data.key);
 }
 
