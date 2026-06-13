@@ -105,6 +105,8 @@ const OPTIONS = {
   'no-realtime': { type: 'boolean' },          // polling only
   // onboarding v2 (#110)
   claim: { type: 'string' },                   // setup --claim <single-use code>
+  // #157 P2: listen keeps going after a batch (supervisor loop, one process)
+  follow: { type: 'boolean' },
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -121,7 +123,10 @@ USAGE
   pidge wait   <correlation_id> [options] block on an already-sent notification
   pidge cancel <correlation_id>           cancel a still-scheduled notification (#56)
   pidge inbox  [--pending|--summary|--all|--limit N]   what you sent: list, pending slice, or counts+latency (#83)
-  pidge listen [--timeout N] [--all]      block until the human MESSAGES you from the app, print + ack + exit (#48)
+  pidge listen [--timeout N] [--all] [--follow]
+                                          block until the human MESSAGES you from the app, print + ack + exit (#48)
+                                          --follow = print+ack and KEEP listening until --timeout
+                                          (exit 0 if any batch landed; one-shot stays the default)
                                           --all (#131) = the SINGLE EAR: also hear notification ANSWERS
                                           (kind notification_reply + self-contained ref) — nothing the human
                                           says can be missed by a looped listen --all
@@ -236,7 +241,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 19;
+const KNOWN_MANIFEST_VERSION = 24;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
@@ -399,6 +404,11 @@ function buildBody() {
   if (customs.length) {
     body.custom_actions = customs.map((spec) => {
       const [id, label, ...flags] = spec.split(':');
+      // #157 P2: fail fast locally — the rule is stable and the server 422
+      // costs a round-trip an agent then has to interpret.
+      if (!/^[a-z0-9_]{1,40}$/.test(id || '')) {
+        die(`pidge: --custom-action id ${JSON.stringify(id)} is invalid — lowercase letters, digits and underscore only (^[a-z0-9_]{1,40}$)`, 1);
+      }
       const ca = { id, label };
       if (flags.includes('destructive')) ca.style = 'destructive';
       if (flags.includes('confirm')) ca.confirm = true;
@@ -936,8 +946,18 @@ ${notes.map((n) => `- ${n}`).join('\n')}
       const timeout = num(v.timeout, 600);
       let deadline = Date.now() + timeout * 1000;
       const queueQs = v.all ? '?all=true' : '';
+      // #157 P2 --follow: print+ack a batch and KEEP listening until the
+      // timeout — the supervisor loop without re-spawning a process per batch.
+      let gotAny = false;
+      const followEnd = () => {
+        if (v.follow && gotAny) {
+          console.error(`pidge: --follow window ended after ${timeout}s — batches were delivered`);
+          process.exit(0);
+        }
+        return false;
+      };
 
-      // Print + ack + exit 0 — shared by the WS and polling paths.
+      // Print + ack (+ exit 0 unless --follow) — shared by the WS and polling paths.
       const printAndAck = async (msgs) => {
         console.log(JSON.stringify(msgs, null, 2));
         // #131: narrate answers so the agent knows WHICH notification spoke back.
@@ -965,7 +985,9 @@ ${notes.map((n) => `- ${n}`).join('\n')}
         } catch (e) {
           console.error(`pidge: WARNING — ack failed (network: ${e.message}); these messages will be re-served next listen`);
         }
-        process.exit(0);
+        gotAny = true;
+        if (!v.follow) process.exit(0);
+        console.error('pidge: --follow — still listening');
       };
 
       // Realtime path (#118): hold ConversationChannel — the human sees "ouvindo
@@ -982,7 +1004,10 @@ ${notes.map((n) => `- ${n}`).join('\n')}
             if (res.status === 200) {
               health.ok();
               const msgs = (await res.json().catch(() => ({}))).messages || [];
-              if (msgs.length) { finish('got-messages'); await printAndAck(msgs); }
+              if (msgs.length) {
+                if (!v.follow) finish('got-messages');
+                await printAndAck(msgs);
+              }
             } else if (res.status >= 500) {
               health.fail(`backlog read ${res.status}`);
             }
@@ -1015,6 +1040,7 @@ ${notes.map((n) => `- ${n}`).join('\n')}
         }
         const outcome = await Promise.race(sessions);
         if (outcome === 'deadline') {
+          followEnd();
           health.exitTimeout(`timed out after ${timeout}s — no message from the human`);
         }
         if (outcome === 'got-messages') {
@@ -1047,6 +1073,7 @@ ${notes.map((n) => `- ${n}`).join('\n')}
           health.fail(`network: ${e.message}`);
         }
         if (Date.now() >= deadline) {
+          followEnd();
           health.exitTimeout(`timed out after ${timeout}s — no message from the human`);
         }
         const pace = health.degraded ? DEGRADED_INTERVAL_S : num(v.interval, 5);
