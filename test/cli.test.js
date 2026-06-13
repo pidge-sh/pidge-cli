@@ -455,3 +455,64 @@ test('setup --force overwrites; a REVOKED stored key needs no --force', async ()
   const written = fs.readFileSync(path.join(home, 'pidge', 'env'), 'utf8');
   assert.match(written, /hld_minted_by_claim/);
 });
+
+// --- per-agent isolation: PIDGE_AGENT + setup --print (incident follow-up) ----
+
+test('PIDGE_AGENT namespaces the config file so two agents never share an identity', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-agent-'));
+
+  // agent "javier" claims
+  let r = runCli(['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'javier' });
+  let out = await r.result;
+  assert.equal(out.code, 0, `javier setup: ${out.stderr}`);
+  const javierEnv = path.join(home, 'pidge', 'agents', 'javier', 'env');
+  assert.ok(fs.existsSync(javierEnv), 'javier gets his own file');
+
+  // a SECOND agent "mkt" claims — must NOT trip the guard (different file), no --force
+  mock.state.claimCode = 'claim-mkt';
+  r = runCli(['setup', '--claim', 'claim-mkt', '--url', `http://127.0.0.1:${port}`], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'mkt' });
+  out = await r.result;
+  await mock.stop();
+  assert.equal(out.code, 0, `mkt setup must not collide: ${out.stderr}`);
+  assert.ok(fs.existsSync(path.join(home, 'pidge', 'agents', 'mkt', 'env')), 'mkt gets a separate file');
+  assert.ok(fs.existsSync(javierEnv), "javier's file is untouched");
+});
+
+test('setup --print emits export lines and writes NO file (per-agent, human-run)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-print-'));
+
+  const { result } = runCli(['setup', '--claim', 'claim-ok', '--print', '--url', `http://127.0.0.1:${port}`], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home });
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stdout, /export PIDGE_TOKEN=hld_minted_by_claim/);
+  assert.match(stdout, /export PIDGE_URL=/);
+  assert.ok(!fs.existsSync(path.join(home, 'pidge', 'env')), '--print must not write the file');
+  assert.match(stderr, /NÃO rode --print de dentro de um agente/);
+});
+
+test('doctor warns when reading the SHARED legacy file (no PIDGE_AGENT, no env var)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-shared-'));
+  fs.mkdirSync(path.join(home, 'pidge'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'pidge', 'env'),
+    `PIDGE_URL=http://127.0.0.1:${port}\nPIDGE_TOKEN=hld_shared\n`);
+
+  const { result } = runCli(['doctor'], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home });
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0);
+  assert.match(stderr, /SHARED file/);
+  assert.match(stderr, /PIDGE_AGENT/);
+});
