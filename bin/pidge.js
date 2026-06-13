@@ -267,7 +267,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 25;
+const KNOWN_MANIFEST_VERSION = 26;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
@@ -698,8 +698,11 @@ async function fetchWhoami(base = BASE, token = TOKEN) {
 
 // doctor: validate the setup WITHOUT exposing secrets. Narration on stderr,
 // a compact machine-readable line on stdout. Exit 0 healthy / 2 broken.
-async function runDoctor(base = BASE, token = TOKEN) {
-  const source = token === TOKEN ? tokenSource() : CONFIG_FILE; // post-setup call passes the fresh token
+async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
+  // sourceLabel is passed by setup (it knows exactly where the key went —
+  // a per-agent file, the shared file, or NOWHERE for --print); the bare
+  // `doctor` command computes it from the env/file precedence.
+  const source = sourceLabel || (token === TOKEN ? tokenSource() : CONFIG_FILE);
   if (!token) {
     console.error('pidge doctor: NO TOKEN — set PIDGE_TOKEN, or onboard with `pidge setup --claim <code>` (the human copies the code from the Pidge app)');
     process.exit(2);
@@ -801,7 +804,7 @@ async function runSetup() {
     console.log(`export PIDGE_URL=${finalBase}`);
     console.log(`export PIDGE_TOKEN=${data.key}`);
     console.error(`pidge: canal "${channelName}" — modo POR-AGENTE (nada gravado em disco). Cole as duas linhas no ambiente de lançamento DESTE agente (systemd/launcher/cron/profile). Cada agente tem a SUA chave; perdeu, é só pegar outro código no app e re-rodar (a chave do canal é a MESMA). NÃO rode --print de dentro de um agente — a chave apareceria no contexto dele.`);
-    await runDoctor(finalBase, data.key);
+    await runDoctor(finalBase, data.key, 'fresh claim (per-agent env — not stored on disk)');
     return;
   }
 
@@ -813,7 +816,7 @@ async function runSetup() {
   console.error(`pidge: canal "${channelName}" configurado — chave em ${CONFIG_FILE} (chmod 600, nunca exibida)`);
   if (!AGENT_ID)
     console.error('pidge: este é o arquivo COMPARTILHADO (single-agent). Vai rodar 2+ agentes nesta máquina? Dê a cada um PIDGE_AGENT=<id> no launch (arquivo isolado por agente) — senão eles enviam como o mesmo canal.');
-  await runDoctor(finalBase, data.key);
+  await runDoctor(finalBase, data.key, CONFIG_FILE);
 }
 
 // skill install (#110e): persistent Pidge knowledge for Claude Code agents —

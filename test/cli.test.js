@@ -497,6 +497,9 @@ test('setup --print emits export lines and writes NO file (per-agent, human-run)
   assert.match(stdout, /export PIDGE_URL=/);
   assert.ok(!fs.existsSync(path.join(home, 'pidge', 'env')), '--print must not write the file');
   assert.match(stderr, /NÃO rode --print de dentro de um agente/);
+  // 0.8.1: the post-setup doctor must NOT claim a config file it never wrote.
+  assert.match(stderr, /not stored on disk/);
+  assert.doesNotMatch(stderr, /token found \(.*pidge.*env\)/);
 });
 
 test('doctor warns when reading the SHARED legacy file (no PIDGE_AGENT, no env var)', async () => {
