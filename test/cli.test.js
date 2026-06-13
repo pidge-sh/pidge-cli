@@ -372,3 +372,40 @@ test('an explicit --timeout always beats the template suggestion', async () => {
   assert.equal(code, 0);
   assert.doesNotMatch(stderr, /suggested by template/);
 });
+
+// --- #157 P2 tails: --follow + local custom-action id validation --------------
+
+test('listen --follow prints+acks a batch and KEEPS listening, exit 0 at the window end', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 11, channel_id: 1, body: 'primeiro lote', created_at: 'x', consumed_at: null }];
+
+  const { result } = runCli(['listen', '--follow', '--no-realtime', '--timeout', '6', '--interval', '1'], port);
+  await sleep(2500);
+  // a second batch lands mid-window — a one-shot listen would have exited already
+  mock.state.messages = [{ id: 12, channel_id: 1, body: 'segundo lote', created_at: 'x', consumed_at: null }];
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stdout, /primeiro lote/);
+  assert.match(stdout, /segundo lote/, 'the follow window must deliver BOTH batches');
+  assert.match(stderr, /--follow — still listening/);
+  assert.match(stderr, /--follow window ended/);
+});
+
+test('an invalid --custom-action id fails fast locally with the spelled-out rule', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  const { result } = runCli(
+    ['notify', '--title', 'x', '--custom-action', 'Não-Válido:Rótulo'],
+    port,
+  );
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 1);
+  assert.match(stderr, /lowercase letters, digits and underscore only/);
+  assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
+});
