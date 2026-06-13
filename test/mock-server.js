@@ -57,7 +57,9 @@ function createMock() {
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/whoami') {
       const auth = req.headers.authorization || '';
-      if (!/^Bearer hld_/.test(auth)) return json(res, 401, { error: 'unauthorized' });
+      // 'hld_revoked' simulates a dead key (the shared-config guard lets a
+      // corpse be overwritten without --force).
+      if (!/^Bearer hld_/.test(auth) || auth === 'Bearer hld_revoked') return json(res, 401, { error: 'unauthorized' });
       return json(res, 200, {
         channel: { id: 1, name: 'mock', icon: 'bot', color: 'violet' },
         user: { name: 'Thiago', timezone: 'America/Sao_Paulo' },
