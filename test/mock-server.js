@@ -15,12 +15,17 @@ function createMock() {
     subscriptions: [],     // channel names confirmed, in order
     onSubscribe: null,     // (channel, sock) => {} test hook
     waitMode: 'ok',
+    wsMode: 'ok',          // '1006' = drop every WS abruptly (the #119 prod failure)
     messages: [],          // served by GET /api/v1/messages
     notifications: {},     // cid → body for GET /api/v1/notifications/:cid
     acks: [],
     notifies: [],
     claimCode: 'claim-ok',   // #110: POST /api/v1/claim exchanges this once
     devices: 1,
+    // #181 ownership + #182 contract/device_reach surfaces (v27).
+    claim: { claimed_by_label: null, claimed_by_fingerprint: null, claimed_at: null, claim_generation: 0 },
+    deviceReach: null,       // set by a test to exercise the honesty warning
+    operatingContract: {},   // PATCH /channels/:id merges into this
   };
   let server = null;
   let wss = null;
@@ -62,9 +67,52 @@ function createMock() {
       if (!/^Bearer hld_/.test(auth) || auth === 'Bearer hld_revoked') return json(res, 401, { error: 'unauthorized' });
       return json(res, 200, {
         channel: { id: 1, name: 'mock', icon: 'bot', color: 'violet' },
+        operating_contract: state.operatingContract,         // #182
         user: { name: 'Thiago', timezone: 'America/Sao_Paulo' },
-        devices: state.devices ?? 1, manifest_version: 16,
+        claim: state.claim,                                  // #181
+        devices: state.devices ?? 1,
+        device_reach: state.deviceReach,                     // #182 (null unless a test sets it)
+        manifest_version: 16,
       });
+    }
+    // #181: POST /claim/ownership — bump generation only on a DIFFERENT fingerprint.
+    if (req.method === 'POST' && url.pathname === '/api/v1/claim/ownership') {
+      const auth = req.headers.authorization || '';
+      if (!/^Bearer hld_/.test(auth) || auth === 'Bearer hld_revoked') return json(res, 401, { error: 'unauthorized' });
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
+        const fp = (p.fingerprint || '').toString();
+        if (!fp) return json(res, 400, { error: 'fingerprint required' });
+        const c = state.claim;
+        const changed = !!c.claimed_by_fingerprint && c.claimed_by_fingerprint !== fp;
+        let gen = changed ? c.claim_generation + 1 : c.claim_generation;
+        if (gen === 0) gen = 1;
+        state.claim = {
+          claimed_by_label: p.label || null, claimed_by_fingerprint: fp,
+          claimed_at: new Date().toISOString(), claim_generation: gen,
+        };
+        json(res, 200, { channel: { id: 1, name: 'mock' }, claim: state.claim, generation: gen });
+      });
+      return;
+    }
+    // #182: PATCH /channels/:id — merge operating_contract (CONTRACT, never policy).
+    const pmatch = url.pathname.match(/^\/api\/v1\/channels\/(\d+)$/);
+    if (req.method === 'PATCH' && pmatch) {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
+        if (p.operating_contract && typeof p.operating_contract === 'object') {
+          for (const [k, val] of Object.entries(p.operating_contract)) {
+            if (val === null) delete state.operatingContract[k];
+            else state.operatingContract[k] = { value: val, by: 'agent:mock', at: new Date().toISOString(), locked: false };
+          }
+        }
+        json(res, 200, { id: 1, name: 'mock', operating_contract: state.operatingContract });
+      });
+      return;
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/manifest') {
       return json(res, 200, {
@@ -83,10 +131,18 @@ function createMock() {
       return json(res, 200, { messages: rows });
     }
     if (req.method === 'POST' && url.pathname === '/api/v1/messages/ack') {
-      state.acks.push(req.url);
-      state.messages = [];
-      if (state.hangAck) return; // simulate a wedged proxy stalling the ack POST
-      return json(res, 200, { acked: 1 });
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
+        state.acks.push(req.url);
+        if (state.hangAck) return; // simulate a wedged proxy stalling the ack POST
+        // #170: state=delivered RENEWS the lease (not consumed); else PROCESS it.
+        if (p.state === 'delivered') return json(res, 200, { renewed: 1 });
+        state.messages = [];
+        json(res, 200, { acked: 1 });
+      });
+      return;
     }
     if (req.method === 'POST' && url.pathname === '/api/v1/notify') {
       let body = '';
@@ -121,6 +177,9 @@ function createMock() {
       handleProtocols: () => 'actioncable-v1-json', // negotiate like ActionCable
     });
     wss.on('connection', (sock) => {
+      // wsMode '1006': drop EVERY socket abruptly (no close frame) → the client
+      // sees close code 1006, the intermittent prod failure (#119 dogfooding).
+      if (state.wsMode === '1006') { try { sock.terminate(); } catch { /* gone */ } return; }
       state.sockets.add(sock);
       sock.send(JSON.stringify({ type: 'welcome' }));
       const ping = setInterval(() => {

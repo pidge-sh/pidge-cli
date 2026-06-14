@@ -41,6 +41,14 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 
+// `pidge --version` / `-v` — handled BEFORE parseArgs (which would otherwise
+// throw "Unknown option" on the undeclared flag). Prints the version, exit 0.
+if (process.argv.includes('--version') || process.argv.includes('-v')) {
+  try { console.log(require(path.join(__dirname, '..', 'package.json')).version); }
+  catch { console.log('unknown'); }
+  process.exit(0);
+}
+
 // Per-agent isolation (incident 2026-06-13): ~/.config/pidge/env is one slot
 // per machine-user, so N agents sharing a HOME share an identity — one agent's
 // setup hijacked another's cron. The fix is a NON-secret namespacing var the
@@ -124,6 +132,11 @@ const OPTIONS = {
   follow: { type: 'boolean' },
   force: { type: 'boolean' },                  // setup: overwrite a config owned by ANOTHER channel
   print: { type: 'boolean' },                  // setup: print export lines instead of writing a file (per-agent, human runs it)
+  // Fix 2 (#170): read-receipt split — `ack` after the work; listen no longer consumes on read.
+  'up-to': { type: 'string' },                 // ack: process messages up to this id
+  ids: { type: 'string' },                     // ack: process this comma-list of ids
+  renew: { type: 'boolean' },                  // ack: heartbeat the visibility-timeout lease (state=delivered)
+  'ack-on-read': { type: 'boolean' },          // listen: restore the pre-0.9 immediate-consume
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -145,15 +158,24 @@ USAGE
   pidge wait   <correlation_id> [options] block on an already-sent notification
   pidge cancel <correlation_id>           cancel a still-scheduled notification (#56)
   pidge inbox  [--pending|--summary|--all|--limit N]   what you sent: list, pending slice, or counts+latency (#83)
-  pidge listen [--timeout N] [--all] [--follow]
-                                          block until the human MESSAGES you from the app, print + ack + exit (#48)
-                                          --follow = print+ack and KEEP listening until --timeout
-                                          (exit 0 if any batch landed; one-shot stays the default)
-                                          --all (#131) = the SINGLE EAR: also hear notification ANSWERS
-                                          (kind notification_reply + self-contained ref) — nothing the human
-                                          says can be missed by a looped listen --all
+  pidge listen [--timeout N] [--all] [--ack-on-read] [--follow]
+                                          block until the human MESSAGES you from the app, print, exit (#48)
+                                          #170: a read message is DELIVERED (gray ✓✓), NOT done — ACK it
+                                          AFTER the work: pidge ack --up-to <id> (a ~10-min lease re-serves
+                                          un-acked messages, so a crash never loses one)
+                                          --ack-on-read = the old immediate-consume (ack on print)
+                                          --follow      = KEEP listening until --timeout (supervisor-only)
+                                          --all (#131)  = the SINGLE EAR: also hear notification ANSWERS
+  pidge ack --up-to <id> | --ids a,b [--renew]
+                                          mark messages PROCESSED (green ✓✓) after you handled them (#170);
+                                          --renew heartbeats the lease on a long task (state=delivered)
+  pidge contract set <key>=<value> | contract show
+                                          DECLARE how you operate (#182): keep_connection_alive,
+                                          mirror_in_origin_session, listen_mode=turn_based|always_on,
+                                          quiet_when_idle. A CONTRACT, never policy (the human can force it).
   pidge skill install                     write .claude/skills/pidge/SKILL.md generated from the
                                           live manifest (persistent Pidge knowledge for Claude Code)
+  pidge --version                         print the CLI version
   pidge --help
 
 REALTIME (#118)
@@ -267,7 +289,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 26;
+const KNOWN_MANIFEST_VERSION = 27;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
@@ -290,6 +312,11 @@ function checkManifestNews(res) {
 const DEGRADE_AFTER = 3;
 // env override = a test/ops hook, not a documented knob
 const DEGRADED_INTERVAL_S = parseInt(process.env.PIDGE_DEGRADED_INTERVAL || '45', 10);
+// When the blocking session began — so a timeout reports the REAL elapsed
+// wall-clock, never the configured deadline. The dogfooding bug (2026-06-14): a
+// WS close 1006 made the CLI exit "timed out after 28800s" when only seconds had
+// passed — the number lied. exitTimeout now reports SESSION_START → now.
+const SESSION_START = Date.now();
 const health = {
   okEver: false, fails: 0, firstFailAt: 0, lastNoteAt: 0, degraded: false,
   ok() {
@@ -309,8 +336,11 @@ const health = {
     }
   },
   exitTimeout(message) {
-    if (this.okEver) { console.error(`pidge: ${message} (= 'no answer yet', not a failure)`); process.exit(3); }
-    console.error(`pidge: ${message} — and NOT ONE healthy round-trip all session: the CHANNEL looks broken (server/network), not the human ignoring you. Surface this to your human.`);
+    // REAL elapsed wall-clock — never the configured deadline (the 2026-06-14
+    // "timed out after 28800s" lie). If only seconds passed, the number says so.
+    const elapsed = Math.round((Date.now() - SESSION_START) / 1000);
+    if (this.okEver) { console.error(`pidge: ${message} after ${elapsed}s (= 'no answer yet', not a failure)`); process.exit(3); }
+    console.error(`pidge: ${message} after ${elapsed}s — and NOT ONE healthy round-trip all session: the CHANNEL looks broken (server/network), not the human ignoring you. Surface this to your human.`);
     process.exit(4);
   },
 };
@@ -397,7 +427,9 @@ async function cableSession({ channel, deadline, onUp, onFrame }) {
     wsFails++;
     const MAX_WS_FAILS = 4; // then fall back to polling for the rest of the session
     if (wsFails >= MAX_WS_FAILS) return 'ws-unavailable';
-    const backoff = Math.min(2000 * wsFails, 10000);
+    // env override = a test/ops hook (keeps the forced-1006 degrade test fast)
+    const base = parseInt(process.env.PIDGE_WS_BACKOFF_MS || '2000', 10) || 2000;
+    const backoff = Math.min(base * wsFails, base * 5);
     console.error(`pidge: realtime socket ${outcome.replace('down: ', '')} — reconnecting in ${Math.round(backoff / 1000)}s (attempt ${wsFails}/${MAX_WS_FAILS})`);
     await sleep(backoff);
   }
@@ -604,7 +636,7 @@ async function doWait(cid, { timeout, interval }) {
     }
 
     if (Date.now() >= deadline) {
-      health.exitTimeout(`timed out after ${timeout}s waiting on ${cid}`);
+      health.exitTimeout(`no answer on ${cid}`);
     }
     // A server WITH long-poll just held us for waitS — loop right back. One that
     // ignored `wait`, an error, or degraded mode returned fast: pace ourselves.
@@ -653,8 +685,11 @@ async function realtimeWait(cid, { timeout, interval }) {
     // fetch + print + exit via the poller (one quick authoritative read)
     await doWait(cid, { timeout: Math.max(10, Math.ceil((deadline - Date.now()) / 1000)), interval });
   }
-  if (outcome === 'deadline') {
-    health.exitTimeout(`timed out after ${timeout}s waiting on ${cid}`);
+  // Only exit-as-timeout if the REAL deadline genuinely passed. An EARLY
+  // 'deadline' (a spurious guard, a WS oddity) must degrade to polling for the
+  // remaining budget, NOT exit lying that the full timeout elapsed (#119).
+  if (outcome === 'deadline' && Date.now() >= deadline - 1500) {
+    health.exitTimeout(`no answer on ${cid}`);
   }
   console.error('pidge: realtime unavailable — falling back to HTTP polling (same contract, less instant)');
   return Math.max(1, Math.ceil((deadline - Date.now()) / 1000)); // remaining budget
@@ -694,6 +729,84 @@ async function fetchWhoami(base = BASE, token = TOKEN) {
   let data = {};
   try { data = await res.json(); } catch { /* leave {} */ }
   return { res, data };
+}
+
+// #181 identity ownership: a STABLE, privacy-safe per-install fingerprint (a
+// HASH, never raw hostname/PII) so the server can tell THIS install apart from a
+// different agent that grabbed the same key. The label is the human-readable
+// self-name (PIDGE_LABEL, else PIDGE_AGENT, else the hostname).
+function agentFingerprint() {
+  const material = [ os.hostname(), os.userInfo().username || '', AGENT_ID, CONFIG_FILE ].join('|');
+  return 'fp_' + crypto.createHash('sha256').update(material).digest('hex').slice(0, 24);
+}
+function agentLabel() {
+  return (process.env.PIDGE_LABEL || AGENT_ID || os.hostname() || 'pidge-cli').slice(0, 80);
+}
+
+// POST /claim/ownership — stamp WHICH install wears this channel's key (#181), so
+// a multi-agent machine can DETECT a silent key swap. Best-effort: a server that
+// predates it 404s (skip silently); a network blip never breaks setup. Returns
+// the server's claim block or null.
+async function claimOwnership(base, token) {
+  try {
+    const res = await fetchT(`${base}/api/v1/claim/ownership`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ fingerprint: agentFingerprint(), label: agentLabel() }),
+    });
+    if (res.status !== 200) return null;
+    const data = await res.json().catch(() => ({}));
+    return data.claim || null;
+  } catch { return null; }
+}
+
+// #182 operating_contract: DECLARE how you operate (a CONTRACT, never policy —
+// nothing derives urgency/ceiling from it; the human can force/lock it).
+//   pidge contract show           → print the channel's operating_contract
+//   pidge contract set key=value  → PATCH it (key ∈ the server's closed allowlist:
+//                                   keep_connection_alive, mirror_in_origin_session,
+//                                   listen_mode=turn_based|always_on, quiet_when_idle)
+async function runContract() {
+  const sub = parsed.positionals[1];
+  let who;
+  try { who = await fetchWhoami(); } catch (e) { die(`pidge: contract failed (network): ${e.message}`, 2); }
+  if (who.res.status !== 200) die(`pidge: contract: whoami failed (${who.res.status})`, 2);
+  const channelId = who.data.channel && who.data.channel.id;
+
+  if (sub === 'show' || sub === undefined) {
+    const oc = who.data.operating_contract || {};
+    console.log(JSON.stringify(oc, null, 2));
+    const keys = Object.keys(oc);
+    console.error(keys.length
+      ? `pidge: operating_contract — ${keys.map((k) => `${k}=${JSON.stringify(oc[k].value)}${oc[k].locked ? ' (locked by human)' : ''}`).join(', ')}`
+      : 'pidge: no operating_contract declared yet — set one with `pidge contract set listen_mode=turn_based`');
+    process.exit(0);
+  }
+  if (sub !== 'set') die('pidge: usage: pidge contract set <key>=<value> | pidge contract show', 1);
+
+  const assignment = parsed.positionals[2];
+  if (!assignment || !assignment.includes('=')) die('pidge: usage: pidge contract set <key>=<value>  (e.g. listen_mode=turn_based)', 1);
+  const eq = assignment.indexOf('=');
+  const key = assignment.slice(0, eq);
+  const raw = assignment.slice(eq + 1);
+  // true/false → bool; everything else passes as a string (the server validates
+  // the allowlist + types and 422s self-describingly).
+  const value = raw === 'true' ? true : raw === 'false' ? false : raw;
+
+  let res, body;
+  try {
+    res = await fetch(`${BASE}/api/v1/channels/${channelId}`, {
+      method: 'PATCH', headers, body: JSON.stringify({ operating_contract: { [key]: value } }),
+    });
+    body = await res.text();
+  } catch (e) {
+    die(`pidge: contract set failed (network): ${e.message}`, 2);
+  }
+  checkManifestNews(res);
+  console.log(body);
+  if (!(res.status >= 200 && res.status < 300)) die(`pidge: contract set failed (${res.status}): ${body}`, 2);
+  console.error(`pidge: declared ${key}=${JSON.stringify(value)} (a CONTRACT, never policy — the human can force/lock it in the app)`);
+  process.exit(0);
 }
 
 // doctor: validate the setup WITHOUT exposing secrets. Narration on stderr,
@@ -741,6 +854,27 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   console.error(`pidge doctor: key valid — canal "${data.channel && data.channel.name}" · ${devices} device(s)`);
   if (devices === 0)
     console.error('pidge doctor: WARNING — 0 devices: sends will reach NOBODY until the human installs/opens the Pidge app on their iPhone');
+  // #182 device-reach honesty (gotcha #9): pushable ≠ deliverable. A prod push
+  // skips a sandbox/old device, so the agent reaches FEWER than it thinks.
+  const reach = data.device_reach;
+  if (reach) {
+    console.error(`pidge doctor: reach — ${reach.deliverable}/${reach.total} device(s) will actually receive a push (${reach.apns_environment} APNs)`);
+    if (reach.total > reach.deliverable)
+      console.error(`pidge doctor: WARNING — ${reach.total - reach.deliverable} registered device(s) are UNREACHABLE (disabled, or on the wrong APNs environment) — a send lands on ${reach.deliverable}, not ${reach.total}.`);
+  }
+  // #181 ownership: did a DIFFERENT install grab this channel since we claimed?
+  // Compare the server's generation/fingerprint to what setup stored locally.
+  if (data.claim) {
+    const localGen = parseInt(FILE_ENV.PIDGE_CLAIM_GENERATION || '', 10);
+    const ourFp = FILE_ENV.PIDGE_FINGERPRINT || agentFingerprint();
+    const srvGen = data.claim.claim_generation;
+    const srvFp = data.claim.claimed_by_fingerprint;
+    if (srvFp && srvFp !== ourFp && Number.isFinite(localGen) && srvGen > localGen) {
+      console.error(`pidge doctor: ⚠️  ANOTHER AGENT CLAIMED THIS CHANNEL — server generation ${srvGen} > yours ${localGen}, now owned by "${data.claim.claimed_by_label}". Your sends may go out as a DIFFERENT identity. If that's not intended, give THIS agent its own PIDGE_AGENT=<id> (isolated config) or PIDGE_TOKEN, then re-run setup.`);
+    } else if (srvFp && srvFp !== ourFp && !Number.isFinite(localGen)) {
+      console.error(`pidge doctor: note — this channel is owned by "${data.claim.claimed_by_label}" (generation ${srvGen}); THIS install hasn't claimed it. If you are its agent, run setup to claim ownership (so a future swap becomes detectable).`);
+    }
+  }
   if (ON_SHARED_FILE)
     console.error(`pidge doctor: WARNING — reading the SHARED file ${CONFIG_FILE}. If another agent runs on this machine, it reads the SAME key and you'll send as each other (the 2026-06-13 incident). Isolate: set PIDGE_AGENT=<id> at this agent's launch (config → ~/.config/pidge/agents/<id>/env) or give it its own PIDGE_TOKEN.`);
   console.error('pidge doctor: all good — try: pidge ask --template decision --title "Pidge funcionando?"');
@@ -814,6 +948,14 @@ async function runSetup() {
   fs.writeFileSync(CONFIG_FILE, `PIDGE_URL=${finalBase}\nPIDGE_TOKEN=${data.key}\n`, { mode: 0o600 });
   try { fs.chmodSync(CONFIG_FILE, 0o600); } catch { /* mode set on create */ }
   console.error(`pidge: canal "${channelName}" configurado — chave em ${CONFIG_FILE} (chmod 600, nunca exibida)`);
+  // #181: claim ownership of the channel for THIS install and record the
+  // generation locally, so a later `pidge doctor` can DETECT a silent key swap
+  // by a different agent (the v25 incident, now caught in code). Best-effort.
+  const claim = await claimOwnership(finalBase, data.key);
+  if (claim) {
+    fs.appendFileSync(CONFIG_FILE, `PIDGE_CLAIM_GENERATION=${claim.claim_generation}\nPIDGE_FINGERPRINT=${agentFingerprint()}\n`, { mode: 0o600 });
+    console.error(`pidge: ownership claimed as "${agentLabel()}" (generation ${claim.claim_generation}) — doctor WARNS if another agent takes this channel.`);
+  }
   if (!AGENT_ID)
     console.error('pidge: este é o arquivo COMPARTILHADO (single-agent). Vai rodar 2+ agentes nesta máquina? Dê a cada um PIDGE_AGENT=<id> no launch (arquivo isolado por agente) — senão eles enviam como o mesmo canal.');
   await runDoctor(finalBase, data.key, CONFIG_FILE);
@@ -971,6 +1113,37 @@ ${notes.map((n) => `- ${n}`).join('\n')}
       process.exit(2);
       break;
     }
+    case 'ack': {
+      // #170 read-receipt split: mark messages PROCESSED (green ✓✓) AFTER you've
+      // durably handled them — `listen` only DELIVERS them now. --renew
+      // (state=delivered) instead RENEWS the visibility-timeout lease, a
+      // heartbeat for a long task so the reservation doesn't lapse and re-serve.
+      const ackBody = {};
+      if (v['up-to'] !== undefined) ackBody.up_to = parseInt(v['up-to'], 10);
+      else if (v.ids !== undefined) ackBody.ids = v.ids.split(',').map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite);
+      else die('pidge: usage: pidge ack --up-to <id> | --ids a,b [--renew]', 1);
+      if (v.renew) ackBody.state = 'delivered';
+      let res, raw;
+      try {
+        res = await fetch(`${BASE}/api/v1/messages/ack`, { method: 'POST', headers, body: JSON.stringify(ackBody) });
+        raw = await res.text();
+      } catch (e) {
+        die(`pidge: ack failed (network): ${e.message}`, 2);
+      }
+      checkManifestNews(res);
+      console.log(raw);
+      if (!(res.status >= 200 && res.status < 300)) die(`pidge: ack failed (${res.status}): ${raw}`, 2);
+      let adata = {};
+      try { adata = JSON.parse(raw); } catch { /* leave {} */ }
+      if (v.renew) console.error(`pidge: lease renewed on ${adata.renewed ?? 0} message(s) (still yours; ack again when done)`);
+      else console.error(`pidge: processed ${adata.acked ?? 0} message(s) — green ✓✓ (the human sees "lida pelo agente")`);
+      process.exit(0);
+      break;
+    }
+    case 'contract': {
+      await runContract();
+      break;
+    }
     case 'inbox': {
       // #83: what this channel sent — the list (default), the pending slice
       // (--pending = delivered + still unanswered) or the one-call summary
@@ -1032,7 +1205,13 @@ ${notes.map((n) => `- ${n}`).join('\n')}
         return false;
       };
 
-      // Print + ack (+ exit 0 unless --follow) — shared by the WS and polling paths.
+      // #170 read-receipt split: by DEFAULT a read message is DELIVERED (gray
+      // ✓✓), NOT consumed — the agent ACKS after the work (`pidge ack`), and a
+      // ~10-min server lease re-serves un-acked messages so a crash never loses
+      // one. --ack-on-read restores the pre-0.9 immediate-consume.
+      const ackOnRead = v['ack-on-read'];
+      let ackNoticeShown = false;
+      // Print + (conditionally) ack — shared by the WS and polling paths.
       const printAndAck = async (msgs) => {
         console.log(JSON.stringify(msgs, null, 2));
         // #131: narrate answers so the agent knows WHICH notification spoke back.
@@ -1044,21 +1223,27 @@ ${notes.map((n) => `- ${n}`).join('\n')}
           }
         }
         const upTo = Math.max(...msgs.map((m) => m.id));
-        try {
-          // fetchT, not fetch: a wedged proxy stalling this ack would otherwise
-          // pin the process forever (the WS drain path awaits printAndAck's exit
-          // with no deadline) — messages are already printed, so a timeout here
-          // just re-serves them next listen (at-least-once).
-          const ack = await fetchT(`${BASE}/api/v1/messages/ack`, {
-            method: 'POST', headers, body: JSON.stringify({ up_to: upTo }),
-          });
-          if (ack.status >= 200 && ack.status < 300) {
-            console.error(`pidge: ${msgs.length} message(s) from the human — acked (answer via notify; reuse thread_id when present)`);
-          } else {
-            console.error(`pidge: WARNING — ack failed (${ack.status}); these messages will be re-served next listen`);
+        if (ackOnRead) {
+          try {
+            // fetchT, not fetch: a wedged proxy stalling this ack would otherwise
+            // pin the process forever (the WS drain path awaits printAndAck's exit
+            // with no deadline) — messages are already printed, so a timeout here
+            // just re-serves them next listen (at-least-once).
+            const ack = await fetchT(`${BASE}/api/v1/messages/ack`, {
+              method: 'POST', headers, body: JSON.stringify({ up_to: upTo }),
+            });
+            if (ack.status >= 200 && ack.status < 300) {
+              console.error(`pidge: ${msgs.length} message(s) — acked on read (--ack-on-read); answer via notify, reuse thread_id when present`);
+            } else {
+              console.error(`pidge: WARNING — ack failed (${ack.status}); these messages will be re-served next listen`);
+            }
+          } catch (e) {
+            console.error(`pidge: WARNING — ack failed (network: ${e.message}); these messages will be re-served next listen`);
           }
-        } catch (e) {
-          console.error(`pidge: WARNING — ack failed (network: ${e.message}); these messages will be re-served next listen`);
+        } else if (!ackNoticeShown) {
+          ackNoticeShown = true;
+          // The version-gated BREAKING flip — LOUD on stderr the first time.
+          console.error(`pidge: #170 — ${msgs.length} message(s) DELIVERED (gray ✓✓), NOT done. ACK AFTER you handle them: \`pidge ack --up-to ${upTo}\` (a ~10-min lease re-serves un-acked messages, so a crash between "I have it" and "I'm done" never loses one). Use --ack-on-read for the old immediate-consume.`);
         }
         gotAny = true;
         if (!v.follow) process.exit(0);
@@ -1114,9 +1299,11 @@ ${notes.map((n) => `- ${n}`).join('\n')}
           }));
         }
         const outcome = await Promise.race(sessions);
-        if (outcome === 'deadline') {
+        // Only a GENUINE deadline exits; an early/spurious 'deadline' or
+        // 'ws-unavailable' degrades to polling below (never an early timeout lie).
+        if (outcome === 'deadline' && Date.now() >= deadline - 1500) {
           followEnd();
-          health.exitTimeout(`timed out after ${timeout}s — no message from the human`);
+          health.exitTimeout('no message from the human');
         }
         if (outcome === 'got-messages') {
           await new Promise(() => {}); // printAndAck is in flight and exits the process
@@ -1149,7 +1336,7 @@ ${notes.map((n) => `- ${n}`).join('\n')}
         }
         if (Date.now() >= deadline) {
           followEnd();
-          health.exitTimeout(`timed out after ${timeout}s — no message from the human`);
+          health.exitTimeout('no message from the human');
         }
         const pace = health.degraded ? DEGRADED_INTERVAL_S : num(v.interval, 5);
         if (Date.now() - askedAt < 2000) {

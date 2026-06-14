@@ -102,7 +102,7 @@ test('Javier #2 — soak: a realtime listen SURVIVES a server restart and still 
   let subscribed = 0;
   mock.state.onSubscribe = () => { subscribed++; };
 
-  const { result } = runCli(['listen', '--realtime', '--timeout', '60'], port);
+  const { result } = runCli(['listen', '--ack-on-read', '--realtime', '--timeout', '60'], port);
 
   // wait until the client is subscribed, then "deploy" (kill + restart)
   while (subscribed === 0) await sleep(50);
@@ -160,7 +160,8 @@ test('a wedged ack does NOT hang the process forever — it times out, exits (me
   mock.state.messages = [{ id: 5, channel_id: 1, body: 'msg + ack travado', created_at: 'x', consumed_at: null }];
 
   // PIDGE_FETCH_TIMEOUT keeps the test fast; default in prod is 30 s.
-  const { result } = runCli(['listen', '--no-realtime', '--timeout', '20'], port, { PIDGE_FETCH_TIMEOUT: '1500' });
+  // --ack-on-read: the wedged-ack resilience lives on the ack path (0.9 default doesn't ack on read).
+  const { result } = runCli(['listen', '--ack-on-read', '--no-realtime', '--timeout', '20'], port, { PIDGE_FETCH_TIMEOUT: '1500' });
   const started = Date.now();
   const { code, stdout, stderr } = await result;
   await mock.stop();
@@ -380,7 +381,9 @@ test('listen --follow prints+acks a batch and KEEPS listening, exit 0 at the win
   const port = await mock.start();
   mock.state.messages = [{ id: 11, channel_id: 1, body: 'primeiro lote', created_at: 'x', consumed_at: null }];
 
-  const { result } = runCli(['listen', '--follow', '--no-realtime', '--timeout', '6', '--interval', '1'], port);
+  // --ack-on-read: a --follow supervisor that consumes inline (so the mock clears
+  // between batches; without it the server lease would gate re-serve, unmodeled here).
+  const { result } = runCli(['listen', '--follow', '--ack-on-read', '--no-realtime', '--timeout', '6', '--interval', '1'], port);
   await sleep(2500);
   // a second batch lands mid-window — a one-shot listen would have exited already
   mock.state.messages = [{ id: 12, channel_id: 1, body: 'segundo lote', created_at: 'x', consumed_at: null }];
@@ -500,6 +503,146 @@ test('setup --print emits export lines and writes NO file (per-agent, human-run)
   // 0.8.1: the post-setup doctor must NOT claim a config file it never wrote.
   assert.match(stderr, /not stored on disk/);
   assert.doesNotMatch(stderr, /token found \(.*pidge.*env\)/);
+});
+
+// --- 0.9.0: Fix 2 (ack-after-work) + Fix 3 (degrade) + #181/#182 -------------
+
+test('--version prints the CLI version and exits 0 (was "Unknown option")', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { result } = runCli(['--version'], port);
+  const { code, stdout } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0);
+  assert.match(stdout.trim(), /^\d+\.\d+\.\d+/);
+});
+
+test('listen (0.9 default) DELIVERS without consuming + shows the ack-after-work notice', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 8, channel_id: 1, body: 'trabalho pendente', created_at: 'x' }];
+
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '10'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stdout, /trabalho pendente/);
+  assert.equal(mock.state.acks.length, 0, 'the 0.9 default must NOT ack on read');
+  assert.match(stderr, /DELIVERED \(gray/);
+  assert.match(stderr, /pidge ack --up-to 8/);
+});
+
+test('ack --up-to processes (green); ack --renew heartbeats the lease', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  let r = runCli(['ack', '--up-to', '8'], port);
+  let out = await r.result;
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /processed 1 message/);
+
+  r = runCli(['ack', '--up-to', '8', '--renew'], port);
+  out = await r.result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /lease renewed on 1 message/);
+});
+
+test('contract set declares operating_contract; contract show reads it back', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  let r = runCli(['contract', 'set', 'listen_mode=turn_based'], port);
+  let out = await r.result;
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /declared listen_mode="turn_based"/);
+  assert.equal(mock.state.operatingContract.listen_mode.value, 'turn_based');
+
+  r = runCli(['contract', 'show'], port);
+  out = await r.result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stdout, /listen_mode/);
+});
+
+test('doctor reports HONEST device reach and warns when pushable > deliverable (gotcha #9)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.deviceReach = { total: 3, pushable: 2, deliverable: 1, apns_environment: 'production', by_environment: { production: 1, sandbox: 1 } };
+
+  const { result } = runCli(['doctor'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0);
+  assert.match(stderr, /will actually receive a push/);
+  assert.match(stderr, /UNREACHABLE/);
+});
+
+test('#181 claim ownership: doctor SHOUTS when another agent took the channel (generation bumped)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-claim-'));
+
+  // agent "a" sets up + claims (generation 1, fingerprint Fa)
+  let r = runCli(['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'a' });
+  let out = await r.result;
+  assert.equal(out.code, 0, `a setup: ${out.stderr}`);
+  assert.match(out.stderr, /ownership claimed as "a" \(generation 1\)/);
+
+  // a DIFFERENT agent "b" claims the SAME channel (different fingerprint) → generation 2
+  mock.state.claimCode = 'claim-b';
+  r = runCli(['setup', '--claim', 'claim-b', '--url', `http://127.0.0.1:${port}`], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'b' });
+  out = await r.result;
+  assert.equal(out.code, 0, `b setup: ${out.stderr}`);
+  assert.match(out.stderr, /generation 2/);
+
+  // agent "a" runs doctor → must SHOUT (stored gen 1 < server gen 2, different fingerprint)
+  r = runCli(['doctor'], port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'a' });
+  out = await r.result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /ANOTHER AGENT CLAIMED THIS CHANNEL/);
+});
+
+test('Fix 3 — repeated WS close 1006 DEGRADES to polling and still delivers (never deaf, #119)', async (t) => {
+  if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.wsMode = '1006'; // every WS connection drops abruptly, repeatedly
+  mock.state.messages = [{ id: 14, channel_id: 1, body: 'sobrevive ao 1006', created_at: 'x' }];
+
+  const { result } = runCli(['listen', '--realtime', '--timeout', '30'], port, { PIDGE_WS_BACKOFF_MS: '100' });
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stdout, /sobrevive ao 1006/);
+  assert.match(stderr, /realtime unavailable|reconnecting/);
+});
+
+test('Fix 3 — repeated 1006 with NO message: REAL wall-clock on timeout (never the 28800s lie), runs to the deadline', async (t) => {
+  if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.wsMode = '1006';
+
+  const { result } = runCli(['listen', '--realtime', '--timeout', '4'], port, { PIDGE_WS_BACKOFF_MS: '100' });
+  const started = Date.now();
+  const { code, stderr } = await result;
+  const elapsedMs = Date.now() - started;
+  await mock.stop();
+
+  assert.equal(code, 3, `stderr: ${stderr}`);
+  const m = stderr.match(/after (\d+)s/);
+  assert.ok(m, `expected a REAL-elapsed timeout line, got: ${stderr}`);
+  assert.ok(Number(m[1]) < 30, `elapsed must be the REAL wall-clock, got ${m[1]}s`);
+  assert.ok(!stderr.includes('28800'), 'must NEVER print the configured-deadline lie');
+  assert.ok(elapsedMs >= 2500, `must run to the ~4s deadline, not bail when WS gave up (~0.6s); ran ${elapsedMs}ms`);
 });
 
 test('doctor warns when reading the SHARED legacy file (no PIDGE_AGENT, no env var)', async () => {
