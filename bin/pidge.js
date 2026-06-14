@@ -132,6 +132,7 @@ const OPTIONS = {
   follow: { type: 'boolean' },
   force: { type: 'boolean' },                  // setup: overwrite a config owned by ANOTHER channel
   print: { type: 'boolean' },                  // setup: print export lines instead of writing a file (per-agent, human runs it)
+  'listen-mode': { type: 'string' },           // setup: declare operating_contract listen mode (turn_based|always_on; default turn_based)
   // Fix 2 (#170): read-receipt split — `ack` after the work; listen no longer consumes on read.
   'up-to': { type: 'string' },                 // ack: process messages up to this id
   ids: { type: 'string' },                     // ack: process this comma-list of ids
@@ -150,6 +151,8 @@ USAGE
                                                    (you run it in YOUR terminal; paste into the
                                                    agent's launcher — never run --print as an agent)
                                           --force  overwrite a shared file owned by another channel
+                                          --listen-mode turn_based|always_on  declare how you
+                                                   operate (#182; default turn_based)
   pidge doctor                            validate the setup WITHOUT exposing secrets:
                                           env source, server, key, "canal X · N devices"
   pidge whoami                            which channel does this key speak for (JSON)
@@ -289,7 +292,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 27;
+const KNOWN_MANIFEST_VERSION = 28;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
@@ -315,8 +318,11 @@ const DEGRADED_INTERVAL_S = parseInt(process.env.PIDGE_DEGRADED_INTERVAL || '45'
 // When the blocking session began — so a timeout reports the REAL elapsed
 // wall-clock, never the configured deadline. The dogfooding bug (2026-06-14): a
 // WS close 1006 made the CLI exit "timed out after 28800s" when only seconds had
-// passed — the number lied. exitTimeout now reports SESSION_START → now.
-const SESSION_START = Date.now();
+// passed — the number lied. exitTimeout now reports elapsed since this baseline.
+// MONOTONIC on purpose (§2.5): performance.now() can't be skewed by a wall-clock
+// change (NTP step / DST) mid-session — a Date.now() delta could, re-opening the
+// "wrong number" failure mode the fix exists to kill.
+const SESSION_START_MONO = performance.now();
 const health = {
   okEver: false, fails: 0, firstFailAt: 0, lastNoteAt: 0, degraded: false,
   ok() {
@@ -338,7 +344,7 @@ const health = {
   exitTimeout(message) {
     // REAL elapsed wall-clock — never the configured deadline (the 2026-06-14
     // "timed out after 28800s" lie). If only seconds passed, the number says so.
-    const elapsed = Math.round((Date.now() - SESSION_START) / 1000);
+    const elapsed = Math.round((performance.now() - SESSION_START_MONO) / 1000);
     if (this.okEver) { console.error(`pidge: ${message} after ${elapsed}s (= 'no answer yet', not a failure)`); process.exit(3); }
     console.error(`pidge: ${message} after ${elapsed}s — and NOT ONE healthy round-trip all session: the CHANNEL looks broken (server/network), not the human ignoring you. Surface this to your human.`);
     process.exit(4);
@@ -743,6 +749,55 @@ function agentLabel() {
   return (process.env.PIDGE_LABEL || AGENT_ID || os.hostname() || 'pidge-cli').slice(0, 80);
 }
 
+// #170 first-run notice: show the ack-after-work BREAKING-flip contract ONCE PER
+// INSTALL (a stamp under the config dir), not every invocation — a turn-based
+// agent runs a FRESH process per turn, so an in-process flag would shout every
+// time. Best-effort: if the stamp can't be persisted (env-var-only install /
+// read-only fs) the caller's per-process guard still shows it once per run.
+const ACK_NOTICE_STAMP = path.join(CONFIG_DIR, '.ack_notice_seen');
+function ackNoticeAlreadySeen() {
+  try { return fs.existsSync(ACK_NOTICE_STAMP); } catch { return false; }
+}
+function markAckNoticeSeen() {
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(ACK_NOTICE_STAMP, `${new Date().toISOString()}\n`, { mode: 0o600 });
+  } catch { /* best-effort — per-process guard covers it */ }
+}
+
+// Shared by `doctor` AND `whoami` (#182/gotcha #9): narrate HONEST device reach —
+// `deliverable` (push-enabled AND on the live APNs environment) can be lower than
+// the headline pushable count. Returns true when reach is BROKEN: devices exist
+// but NONE are deliverable (a send reaches nobody). doctor exits 2 on that.
+function reportDeviceReach(data) {
+  const reach = data.device_reach;
+  if (!reach) return false;
+  console.error(`pidge: reach — ${reach.deliverable}/${reach.total} device(s) will actually receive a push (${reach.apns_environment} APNs)`);
+  if (reach.total > reach.deliverable)
+    console.error(`pidge: WARNING — ${reach.total - reach.deliverable} registered device(s) are UNREACHABLE (disabled, or on the wrong APNs environment): a send lands on ${reach.deliverable}, not ${reach.total} ("você pensa que alcança ${reach.total}, alcança ${reach.deliverable}").`);
+  return reach.total > 0 && reach.deliverable === 0;
+}
+
+// Shared by `doctor` AND `whoami` (#181): SHOUT when a DIFFERENT install claimed
+// this channel since we set up. Returns 'hard' (different fingerprint AND higher
+// generation), 'soft' (we never claimed locally — informational), or null.
+function reportClaimMismatch(data) {
+  if (!data.claim) return null;
+  const localGen = parseInt(FILE_ENV.PIDGE_CLAIM_GENERATION || '', 10);
+  const ourFp = FILE_ENV.PIDGE_FINGERPRINT || agentFingerprint();
+  const srvGen = data.claim.claim_generation;
+  const srvFp = data.claim.claimed_by_fingerprint;
+  if (srvFp && srvFp !== ourFp && Number.isFinite(localGen) && srvGen > localGen) {
+    console.error(`pidge: ⚠️  ANOTHER AGENT CLAIMED THIS CHANNEL — server generation ${srvGen} > yours ${localGen}, now owned by "${data.claim.claimed_by_label}". Your sends may go out as a DIFFERENT identity. If that's not intended, give THIS agent its own PIDGE_AGENT=<id> (isolated config) or PIDGE_TOKEN, then re-run setup.`);
+    return 'hard';
+  }
+  if (srvFp && srvFp !== ourFp && !Number.isFinite(localGen)) {
+    console.error(`pidge: note — this channel is owned by "${data.claim.claimed_by_label}" (generation ${srvGen}); THIS install hasn't claimed it. If you are its agent, run setup to claim ownership (so a future swap becomes detectable).`);
+    return 'soft';
+  }
+  return null;
+}
+
 // POST /claim/ownership — stamp WHICH install wears this channel's key (#181), so
 // a multi-agent machine can DETECT a silent key swap. Best-effort: a server that
 // predates it 404s (skip silently); a network blip never breaks setup. Returns
@@ -760,14 +815,85 @@ async function claimOwnership(base, token) {
   } catch { return null; }
 }
 
-// #182 operating_contract: DECLARE how you operate (a CONTRACT, never policy —
-// nothing derives urgency/ceiling from it; the human can force/lock it).
+// #182 step 5: after onboarding, DECLARE how this agent operates so the human
+// knows what to expect from this channel. ADVISORY — Pidge enforces nothing; it's
+// metadata the human reads. The default is the common case (a turn-based agent:
+// one-shot listen, no keep-alive); `--listen-mode always_on` flips it for a
+// long-lived supervisor. Non-interactive by design (the safe default is narrated);
+// best-effort — a 422/blip never breaks setup. Returns the declared mode or null.
+async function declareOperatingContract(base, token, channelId) {
+  if (!channelId) return null;
+  const mode = v['listen-mode'];
+  let contract;
+  if (mode === 'always_on') contract = { listen_mode: 'always_on', keep_connection_alive: true };
+  else if (!mode || mode === 'turn_based') contract = { listen_mode: 'turn_based', keep_connection_alive: false };
+  else { console.error(`pidge: --listen-mode must be turn_based or always_on (got "${mode}") — skipping the contract declaration`); return null; }
+  try {
+    const res = await fetchT(`${base}/api/v1/channels/${channelId}`, {
+      method: 'PATCH',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ operating_contract: contract }),
+    });
+    if (res.status >= 200 && res.status < 300) {
+      const hint = mode ? '' : ' (default — pass --listen-mode always_on for a long-lived supervisor)';
+      console.error(`pidge: declared listen_mode=${contract.listen_mode}${hint} — ADVISORY, how you operate (the human sees it; Pidge enforces nothing). Change anytime: pidge contract set listen_mode=...`);
+      return contract.listen_mode;
+    }
+    console.error(`pidge: note — couldn't declare the operating_contract (${res.status}); set it later with \`pidge contract set listen_mode=turn_based\``);
+  } catch (e) {
+    console.error(`pidge: note — couldn't declare the operating_contract (network: ${e.message}); set it later with \`pidge contract set\``);
+  }
+  return null;
+}
+
+// #182 the CLOSED allowlist (mirrors the server's OPERATING_CONTRACT_KEYS) — so
+// `contract set` and `setup` reject an unknown key / bad value type LOCALLY (exit
+// 1) before the round-trip, instead of leaning on the server's 422.
+const OPERATING_CONTRACT_SPEC = {
+  keep_connection_alive: 'boolean',
+  mirror_in_origin_session: 'boolean',
+  listen_mode: ['turn_based', 'always_on'],
+  quiet_when_idle: 'boolean',
+};
+// Coerce + validate one operating_contract value against the allowlist. Returns
+// the typed value, or throws an Error whose message the caller die()s with (exit 1).
+function coerceContractValue(key, raw) {
+  const spec = OPERATING_CONTRACT_SPEC[key];
+  if (!spec) throw new Error(`unknown operating_contract key "${key}" (allowed: ${Object.keys(OPERATING_CONTRACT_SPEC).join(', ')})`);
+  if (spec === 'boolean') {
+    if (raw === true || raw === 'true') return true;
+    if (raw === false || raw === 'false') return false;
+    throw new Error(`operating_contract.${key} must be true or false`);
+  }
+  const value = String(raw);
+  if (!spec.includes(value)) throw new Error(`operating_contract.${key} must be one of: ${spec.join(', ')}`);
+  return value;
+}
+
+// #182 operating_contract: DECLARE how you operate. ADVISORY, never policy —
+// nothing derives urgency/ceiling from it and Pidge enforces nothing; you declare,
+// the human registers their own expectation and SEES if you honor it.
 //   pidge contract show           → print the channel's operating_contract
-//   pidge contract set key=value  → PATCH it (key ∈ the server's closed allowlist:
-//                                   keep_connection_alive, mirror_in_origin_session,
-//                                   listen_mode=turn_based|always_on, quiet_when_idle)
+//   pidge contract set key=value  → PATCH it (key ∈ the closed allowlist above)
 async function runContract() {
   const sub = parsed.positionals[1];
+  if (sub !== 'show' && sub !== 'set' && sub !== undefined)
+    die('pidge: usage: pidge contract set <key>=<value> | pidge contract show', 1);
+
+  // For `set`: parse + validate the key/value LOCALLY (exit 1) BEFORE any network
+  // — an unknown key / bad type never reaches the server (the allowlist is closed
+  // and known client-side; the server would 422, but a local usage error is
+  // faster and clearer, and avoids a needless round-trip).
+  let key, value;
+  if (sub === 'set') {
+    const assignment = parsed.positionals[2];
+    if (!assignment || !assignment.includes('=')) die('pidge: usage: pidge contract set <key>=<value>  (e.g. listen_mode=turn_based)', 1);
+    const eq = assignment.indexOf('=');
+    key = assignment.slice(0, eq);
+    const raw = assignment.slice(eq + 1);
+    try { value = coerceContractValue(key, raw); } catch (e) { die(`pidge: ${e.message}`, 1); }
+  }
+
   let who;
   try { who = await fetchWhoami(); } catch (e) { die(`pidge: contract failed (network): ${e.message}`, 2); }
   if (who.res.status !== 200) die(`pidge: contract: whoami failed (${who.res.status})`, 2);
@@ -778,20 +904,10 @@ async function runContract() {
     console.log(JSON.stringify(oc, null, 2));
     const keys = Object.keys(oc);
     console.error(keys.length
-      ? `pidge: operating_contract — ${keys.map((k) => `${k}=${JSON.stringify(oc[k].value)}${oc[k].locked ? ' (locked by human)' : ''}`).join(', ')}`
+      ? `pidge: operating_contract — ${keys.map((k) => `${k}=${JSON.stringify(oc[k].value)}${oc[k].locked ? ' (registered by your human)' : ''}`).join(', ')}`
       : 'pidge: no operating_contract declared yet — set one with `pidge contract set listen_mode=turn_based`');
     process.exit(0);
   }
-  if (sub !== 'set') die('pidge: usage: pidge contract set <key>=<value> | pidge contract show', 1);
-
-  const assignment = parsed.positionals[2];
-  if (!assignment || !assignment.includes('=')) die('pidge: usage: pidge contract set <key>=<value>  (e.g. listen_mode=turn_based)', 1);
-  const eq = assignment.indexOf('=');
-  const key = assignment.slice(0, eq);
-  const raw = assignment.slice(eq + 1);
-  // true/false → bool; everything else passes as a string (the server validates
-  // the allowlist + types and 422s self-describingly).
-  const value = raw === 'true' ? true : raw === 'false' ? false : raw;
 
   let res, body;
   try {
@@ -805,7 +921,7 @@ async function runContract() {
   checkManifestNews(res);
   console.log(body);
   if (!(res.status >= 200 && res.status < 300)) die(`pidge: contract set failed (${res.status}): ${body}`, 2);
-  console.error(`pidge: declared ${key}=${JSON.stringify(value)} (a CONTRACT, never policy — the human can force/lock it in the app)`);
+  console.error(`pidge: declared ${key}=${JSON.stringify(value)} (ADVISORY, never policy — the human sees if you honor it; Pidge enforces nothing)`);
   process.exit(0);
 }
 
@@ -854,29 +970,19 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   console.error(`pidge doctor: key valid — canal "${data.channel && data.channel.name}" · ${devices} device(s)`);
   if (devices === 0)
     console.error('pidge doctor: WARNING — 0 devices: sends will reach NOBODY until the human installs/opens the Pidge app on their iPhone');
-  // #182 device-reach honesty (gotcha #9): pushable ≠ deliverable. A prod push
-  // skips a sandbox/old device, so the agent reaches FEWER than it thinks.
-  const reach = data.device_reach;
-  if (reach) {
-    console.error(`pidge doctor: reach — ${reach.deliverable}/${reach.total} device(s) will actually receive a push (${reach.apns_environment} APNs)`);
-    if (reach.total > reach.deliverable)
-      console.error(`pidge doctor: WARNING — ${reach.total - reach.deliverable} registered device(s) are UNREACHABLE (disabled, or on the wrong APNs environment) — a send lands on ${reach.deliverable}, not ${reach.total}.`);
-  }
-  // #181 ownership: did a DIFFERENT install grab this channel since we claimed?
-  // Compare the server's generation/fingerprint to what setup stored locally.
-  if (data.claim) {
-    const localGen = parseInt(FILE_ENV.PIDGE_CLAIM_GENERATION || '', 10);
-    const ourFp = FILE_ENV.PIDGE_FINGERPRINT || agentFingerprint();
-    const srvGen = data.claim.claim_generation;
-    const srvFp = data.claim.claimed_by_fingerprint;
-    if (srvFp && srvFp !== ourFp && Number.isFinite(localGen) && srvGen > localGen) {
-      console.error(`pidge doctor: ⚠️  ANOTHER AGENT CLAIMED THIS CHANNEL — server generation ${srvGen} > yours ${localGen}, now owned by "${data.claim.claimed_by_label}". Your sends may go out as a DIFFERENT identity. If that's not intended, give THIS agent its own PIDGE_AGENT=<id> (isolated config) or PIDGE_TOKEN, then re-run setup.`);
-    } else if (srvFp && srvFp !== ourFp && !Number.isFinite(localGen)) {
-      console.error(`pidge doctor: note — this channel is owned by "${data.claim.claimed_by_label}" (generation ${srvGen}); THIS install hasn't claimed it. If you are its agent, run setup to claim ownership (so a future swap becomes detectable).`);
-    }
-  }
+  // #182 device-reach honesty (gotcha #9) + #181 ownership — shared with whoami.
+  const unreachable = reportDeviceReach(data);
+  reportClaimMismatch(data);
   if (ON_SHARED_FILE)
     console.error(`pidge doctor: WARNING — reading the SHARED file ${CONFIG_FILE}. If another agent runs on this machine, it reads the SAME key and you'll send as each other (the 2026-06-13 incident). Isolate: set PIDGE_AGENT=<id> at this agent's launch (config → ~/.config/pidge/agents/<id>/env) or give it its own PIDGE_TOKEN.`);
+  // #182: devices exist but 0 are deliverable ⇒ a send reaches NOBODY — BROKEN
+  // (exit 2). (0 devices total stays a warning above: a fresh setup before the
+  // app is installed isn't "broken".) The claim mismatch SHOUTS but stays exit 0
+  // — the warning is the contract (§4.6: the severity split is a judgment call).
+  if (unreachable) {
+    console.error('pidge doctor: BROKEN (exit 2) — devices exist but 0 are reachable (all disabled or on the wrong APNs environment): a send reaches nobody.');
+    process.exit(2);
+  }
   console.error('pidge doctor: all good — try: pidge ask --template decision --title "Pidge funcionando?"');
   console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version }));
   process.exit(0);
@@ -928,6 +1034,12 @@ async function runSetup() {
 
   const finalBase = (data.base_url || base).replace(/\/+$/, '');
   const channelName = data.channel && data.channel.name;
+  const channelId = data.channel && data.channel.id;
+
+  // #182 step 5: DECLARE how this agent operates (operating_contract) right after
+  // the claim succeeds — ADVISORY metadata, the same for --print and the file
+  // path. Done here (before the branch) so both onboarding modes declare it.
+  await declareOperatingContract(finalBase, data.key, channelId);
 
   // --print: the pure per-agent path — emit the export lines (the HUMAN runs
   // this in THEIR terminal and pastes them into the agent's launcher). Stores
@@ -1035,6 +1147,10 @@ ${notes.map((n) => `- ${n}`).join('\n')}
       if (res.status !== 200) die(`pidge: whoami failed (${res.status}): ${JSON.stringify(data)}`, 2);
       console.log(JSON.stringify(data, null, 2));
       console.error(`pidge: you are canal "${data.channel && data.channel.name}" · ${data.devices ?? '?'} device(s)`);
+      // §5.2/§4.6: whoami MUST also report HONEST reach + SHOUT on a claim swap,
+      // not just doctor — the same shared helpers (deliverable, ANOTHER AGENT…).
+      reportDeviceReach(data);
+      reportClaimMismatch(data);
       process.exit(0);
       break;
     }
@@ -1119,6 +1235,8 @@ ${notes.map((n) => `- ${n}`).join('\n')}
       // (state=delivered) instead RENEWS the visibility-timeout lease, a
       // heartbeat for a long task so the reservation doesn't lapse and re-serve.
       const ackBody = {};
+      if (v['up-to'] !== undefined && v.ids !== undefined)
+        die('pidge: pass EITHER --up-to <id> OR --ids a,b, not both', 1);
       if (v['up-to'] !== undefined) ackBody.up_to = parseInt(v['up-to'], 10);
       else if (v.ids !== undefined) ackBody.ids = v.ids.split(',').map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite);
       else die('pidge: usage: pidge ack --up-to <id> | --ids a,b [--renew]', 1);
@@ -1194,6 +1312,14 @@ ${notes.map((n) => `- ${n}`).join('\n')}
       const timeout = num(v.timeout, 600);
       let deadline = Date.now() + timeout * 1000;
       const queueQs = v.all ? '?all=true' : '';
+      // §2.6: --follow is SUPERVISOR-ONLY — warn LOUDLY at startup. A turn-based
+      // agent that uses it traps its turn (the process keeps listening); the
+      // default one-shot, looped from the supervisor, is what almost everyone wants.
+      if (v.follow) {
+        console.error('pidge: --follow keeps this process listening until --timeout (supervisor mode).');
+        console.error('pidge: a TURN-BASED agent must NOT use --follow — it traps the turn. Use the');
+        console.error('pidge: default one-shot (loop the command from your supervisor) instead.');
+      }
       // #157 P2 --follow: print+ack a batch and KEEP listening until the
       // timeout — the supervisor loop without re-spawning a process per batch.
       let gotAny = false;
@@ -1210,7 +1336,9 @@ ${notes.map((n) => `- ${n}`).join('\n')}
       // ~10-min server lease re-serves un-acked messages so a crash never loses
       // one. --ack-on-read restores the pre-0.9 immediate-consume.
       const ackOnRead = v['ack-on-read'];
-      let ackNoticeShown = false;
+      // Per-INSTALL notice (stamp file) + an in-process guard so a --follow run
+      // doesn't repeat it across batches before the stamp write is observed.
+      let ackNoticeShownThisProcess = false;
       // Print + (conditionally) ack — shared by the WS and polling paths.
       const printAndAck = async (msgs) => {
         console.log(JSON.stringify(msgs, null, 2));
@@ -1240,10 +1368,11 @@ ${notes.map((n) => `- ${n}`).join('\n')}
           } catch (e) {
             console.error(`pidge: WARNING — ack failed (network: ${e.message}); these messages will be re-served next listen`);
           }
-        } else if (!ackNoticeShown) {
-          ackNoticeShown = true;
+        } else if (!ackNoticeShownThisProcess && !ackNoticeAlreadySeen()) {
+          ackNoticeShownThisProcess = true;
+          markAckNoticeSeen(); // once per install (stamp); a fresh per-turn process won't re-shout
           // The version-gated BREAKING flip — LOUD on stderr the first time.
-          console.error(`pidge: #170 — ${msgs.length} message(s) DELIVERED (gray ✓✓), NOT done. ACK AFTER you handle them: \`pidge ack --up-to ${upTo}\` (a ~10-min lease re-serves un-acked messages, so a crash between "I have it" and "I'm done" never loses one). Use --ack-on-read for the old immediate-consume.`);
+          console.error(`pidge: NEW in 0.9.x — ${msgs.length} message(s) DELIVERED (gray ✓✓), NOT done. ACK AFTER you handle them: \`pidge ack --up-to ${upTo}\` (a ~10-min lease re-serves un-acked messages, so a crash between "I have it" and "I'm done" never loses one). Use --ack-on-read for the old immediate-consume.`);
         }
         gotAny = true;
         if (!v.follow) process.exit(0);
