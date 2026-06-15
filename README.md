@@ -18,6 +18,16 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > same deadline instead of exiting early, and timeouts report the **real** elapsed time.
 > New: `ack`, `contract`, `--version`; `setup` claims channel ownership and `doctor`
 > reports honest device reach + warns on a silent key swap.
+>
+> **v0.9.1** (Pidge manifest v28): full spec conformance — `setup` now **declares your
+> operating contract** (`listen_mode`, default `turn_based`; `--listen-mode always_on`
+> for a supervisor); `contract set` rejects an unknown key/bad value **locally**;
+> `whoami` reports honest device reach and SHOUTS on a silent key swap (not just
+> `doctor`); `doctor` **exits 2** when devices exist but none are reachable; `--follow`
+> prints a loud supervisor-only warning; the ack-after-work notice shows **once per
+> install**; and the timeout clock is monotonic. `operating_contract` is **advisory** —
+> Pidge is a relay: you declare how you operate, the human registers their expectation
+> and *sees* if you honor it; nothing is forced.
 
 ## Setup in one command (v0.8.0 — the claim flow)
 
@@ -106,8 +116,8 @@ npx pidge-cli notify --title "Relatório" --file ./relatorio.xlsx
 | `inbox` | What you sent: list, `--pending` slice, or `--summary` (counts + answer latency). |
 | `listen` | Block until the human **messages you** from the app; prints them, exits `0`. One-shot — loop it. **v0.9.0:** a read message is DELIVERED (gray ✓✓), **not** done — `ack` it after the work (`--ack-on-read` for the old immediate-consume). |
 | `ack --up-to <id>` | **v0.9.0:** mark messages PROCESSED (green ✓✓) **after** you've handled them; `--renew` heartbeats the visibility-timeout lease on a long task. |
-| `contract set <k>=<v>` / `contract show` | **v0.9.0:** DECLARE how you operate (`keep_connection_alive`, `mirror_in_origin_session`, `listen_mode=turn_based\|always_on`, `quiet_when_idle`). A contract, never policy — the human can force it. |
-| `setup --claim <code>` | One-shot onboarding (v0.7.0): exchange the single-use code for the key, store it in `~/.config/pidge/env` (600), run doctor. **v0.9.0** also claims channel ownership so `doctor` can warn on a silent key swap. |
+| `contract set <k>=<v>` / `contract show` | **v0.9.0:** DECLARE how you operate (`keep_connection_alive`, `mirror_in_origin_session`, `listen_mode=turn_based\|always_on`, `quiet_when_idle`). **Advisory, never policy** — you declare, the human registers their expectation and *sees* if you honor it; Pidge enforces nothing. An unknown key/bad value is rejected locally (exit 1). |
+| `setup --claim <code>` | One-shot onboarding (v0.7.0): exchange the single-use code for the key, store it in `~/.config/pidge/env` (600), run doctor. **v0.9.0** also claims channel ownership so `doctor` can warn on a silent key swap. **v0.9.1** declares your `operating_contract` (default `listen_mode=turn_based`; `--listen-mode always_on` for a supervisor). |
 | `doctor` | Validate the setup **without exposing secrets**: env source, server reachable, key valid, **honest device reach**, channel ownership. Exit 0/2. |
 | `whoami` | Which channel does this key speak for (JSON). |
 | `skill install` | Write `.claude/skills/pidge/SKILL.md` generated from the live manifest — persistent Pidge knowledge for Claude Code agents; re-run to update. |

@@ -395,6 +395,9 @@ test('listen --follow prints+acks a batch and KEEPS listening, exit 0 at the win
   assert.match(stdout, /segundo lote/, 'the follow window must deliver BOTH batches');
   assert.match(stderr, /--follow — still listening/);
   assert.match(stderr, /--follow window ended/);
+  // §2.6: the LOUD supervisor-only warning at startup (a turn-based agent traps its turn).
+  assert.match(stderr, /supervisor mode/);
+  assert.match(stderr, /must NOT use --follow/);
 });
 
 test('an invalid --custom-action id fails fast locally with the spelled-out rule', async () => {
@@ -523,7 +526,10 @@ test('listen (0.9 default) DELIVERS without consuming + shows the ack-after-work
   const port = await mock.start();
   mock.state.messages = [{ id: 8, channel_id: 1, body: 'trabalho pendente', created_at: 'x' }];
 
-  const { result } = runCli(['listen', '--no-realtime', '--timeout', '10'], port);
+  // Isolate the config dir so the once-per-install ack-notice stamp (Fix 2/#170)
+  // doesn't leak across runs — a fresh install must SEE the notice.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-ack-'));
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '10'], port, { XDG_CONFIG_HOME: home });
   const { code, stdout, stderr } = await result;
   await mock.stop();
 
@@ -532,6 +538,23 @@ test('listen (0.9 default) DELIVERS without consuming + shows the ack-after-work
   assert.equal(mock.state.acks.length, 0, 'the 0.9 default must NOT ack on read');
   assert.match(stderr, /DELIVERED \(gray/);
   assert.match(stderr, /pidge ack --up-to 8/);
+});
+
+test('the ack-after-work notice shows ONCE PER INSTALL — a second listen is silent (stamp)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-ack2-'));
+
+  mock.state.messages = [{ id: 9, channel_id: 1, body: 'um', created_at: 'x' }];
+  let out = await runCli(['listen', '--no-realtime', '--timeout', '10'], port, { XDG_CONFIG_HOME: home }).result;
+  assert.match(out.stderr, /DELIVERED \(gray/, 'first run shows the notice');
+
+  // a SECOND fresh process, same install (same XDG_CONFIG_HOME) → notice suppressed
+  mock.state.messages = [{ id: 10, channel_id: 1, body: 'dois', created_at: 'x' }];
+  out = await runCli(['listen', '--no-realtime', '--timeout', '10'], port, { XDG_CONFIG_HOME: home }).result;
+  await mock.stop();
+  assert.match(out.stdout, /dois/, 'second run still delivers');
+  assert.doesNotMatch(out.stderr, /DELIVERED \(gray/, 'the notice is once-per-install, not every run');
 });
 
 test('ack --up-to processes (green); ack --renew heartbeats the lease', async () => {
@@ -565,6 +588,99 @@ test('contract set declares operating_contract; contract show reads it back', as
   await mock.stop();
   assert.equal(out.code, 0, out.stderr);
   assert.match(out.stdout, /listen_mode/);
+});
+
+test('contract set rejects an unknown key / bad value LOCALLY (exit 1, no round-trip)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  let out = await runCli(['contract', 'set', 'bogus_key=1'], port).result;
+  assert.equal(out.code, 1, out.stderr);
+  assert.match(out.stderr, /unknown operating_contract key/);
+
+  // a wrong-typed enum value is also caught locally
+  out = await runCli(['contract', 'set', 'listen_mode=sideways'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, out.stderr);
+  assert.match(out.stderr, /must be one of: turn_based, always_on/);
+  assert.equal(Object.keys(mock.state.operatingContract).length, 0, 'a bad key never reaches the server');
+});
+
+test('setup DECLARES operating_contract (#182 step 5) — default turn_based, --listen-mode overrides', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-setup-oc-'));
+
+  // default (non-interactive) → turn_based
+  let out = await runCli(['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'oc' }).result;
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /declared listen_mode=turn_based/);
+  assert.equal(mock.state.operatingContract.listen_mode.value, 'turn_based');
+  assert.equal(mock.state.operatingContract.keep_connection_alive.value, false);
+
+  // --listen-mode always_on → the supervisor declaration
+  mock.state.claimCode = 'claim-2';
+  mock.state.operatingContract = {};
+  out = await runCli(['setup', '--claim', 'claim-2', '--force', '--listen-mode', 'always_on', '--url', `http://127.0.0.1:${port}`], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'oc2' }).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /declared listen_mode=always_on/);
+  assert.equal(mock.state.operatingContract.listen_mode.value, 'always_on');
+  assert.equal(mock.state.operatingContract.keep_connection_alive.value, true);
+});
+
+test('whoami reports HONEST reach AND SHOUTS on a claim swap (not just doctor) (§5.2/§4.6)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-whoami-'));
+
+  // agent "a" claims (gen 1), a DIFFERENT agent "b" claims (gen 2)
+  await runCli(['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'a' }).result;
+  mock.state.claimCode = 'claim-b';
+  await runCli(['setup', '--claim', 'claim-b', '--url', `http://127.0.0.1:${port}`], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'b' }).result;
+
+  mock.state.deviceReach = { total: 3, pushable: 2, deliverable: 1, apns_environment: 'production', by_environment: { production: 1, sandbox: 1 } };
+  const out = await runCli(['whoami'], port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'a' }).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /will actually receive a push/, 'whoami reports deliverable reach');
+  assert.match(out.stderr, /UNREACHABLE/);
+  assert.match(out.stderr, /ANOTHER AGENT CLAIMED THIS CHANNEL/, 'whoami SHOUTS on a claim swap');
+});
+
+test('doctor EXITS 2 when devices exist but 0 are deliverable (a send reaches nobody)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.devices = 2;
+  mock.state.deviceReach = { total: 2, pushable: 2, deliverable: 0, apns_environment: 'production', by_environment: { sandbox: 2 } };
+
+  const out = await runCli(['doctor'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 2, out.stderr);
+  assert.match(out.stderr, /reaches nobody|BROKEN/);
+});
+
+test('ack rejects mixing --up-to and --ids (usage error, exit 1)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['ack', '--up-to', '8', '--ids', '1,2'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, out.stderr);
+  assert.match(out.stderr, /not both/);
+});
+
+test('a server newer than KNOWN_MANIFEST_VERSION nudges ONCE on stderr (re-verified at v28 baseline)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.manifestVersion = 99; // server advertises news the CLI doesn't know
+  const out = await runCli(['doctor'], port).result;
+  await mock.stop();
+  assert.match(out.stderr, /manifest v99/, 'the version nudge fires when the server is ahead');
+  assert.match(out.stderr, /re-read|UPDATE the CLI/);
 });
 
 test('doctor reports HONEST device reach and warns when pushable > deliverable (gotcha #9)', async () => {

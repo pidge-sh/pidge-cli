@@ -26,13 +26,14 @@ function createMock() {
     claim: { claimed_by_label: null, claimed_by_fingerprint: null, claimed_at: null, claim_generation: 0 },
     deviceReach: null,       // set by a test to exercise the honesty warning
     operatingContract: {},   // PATCH /channels/:id merges into this
+    manifestVersion: 16,     // X-Pidge-Manifest-Version header — a test bumps it to fire the news nudge
   };
   let server = null;
   let wss = null;
   let port = null;
 
   const json = (res, code, body) => {
-    res.writeHead(code, { 'content-type': 'application/json', 'x-pidge-manifest-version': '16' });
+    res.writeHead(code, { 'content-type': 'application/json', 'x-pidge-manifest-version': String(state.manifestVersion) });
     res.end(JSON.stringify(body));
   };
 
