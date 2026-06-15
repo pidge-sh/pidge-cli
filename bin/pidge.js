@@ -919,8 +919,17 @@ async function runContract() {
     die(`pidge: contract set failed (network): ${e.message}`, 2);
   }
   checkManifestNews(res);
-  console.log(body);
   if (!(res.status >= 200 && res.status < 300)) die(`pidge: contract set failed (${res.status}): ${body}`, 2);
+  // stdout = ONLY the operating_contract, never the raw channel JSON. The
+  // /channels PATCH echoes the whole channel — INCLUDING "key":"hld_…" — and
+  // dumping it would land this agent's OWN key in its stdout/transcript/logs
+  // (the one thing the whole claim flow exists to avoid). Print just the contract.
+  let parsedBody = {};
+  try { parsedBody = JSON.parse(body); } catch { /* leave {} */ }
+  console.log(JSON.stringify({
+    operating_contract: parsedBody.operating_contract || {},
+    operating_contract_ignored: parsedBody.operating_contract_ignored
+  }, null, 2));
   console.error(`pidge: declared ${key}=${JSON.stringify(value)} (ADVISORY, never policy — the human sees if you honor it; Pidge enforces nothing)`);
   process.exit(0);
 }
