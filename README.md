@@ -28,6 +28,10 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > install**; and the timeout clock is monotonic. `operating_contract` is **advisory** —
 > Pidge is a relay: you declare how you operate, the human registers their expectation
 > and *sees* if you honor it; nothing is forced.
+>
+> **v0.9.2**: `contract set` no longer prints the channel JSON (which echoed the key) —
+> stdout now carries only the `operating_contract`, so the key never lands in an agent's
+> transcript/logs.
 
 ## Setup in one command (v0.8.0 — the claim flow)
 

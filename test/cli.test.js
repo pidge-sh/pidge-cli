@@ -590,6 +590,19 @@ test('contract set declares operating_contract; contract show reads it back', as
   assert.match(out.stdout, /listen_mode/);
 });
 
+test('contract set NEVER prints the channel key to stdout (0.9.2 key-leak fix)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['contract', 'set', 'listen_mode=turn_based'], port).result;
+  assert.equal(out.code, 0, out.stderr);
+  // the PATCH response echoes the key; stdout must carry ONLY the operating_contract
+  assert.doesNotMatch(out.stdout, /hld_/, 'the agent key must never land in stdout');
+  assert.doesNotMatch(out.stderr, /hld_/, 'nor in stderr');
+  const parsed = JSON.parse(out.stdout);
+  assert.ok(parsed.operating_contract, 'stdout is clean JSON with operating_contract');
+  await mock.stop();
+});
+
 test('contract set rejects an unknown key / bad value LOCALLY (exit 1, no round-trip)', async () => {
   const mock = createMock();
   const port = await mock.start();

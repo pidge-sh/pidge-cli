@@ -111,7 +111,9 @@ function createMock() {
             else state.operatingContract[k] = { value: val, by: 'agent:mock', at: new Date().toISOString(), locked: false };
           }
         }
-        json(res, 200, { id: 1, name: 'mock', operating_contract: state.operatingContract });
+        // Mirror prod: the /channels PATCH echoes the WHOLE channel, key included
+        // — so the CLI must NOT dump it to stdout (the 0.9.2 key-leak fix).
+        json(res, 200, { id: 1, name: 'mock', key: 'hld_mock_secret_key', operating_contract: state.operatingContract });
       });
       return;
     }
