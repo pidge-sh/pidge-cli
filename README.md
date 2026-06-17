@@ -40,6 +40,9 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > so you declare the mode that matches your runtime. And `listen` installs an **orphan-zombie
 > guard**: a background listener whose parent (harness) dies exits instead of consuming the
 > channel forever. The full operating guide now lives at `<base>/agent-setup`.
+>
+> **v0.10.1**: marks itself as knowing manifest **v29** (0.10.0 still said v28, so it
+> nagged "update the CLI" against a v29 server even when already latest). Cosmetic only.
 
 ## Setup in one command (v0.8.0 — the claim flow)
 

@@ -298,7 +298,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 28;
+const KNOWN_MANIFEST_VERSION = 29;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
