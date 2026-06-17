@@ -20,7 +20,7 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > reports honest device reach + warns on a silent key swap.
 >
 > **v0.9.1** (Pidge manifest v28): full spec conformance — `setup` now **declares your
-> operating contract** (`listen_mode`, default `turn_based`; `--listen-mode always_on`
+> operating contract** (`listen_mode`, default `turn_based`; `--listen-mode persistent`
 > for a supervisor); `contract set` rejects an unknown key/bad value **locally**;
 > `whoami` reports honest device reach and SHOUTS on a silent key swap (not just
 > `doctor`); `doctor` **exits 2** when devices exist but none are reachable; `--follow`
@@ -32,6 +32,14 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > **v0.9.2**: `contract set` no longer prints the channel JSON (which echoed the key) —
 > stdout now carries only the `operating_contract`, so the key never lands in an agent's
 > transcript/logs.
+>
+> **v0.10.0** (Pidge manifest v29): the onboarding-close batch. **`pidge selftest`** proves
+> your listener works by ROUND-TRIP (#205) — fire a nonce, run the listener, confirm it
+> picks it up + acks in time (PASS exit 0 / FAIL exit 2 with the likely cause). `listen_mode`
+> grew to **`turn_based | persistent | external_daemon`** (`always_on` is a tolerated alias),
+> so you declare the mode that matches your runtime. And `listen` installs an **orphan-zombie
+> guard**: a background listener whose parent (harness) dies exits instead of consuming the
+> channel forever. The full operating guide now lives at `<base>/agent-setup`.
 
 ## Setup in one command (v0.8.0 — the claim flow)
 
@@ -120,8 +128,9 @@ npx pidge-cli notify --title "Relatório" --file ./relatorio.xlsx
 | `inbox` | What you sent: list, `--pending` slice, or `--summary` (counts + answer latency). |
 | `listen` | Block until the human **messages you** from the app; prints them, exits `0`. One-shot — loop it. **v0.9.0:** a read message is DELIVERED (gray ✓✓), **not** done — `ack` it after the work (`--ack-on-read` for the old immediate-consume). |
 | `ack --up-to <id>` | **v0.9.0:** mark messages PROCESSED (green ✓✓) **after** you've handled them; `--renew` heartbeats the visibility-timeout lease on a long task. |
-| `contract set <k>=<v>` / `contract show` | **v0.9.0:** DECLARE how you operate (`keep_connection_alive`, `mirror_in_origin_session`, `listen_mode=turn_based\|always_on`, `quiet_when_idle`). **Advisory, never policy** — you declare, the human registers their expectation and *sees* if you honor it; Pidge enforces nothing. An unknown key/bad value is rejected locally (exit 1). |
-| `setup --claim <code>` | One-shot onboarding (v0.7.0): exchange the single-use code for the key, store it in `~/.config/pidge/env` (600), run doctor. **v0.9.0** also claims channel ownership so `doctor` can warn on a silent key swap. **v0.9.1** declares your `operating_contract` (default `listen_mode=turn_based`; `--listen-mode always_on` for a supervisor). |
+| `contract set <k>=<v>` / `contract show` | **v0.9.0:** DECLARE how you operate (`keep_connection_alive`, `mirror_in_origin_session`, `listen_mode=turn_based\|persistent\|external_daemon`, `quiet_when_idle`). **Advisory, never policy** — you declare, the human registers their expectation and *sees* if you honor it; Pidge enforces nothing. An unknown key/bad value is rejected locally (exit 1). |
+| `selftest [--window N]` | **v0.10.0 (#205):** prove your listener works by ROUND-TRIP — fire a nonce, run the listener, confirm it picks it up + acks in time. PASS exit `0` / FAIL exit `2` with the likely cause (timeout / orphan / transport). Run it as the last onboarding step + whenever sends seem to go unheard. |
+| `setup --claim <code>` | One-shot onboarding (v0.7.0): exchange the single-use code for the key, store it in `~/.config/pidge/env` (600), run doctor. **v0.9.0** also claims channel ownership so `doctor` can warn on a silent key swap. **v0.9.1+** declares your `operating_contract` (default `listen_mode=turn_based`; `--listen-mode persistent\|external_daemon` for a supervisor/daemon). |
 | `doctor` | Validate the setup **without exposing secrets**: env source, server reachable, key valid, **honest device reach**, channel ownership. Exit 0/2. |
 | `whoami` | Which channel does this key speak for (JSON). |
 | `skill install` | Write `.claude/skills/pidge/SKILL.md` generated from the live manifest — persistent Pidge knowledge for Claude Code agents; re-run to update. |

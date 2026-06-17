@@ -613,10 +613,15 @@ test('contract set rejects an unknown key / bad value LOCALLY (exit 1, no round-
 
   // a wrong-typed enum value is also caught locally
   out = await runCli(['contract', 'set', 'listen_mode=sideways'], port).result;
-  await mock.stop();
   assert.equal(out.code, 1, out.stderr);
-  assert.match(out.stderr, /must be one of: turn_based, always_on/);
+  assert.match(out.stderr, /must be one of: turn_based, persistent, external_daemon, always_on/);
   assert.equal(Object.keys(mock.state.operatingContract).length, 0, 'a bad key never reaches the server');
+
+  // §3c: external_daemon is now ACCEPTED (reaches the server, exit 0)
+  out = await runCli(['contract', 'set', 'listen_mode=external_daemon'], port).result;
+  assert.equal(out.code, 0, out.stderr);
+
+  await mock.stop();
 });
 
 test('setup DECLARES operating_contract (#182 step 5) — default turn_based, --listen-mode overrides', async () => {
@@ -790,4 +795,41 @@ test('doctor warns when reading the SHARED legacy file (no PIDGE_AGENT, no env v
   assert.equal(code, 0);
   assert.match(stderr, /SHARED file/);
   assert.match(stderr, /PIDGE_AGENT/);
+});
+
+// #205 — reachability self-test (round-trip over the unified queue + ack).
+test('selftest — PASS: fire a nonce, the listener acks it, the server confirms', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { result } = runCli(['selftest', '--window', '10', '--no-realtime'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, `expected PASS exit 0, got ${code}; stderr: ${stderr}`);
+  assert.match(stderr, /SELF-TEST PASSED/);
+  assert.match(stdout, /"status":\s*"passed"/);
+  // it acked ONLY the nonce by id (ids:[…]), never up_to — so real pending messages aren't eaten
+  assert.ok(mock.state.acks.some((u) => /messages\/ack/.test(u)), 'it acked the nonce');
+});
+
+test('selftest — FAIL with cause when the listener never receives the nonce', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.dropSelftest = true; // the nonce never reaches the queue (orphan / dead transport)
+  const { result } = runCli(['selftest', '--window', '5', '--no-realtime'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 2, `expected FAIL exit 2, got ${code}; stderr: ${stderr}`);
+  assert.match(stderr, /SELF-TEST FAILED/);
+  assert.match(stderr, /never received the nonce/);
+  assert.match(stdout, /"saw_nonce":\s*false/);
+});
+
+test('selftest — a non-numeric --window falls back to the default, never a false FAIL', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { result } = runCli(['selftest', '--window', '30s', '--no-realtime'], port); // typo'd window
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, `a typo'd window must not masquerade as a dead listener; stderr: ${stderr}`);
+  assert.match(stderr, /SELF-TEST PASSED/);
 });
