@@ -27,6 +27,8 @@ function createMock() {
     deviceReach: null,       // set by a test to exercise the honesty warning
     operatingContract: {},   // PATCH /channels/:id merges into this
     manifestVersion: 16,     // X-Pidge-Manifest-Version header — a test bumps it to fire the news nudge
+    selftests: {},           // #205: id → {nonce, window_seconds, created, processed}
+    selftestSeq: 100,        // next selftest/message id
   };
   let server = null;
   let wss = null;
@@ -142,7 +144,11 @@ function createMock() {
         if (state.hangAck) return; // simulate a wedged proxy stalling the ack POST
         // #170: state=delivered RENEWS the lease (not consumed); else PROCESS it.
         if (p.state === 'delivered') return json(res, 200, { renewed: 1 });
-        state.messages = [];
+        // #205: mark an acked selftest PROCESSED (the round-trip PASS signal). ids
+        // acks just those; up_to (no ids) processes + clears the whole queue.
+        const ackedIds = Array.isArray(p.ids) ? p.ids : state.messages.map((mm) => mm.id);
+        for (const st of Object.values(state.selftests)) if (ackedIds.includes(st.id)) st.processed = true;
+        state.messages = Array.isArray(p.ids) ? state.messages.filter((mm) => !p.ids.includes(mm.id)) : [];
         json(res, 200, { acked: 1 });
       });
       return;
@@ -169,6 +175,32 @@ function createMock() {
     if (req.method === 'GET' && m) {
       const cid = decodeURIComponent(m[1]);
       return json(res, 200, state.notifications[cid] || { responded: false, correlation_id: cid });
+    }
+    // #205: reachability self-test. POST mints a nonce + a kind:'system' selftest
+    // message on the queue; GET reads PASS (acked in window) / FAILED / pending.
+    if (req.method === 'POST' && url.pathname === '/api/v1/selftest') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
+        const id = state.selftestSeq++;
+        const windowS = Math.max(5, Math.min(120, parseInt(p.window_seconds, 10) || 30));
+        const nonce = `nonce-${id}`;
+        state.selftests[id] = { id, nonce, window_seconds: windowS, created: Date.now(), processed: false };
+        // dropSelftest: the nonce never reaches the queue (simulates an orphaned/
+        // unreachable listener or a transport that drops it) → the CLI FAILs with cause.
+        if (!state.dropSelftest) state.messages.push({ id, kind: 'system', system_kind: 'selftest', nonce, body: `selftest nonce=${nonce}` });
+        json(res, 201, { id, status: 'pending', nonce, window_seconds: windowS, expires_at: new Date(Date.now() + windowS * 1000).toISOString() });
+      });
+      return;
+    }
+    const stMatch = url.pathname.match(/^\/api\/v1\/selftest\/(\d+)$/);
+    if (req.method === 'GET' && stMatch) {
+      const st = state.selftests[stMatch[1]];
+      if (!st) return json(res, 404, { error: 'not_found' });
+      const status = st.processed ? 'passed'
+        : (Date.now() < st.created + st.window_seconds * 1000 ? 'pending' : 'failed');
+      return json(res, 200, { id: st.id, status, nonce: st.nonce, window_seconds: st.window_seconds });
     }
     json(res, 404, { error: 'not_found' });
   };

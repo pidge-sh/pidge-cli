@@ -138,6 +138,7 @@ const OPTIONS = {
   ids: { type: 'string' },                     // ack: process this comma-list of ids
   renew: { type: 'boolean' },                  // ack: heartbeat the visibility-timeout lease (state=delivered)
   'ack-on-read': { type: 'boolean' },          // listen: restore the pre-0.9 immediate-consume
+  window: { type: 'string' },                  // selftest: reachability window in seconds (default 30)
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -151,8 +152,8 @@ USAGE
                                                    (you run it in YOUR terminal; paste into the
                                                    agent's launcher — never run --print as an agent)
                                           --force  overwrite a shared file owned by another channel
-                                          --listen-mode turn_based|always_on  declare how you
-                                                   operate (#182; default turn_based)
+                                          --listen-mode turn_based|persistent|external_daemon
+                                                   declare how you operate (#182; default turn_based)
   pidge doctor                            validate the setup WITHOUT exposing secrets:
                                           env source, server, key, "canal X · N devices"
   pidge whoami                            which channel does this key speak for (JSON)
@@ -174,8 +175,13 @@ USAGE
                                           --renew heartbeats the lease on a long task (state=delivered)
   pidge contract set <key>=<value> | contract show
                                           DECLARE how you operate (#182): keep_connection_alive,
-                                          mirror_in_origin_session, listen_mode=turn_based|always_on,
-                                          quiet_when_idle. A CONTRACT, never policy (the human can force it).
+                                          mirror_in_origin_session,
+                                          listen_mode=turn_based|persistent|external_daemon,
+                                          quiet_when_idle. ADVISORY, never policy (the human SEES if you honor it).
+  pidge selftest [--window N]             prove your listener works by ROUND-TRIP (#205): fire a nonce,
+                                          run the listener, confirm it picks it up + acks in time.
+                                          PASS exit 0 / FAIL exit 2 (with the likely cause). Run it as the
+                                          last onboarding step + whenever sends seem to go unheard.
   pidge skill install                     write .claude/skills/pidge/SKILL.md generated from the
                                           live manifest (persistent Pidge knowledge for Claude Code)
   pidge --version                         print the CLI version
@@ -825,9 +831,11 @@ async function declareOperatingContract(base, token, channelId) {
   if (!channelId) return null;
   const mode = v['listen-mode'];
   let contract;
-  if (mode === 'always_on') contract = { listen_mode: 'always_on', keep_connection_alive: true };
-  else if (!mode || mode === 'turn_based') contract = { listen_mode: 'turn_based', keep_connection_alive: false };
-  else { console.error(`pidge: --listen-mode must be turn_based or always_on (got "${mode}") — skipping the contract declaration`); return null; }
+  // turn_based holds no connection; persistent/external_daemon/always_on all keep one
+  // alive (a supervisor or daemon holding the listen). §3c.
+  if (!mode || mode === 'turn_based') contract = { listen_mode: 'turn_based', keep_connection_alive: false };
+  else if (['persistent', 'external_daemon', 'always_on'].includes(mode)) contract = { listen_mode: mode, keep_connection_alive: true };
+  else { console.error(`pidge: --listen-mode must be turn_based | persistent | external_daemon (got "${mode}") — skipping the contract declaration`); return null; }
   try {
     const res = await fetchT(`${base}/api/v1/channels/${channelId}`, {
       method: 'PATCH',
@@ -852,7 +860,10 @@ async function declareOperatingContract(base, token, channelId) {
 const OPERATING_CONTRACT_SPEC = {
   keep_connection_alive: 'boolean',
   mirror_in_origin_session: 'boolean',
-  listen_mode: ['turn_based', 'always_on'],
+  // §3c: match your RUNTIME. turn_based (no event loop — block-and-exit) · persistent
+  // (a supervisor holding the socket, --follow) · external_daemon (a daemon outside the
+  // session). always_on stays as a tolerated deprecated alias of persistent.
+  listen_mode: ['turn_based', 'persistent', 'external_daemon', 'always_on'],
   quiet_when_idle: 'boolean',
 };
 // Coerce + validate one operating_contract value against the allowlist. Returns
@@ -932,6 +943,92 @@ async function runContract() {
   }, null, 2));
   console.error(`pidge: declared ${key}=${JSON.stringify(value)} (ADVISORY, never policy — the human sees if you honor it; Pidge enforces nothing)`);
   process.exit(0);
+}
+
+// Orphan-zombie guard (§3c pitfall #1): when `npx pidge-cli listen` is launched as a
+// background task and the harness later kills the npx wrapper, the node LEAF can
+// orphan and keep consuming the channel forever without ever waking the agent. A
+// long-running listen polls its parent: if it had a real parent at startup and that
+// parent dies (re-parented to pid 1), it exits so it stops eating the queue. Skipped
+// when started detached (ppid 1 already — e.g. an external_daemon under systemd).
+function installOrphanWatchdog() {
+  if (process.ppid === 1) return; // already detached — nothing to orphan from
+  const t = setInterval(() => {
+    if (process.ppid === 1) {
+      console.error('pidge: parent process died — exiting so I stop consuming the channel (orphan-zombie guard). Relaunch from your harness.');
+      process.exit(0);
+    }
+  }, 2000);
+  if (t.unref) t.unref(); // never keep the process alive just for the watchdog
+}
+
+// selftest (#205): prove the listener works by ROUND-TRIP, not prose. Fire a nonce
+// onto our own queue, run the listener (long-poll floor — the reachability path) for
+// the window, ack the nonce, then read the server's verdict. PASS = it round-tripped
+// in time. FAIL = the server's window verdict + a likely CAUSE the server can't see
+// (the orphan/`&`/transport bugs). Only the nonce is acked (ids:[id]) and any real
+// messages briefly served are re-served fast (lease=60), so it doesn't eat the queue.
+async function doSelftest() {
+  // Guard the parse: a non-numeric --window (e.g. "30s", a typo) must NOT become NaN
+  // — that would make the deadline NaN, skip the poll loop entirely, and mis-report a
+  // perfectly fine listener as "orphaned/dead" (the most misleading failure possible).
+  const rawWindow = num(v.window, 30);
+  const windowS = Math.max(5, Math.min(120, Number.isFinite(rawWindow) ? rawWindow : 30));
+  let fired;
+  try {
+    const res = await fetchT(`${BASE}/api/v1/selftest`, {
+      method: 'POST', headers, body: JSON.stringify({ window_seconds: windowS }),
+    });
+    checkManifestNews(res);
+    if (res.status < 200 || res.status >= 300) die(`pidge: selftest: the server refused (${res.status}) — is your key valid? try \`pidge doctor\``, 2);
+    fired = await res.json();
+  } catch (e) {
+    die(`pidge: selftest failed (network): ${e.message}`, 2);
+  }
+  const id = fired.id;
+  console.error(`pidge: self-test fired (id ${id}) — listening up to ${windowS}s to prove the round-trip (a nonce on your own queue; PASS = your listener picks it up + acks it in time)`);
+
+  const deadline = Date.now() + windowS * 1000;
+  let sawNonce = false;
+  while (Date.now() < deadline && !sawNonce) {
+    const waitS = Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
+    const askedAt = Date.now();
+    try {
+      const qs = new URLSearchParams({ all: 'true', lease: '60' });
+      if (waitS > 0) qs.set('wait', String(waitS));
+      const res = await fetchT(`${BASE}/api/v1/messages?${qs}`, { headers }, (waitS + 10) * 1000);
+      if (res.status === 200) {
+        const msgs = (await res.json().catch(() => ({}))).messages || [];
+        if (msgs.some((m) => m.id === id)) {
+          sawNonce = true;
+          // ack ONLY the nonce (ids, not up_to) so real pending messages aren't consumed.
+          try { await fetchT(`${BASE}/api/v1/messages/ack`, { method: 'POST', headers, body: JSON.stringify({ ids: [ id ] }) }); } catch { /* server verdict is the source of truth */ }
+        }
+      }
+    } catch { /* keep trying until the deadline */ }
+    // pace: if the poll returned fast (the server didn't actually hold ?wait=), don't busy-spin.
+    if (!sawNonce && Date.now() - askedAt < 1000 && Date.now() < deadline) await sleep(1000);
+  }
+
+  let verdict = {};
+  try {
+    const res = await fetchT(`${BASE}/api/v1/selftest/${id}`, { headers });
+    if (res.status === 200) verdict = await res.json();
+  } catch (e) {
+    die(`pidge: selftest: couldn't read the result (${e.message})`, 2);
+  }
+
+  if (verdict.status === 'passed') {
+    console.error('pidge: ✅ SELF-TEST PASSED — your listener received the nonce and acked it in time. Reachability proven.');
+    console.log(JSON.stringify({ status: 'passed', id, window_seconds: windowS }));
+    process.exit(0);
+  }
+  const cause = sawNonce
+    ? 'your listener received the nonce but acked it AFTER the window — a slow/flaky transport, or the work between read and ack took too long. Widen --window, or make your real listen loop ack sooner.'
+    : 'your listener never received the nonce in the window — likely an ORPHANED/detached listener (an npx leaf left running, or a loose `&`), or a dead transport. Run ONE single-process listener as a tracked background task; `pidge listen --no-realtime` is the robust floor.';
+  console.error(`pidge: ❌ SELF-TEST FAILED — ${cause}`);
+  console.log(JSON.stringify({ status: verdict.status || 'failed', id, saw_nonce: sawNonce }));
+  process.exit(2);
 }
 
 // doctor: validate the setup WITHOUT exposing secrets. Narration on stderr,
@@ -1271,6 +1368,12 @@ ${notes.map((n) => `- ${n}`).join('\n')}
       await runContract();
       break;
     }
+    case 'selftest': {
+      // #205: prove reachability by round-trip. Fire a nonce, run the listener,
+      // confirm it picks it up + acks in time. PASS exit 0 / FAIL exit 2.
+      await doSelftest();
+      break;
+    }
     case 'inbox': {
       // #83: what this channel sent — the list (default), the pending slice
       // (--pending = delivered + still unanswered) or the one-call summary
@@ -1318,6 +1421,7 @@ ${notes.map((n) => `- ${n}`).join('\n')}
       // ANSWERS (kind notification_reply, with a self-contained ref), so a
       // fire-and-forget notify can't lose its reply. Without --all the original
       // composer-only contract stands (no double-consumption for ask/wait users).
+      installOrphanWatchdog(); // §3c: a killed-parent orphan exits instead of eating the queue
       const timeout = num(v.timeout, 600);
       let deadline = Date.now() + timeout * 1000;
       const queueQs = v.all ? '?all=true' : '';
