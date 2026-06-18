@@ -33,6 +33,12 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > stdout now carries only the `operating_contract`, so the key never lands in an agent's
 > transcript/logs.
 >
+> **v0.11.0** (Pidge manifest v30): the **first-contact WOW** (#217). New **`pidge hello`** —
+> your channel's debut handshake, narrated LIVE on the lock screen by a server-driven 3-stage
+> Live Activity (Conectando → toque para confirmar → Concluído ✓) so your human *sees* the
+> agent→human→agent loop close. Send + wait in one; run it as your first contact on a fresh
+> channel. (It's a thin `ask --template onboarding` wrapper — that path already works on v0.10.0.)
+>
 > **v0.10.0** (Pidge manifest v29): the onboarding-close batch. **`pidge selftest`** proves
 > your listener works by ROUND-TRIP (#205) — fire a nonce, run the listener, confirm it
 > picks it up + acks in time (PASS exit 0 / FAIL exit 2 with the likely cause). `listen_mode`
@@ -121,6 +127,7 @@ npx pidge-cli notify --title "Relatório" --file ./relatorio.xlsx
 
 | Command | What it does |
 |---|---|
+| `hello` | **v0.11.0 (#217):** your channel's **first-contact WOW** — send the onboarding handshake **and block** until the human confirms. The server narrates a 3-stage Live Activity on the lock screen (Conectando → toque para confirmar → Concluído ✓) so they *see* the agent→human→agent loop close. Run it as your **first** contact on a fresh channel. A thin `ask --template onboarding` wrapper with friendly default copy. |
 | `ask` | Send a notification **and block** until the human answers; prints the chosen action JSON. The default for agents. |
 | `notify` | Send only. Prints the raw 201 JSON; the `correlation_id` + warnings go to stderr. |
 | `wait <correlation_id>` | Block on an already-sent notification until it's answered. |
