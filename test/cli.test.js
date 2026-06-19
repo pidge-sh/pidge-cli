@@ -374,6 +374,39 @@ test('an explicit --timeout always beats the template suggestion', async () => {
   assert.doesNotMatch(stderr, /suggested by template/);
 });
 
+// --- #217: hello = the first-contact WOW (template onboarding, send + wait) ----
+
+test('hello sends template=onboarding with default copy, narrates the WOW, returns the answer', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['wow-1'] = {
+    responded: true,
+    chosen_action: { kind: 'completed', action_id: 'done', label: 'Feito ✓', text: null },
+  };
+
+  const { result } = runCli(['hello', '--no-realtime', '--correlation-id', 'wow-1'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stderr, /WOW sent/);
+  assert.equal(JSON.parse(stdout).action_id, 'done');
+  const sent = mock.state.notifies.at(-1);
+  assert.equal(sent.template, 'onboarding', 'hello must pin the onboarding template (the WOW trigger)');
+  assert.ok(sent.title && sent.title.length > 0, 'hello supplies a default title');
+});
+
+test('hello --profile tracking is refused locally (the handshake needs an answer)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { result } = runCli(['hello', '--no-realtime', '--profile', 'tracking'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 1);
+  assert.match(stderr, /tracking/);
+});
+
 // --- #157 P2 tails: --follow + local custom-action id validation --------------
 
 test('listen --follow prints+acks a batch and KEEPS listening, exit 0 at the window end', async () => {

@@ -157,6 +157,10 @@ USAGE
   pidge doctor                            validate the setup WITHOUT exposing secrets:
                                           env source, server, key, "canal X · N devices"
   pidge whoami                            which channel does this key speak for (JSON)
+  pidge hello  [options]                  FIRST-CONTACT WOW (#217): your channel's debut handshake,
+                                          narrated LIVE on the lock screen by a 3-stage Live Activity
+                                          (Conectando → toque para confirmar → Concluído ✓). send + wait
+                                          in one — run it as your FIRST contact on a fresh channel.
   pidge ask    [options]                  send AND wait for the answer (prints chosen_action JSON)
   pidge notify [options]                  send only (prints the 201 JSON)
   pidge wait   <correlation_id> [options] block on an already-sent notification
@@ -298,7 +302,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 28;
+const KNOWN_MANIFEST_VERSION = 30;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
@@ -1271,6 +1275,31 @@ ${notes.map((n) => `- ${n}`).join('\n')}
       if (ok && info.correlation_id)
         console.error(`pidge: correlation_id=${info.correlation_id} (use: pidge wait ${info.correlation_id})`);
       process.exit(ok ? 0 : 2);
+      break;
+    }
+    case 'hello': {
+      // #217 — the first-contact WOW: fire the onboarding handshake and block on
+      // your human's confirmation. The SERVER narrates a 3-stage Live Activity on
+      // the lock screen (Conectando → toque para confirmar → Concluído ✓) so your
+      // human SEES the agent→human→agent loop close. One command: send + wait.
+      // Run it as your FIRST contact on a fresh channel. A thin wrapper over `ask`:
+      // it just pins template=onboarding and friendly default copy.
+      if (v.profile === 'tracking')
+        die('pidge: `hello --profile tracking` makes no sense — the handshake waits for a confirmation, which tracking (Live-Activity-only) never produces', 1);
+      v.template = 'onboarding';
+      if (v.title === undefined) v.title = 'Seu agente está pronto 🐦';
+      if (v.body === undefined) v.body = 'Toque em Feito ✓ para confirmar que me recebeu — você vai ver o teste fechar na tela.';
+      const cid = v['correlation-id'] || crypto.randomUUID();
+      v['correlation-id'] = cid;
+      console.error(`pidge: correlation_id=${cid}`);
+      const { ok, info } = await doNotify();
+      if (!ok) process.exit(2);
+      console.error(`pidge: WOW sent (${info.registered_devices} device(s)) — watch the lock screen narrate the handshake; waiting for your human to confirm on ${cid}`);
+      // No --timeout ⇒ obey the template's suggestion from the 201 echo (onboarding
+      // = 3600 s); explicit --timeout always wins.
+      let timeout = num(v.timeout, NaN);
+      if (!Number.isFinite(timeout)) timeout = info.suggested_ask_timeout || 3600;
+      await waitForAnswer(cid, { timeout, interval: num(v.interval, 30) });
       break;
     }
     case 'ask': {
