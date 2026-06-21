@@ -33,6 +33,13 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > stdout now carries only the `operating_contract`, so the key never lands in an agent's
 > transcript/logs.
 >
+> **v0.11.1** (Pidge manifest v31): **`pidge doctor` now probes the realtime path** (#171) —
+> after the HTTP checks it opens a quick `/cable` subscription and reports `realtime: ok` or
+> `realtime: INDISPONÍVEL` (the #119 failure class an HTTP-only doctor couldn't see: an edge
+> killing held responses, a proxy refusing the WebSocket). Exit stays `0` — an unavailable WS
+> just degrades `listen` to polling — but you learn it BEFORE the first deaf listen. The doctor
+> hint now leads with `pidge hello`, and the version nudge knows v31 (#229).
+>
 > **v0.11.0** (Pidge manifest v30): the **first-contact WOW** (#217). New **`pidge hello`** —
 > your channel's debut handshake, narrated LIVE on the lock screen by a server-driven 3-stage
 > Live Activity (Conectando → toque para confirmar → Concluído ✓) so your human *sees* the
@@ -138,7 +145,7 @@ npx pidge-cli notify --title "Relatório" --file ./relatorio.xlsx
 | `contract set <k>=<v>` / `contract show` | **v0.9.0:** DECLARE how you operate (`keep_connection_alive`, `mirror_in_origin_session`, `listen_mode=turn_based\|persistent\|external_daemon`, `quiet_when_idle`). **Advisory, never policy** — you declare, the human registers their expectation and *sees* if you honor it; Pidge enforces nothing. An unknown key/bad value is rejected locally (exit 1). |
 | `selftest [--window N]` | **v0.10.0 (#205):** prove your listener works by ROUND-TRIP — fire a nonce, run the listener, confirm it picks it up + acks in time. PASS exit `0` / FAIL exit `2` with the likely cause (timeout / orphan / transport). Run it as the last onboarding step + whenever sends seem to go unheard. |
 | `setup --claim <code>` | One-shot onboarding (v0.7.0): exchange the single-use code for the key, store it in `~/.config/pidge/env` (600), run doctor. **v0.9.0** also claims channel ownership so `doctor` can warn on a silent key swap. **v0.9.1+** declares your `operating_contract` (default `listen_mode=turn_based`; `--listen-mode persistent\|external_daemon` for a supervisor/daemon). |
-| `doctor` | Validate the setup **without exposing secrets**: env source, server reachable, key valid, **honest device reach**, channel ownership. Exit 0/2. |
+| `doctor` | Validate the setup **without exposing secrets**: env source, server reachable, key valid, **honest device reach**, channel ownership, and (**v0.11.1, #171**) a **realtime probe** (`realtime: ok / INDISPONÍVEL` — exit stays 0; an unavailable WS just degrades `listen` to polling). Exit 0/2. |
 | `whoami` | Which channel does this key speak for (JSON). |
 | `skill install` | Write `.claude/skills/pidge/SKILL.md` generated from the live manifest — persistent Pidge knowledge for Claude Code agents; re-run to update. |
 | `--version` | Print the CLI version. |

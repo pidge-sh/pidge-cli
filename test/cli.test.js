@@ -260,6 +260,37 @@ test('doctor warns LOUD on 0 devices (sends reach nobody)', async () => {
   assert.match(stderr, /0 devices.*NOBODY/);
 });
 
+test('#171 doctor probes the realtime path: reports ok when the socket confirms', async (t) => {
+  if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
+  const mock = createMock();
+  const port = await mock.start();
+
+  const { result } = runCli(['doctor'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stderr, /realtime: ok/);
+  assert.equal(JSON.parse(stdout).realtime, 'ok');
+  assert.match(stderr, /pidge hello/, 'the hint now leads with the first-contact WOW (#229)');
+});
+
+test('#171 doctor: realtime INDISPONÍVEL but the doctor STILL exits 0 (degrade is the contract)', async (t) => {
+  if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.wsMode = '1006'; // a proxy/edge refusing the upgrade (#119)
+
+  const { result } = runCli(['doctor'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, 'an unavailable WS must NOT fail the doctor — listen just polls');
+  assert.match(stderr, /realtime: INDISPON/);
+  assert.match(stderr, /--no-realtime/);
+  assert.equal(JSON.parse(stdout).realtime, 'unavailable');
+});
+
 test('whoami prints the channel identity JSON', async () => {
   const mock = createMock();
   const port = await mock.start();
@@ -724,7 +755,7 @@ test('ack rejects mixing --up-to and --ids (usage error, exit 1)', async () => {
   assert.match(out.stderr, /not both/);
 });
 
-test('a server newer than KNOWN_MANIFEST_VERSION nudges ONCE on stderr (re-verified at v28 baseline)', async () => {
+test('a server newer than KNOWN_MANIFEST_VERSION nudges ONCE on stderr (KNOWN=31 baseline)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.manifestVersion = 99; // server advertises news the CLI doesn't know
