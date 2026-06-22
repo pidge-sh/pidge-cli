@@ -302,7 +302,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
 // the manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 30;
+const KNOWN_MANIFEST_VERSION = 31;
 let newsWarned = false;
 function checkManifestNews(res) {
   const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
@@ -381,10 +381,10 @@ function wantRealtime() {
 // The server pings every ~3 s — that heartbeat is the liveness check (silence
 // >15 s ⇒ the socket is dead even if TCP hasn't noticed; close → caller
 // reconnects). Returns {close()} or null if the constructor itself failed.
-function cableSubscribe({ channel, onUp, onFrame, onDown }) {
+function cableSubscribe({ channel, onUp, onFrame, onDown, base = BASE, token = TOKEN }) {
   let ws;
   try {
-    ws = new WebSocket(BASE.replace(/^http/, 'ws') + '/cable', ['actioncable-v1-json', TOKEN]);
+    ws = new WebSocket(base.replace(/^http/, 'ws') + '/cable', ['actioncable-v1-json', token]);
   } catch (e) { onDown(e.message); return null; }
   const identifier = JSON.stringify({ channel });
   let lastBeat = Date.now();
@@ -450,6 +450,41 @@ async function cableSession({ channel, deadline, onUp, onFrame }) {
     await sleep(backoff);
   }
   return 'deadline';
+}
+
+// #171: doctor's realtime probe — the failure class an HTTP-only doctor can't
+// see (#119: an edge killing held responses, a proxy refusing the upgrade). A
+// green HTTP doctor can coexist with a `listen` that's deaf over the socket.
+// Open ONE ConversationChannel subscription on /cable (reusing cableSubscribe —
+// the same client `listen` holds), wait for confirm_subscription, close — all
+// within ≤5 s. Degrade is the CONTRACT, not a failure: an unavailable WS just
+// means `listen` polls (works, less instant), so this NEVER changes the exit
+// code — it only lets the agent KNOW before the first deaf listen. Resolves
+// {ok, ms} | {ok:false, reason} | {skipped:true} (Node <22 has no native
+// WebSocket — same gate as wantRealtime, :373).
+function probeRealtime(base, token) {
+  if (typeof WebSocket !== 'function') return Promise.resolve({ skipped: true });
+  return new Promise((resolve) => {
+    const started = Date.now();
+    let settled = false;
+    let sub = null;
+    const done = (result) => {
+      if (settled) return; settled = true;
+      clearTimeout(guard);
+      if (sub) sub.close();
+      resolve(result);
+    };
+    const guard = setTimeout(() => done({ ok: false, reason: 'no confirm_subscription within 5s' }), 5000);
+    sub = cableSubscribe({
+      channel: 'ConversationChannel',
+      base,
+      token,
+      onUp: () => done({ ok: true, ms: Date.now() - started }),
+      onFrame: () => { /* a stray frame during the probe is irrelevant */ },
+      onDown: (why) => done({ ok: false, reason: why }),
+    });
+    if (!sub) done({ ok: false, reason: 'WebSocket constructor failed' });
+  });
 }
 
 // Map CLI flags → the /notify JSON body, including only what was provided.
@@ -1093,8 +1128,25 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     console.error('pidge doctor: BROKEN (exit 2) — devices exist but 0 are reachable (all disabled or on the wrong APNs environment): a send reaches nobody.');
     process.exit(2);
   }
-  console.error('pidge doctor: all good — try: pidge ask --template decision --title "Pidge funcionando?"');
-  console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version }));
+  // #171: probe the realtime path (the #119 failure class an HTTP-only doctor
+  // misses). Exit stays 0 either way — an unavailable WS degrades to polling.
+  const rt = await probeRealtime(base, token);
+  let realtime;
+  if (rt.skipped) {
+    realtime = 'skipped';
+    console.error('pidge doctor: realtime: skipped — this Node lacks a native WebSocket (need Node ≥22); `listen` will poll. Upgrade Node for instant delivery.');
+  } else if (rt.ok) {
+    realtime = 'ok';
+    console.error(`pidge doctor: realtime: ok (ws connect + subscribe em ${rt.ms}ms)`);
+  } else {
+    realtime = 'unavailable';
+    console.error(`pidge doctor: realtime: INDISPONÍVEL — ${rt.reason}. O \`listen\` degrada pra polling (funciona, menos instantâneo); use --no-realtime pra fixar o piso.`);
+  }
+  // #229: lead with `pidge hello` — the first-contact WOW (send + wait in one),
+  // the same debut the /agent-setup guide leads with. It's a thin wrapper over
+  // `ask --template onboarding` (the underlying mechanism, if you need it raw).
+  console.error('pidge doctor: all good — try: pidge hello   (first-contact WOW — send + wait in one; equivalent: pidge ask --template onboarding)');
+  console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version, realtime }));
   process.exit(0);
 }
 
