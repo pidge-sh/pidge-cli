@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.13.0 — 2026-06-25
+
+Template system (#246) — the agent now declares an intent TYPE; the server maps it to
+the human's delivery profile (the human never sees the type). Soft-rollout: typeless
+sends still work in 0.13.x (server falls back to `fyi`); 0.14 will require a type.
+
+- **feat:** 6 type subcommands — `pidge fyi` · `report` · `ask` · `event` · `alert` ·
+  `live`. Each stamps `template_kind` on the `/notify` payload. fyi/report/event/alert/
+  live are fire-and-forget (like `notify`); `ask` send+waits for the answer. (#246)
+- **feat:** `pidge notify` (and `pidge send`) is **deprecated** with a local warning —
+  it still works for one minor (0.13.x; the server falls back to `fyi`) and will 422 in
+  0.14. Use a typed send instead. (#246)
+- **feat:** local validation before the round-trip — `ask` requires a way to answer
+  (`--actions`, `--custom-action`, or a `--template` that supplies them); `event`
+  requires a valid ISO8601 `--event-at`. Friendly exit-1 errors, nothing sent. (#246)
+- **feat:** `alert --escalate` adds `escalate: true` (ask the Urgente profile for an
+  AlarmKit alarm that breaks through silent/Focus; the human's profile decides). (#246)
+- **feat:** an unknown subcommand now points at the type catalog instead of dumping the
+  whole USAGE; `pidge <type> --help` shows each typed send's own flags. (#246)
+- **docs:** `pidge skill install` writes a **"Choose the right type"** catalog table
+  into the generated `SKILL.md`. (#246)
+
 ## 0.12.0 — 2026-06-25
 
 CLI bugs batch, all reported by an agent in real production use. No breaking changes.

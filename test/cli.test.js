@@ -145,7 +145,8 @@ test('ask over the realtime socket resolves from the InboxChannel frame', async 
     }, 500);
   };
 
-  const { result } = runCli(['ask', '--realtime', '--title', 'Aprovar?', '--timeout', '30'], port);
+  // #246: ask now requires a way to answer (--actions/--custom-action/--template).
+  const { result } = runCli(['ask', '--realtime', '--title', 'Aprovar?', '--actions', 'yes,no', '--timeout', '30'], port);
   const { code, stdout, stderr } = await result;
   await mock.stop();
 
@@ -1064,4 +1065,190 @@ test('#244 — skill install includes the always-on recipe for turn-based agents
   assert.match(skill, /always-on/i, 'the recipe section is present');
   assert.match(skill, /pidge listen --follow/, 'Path 1 — interactive window');
   assert.match(skill, /pidge listen --timeout 50/, 'Path 2 — supervisor poll');
+});
+
+// --- 0.13.0 — template system (#246): type subcommands + skill --------------
+
+// 1) one spec per typed send — each stamps the right template_kind on /notify.
+
+test('#246 — pidge fyi stamps template_kind:fyi and fire-and-forgets', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['fyi', '--title', 'Build done', '--body', '2m12s'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  const sent = mock.state.notifies.at(-1);
+  assert.equal(sent.template_kind, 'fyi');
+  assert.equal(sent.title, 'Build done');
+});
+
+test('#246 — pidge report stamps template_kind:report', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['report', '--title', 'Standup', '--body-markdown', '# Resumo'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(mock.state.notifies.at(-1).template_kind, 'report');
+});
+
+test('#246 — pidge ask stamps template_kind:ask, send+waits, prints chosen_action', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['ask-1'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'yes', label: 'Sim', text: null },
+  };
+  const out = await runCli(
+    ['ask', '--no-realtime', '--title', 'Aprovar deploy?', '--actions', 'yes,no', '--correlation-id', 'ask-1'],
+    port,
+  ).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(JSON.parse(out.stdout).action_id, 'yes');
+  const sent = mock.state.notifies.at(-1);
+  assert.equal(sent.template_kind, 'ask');
+  assert.deepEqual(sent.actions, ['yes', 'no']);
+});
+
+test('#246 — pidge event stamps template_kind:event with event_at + lead_minutes', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(
+    ['event', '--title', 'Sprint review', '--event-at', '2026-06-26T14:00-03:00', '--lead-minutes', '15'],
+    port,
+  ).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  const sent = mock.state.notifies.at(-1);
+  assert.equal(sent.template_kind, 'event');
+  assert.equal(sent.event_at, '2026-06-26T14:00-03:00');
+  assert.equal(sent.lead_minutes, 15);
+});
+
+test('#246 — pidge alert stamps template_kind:alert; --escalate adds escalate:true', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  // plain alert: escalate is NOT set
+  let out = await runCli(['alert', '--title', '503 spike'], port).result;
+  assert.equal(out.code, 0, out.stderr);
+  let sent = mock.state.notifies.at(-1);
+  assert.equal(sent.template_kind, 'alert');
+  assert.equal(sent.escalate, undefined, 'no --escalate ⇒ no escalate flag');
+
+  // alert --escalate: escalate:true rides the payload
+  out = await runCli(['alert', '--title', 'API down', '--escalate'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  sent = mock.state.notifies.at(-1);
+  assert.equal(sent.template_kind, 'alert');
+  assert.equal(sent.escalate, true);
+});
+
+test('#246 — pidge live stamps template_kind:live', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['live', '--title', 'Deploy v3.2 — building...'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(mock.state.notifies.at(-1).template_kind, 'live');
+});
+
+// 2) friendly local errors — fail fast, nothing reaches the server.
+
+test('#246 — pidge ask WITHOUT a way to answer errors locally (exit 1, no send)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['ask', '--no-realtime', '--title', 'Aprovar?'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, out.stderr);
+  assert.match(out.stderr, /--actions required for ask/);
+  assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
+});
+
+test('#246 — pidge event WITHOUT --event-at errors locally with the ISO8601 recipe', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['event', '--title', 'Standup'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, out.stderr);
+  assert.match(out.stderr, /--event-at required for event/);
+  assert.match(out.stderr, /ISO8601/);
+  assert.equal(mock.state.notifies.length, 0);
+});
+
+test('#246 — pidge event with a non-ISO8601 --event-at errors locally (no send)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['event', '--title', 'Standup', '--event-at', 'amanhã às 14h'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, out.stderr);
+  assert.match(out.stderr, /not a valid ISO8601/);
+  assert.equal(mock.state.notifies.length, 0);
+});
+
+test('#246 — an unknown subcommand points at the type catalog (exit 1, no send)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['frobnicate', '--title', 'x'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, out.stderr);
+  assert.match(out.stderr, /unknown subcommand 'frobnicate'/);
+  assert.match(out.stderr, /fyi · report · ask · event · alert · live/);
+  assert.equal(mock.state.notifies.length, 0);
+});
+
+// 3) `pidge notify` is deprecated — warns locally but STILL sends (soft-rollout:
+//    no template_kind, the server falls back to fyi). `pidge send` is the same alias.
+
+test('#246 — pidge notify warns DEPRECATED but still sends WITHOUT a template_kind', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['notify', '--title', 'legado'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /deprecated/);
+  assert.match(out.stderr, /0\.14/, 'tells the agent when it goes away');
+  const sent = mock.state.notifies.at(-1);
+  assert.equal(sent.title, 'legado');
+  assert.equal(sent.template_kind, undefined, 'soft-rollout: typeless send, server falls back to fyi');
+});
+
+test('#246 — pidge send is a deprecated alias of notify (warns + sends)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['send', '--title', 'via send'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /`pidge send` is deprecated/);
+  assert.equal(mock.state.notifies.at(-1).template_kind, undefined);
+});
+
+// 4) the generated skill carries the type catalog table.
+
+test('#246 — skill install includes the "Choose the right type" catalog table', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-skill246-'));
+
+  const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
+    cwd: dir,
+    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test' },
+  });
+  const out = await new Promise((resolve) => {
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    child.on('exit', (code) => resolve({ code, stdout, stderr }));
+  });
+  await mock.stop();
+
+  assert.equal(out.code, 0, out.stderr);
+  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  assert.match(skill, /Choose the right type/, 'the type catalog section is present');
+  assert.match(skill, /REQUIRED in 0\.14/);
+  // the table lists all six types
+  for (const t of ['fyi', 'report', 'ask', 'event', 'alert', 'live']) {
+    assert.match(skill, new RegExp(`pidge ${t}`), `skill mentions pidge ${t}`);
+  }
 });
