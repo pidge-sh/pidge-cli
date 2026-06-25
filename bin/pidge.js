@@ -126,6 +126,7 @@ const OPTIONS = {
   // realtime (#118): WS by default when the runtime has a WebSocket (Node ≥22)
   realtime: { type: 'boolean' },               // force WS (warn+fallback if unavailable)
   'no-realtime': { type: 'boolean' },          // polling only
+  'quiet-nag': { type: 'boolean' },            // #241: silence the manifest-version nag for this run
   // onboarding v2 (#110)
   claim: { type: 'string' },                   // setup --claim <single-use code>
   // #157 P2: listen keeps going after a batch (supervisor loop, one process)
@@ -268,6 +269,160 @@ only: it never produces an answer, so \`ask\` refuses it.
 
 Full spec (the contract — always current): GET $PIDGE_URL/api/v1/manifest`;
 
+// ---------------------------------------------------------------------------
+// #240: per-subcommand help. `pidge <cmd> --help` (and `pidge help <cmd>`) must
+// show the focused help for THAT command — its synopsis, what it does, and only
+// the flags that apply — instead of dumping the global USAGE (the bug an agent
+// hit: `pidge ask --help` listed the global flags, burying ask's own
+// --actions/--timeout). The global USAGE stays the no-command / `pidge --help`
+// view. One option dictionary feeds both so the text can't drift.
+// ---------------------------------------------------------------------------
+const OPTION_DOCS = {
+  title: '--title TEXT             (required) the headline',
+  body: '--body TEXT              the message shown on the banner',
+  'body-markdown': '--body-markdown MD       rich body for the tap-through detail screen',
+  subtitle: '--subtitle TEXT          a secondary line under the title',
+  template: '--template ID            content/action pattern: context · decision · approval · reminder · nudge · sensitive',
+  profile: '--profile ID             delivery profile (the human owns it): default · event · escalating · custom',
+  'event-at': '--event-at ISO8601       WHEN the thing happens (required by profile event)',
+  'lead-minutes': '--lead-minutes N         notify/countdown N min before event_at (5–240)',
+  urgency: '--urgency LEVEL          normal | persistent | alarm (low-level — prefer --profile)',
+  image: '--image PATH_OR_URL      banner+feed image: a local path is uploaded; an https URL is sent as-is',
+  file: '--file PATH              a real artifact (xlsx/pdf/csv…) uploaded for the human (≤25 MB)',
+  url: '--url URL                deep link the app opens on tap (PR, dashboard, log)',
+  copy: '--copy TEXT              tap-to-copy value on the detail screen',
+  actions: '--actions LIST|JSON      comma list from the catalog (yes,no,reply) OR a JSON array of {"id","label"} custom actions',
+  'custom-action': '--custom-action SPEC     "id:label[:destructive][:confirm][:biometric][:terminal]" (repeatable)',
+  'deliver-at': '--deliver-at ISO8601     schedule the send for later',
+  'reply-to': '--reply-to URL           also POST the answer to your webhook (HMAC-signed)',
+  'correlation-id': '--correlation-id ID      idempotency + routing key (auto-generated if omitted)',
+  thread: '--thread ID              conversation handle (#49): same id ⇒ one strand on the phone',
+  after: '--after CID              decision queue (#157): held until that notification is answered',
+  'collapse-key': '--collapse-key KEY       replace/update a prior notification',
+  param: '--param KEY=VALUE        pass ANY raw /notify field (repeatable) — the manifest is the contract',
+  timeout: '--timeout SECONDS        how long to block (ask: 600 · wait: 300 · listen: 600)',
+  interval: '--interval SECONDS       FALLBACK poll cadence (default 30) — normally unused (WS/long-poll)',
+  realtime: '--realtime               force the realtime WebSocket (warn + fall back to polling if unavailable)',
+  'no-realtime': '--no-realtime            polling only (skip the WebSocket)',
+  pending: '--pending                only delivered + still-unanswered notifications',
+  summary: '--summary                counts + answer latency (one call)',
+  'all-inbox': '--all                    whole-account scope (not just this channel)',
+  'all-listen': '--all                    single ear: also hear notification ANSWERS, not just messages (#131)',
+  limit: '--limit N                cap the number of rows',
+  claim: '--claim CODE             the single-use setup code (the human copies it from the Pidge app)',
+  'url-base': '--url BASE               the Pidge server base URL (default https://pidge.sh)',
+  print: '--print                  emit `export …` lines instead of writing a file (per-agent; you run it)',
+  force: '--force                  overwrite a shared config owned by another channel',
+  'listen-mode': '--listen-mode MODE       declare how you operate: turn_based | persistent | external_daemon',
+  follow: '--follow                 KEEP listening until --timeout (supervisor-only; traps a turn-based agent)',
+  'ack-on-read': '--ack-on-read            consume messages on read (pre-0.9 immediate-consume)',
+  'up-to': '--up-to ID               process every message up to this id',
+  ids: '--ids a,b                process this comma-list of ids',
+  renew: '--renew                  heartbeat the visibility-timeout lease instead of processing',
+  window: '--window N               reachability window in seconds (default 30)',
+  'quiet-nag': '--quiet-nag              silence the "server has new capabilities" nag for this run',
+};
+// Content flags shared by notify / ask / hello.
+const CONTENT_OPTS = ['title', 'body', 'body-markdown', 'subtitle', 'template', 'profile',
+  'event-at', 'lead-minutes', 'urgency', 'image', 'file', 'url', 'copy', 'actions',
+  'custom-action', 'deliver-at', 'reply-to', 'correlation-id', 'thread', 'after',
+  'collapse-key', 'param'];
+
+const HELP = {
+  setup: {
+    summary: 'one-shot onboarding (#110): exchange a single-use claim code for the channel key, store it, run doctor.',
+    usage: 'pidge setup --claim CODE [--url BASE] [--print] [--force] [--listen-mode MODE]',
+    body: 'The CLI writes the key itself (chmod 600) — it never appears on screen or in the agent\'s chat. MULTI-AGENT: set PIDGE_AGENT=<id> at each agent\'s launch for an isolated config.',
+    opts: ['claim', 'url-base', 'print', 'force', 'listen-mode'],
+  },
+  doctor: {
+    summary: 'validate the setup WITHOUT exposing secrets (env source, server, key, device reach, realtime probe).',
+    usage: 'pidge doctor',
+    opts: [],
+  },
+  whoami: {
+    summary: 'which channel does this key speak for (prints the identity JSON).',
+    usage: 'pidge whoami',
+    opts: [],
+  },
+  hello: {
+    summary: 'first-contact WOW (#217): your channel\'s debut handshake, narrated live by a 3-stage Live Activity. send + wait in one.',
+    usage: 'pidge hello [options]',
+    body: 'A thin wrapper over `ask --template onboarding` with friendly default copy. Run it as your FIRST contact on a fresh channel.',
+    opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
+  },
+  ask: {
+    summary: 'send a notification AND block until the human answers (prints chosen_action JSON to stdout).',
+    usage: 'pidge ask [options]',
+    body: 'Sends, then holds a WebSocket (or polls) until a TERMINAL answer. A snooze/reschedule re-fires — ask keeps waiting through it and prints snooze_until. profile "tracking" is refused (it never produces an answer).',
+    opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
+  },
+  notify: {
+    summary: 'send a notification and print the 201 JSON (does NOT wait for an answer).',
+    usage: 'pidge notify [options]',
+    body: 'Fire-and-forget: stdout is the raw 201 (correlation_id, registered_devices, escalation, degrade). Block on the answer later with `pidge wait <cid>`, or use `pidge ask` to send+wait in one.',
+    opts: [...CONTENT_OPTS],
+  },
+  wait: {
+    summary: 'block on an already-sent notification until it is answered (prints chosen_action JSON).',
+    usage: 'pidge wait <correlation_id> [options]',
+    opts: ['timeout', 'interval', 'realtime', 'no-realtime'],
+  },
+  cancel: {
+    summary: 'cancel a still-scheduled notification before it fires (#56; idempotent; 409 once it reached the phone).',
+    usage: 'pidge cancel <correlation_id>',
+    opts: [],
+  },
+  inbox: {
+    summary: 'what you sent: the list (default), the pending slice, or counts + answer latency (#83).',
+    usage: 'pidge inbox [--pending | --summary] [--all] [--limit N]',
+    opts: ['pending', 'summary', 'all-inbox', 'limit'],
+  },
+  listen: {
+    summary: 'block until the human MESSAGES you from the app, print, ACK after the work, exit (#48).',
+    usage: 'pidge listen [--timeout N] [--all] [--ack-on-read] [--follow]',
+    body: 'One-shot by design (loop it, don\'t daemonize). #170: a read message is DELIVERED (gray ✓✓), NOT done — ack it AFTER the work with `pidge ack --up-to <id>` (a ~10-min lease re-serves un-acked messages, so a crash never loses one).',
+    opts: ['timeout', 'all-listen', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime'],
+  },
+  ack: {
+    summary: 'mark messages PROCESSED (green ✓✓) after you handled them, or --renew the lease on a long task (#170).',
+    usage: 'pidge ack --up-to <id> | --ids a,b [--renew]',
+    opts: ['up-to', 'ids', 'renew'],
+  },
+  contract: {
+    summary: 'DECLARE how you operate (#182) — ADVISORY, never policy (the human SEES if you honor it).',
+    usage: 'pidge contract set <key>=<value> | pidge contract show',
+    body: 'Keys: keep_connection_alive, mirror_in_origin_session, listen_mode=turn_based|persistent|external_daemon, quiet_when_idle. An unknown key / bad value is rejected locally (exit 1).',
+    opts: [],
+  },
+  selftest: {
+    summary: 'prove your listener works by ROUND-TRIP (#205): fire a nonce, run the listener, confirm it acks in time.',
+    usage: 'pidge selftest [--window N]',
+    body: 'PASS exit 0 / FAIL exit 2 (with the likely cause). Run it as the last onboarding step + whenever sends seem to go unheard.',
+    opts: ['window'],
+  },
+  skill: {
+    summary: 'write .claude/skills/pidge/SKILL.md generated from the live manifest (persistent Pidge knowledge for Claude Code).',
+    usage: 'pidge skill install',
+    opts: [],
+  },
+};
+
+// Render the focused help for one command, or the global USAGE when the topic is
+// unknown / absent (so `pidge --help` and `pidge help` keep the full overview).
+function helpFor(topic) {
+  const h = HELP[topic];
+  if (!h) return USAGE;
+  const lines = [`pidge ${topic} — ${h.summary}`, '', 'USAGE', `  ${h.usage}`];
+  if (h.body) { lines.push('', h.body); }
+  if (h.opts && h.opts.length) {
+    lines.push('', 'OPTIONS');
+    for (const key of h.opts) lines.push(`  ${OPTION_DOCS[key] || key}`);
+  }
+  lines.push('', 'Run `pidge --help` for all commands; GET $PIDGE_URL/api/v1/manifest is the full contract (Bearer auth).');
+  return lines.join('\n');
+}
+
 let parsed;
 try {
   parsed = parseArgs({ options: OPTIONS, allowPositionals: true });
@@ -276,9 +431,18 @@ try {
 }
 const v = parsed.values;
 const command = parsed.positionals[0];
+// #241: silence the manifest-version nag entirely (per run via --quiet-nag, or
+// per environment via PIDGE_QUIET_NAG=1) — for scripts and CI where the nudge is noise.
+const QUIET_NAG = !!v['quiet-nag'] || process.env.PIDGE_QUIET_NAG === '1';
 
-// `pidge --help` / `-h` / `help` → full help on stdout, exit 0. No command → stderr, exit 1.
-if (v.help || command === 'help') { console.log(USAGE); process.exit(0); }
+// Help on stdout, exit 0. #240: `pidge <cmd> --help` / `pidge help <cmd>` show the
+// FOCUSED help for that command (its synopsis + own flags); `pidge --help` / `help`
+// with no command show the global USAGE. No command at all → USAGE on stderr, exit 1.
+if (v.help || command === 'help') {
+  const topic = command === 'help' ? parsed.positionals[1] : command;
+  console.log(helpFor(topic));
+  process.exit(0);
+}
 if (!command) { console.error(USAGE); process.exit(1); }
 // `setup` is the command that CREATES the token config — it must run without one.
 if (!TOKEN && command !== 'setup')
@@ -300,17 +464,48 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 }
 
 // The server advertises its manifest version on every response. When it's newer
-// than what this CLI shipped knowing, nudge ONCE on stderr — the agent re-reads
-// the manifest (whats_new) and learns the new capabilities without polling.
+// than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
+// manifest (whats_new) and learns the new capabilities without polling.
 const KNOWN_MANIFEST_VERSION = 31;
+const NAG_TTL_MS = 24 * 60 * 60 * 1000; // #241: at most one nag per 24 h
 let newsWarned = false;
+
+// #241: a tiny per-install state cache (~/.config/pidge/state.json, per-agent
+// when PIDGE_AGENT is set — same dir as the env file). Best-effort: a read-only
+// fs just means the throttle falls back to once-per-process. Date is fine here
+// (this is the CLI process, not a workflow script).
+function stateFilePath() { return path.join(pidgeConfigDir(), 'state.json'); }
+function readState() {
+  try { return JSON.parse(fs.readFileSync(stateFilePath(), 'utf8')) || {}; } catch { return {}; }
+}
+function writeState(patch) {
+  try {
+    const next = { ...readState(), ...patch };
+    fs.mkdirSync(pidgeConfigDir(), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(stateFilePath(), JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
+  } catch { /* best-effort — the nag just won't persist its throttle */ }
+}
+
 function checkManifestNews(res) {
-  const v = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
-  if (v > KNOWN_MANIFEST_VERSION && !newsWarned) {
-    newsWarned = true;
-    // #119: a pinned npx ref never updates itself — give the CONCRETE command.
-    console.error(`pidge: the server has NEW capabilities (manifest v${v}; this CLI knows v${KNOWN_MANIFEST_VERSION}) — re-read GET $PIDGE_URL/api/v1/manifest (see whats_new) and UPDATE the CLI: npm i -g pidge-cli@latest  (npx users: run npx pidge-cli@latest, a pinned ref never self-updates)`);
+  if (QUIET_NAG || newsWarned) return;
+  const ver = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
+  // (c) only when the server is ahead of what THIS CLI knows.
+  if (!(ver > KNOWN_MANIFEST_VERSION)) return;
+  // #241 throttle: nag at most once per 24 h, and after that window only when the
+  // server version actually CHANGED — so 5 calls in a row (or a steady server)
+  // don't re-spam. A recent OR unchanged record suppresses; the record's seenAt is
+  // stamped only on a real nag (suppressed runs don't roll the 24 h clock forward).
+  const last = readState().manifestVersion;
+  if (last && last.seenAt) {
+    const recent = (Date.now() - Date.parse(last.seenAt)) < NAG_TTL_MS; // (a)
+    const unchanged = last.value === ver;                               // (b)
+    if (recent || unchanged) { newsWarned = true; return; }
   }
+  newsWarned = true;
+  writeState({ manifestVersion: { value: ver, seenAt: new Date().toISOString() } });
+  // #119: a pinned npx ref never updates itself — give the CONCRETE command.
+  // #243: show the AUTHENTICATED curl so re-reading the manifest doesn't 401.
+  console.error(`pidge: the server has NEW capabilities (manifest v${ver}; this CLI knows v${KNOWN_MANIFEST_VERSION}) — re-read the contract:  curl -H "Authorization: Bearer $PIDGE_TOKEN" $PIDGE_URL/api/v1/manifest  (see whats_new), then UPDATE the CLI: npm i -g pidge-cli@latest  (npx users: run npx pidge-cli@latest, a pinned ref never self-updates). Silence this with --quiet-nag or PIDGE_QUIET_NAG=1.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +682,48 @@ function probeRealtime(base, token) {
   });
 }
 
+// #242: a custom action id is lowercase letters, digits and underscore (≤40) —
+// the same rule the server enforces, validated LOCALLY so a typo fails fast.
+const CUSTOM_ACTION_ID = /^[a-z0-9_]{1,40}$/;
+
+// --custom-action "id:label[:destructive][:confirm][:biometric][:terminal]"
+function customActionFromSpec(spec) {
+  const [id, label, ...flags] = spec.split(':');
+  // #157 P2: fail fast locally — the rule is stable and the server 422 costs a
+  // round-trip an agent then has to interpret.
+  if (!CUSTOM_ACTION_ID.test(id || '')) {
+    die(`pidge: --custom-action id ${JSON.stringify(id)} is invalid — lowercase letters, digits and underscore only (^[a-z0-9_]{1,40}$)`, 1);
+  }
+  const ca = { id, label };
+  if (flags.includes('destructive')) ca.style = 'destructive';
+  if (flags.includes('confirm')) ca.confirm = true;
+  if (flags.includes('biometric')) ca.biometric = true;
+  if (flags.includes('terminal')) ca.terminal = true;
+  return ca;
+}
+
+// #242: one item of a JSON --actions array → a custom_actions spec. Validates
+// {id,label} and passes the optional gating fields the server understands.
+function customActionFromJson(item, i) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    die(`pidge: --actions[${i}] must be an object with "id" and "label" (e.g. {"id":"approve","label":"Aprovar agora"})`, 1);
+  }
+  if (typeof item.id !== 'string' || !CUSTOM_ACTION_ID.test(item.id)) {
+    die(`pidge: --actions[${i}].id ${JSON.stringify(item.id)} is invalid — lowercase letters, digits and underscore only (^[a-z0-9_]{1,40}$)`, 1);
+  }
+  if (typeof item.label !== 'string' || !item.label.trim()) {
+    die(`pidge: --actions[${i}].label is required — a non-empty string`, 1);
+  }
+  const ca = { id: item.id, label: item.label };
+  if (item.sf_symbol !== undefined) ca.sf_symbol = item.sf_symbol;
+  if (item.style !== undefined) ca.style = item.style;
+  if (item.destructive) ca.style = 'destructive';
+  if (item.confirm !== undefined) ca.confirm = !!item.confirm;
+  if (item.biometric !== undefined) ca.biometric = !!item.biometric;
+  if (item.terminal !== undefined) ca.terminal = !!item.terminal;
+  return ca;
+}
+
 // Map CLI flags → the /notify JSON body, including only what was provided.
 function buildBody() {
   if (!v.title) die('pidge: --title is required', 1);
@@ -507,25 +744,27 @@ function buildBody() {
   if (v.thread !== undefined) body.thread_id = v.thread;
   if (v.after !== undefined) body.after = v.after;
   if (v['collapse-key'] !== undefined) body.collapse_key = v['collapse-key'];
-  if (v.actions !== undefined) body.actions = v.actions.split(',').filter(Boolean);
 
-  const customs = v['custom-action'] || [];
-  if (customs.length) {
-    body.custom_actions = customs.map((spec) => {
-      const [id, label, ...flags] = spec.split(':');
-      // #157 P2: fail fast locally — the rule is stable and the server 422
-      // costs a round-trip an agent then has to interpret.
-      if (!/^[a-z0-9_]{1,40}$/.test(id || '')) {
-        die(`pidge: --custom-action id ${JSON.stringify(id)} is invalid — lowercase letters, digits and underscore only (^[a-z0-9_]{1,40}$)`, 1);
-      }
-      const ca = { id, label };
-      if (flags.includes('destructive')) ca.style = 'destructive';
-      if (flags.includes('confirm')) ca.confirm = true;
-      if (flags.includes('biometric')) ca.biometric = true;
-      if (flags.includes('terminal')) ca.terminal = true;
-      return ca;
-    });
+  // --actions: the short comma form (built-in catalog ids → body.actions) OR a
+  // JSON array of custom {id,label,…} specs (#242 → body.custom_actions). A
+  // leading '[' selects JSON; bad JSON is a friendly LOCAL error (exit 1), never
+  // a silent fall-through that drops the labels and sends a plain notification.
+  // --custom-action specs APPEND to whatever the JSON form produced, so both can coexist.
+  const customActions = [];
+  if (v.actions !== undefined) {
+    const trimmed = v.actions.trim();
+    if (trimmed.startsWith('[')) {
+      let arr;
+      try { arr = JSON.parse(trimmed); }
+      catch (e) { die(`pidge: --actions looks like JSON but didn't parse (${e.message}). Use a JSON array of {"id","label"} objects, or the short form yes,no,reply`, 1); }
+      if (!Array.isArray(arr)) die('pidge: --actions JSON must be an ARRAY of {"id","label"} objects', 1);
+      arr.forEach((item, i) => customActions.push(customActionFromJson(item, i)));
+    } else {
+      body.actions = trimmed.split(',').filter(Boolean);
+    }
   }
+  for (const spec of v['custom-action'] || []) customActions.push(customActionFromSpec(spec));
+  if (customActions.length) body.custom_actions = customActions;
 
   // Escape hatch: any raw /notify field, so a NEW server field documented in the
   // manifest works the day it ships — no CLI release needed. JSON values parse
@@ -1279,6 +1518,25 @@ ${notes.map((n) => `- ${n}`).join('\n')}
 - \`pidge ask …\` blocks and prints chosen_action JSON; \`pidge wait <cid>\` blocks on an existing send.
 - \`pidge listen\` blocks until the human MESSAGES you from the app (composer) — run it when idle.
 - ${exits}
+
+## Stay "always-on" while you're turn-based (#244)
+
+A turn-based agent (Claude Code, ChatGPT, anything that only runs when invoked) can still be COMMANDABLE by your human. Two ways, neither needs a daemon:
+
+### Path 1 — an interactive listening window (active session)
+\`\`\`bash
+pidge listen --follow --timeout 300   # hold for 5 min (--timeout is SECONDS), printing messages as they arrive
+\`\`\`
+Good while you're actively working. You stay online until the window closes. \`--follow\` is supervisor-style — it traps the turn — so only use it when you intend to sit and wait.
+
+### Path 2 — a supervisor that polls, no daemon (24/7)
+A \`cron\` job or \`systemd\` timer invokes you every N minutes; each tick runs ONE one-shot listen and exits:
+\`\`\`bash
+pidge listen --timeout 50   # block up to 50s for a message, print it, exit 0 (exit 3 = nothing this tick)
+\`\`\`
+Each poll is one of your turns: pick up the message, do the work, \`pidge ack --up-to <id>\`, then sleep until the next tick. Real always-on without being a daemon. With Claude Code, the built-in \`/loop\` (auto-wake every N min) drives the same loop.
+
+> \`--timeout\` is always SECONDS (not "5m"). One-shot \`pidge listen\` is the polling primitive — loop it from your supervisor; do NOT background it with \`&\` (an orphaned listener eats the queue).
 
 ## Full spec
 

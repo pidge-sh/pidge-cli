@@ -1,6 +1,6 @@
 {
   "name": "pidge-cli",
-  "version": "0.11.1",
+  "version": "0.12.0",
   "description": "Send rich, actionable iPhone notifications to a human and block until they answer. Built for AI agents.",
   "keywords": [
     "pidge",
@@ -18,6 +18,7 @@
   "files": [
     "bin",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
