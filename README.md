@@ -11,6 +11,15 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > current spec (fields, profiles, guarantees). This CLI is a thin pipe over it — any
 > new server field works without a CLI update via `--param key=value`.
 
+> **New in v0.12.0** — CLI bugs batch (all reported by an agent in real use): **`pidge
+> <sub> --help`** now shows that subcommand's own help (its flags), not the global dump
+> (#240); the **manifest-version nag is throttled to once / 24 h** (cached in
+> `~/.config/pidge/state.json`) with `--quiet-nag` / `PIDGE_QUIET_NAG=1` to silence it
+> (#241); **`--actions` accepts a JSON array** of custom `{id,label}` actions for custom
+> labels (#242, the short `yes,no,reply` form unchanged); the nag's manifest re-read
+> example now shows the **`Authorization: Bearer`** header so it doesn't 401 (#243); and
+> `skill install` writes an **"always-on for turn-based agents"** recipe (#244).
+>
 > **New in v0.9.0** (ships with Pidge manifest v27): **`listen` no longer consumes on
 > read** — a read message is DELIVERED, and you `ack` it after the work (a ~10-min
 > server lease re-serves un-acked messages, so a crash never loses one; `--ack-on-read`
@@ -192,10 +201,12 @@ WebSocket  →  ?wait= long-poll (capped 25 s server-side)  →  plain GETs ever
                         and saves on the phone; uploaded automatically (≤25 MB)
 --url URL               deep link the app opens when the user taps (PR, dashboard, log)
 --copy TEXT             value offered as tap-to-copy on the detail (code, token)
---actions LIST          comma list: yes,no,approve,reject,accept,decline,later,
-                        done,snooze,reschedule,reply,mute
+--actions LIST|JSON     comma list of catalog ids: yes,no,approve,reject,accept,
+                        decline,later,done,snooze,reschedule,reply,mute — OR a JSON
+                        array of custom actions for your own labels:
+                        '[{"id":"approve","label":"Aprovar agora"},{"id":"defer","label":"Depois"}]'
 --custom-action SPEC    "id:label[:destructive][:confirm][:biometric][:terminal]"
-                        (repeatable — your own buttons)
+                        (repeatable — your own buttons; composes with --actions JSON)
 --deliver-at ISO8601    schedule for later
 --reply-to URL          also POST the answer to your webhook (HMAC-signed)
 --correlation-id ID     idempotency + routing key (auto-generated if omitted)

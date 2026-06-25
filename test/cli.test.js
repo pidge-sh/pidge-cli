@@ -759,10 +759,16 @@ test('a server newer than KNOWN_MANIFEST_VERSION nudges ONCE on stderr (KNOWN=31
   const mock = createMock();
   const port = await mock.start();
   mock.state.manifestVersion = 99; // server advertises news the CLI doesn't know
-  const out = await runCli(['doctor'], port).result;
+  // #241: isolate the per-install state cache so the 24h throttle can't leak
+  // across suite runs (a re-run would otherwise suppress the nag and false-fail).
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-nag-'));
+  const out = await runCli(['doctor'], port, { XDG_CONFIG_HOME: home }).result;
   await mock.stop();
   assert.match(out.stderr, /manifest v99/, 'the version nudge fires when the server is ahead');
   assert.match(out.stderr, /re-read|UPDATE the CLI/);
+  // #243: the re-read instruction now shows the AUTHENTICATED curl (Bearer), so an
+  // agent that copy-pastes it doesn't take a 401 on the manifest.
+  assert.match(out.stderr, /Authorization: Bearer \$PIDGE_TOKEN/);
 });
 
 test('doctor reports HONEST device reach and warns when pushable > deliverable (gotcha #9)', async () => {
@@ -896,4 +902,166 @@ test('selftest — a non-numeric --window falls back to the default, never a fal
   await mock.stop();
   assert.equal(code, 0, `a typo'd window must not masquerade as a dead listener; stderr: ${stderr}`);
   assert.match(stderr, /SELF-TEST PASSED/);
+});
+
+// --- 0.12.0 — CLI bugs batch (#240/#241/#242/#243/#244) -----------------------
+
+// #240: `pidge <sub> --help` must show the SUBCOMMAND's own help, not the global
+// USAGE dump (help exits before any network — no mock server needed).
+test('#240 — `pidge ask --help` shows the subcommand help (own flags), not the global dump', async () => {
+  const out = await runCli(['ask', '--help'], 1).result;
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stdout, /^pidge ask —/, 'leads with the focused ask header');
+  assert.match(out.stdout, /--actions LIST\|JSON/, "lists ask's own --actions flag");
+  assert.match(out.stdout, /--timeout SECONDS/, 'and --timeout');
+  assert.doesNotMatch(out.stdout, /pidge setup --claim CODE/, 'must NOT be the global command list');
+});
+
+test('#240 — other subcommands get their own focused help too (notify / wait / listen / inbox / ack)', async () => {
+  const cases = [
+    ['notify', /^pidge notify —/, /--body-markdown MD/],
+    ['wait', /^pidge wait —/, /pidge wait <correlation_id>/],
+    ['listen', /^pidge listen —/, /--follow/],
+    ['inbox', /^pidge inbox —/, /--summary/],
+    ['ack', /^pidge ack —/, /--up-to ID/],
+  ];
+  for (const [cmd, header, flag] of cases) {
+    const out = await runCli([cmd, '--help'], 1).result;
+    assert.equal(out.code, 0, `${cmd} --help: ${out.stderr}`);
+    assert.match(out.stdout, header, `${cmd} leads with its focused header`);
+    assert.match(out.stdout, flag, `${cmd} lists its own flag`);
+    assert.doesNotMatch(out.stdout, /pidge setup --claim CODE/, `${cmd} is not the global dump`);
+  }
+});
+
+test('#240 — `pidge --help` (no command) keeps the global overview; `pidge help ask` is focused', async () => {
+  let out = await runCli(['--help'], 1).result;
+  assert.equal(out.code, 0);
+  assert.match(out.stdout, /pidge setup --claim CODE/, 'global --help lists all commands');
+
+  out = await runCli(['help', 'ask'], 1).result;
+  assert.equal(out.code, 0);
+  assert.match(out.stdout, /^pidge ask —/, '`pidge help <cmd>` is the focused form');
+});
+
+// #241: the manifest-version nag is throttled to once / 24h (per-install cache).
+test('#241 — the version nag fires ONCE then is throttled: 5 runs in a row = 1 nag', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.manifestVersion = 99;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-nag5-'));
+
+  let nags = 0;
+  for (let i = 0; i < 5; i++) {
+    const out = await runCli(['doctor'], port, { XDG_CONFIG_HOME: home }).result;
+    if (/manifest v99/.test(out.stderr)) nags++;
+  }
+  await mock.stop();
+  assert.equal(nags, 1, 'the nag must be throttled to once per 24h, not once per call');
+});
+
+test('#241 — --quiet-nag and PIDGE_QUIET_NAG=1 silence the nag entirely', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.manifestVersion = 99;
+
+  // --quiet-nag flag (fresh home so the throttle isn't what's hiding it)
+  let home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-quiet-'));
+  let out = await runCli(['doctor', '--quiet-nag'], port, { XDG_CONFIG_HOME: home }).result;
+  assert.doesNotMatch(out.stderr, /manifest v99/, '--quiet-nag silences the nag');
+
+  // PIDGE_QUIET_NAG=1 env, again a fresh home
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-quiet2-'));
+  out = await runCli(['doctor'], port, { XDG_CONFIG_HOME: home, PIDGE_QUIET_NAG: '1' }).result;
+  assert.doesNotMatch(out.stderr, /manifest v99/, 'PIDGE_QUIET_NAG=1 silences the nag');
+  await mock.stop();
+});
+
+// #242: --actions accepts a JSON array of custom {id,label} actions.
+test('#242 — --actions accepts a JSON array of custom {id,label} actions', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(
+    ['notify', '--title', 'Deploy?', '--actions',
+      '[{"id":"approve","label":"Aprovar agora"},{"id":"defer","label":"Deixa pra amanhã"}]'],
+    port,
+  ).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  const sent = mock.state.notifies.at(-1);
+  assert.deepEqual(sent.custom_actions, [
+    { id: 'approve', label: 'Aprovar agora' },
+    { id: 'defer', label: 'Deixa pra amanhã' },
+  ]);
+  assert.equal(sent.actions, undefined, 'the JSON form does not also set the short actions list');
+});
+
+test('#242 — the short comma form still works (compat retro)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['notify', '--title', 'x', '--actions', 'yes,no,reply'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  const sent = mock.state.notifies.at(-1);
+  assert.deepEqual(sent.actions, ['yes', 'no', 'reply']);
+  assert.equal(sent.custom_actions, undefined);
+});
+
+test('#242 — JSON --actions composes with --custom-action (both appended)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(
+    ['notify', '--title', 'x', '--actions', '[{"id":"approve","label":"Aprovar"}]',
+      '--custom-action', 'defer:Depois'],
+    port,
+  ).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  const sent = mock.state.notifies.at(-1);
+  assert.deepEqual(sent.custom_actions.map((c) => c.id), ['approve', 'defer']);
+});
+
+test('#242 — malformed JSON in --actions fails fast LOCALLY (exit 1, no send)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['notify', '--title', 'x', '--actions', '[{"id":"approve"'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, out.stderr);
+  assert.match(out.stderr, /looks like JSON but didn't parse/);
+  assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
+});
+
+test('#242 — a JSON item missing id/label is rejected locally with the spelled-out rule', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['notify', '--title', 'x', '--actions', '[{"label":"no id"}]'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, out.stderr);
+  assert.match(out.stderr, /is invalid|label is required/);
+  assert.equal(mock.state.notifies.length, 0);
+});
+
+// #244: the generated skill carries the always-on recipe for turn-based agents.
+test('#244 — skill install includes the always-on recipe for turn-based agents', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-skill244-'));
+
+  const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
+    cwd: dir,
+    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test' },
+  });
+  const out = await new Promise((resolve) => {
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    child.on('exit', (code) => resolve({ code, stdout, stderr }));
+  });
+  await mock.stop();
+
+  assert.equal(out.code, 0, out.stderr);
+  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  assert.match(skill, /always-on/i, 'the recipe section is present');
+  assert.match(skill, /pidge listen --follow/, 'Path 1 — interactive window');
+  assert.match(skill, /pidge listen --timeout 50/, 'Path 2 — supervisor poll');
 });
