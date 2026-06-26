@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.13.1 — 2026-06-26
+
+Polish from an agent E2E (2026-06-26). No breaking changes.
+
+- **fix:** the manifest-version nudge no longer scolds "your CLI is stale, UPDATE it".
+  pidge is a thin pipe — `--param KEY=VALUE` carries any new `/notify` field NOW, so a
+  server manifest bump almost never needs a CLI release. The nudge is reframed as "new
+  capabilities + how to use them today" and `KNOWN_MANIFEST_VERSION` is bumped 31 → 36
+  (the current server), silencing the false-positive on `@latest`. (#26)
+- **fix:** the public manifest (#249-A) curl in that nudge drops the mandatory Bearer —
+  the catalog reads without a key; the Bearer is shown only as the optional way to also
+  see the channel's own config. (#26)
+- **fix:** the realtime reconnect log no longer reads "realtime socket **socket** closed"
+  (doubled word) and the counter no longer sticks at "attempt 1/4" — it now shows a
+  monotonic "reconnect #N" so a connect→drop flap visibly advances instead of looking
+  like a stuck loop. (#25)
+
 ## 0.13.0 — 2026-06-25
 
 Template system (#246) — the agent now declares an intent TYPE; the server maps it to

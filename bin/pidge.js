@@ -504,7 +504,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 31;
+const KNOWN_MANIFEST_VERSION = 36;
 const NAG_TTL_MS = 24 * 60 * 60 * 1000; // #241: at most one nag per 24 h
 let newsWarned = false;
 
@@ -541,9 +541,13 @@ function checkManifestNews(res) {
   }
   newsWarned = true;
   writeState({ manifestVersion: { value: ver, seenAt: new Date().toISOString() } });
-  // #119: a pinned npx ref never updates itself — give the CONCRETE command.
-  // #243: show the AUTHENTICATED curl so re-reading the manifest doesn't 401.
-  console.error(`pidge: the server has NEW capabilities (manifest v${ver}; this CLI knows v${KNOWN_MANIFEST_VERSION}) — re-read the contract:  curl -H "Authorization: Bearer $PIDGE_TOKEN" $PIDGE_URL/api/v1/manifest  (see whats_new), then UPDATE the CLI: npm i -g pidge-cli@latest  (npx users: run npx pidge-cli@latest, a pinned ref never self-updates). Silence this with --quiet-nag or PIDGE_QUIET_NAG=1.`);
+  // #26: pidge is a THIN PIPE — a server manifest bump almost never needs a CLI
+  // release, because --param carries any new /notify field NOW. So the nudge is
+  // "new capabilities + how to use them today", NOT "your CLI is stale, update it".
+  // #249-A: the manifest is PUBLIC — the curl reads the catalog without a key
+  // (a key only adds your channel's own config). Updating the CLI is the LAST,
+  // optional step (only to gain native flags), never the headline.
+  console.error(`pidge: the server has NEW capabilities (manifest v${ver}; this CLI knows v${KNOWN_MANIFEST_VERSION}) — pidge is a thin pipe, so you can use any new /notify field RIGHT NOW via --param KEY=VALUE. Read the catalog (whats_new) in the public manifest:  curl $PIDGE_URL/api/v1/manifest  (public; add -H "Authorization: Bearer $PIDGE_TOKEN" to also see your channel's config). Updating the CLI only matters to gain native flags:  npx pidge-cli@latest  (a pinned ref never self-updates). Silence this with --quiet-nag or PIDGE_QUIET_NAG=1.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +645,9 @@ function cableSubscribe({ channel, onUp, onFrame, onDown, base = BASE, token = T
     if (f.identifier === identifier && f.message) onFrame(f.message);
   };
   ws.onerror = () => { /* onclose follows with the code */ };
-  ws.onclose = (e) => die(`socket closed (${e.code})`);
+  // #25: the reconnect log prefixes "realtime socket …", so the reason must NOT
+  // start with "socket" again (was "socket socket closed (1006)").
+  ws.onclose = (e) => die(`closed (${e.code})`);
   return { close: () => { closed = true; clearInterval(beatCheck); try { ws.close(); } catch { /* noop */ } } };
 }
 
@@ -651,7 +657,8 @@ function cableSubscribe({ channel, onUp, onFrame, onDown, base = BASE, token = T
 // `finish(reason)` to end the session (e.g. when the answer landed over HTTP).
 // Resolves 'deadline' | 'ws-unavailable'.
 async function cableSession({ channel, deadline, onUp, onFrame }) {
-  let wsFails = 0;
+  let wsFails = 0;      // consecutive drops SINCE the last healthy connect — the degrade gate
+  let wsReconnects = 0; // monotonic total this session — what we DISPLAY (never reset)
   while (Date.now() < deadline) {
     const outcome = await new Promise((resolve) => {
       let sub = null;
@@ -674,12 +681,17 @@ async function cableSession({ channel, deadline, onUp, onFrame }) {
     if (outcome === 'deadline') return 'deadline';
     if (!outcome.startsWith('down: ')) return outcome; // caller-driven finish (e.g. 'answered')
     wsFails++;
+    wsReconnects++;
     const MAX_WS_FAILS = 4; // then fall back to polling for the rest of the session
     if (wsFails >= MAX_WS_FAILS) return 'ws-unavailable';
     // env override = a test/ops hook (keeps the forced-1006 degrade test fast)
     const base = parseInt(process.env.PIDGE_WS_BACKOFF_MS || '2000', 10) || 2000;
     const backoff = Math.min(base * wsFails, base * 5);
-    console.error(`pidge: realtime socket ${outcome.replace('down: ', '')} — reconnecting in ${Math.round(backoff / 1000)}s (attempt ${wsFails}/${MAX_WS_FAILS})`);
+    // #25: show the MONOTONIC reconnect count, not the consecutive-fail counter —
+    // a connect→drop FLAP resets wsFails (onUp forgives a healthy connect), so the
+    // old "attempt 1/4" repeated forever and looked like a stuck loop. The cumulative
+    // "#N" visibly advances; the polling fallback is spelled out so the ceiling is clear.
+    console.error(`pidge: realtime socket ${outcome.replace('down: ', '')} — reconnecting in ${Math.round(backoff / 1000)}s (reconnect #${wsReconnects}; falls back to polling after ${MAX_WS_FAILS} consecutive failures)`);
     await sleep(backoff);
   }
   return 'deadline';
