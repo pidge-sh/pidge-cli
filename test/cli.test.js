@@ -756,7 +756,7 @@ test('ack rejects mixing --up-to and --ids (usage error, exit 1)', async () => {
   assert.match(out.stderr, /not both/);
 });
 
-test('a server newer than KNOWN_MANIFEST_VERSION nudges ONCE on stderr (KNOWN=31 baseline)', async () => {
+test('a server newer than KNOWN_MANIFEST_VERSION nudges ONCE on stderr (KNOWN=36 baseline)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.manifestVersion = 99; // server advertises news the CLI doesn't know
@@ -766,9 +766,14 @@ test('a server newer than KNOWN_MANIFEST_VERSION nudges ONCE on stderr (KNOWN=31
   const out = await runCli(['doctor'], port, { XDG_CONFIG_HOME: home }).result;
   await mock.stop();
   assert.match(out.stderr, /manifest v99/, 'the version nudge fires when the server is ahead');
-  assert.match(out.stderr, /re-read|UPDATE the CLI/);
-  // #243: the re-read instruction now shows the AUTHENTICATED curl (Bearer), so an
-  // agent that copy-pastes it doesn't take a 401 on the manifest.
+  // #26: the nudge reframes as "new capabilities you can use NOW via --param" — a
+  // thin-pipe CLI rarely needs a release on a server bump — NOT "your CLI is stale,
+  // UPDATE it" as the headline action.
+  assert.match(out.stderr, /thin pipe/, 'reframed as new capabilities, not a stale-CLI scold');
+  assert.match(out.stderr, /--param/, 'tells the agent how to use the new field today');
+  assert.doesNotMatch(out.stderr, /UPDATE the CLI/, 'updating is no longer the headline action');
+  // #249-A: the manifest is PUBLIC — the curl reads without a key; the Bearer is
+  // shown only as the OPTIONAL way to also see the channel's own config.
   assert.match(out.stderr, /Authorization: Bearer \$PIDGE_TOKEN/);
 });
 
