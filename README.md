@@ -11,6 +11,15 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > current spec (fields, profiles, guarantees). This CLI is a thin pipe over it — any
 > new server field works without a CLI update via `--param key=value`.
 
+> **New in v0.14.0** — the **married vocabulary** (perfis): the CLI now speaks the same
+> language as the server (manifest v42) and the app. **One list of 5 types** —
+> `pidge message · important · urgent · event · live` (message←fyi, important←report,
+> urgent←alert; old names still work as aliases). **RESPONSE is a separate axis**:
+> `--actions`/`--custom-action` add buttons on ANY type, and **`--wait`** blocks until
+> the human answers — the explicit *pedir vs esperar*. `pidge ask` is now the shortcut
+> for `important --wait`; new **`pidge approval`** = important + Aprovar/Rejeitar + Face
+> ID + wait. `important` is the recommended default.
+>
 > **New in v0.12.0** — CLI bugs batch (all reported by an agent in real use): **`pidge
 > <sub> --help`** now shows that subcommand's own help (its flags), not the global dump
 > (#240); the **manifest-version nag is throttled to once / 24 h** (cached in
@@ -113,39 +122,73 @@ export PIDGE_TOKEN=hld_xxx                          # your channel's bearer key
 # (or skip the exports: the CLI reads ~/.config/pidge/env — KEY=VALUE — so the
 #  key never has to appear in an agent's chat; explicit env vars win)
 
-# Send AND wait for the answer (the one an agent wants):
+# Just inform — fire-and-forget (clears when the human opens it):
+npx pidge-cli message --title "Build verde" --body "2m12s"
+
+# A pendency they should resolve — the DEFAULT type (card "aguardando você"):
+npx pidge-cli important --title "Revisar o PR #42" --url https://github.com/…/pull/42
+
+# Send AND wait for the answer (the one an agent wants) — = important + --wait:
 npx pidge-cli ask \
   --title "Aprovar deploy?" --actions yes,no,reply --timeout 600
 
-# Urgent — escalates to an AlarmKit alarm if the human doesn't answer in minutes:
-npx pidge-cli ask \
-  --title "Posso rodar a migration?" --profile escalating --actions yes,no
+# A go/no-go with Face ID — the approval RECIPE (= important + Aprovar/Rejeitar + wait):
+npx pidge-cli approval --title "Deploy em produção?"
+
+# Urgent — breaks through silent/Focus; --escalate forces an AlarmKit alarm:
+npx pidge-cli urgent --title "Saldo caiu de R$ 5k" --escalate
 
 # A thing with a known time — push at T−lead + a lock-screen countdown to the event:
-npx pidge-cli notify \
-  --title "Reunião com o time" --profile event --event-at "2026-06-10T15:00:00"
+npx pidge-cli event \
+  --title "Reunião com o time" --event-at "2026-06-10T15:00:00"
 
 # A chart you generated — uploaded for you, shown on the banner + feed:
-npx pidge-cli notify --title "Gráfico pronto" --image ./chart.png
+npx pidge-cli message --title "Gráfico pronto" --image ./chart.png
 
 # A real artifact — the human previews it on the phone, shares it, saves to Files:
-npx pidge-cli notify --title "Relatório" --file ./relatorio.xlsx
+npx pidge-cli important --title "Relatório" --file ./relatorio.xlsx
 ```
 
-`ask` prints the chosen action as JSON to **stdout** and exits `0`:
+`ask`/`approval` (and any `--wait` send) print the chosen action as JSON to
+**stdout** and exit `0`:
 
 ```json
 { "kind": "acted", "action_id": "yes", "label": "Sim", "text": null,
   "at": "2026-06-08T18:19:51Z", "snooze_until": null }
 ```
 
+## Two axes: the TYPE + the RESPONSE
+
+You pick **one type** (how much it may intrude — the human already configured how each
+arrives), then ORTHOGONALLY decide the **response** (buttons? wait or not?).
+
+**Axis 1 — type** (the married catalog of 5):
+
+| Type | For | Clears when |
+|---|---|---|
+| `pidge message` | só avisar, no action | the human OPENS it |
+| `pidge important` ⭐ | a pendency they should resolve (the DEFAULT) | **Feito** |
+| `pidge urgent` | wake them now (rare, real); `--escalate` = AlarmKit alarm | Feito (cuts the alarm) |
+| `pidge event --event-at <ISO>` | a thing with a known time (countdown LA) | passed / Feito |
+| `pidge live` | track something live (Live Activity) | you end it |
+
+**Axis 2 — response** (composes on ANY type): `--actions sim,nao` / `--custom-action`
+add buttons (free text is always available); `--wait` blocks until the human answers
+(else fire-and-forget — the answer arrives later in `pidge listen --all`). Two shortcuts
+bundle both: **`pidge ask`** = `important --wait` (needs `--actions`); **`pidge approval`**
+= `important` + Aprovar/Rejeitar + Face ID + `--wait`.
+
+> Old names still work as **aliases**: `fyi`→message, `report`→important, `alert`→urgent.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
+| `message` / `important` / `urgent` / `event` / `live` | The 5 message types (axis 1). Fire-and-forget by default; add `--actions`/`--wait` (axis 2) to ask for a reply. `important` is the recommended default. |
+| `ask` | `important --wait` shortcut: send **and block** until the human answers; prints the chosen action JSON. Requires a way to answer (`--actions`/`--custom-action`/`--template`). |
+| `approval` | Go/no-go RECIPE: `important` + Aprovar (Face ID) / Rejeitar + `--wait`. Pass your own `--actions` to override the pair. |
 | `hello` | **v0.11.0 (#217):** your channel's **first-contact WOW** — send the onboarding handshake **and block** until the human confirms. The server narrates a 3-stage Live Activity on the lock screen (Conectando → toque para confirmar → Concluído ✓) so they *see* the agent→human→agent loop close. Run it as your **first** contact on a fresh channel. A thin `ask --template onboarding` wrapper with friendly default copy. |
-| `ask` | Send a notification **and block** until the human answers; prints the chosen action JSON. The default for agents. |
-| `notify` | Send only. Prints the raw 201 JSON; the `correlation_id` + warnings go to stderr. |
+| `notify` | **Deprecated** — send without a type (the server picks the channel default). Prefer a typed send. Prints the raw 201 JSON; the `correlation_id` + warnings go to stderr. |
 | `wait <correlation_id>` | Block on an already-sent notification until it's answered. |
 | `cancel <correlation_id>` | Cancel a **still-scheduled** notification before it fires (idempotent; 409 once it reached the phone). |
 | `inbox` | What you sent: list, `--pending` slice, or `--summary` (counts + answer latency). |
@@ -188,11 +231,11 @@ WebSocket  →  ?wait= long-poll (capped 25 s server-side)  →  plain GETs ever
 --body TEXT             the message shown on the banner
 --body-markdown MD      rich body for the tap-through detail screen
 --subtitle TEXT
---profile ID            delivery profile — the HUMAN owns what each one does:
-                        default · event (needs --event-at; countdown Live Activity) ·
-                        escalating (alarm if unanswered minutes after delivery) ·
-                        the user's custom profiles. See the manifest's `profiles`.
---event-at ISO8601      WHEN the thing happens (a FACT; required by profile event)
+--profile ID            low-level alias of the TYPE — the HUMAN owns what each does:
+                        message · important · urgent · event (needs --event-at) ·
+                        live · the user's custom profiles. Prefer the typed
+                        subcommands above; an explicit --profile still wins.
+--event-at ISO8601      WHEN the thing happens (a FACT; required by event)
 --lead-minutes N        notify/start the countdown N min before event_at (5–240)
 --urgency LEVEL         normal | persistent | alarm (low-level — prefer --profile)
 --image PATH_OR_URL     image on the banner + feed: a local path is uploaded for you
@@ -207,13 +250,16 @@ WebSocket  →  ?wait= long-poll (capped 25 s server-side)  →  plain GETs ever
                         '[{"id":"approve","label":"Aprovar agora"},{"id":"defer","label":"Depois"}]'
 --custom-action SPEC    "id:label[:destructive][:confirm][:biometric][:terminal]"
                         (repeatable — your own buttons; composes with --actions JSON)
+--wait                  RESPONSE axis: block until the human answers (ANY type), then
+                        print chosen_action JSON. Without it: fire-and-forget (the
+                        answer arrives later in `pidge listen --all`). ask/approval imply it.
 --deliver-at ISO8601    schedule for later
 --reply-to URL          also POST the answer to your webhook (HMAC-signed)
 --correlation-id ID     idempotency + routing key (auto-generated if omitted)
 --collapse-key KEY      replace/update a prior notification
 --param KEY=VALUE       pass ANY raw /notify field (repeatable) — future server
                         fields work day-one, no CLI update needed
---timeout SECONDS       ask: default 600 · wait: default 300
+--timeout SECONDS       how long --wait blocks (ask/approval: template suggestion ~3600 · wait: 300)
 --interval SECONDS      FALLBACK poll cadence (default 30) — normally unused: WS or
                         the server-held long-poll (?wait=25) make answers ~instant
 --realtime              force the WebSocket (Node ≥22); --no-realtime = polling only
@@ -224,9 +270,10 @@ WebSocket  →  ?wait= long-poll (capped 25 s server-side)  →  plain GETs ever
 - **`ask` prints `correlation_id=<cid>` as its FIRST stderr line** (minted client-side
   when you don't pass one) — a killed `ask` always leaves the handle behind, so you
   can `pidge wait <cid>` instead of re-sending.
-- **stdout is always machine-readable.** `notify` → the raw 201 JSON; `ask`/`wait` →
-  the `chosen_action` JSON. Everything human (warnings, the correlation_id, snooze
-  notices, armed-escalation and policy-degrade narration) goes to **stderr**.
+- **stdout is always machine-readable.** A fire-and-forget send → the raw 201 JSON; a
+  `--wait` send / `ask` / `approval` / `wait` → the `chosen_action` JSON. Everything
+  human (warnings, the correlation_id, snooze notices, armed-escalation and
+  policy-degrade narration) goes to **stderr**.
 - **Exit codes:** `0` answered · `3` timed out (= *no answer yet*, NOT a failure —
   back off and retry later) · `4` timed out **without one healthy round-trip all
   session** (the CHANNEL looks broken — server/network — tell your human) ·
@@ -234,11 +281,11 @@ WebSocket  →  ?wait= long-poll (capped 25 s server-side)  →  plain GETs ever
 - **Responses are one-and-done.** Every answer closes the notification EXCEPT a
   **snooze** (or a reschedule that set a new time), which re-fires later. `ask`/`wait`
   keep polling through a snooze and print `snooze_until` so you can schedule a re-check.
-- **Profiles degrade, never reject.** An over-ceiling profile is delivered at the
-  channel's allowed level — read `degraded`/`degrade_reason` in the 201 (narrated on
-  stderr). That's the human's policy working; don't retry harder.
-- **`ask --profile tracking` is refused** — tracking is Live-Activity-only and never
-  produces an answer.
+- **Types degrade, never reject.** An over-ceiling type is delivered at the channel's
+  allowed level — read `degraded`/`degrade_reason` in the 201 (narrated on stderr).
+  That's the human's policy working; don't retry harder.
+- **`--wait` / `ask` on `live` is refused** — `live` is status-only and never produces
+  an answer.
 - A genuine follow-up question is a **new** notification, never a second answer on
   the same one.
 

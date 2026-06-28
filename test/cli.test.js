@@ -1076,27 +1076,27 @@ test('#244 — skill install includes the always-on recipe for turn-based agents
 
 // 1) one spec per typed send — each stamps the right template_kind on /notify.
 
-test('#246 — pidge fyi stamps template_kind:fyi and fire-and-forgets', async () => {
+test('perfis-CLI — pidge message stamps template_kind:message and fire-and-forgets', async () => {
   const mock = createMock();
   const port = await mock.start();
-  const out = await runCli(['fyi', '--title', 'Build done', '--body', '2m12s'], port).result;
+  const out = await runCli(['message', '--title', 'Build done', '--body', '2m12s'], port).result;
   await mock.stop();
   assert.equal(out.code, 0, out.stderr);
   const sent = mock.state.notifies.at(-1);
-  assert.equal(sent.template_kind, 'fyi');
+  assert.equal(sent.template_kind, 'message');
   assert.equal(sent.title, 'Build done');
 });
 
-test('#246 — pidge report stamps template_kind:report', async () => {
+test('perfis-CLI — pidge important (⭐ default) stamps template_kind:important', async () => {
   const mock = createMock();
   const port = await mock.start();
-  const out = await runCli(['report', '--title', 'Standup', '--body-markdown', '# Resumo'], port).result;
+  const out = await runCli(['important', '--title', 'Revisar PR', '--body-markdown', '# Resumo'], port).result;
   await mock.stop();
   assert.equal(out.code, 0, out.stderr);
-  assert.equal(mock.state.notifies.at(-1).template_kind, 'report');
+  assert.equal(mock.state.notifies.at(-1).template_kind, 'important');
 });
 
-test('#246 — pidge ask stamps template_kind:ask, send+waits, prints chosen_action', async () => {
+test('perfis-CLI — pidge ask is the shortcut for important + --wait (template_kind:important)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['ask-1'] = {
@@ -1111,7 +1111,7 @@ test('#246 — pidge ask stamps template_kind:ask, send+waits, prints chosen_act
   assert.equal(out.code, 0, out.stderr);
   assert.equal(JSON.parse(out.stdout).action_id, 'yes');
   const sent = mock.state.notifies.at(-1);
-  assert.equal(sent.template_kind, 'ask');
+  assert.equal(sent.template_kind, 'important', 'ask now sends the canonical `important` (no `ask` type in the married catalog)');
   assert.deepEqual(sent.actions, ['yes', 'no']);
 });
 
@@ -1130,23 +1130,23 @@ test('#246 — pidge event stamps template_kind:event with event_at + lead_minut
   assert.equal(sent.lead_minutes, 15);
 });
 
-test('#246 — pidge alert stamps template_kind:alert; --escalate adds escalate:true', async () => {
+test('perfis-CLI — pidge urgent stamps template_kind:urgent; --escalate adds escalate:true', async () => {
   const mock = createMock();
   const port = await mock.start();
 
-  // plain alert: escalate is NOT set
-  let out = await runCli(['alert', '--title', '503 spike'], port).result;
+  // plain urgent: escalate is NOT set
+  let out = await runCli(['urgent', '--title', '503 spike'], port).result;
   assert.equal(out.code, 0, out.stderr);
   let sent = mock.state.notifies.at(-1);
-  assert.equal(sent.template_kind, 'alert');
+  assert.equal(sent.template_kind, 'urgent');
   assert.equal(sent.escalate, undefined, 'no --escalate ⇒ no escalate flag');
 
-  // alert --escalate: escalate:true rides the payload
-  out = await runCli(['alert', '--title', 'API down', '--escalate'], port).result;
+  // urgent --escalate: escalate:true rides the payload
+  out = await runCli(['urgent', '--title', 'API down', '--escalate'], port).result;
   await mock.stop();
   assert.equal(out.code, 0, out.stderr);
   sent = mock.state.notifies.at(-1);
-  assert.equal(sent.template_kind, 'alert');
+  assert.equal(sent.template_kind, 'urgent');
   assert.equal(sent.escalate, true);
 });
 
@@ -1159,9 +1159,118 @@ test('#246 — pidge live stamps template_kind:live', async () => {
   assert.equal(mock.state.notifies.at(-1).template_kind, 'live');
 });
 
-// 2) friendly local errors — fail fast, nothing reaches the server.
+// --- perfis-CLI: the RESPONSE axis (--wait) composes on ANY type --------------
 
-test('#246 — pidge ask WITHOUT a way to answer errors locally (exit 1, no send)', async () => {
+test('perfis-CLI — --wait on a normal type blocks until the answer and prints chosen_action', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['imp-wait'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'yes', label: 'Sim', text: null },
+  };
+  const out = await runCli(
+    ['important', '--wait', '--no-realtime', '--title', 'Posso seguir?', '--actions', 'yes,no', '--correlation-id', 'imp-wait'],
+    port,
+  ).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(JSON.parse(out.stdout).action_id, 'yes', '--wait prints chosen_action JSON to stdout');
+  assert.equal(mock.state.notifies.at(-1).template_kind, 'important');
+});
+
+test('perfis-CLI — WITHOUT --wait a typed send is fire-and-forget (prints the raw 201, exits 0)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['important', '--title', 'fyi-ish', '--actions', 'yes,no'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  // stdout is the raw 201 (has a correlation_id / status), NOT a chosen_action
+  const parsed = JSON.parse(out.stdout);
+  assert.ok(parsed.status || parsed.correlation_id, 'fire-and-forget prints the 201');
+  assert.equal(parsed.action_id, undefined, 'no chosen_action without --wait');
+});
+
+test('perfis-CLI — `live --wait` is refused locally (status-only, never answers)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['live', '--wait', '--title', 'Deploy'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, out.stderr);
+  assert.match(out.stderr, /can't --wait|status-only/);
+  assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
+});
+
+// --- perfis-CLI: the approval RECIPE (important + Aprovar/Rejeitar + Face ID + --wait) ---
+
+test('perfis-CLI — pidge approval injects Aprovar(Face ID)/Rejeitar, waits, prints chosen_action', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['appr-1'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'aprovar', label: 'Aprovar', text: null },
+  };
+  const out = await runCli(
+    ['approval', '--no-realtime', '--title', 'Deploy em produção?', '--correlation-id', 'appr-1'],
+    port,
+  ).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(JSON.parse(out.stdout).action_id, 'aprovar');
+  const sent = mock.state.notifies.at(-1);
+  assert.equal(sent.template_kind, 'important', 'approval is the important type under the hood');
+  // the default pair: Aprovar gated by Face ID (custom id avoids the built-in collision), Rejeitar destructive
+  assert.deepEqual(sent.custom_actions, [
+    { id: 'aprovar', label: 'Aprovar', biometric: true, terminal: true },
+    { id: 'rejeitar', label: 'Rejeitar', style: 'destructive', terminal: true },
+  ]);
+  assert.equal(sent.actions, undefined, 'approval uses custom_actions, not built-in actions');
+});
+
+test('perfis-CLI — pidge approval lets the user OVERRIDE the default pair', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['appr-2'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'yes', label: 'Sim', text: null },
+  };
+  const out = await runCli(
+    ['approval', '--no-realtime', '--title', 'Go?', '--actions', 'yes,no', '--correlation-id', 'appr-2'],
+    port,
+  ).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  const sent = mock.state.notifies.at(-1);
+  assert.equal(sent.template_kind, 'important');
+  assert.deepEqual(sent.actions, ['yes', 'no'], "the user's --actions wins");
+  assert.equal(sent.custom_actions, undefined, 'no default pair injected when the user supplies actions');
+});
+
+// --- perfis-CLI: compat aliases (old names → new canonical type) --------------
+
+test('perfis-CLI — fyi→message, report→important, alert→urgent (mapped + a rename note)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  let out = await runCli(['fyi', '--title', 'x'], port).result;
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(mock.state.notifies.at(-1).template_kind, 'message');
+  assert.match(out.stderr, /renamed → use `pidge message`/);
+
+  out = await runCli(['report', '--title', 'x'], port).result;
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(mock.state.notifies.at(-1).template_kind, 'important');
+  assert.match(out.stderr, /renamed → use `pidge important`/);
+
+  out = await runCli(['alert', '--title', 'x', '--escalate'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  const sent = mock.state.notifies.at(-1);
+  assert.equal(sent.template_kind, 'urgent');
+  assert.equal(sent.escalate, true, 'alert→urgent still honors --escalate');
+  assert.match(out.stderr, /renamed → use `pidge urgent`/);
+});
+
+test('perfis-CLI — the `ask` alias still requires a way to answer (--actions)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['ask', '--no-realtime', '--title', 'Aprovar?'], port).result;
@@ -1170,6 +1279,9 @@ test('#246 — pidge ask WITHOUT a way to answer errors locally (exit 1, no send
   assert.match(out.stderr, /--actions required for ask/);
   assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
 });
+
+// 2) friendly local errors — fail fast, nothing reaches the server.
+// (the `ask`-needs-actions guard is covered above in the alias section.)
 
 test('#246 — pidge event WITHOUT --event-at errors locally with the ISO8601 recipe', async () => {
   const mock = createMock();
@@ -1199,7 +1311,7 @@ test('#246 — an unknown subcommand points at the type catalog (exit 1, no send
   await mock.stop();
   assert.equal(out.code, 1, out.stderr);
   assert.match(out.stderr, /unknown subcommand 'frobnicate'/);
-  assert.match(out.stderr, /fyi · report · ask · event · alert · live/);
+  assert.match(out.stderr, /message · important · urgent · event · live/);
   assert.equal(mock.state.notifies.length, 0);
 });
 
@@ -1213,10 +1325,10 @@ test('#246 — pidge notify warns DEPRECATED but still sends WITHOUT a template_
   await mock.stop();
   assert.equal(out.code, 0, out.stderr);
   assert.match(out.stderr, /deprecated/);
-  assert.match(out.stderr, /0\.14/, 'tells the agent when it goes away');
+  assert.match(out.stderr, /message · important · urgent · event · live/, 'points at the married catalog');
   const sent = mock.state.notifies.at(-1);
   assert.equal(sent.title, 'legado');
-  assert.equal(sent.template_kind, undefined, 'soft-rollout: typeless send, server falls back to fyi');
+  assert.equal(sent.template_kind, undefined, 'typeless send, server picks the channel default');
 });
 
 test('#246 — pidge send is a deprecated alias of notify (warns + sends)', async () => {
@@ -1250,10 +1362,13 @@ test('#246 — skill install includes the "Choose the right type" catalog table'
 
   assert.equal(out.code, 0, out.stderr);
   const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
-  assert.match(skill, /Choose the right type/, 'the type catalog section is present');
-  assert.match(skill, /REQUIRED in 0\.14/);
-  // the table lists all six types
-  for (const t of ['fyi', 'report', 'ask', 'event', 'alert', 'live']) {
+  assert.match(skill, /Two axes: the TYPE \+ the RESPONSE/, 'the two-axes section is present');
+  assert.match(skill, /composes on ANY type/i, 'the response axis is explained');
+  // the married catalog of 5
+  for (const t of ['message', 'important', 'urgent', 'event', 'live']) {
     assert.match(skill, new RegExp(`pidge ${t}`), `skill mentions pidge ${t}`);
   }
+  // the two response shortcuts + pedir-vs-esperar
+  assert.match(skill, /pidge approval/, 'the approval recipe');
+  assert.match(skill, /pedir vs esperar|pedir.*esperar/i, 'teaches pedir vs esperar');
 });
