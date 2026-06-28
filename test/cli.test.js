@@ -1090,7 +1090,7 @@ test('perfis-CLI — pidge message stamps template_kind:message and fire-and-for
 test('perfis-CLI — pidge important (⭐ default) stamps template_kind:important', async () => {
   const mock = createMock();
   const port = await mock.start();
-  const out = await runCli(['important', '--title', 'Revisar PR', '--body-markdown', '# Resumo'], port).result;
+  const out = await runCli(['important', '--title', 'Review PR', '--body-markdown', '# Summary'], port).result;
   await mock.stop();
   assert.equal(out.code, 0, out.stderr);
   assert.equal(mock.state.notifies.at(-1).template_kind, 'important');
@@ -1104,7 +1104,7 @@ test('perfis-CLI — pidge ask is the shortcut for important + --wait (template_
     chosen_action: { kind: 'acted', action_id: 'yes', label: 'Sim', text: null },
   };
   const out = await runCli(
-    ['ask', '--no-realtime', '--title', 'Aprovar deploy?', '--actions', 'yes,no', '--correlation-id', 'ask-1'],
+    ['ask', '--no-realtime', '--title', 'Approve deploy?', '--actions', 'yes,no', '--correlation-id', 'ask-1'],
     port,
   ).result;
   await mock.stop();
@@ -1169,7 +1169,7 @@ test('perfis-CLI — --wait on a normal type blocks until the answer and prints 
     chosen_action: { kind: 'acted', action_id: 'yes', label: 'Sim', text: null },
   };
   const out = await runCli(
-    ['important', '--wait', '--no-realtime', '--title', 'Posso seguir?', '--actions', 'yes,no', '--correlation-id', 'imp-wait'],
+    ['important', '--wait', '--no-realtime', '--title', 'Can I proceed?', '--actions', 'yes,no', '--correlation-id', 'imp-wait'],
     port,
   ).result;
   await mock.stop();
@@ -1200,28 +1200,28 @@ test('perfis-CLI — `live --wait` is refused locally (status-only, never answer
   assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
 });
 
-// --- perfis-CLI: the approval RECIPE (important + Aprovar/Rejeitar + Face ID + --wait) ---
+// --- perfis-CLI: the approval RECIPE (important + Approve/Reject + Face ID + --wait) ---
 
-test('perfis-CLI — pidge approval injects Aprovar(Face ID)/Rejeitar, waits, prints chosen_action', async () => {
+test('perfis-CLI — pidge approval injects Approve(Face ID)/Reject, waits, prints chosen_action', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['appr-1'] = {
     responded: true,
-    chosen_action: { kind: 'acted', action_id: 'aprovar', label: 'Aprovar', text: null },
+    chosen_action: { kind: 'acted', action_id: 'grant', label: 'Approve', text: null },
   };
   const out = await runCli(
-    ['approval', '--no-realtime', '--title', 'Deploy em produção?', '--correlation-id', 'appr-1'],
+    ['approval', '--no-realtime', '--title', 'Deploy to production?', '--correlation-id', 'appr-1'],
     port,
   ).result;
   await mock.stop();
   assert.equal(out.code, 0, out.stderr);
-  assert.equal(JSON.parse(out.stdout).action_id, 'aprovar');
+  assert.equal(JSON.parse(out.stdout).action_id, 'grant');
   const sent = mock.state.notifies.at(-1);
   assert.equal(sent.template_kind, 'important', 'approval is the important type under the hood');
-  // the default pair: Aprovar gated by Face ID (custom id avoids the built-in collision), Rejeitar destructive
+  // the default pair: Approve gated by Face ID (custom id avoids the built-in collision), Reject destructive
   assert.deepEqual(sent.custom_actions, [
-    { id: 'aprovar', label: 'Aprovar', biometric: true, terminal: true },
-    { id: 'rejeitar', label: 'Rejeitar', style: 'destructive', terminal: true },
+    { id: 'grant', label: 'Approve', biometric: true, terminal: true },
+    { id: 'deny', label: 'Reject', style: 'destructive', terminal: true },
   ]);
   assert.equal(sent.actions, undefined, 'approval uses custom_actions, not built-in actions');
 });
@@ -1273,7 +1273,7 @@ test('perfis-CLI — fyi→message, report→important, alert→urgent (mapped +
 test('perfis-CLI — the `ask` alias still requires a way to answer (--actions)', async () => {
   const mock = createMock();
   const port = await mock.start();
-  const out = await runCli(['ask', '--no-realtime', '--title', 'Aprovar?'], port).result;
+  const out = await runCli(['ask', '--no-realtime', '--title', 'Approve?'], port).result;
   await mock.stop();
   assert.equal(out.code, 1, out.stderr);
   assert.match(out.stderr, /--actions required for ask/);
@@ -1368,7 +1368,7 @@ test('#246 — skill install includes the "Choose the right type" catalog table'
   for (const t of ['message', 'important', 'urgent', 'event', 'live']) {
     assert.match(skill, new RegExp(`pidge ${t}`), `skill mentions pidge ${t}`);
   }
-  // the two response shortcuts + pedir-vs-esperar
+  // the two response shortcuts + send-and-go vs wait
   assert.match(skill, /pidge approval/, 'the approval recipe');
-  assert.match(skill, /pedir vs esperar|pedir.*esperar/i, 'teaches pedir vs esperar');
+  assert.match(skill, /send-and-go vs wait/i, 'teaches send-and-go vs wait');
 });

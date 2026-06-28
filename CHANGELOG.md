@@ -16,14 +16,14 @@ axis. No scripts break — the old names keep working as aliases.
 - **feat:** RESPONSE is now its own axis, composing on ANY type — `--actions`/
   `--custom-action` (buttons) + the new **`--wait`** (block until the human answers,
   then print `chosen_action` JSON; without it = fire-and-forget). This is the explicit
-  "pedir vs esperar". (perfis-S2)
+  "send-and-go vs wait". (perfis-S2)
 - **feat:** `pidge ask` is now the shortcut for `important --wait` (still REQUIRES a way
   to answer; preserved behavior). There is no `ask` TYPE in the married catalog — asking
   is a type + buttons + wait. (perfis-S2)
-- **feat:** `pidge approval` — a new go/no-go RECIPE = `important` + Aprovar/Rejeitar +
-  Face ID on Aprovar + `--wait`. Sent as `custom_actions` (only custom actions carry
+- **feat:** `pidge approval` — a new go/no-go RECIPE = `important` + Approve/Reject +
+  Face ID on Approve + `--wait`. Sent as `custom_actions` (only custom actions carry
   `biometric`, and a custom id can't reuse a built-in like approve/reject — so the ids
-  are `aprovar`/`rejeitar`). Pass your own `--actions`/`--custom-action` to override the
+  are `grant`/`deny`). Pass your own `--actions`/`--custom-action` to override the
   pair. (perfis-S2)
 - **docs:** USAGE, per-command help and the generated `SKILL.md` rewritten around the two
   axes (type + response) — mirrors the human's app, drops the dead fyi/report framing.

@@ -16,8 +16,8 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > `pidge message · important · urgent · event · live` (message←fyi, important←report,
 > urgent←alert; old names still work as aliases). **RESPONSE is a separate axis**:
 > `--actions`/`--custom-action` add buttons on ANY type, and **`--wait`** blocks until
-> the human answers — the explicit *pedir vs esperar*. `pidge ask` is now the shortcut
-> for `important --wait`; new **`pidge approval`** = important + Aprovar/Rejeitar + Face
+> the human answers — the explicit *send-and-go vs wait*. `pidge ask` is now the shortcut
+> for `important --wait`; new **`pidge approval`** = important + Approve/Reject + Face
 > ID + wait. `important` is the recommended default.
 >
 > **New in v0.12.0** — CLI bugs batch (all reported by an agent in real use): **`pidge
@@ -123,30 +123,30 @@ export PIDGE_TOKEN=hld_xxx                          # your channel's bearer key
 #  key never has to appear in an agent's chat; explicit env vars win)
 
 # Just inform — fire-and-forget (clears when the human opens it):
-npx pidge-cli message --title "Build verde" --body "2m12s"
+npx pidge-cli message --title "Build green" --body "2m12s"
 
-# A pendency they should resolve — the DEFAULT type (card "aguardando você"):
-npx pidge-cli important --title "Revisar o PR #42" --url https://github.com/…/pull/42
+# A pendency they should resolve — the DEFAULT type ("waiting-for-you" card):
+npx pidge-cli important --title "Review PR #42" --url https://github.com/…/pull/42
 
 # Send AND wait for the answer (the one an agent wants) — = important + --wait:
 npx pidge-cli ask \
-  --title "Aprovar deploy?" --actions yes,no,reply --timeout 600
+  --title "Approve deploy?" --actions yes,no,reply --timeout 600
 
-# A go/no-go with Face ID — the approval RECIPE (= important + Aprovar/Rejeitar + wait):
-npx pidge-cli approval --title "Deploy em produção?"
+# A go/no-go with Face ID — the approval RECIPE (= important + Approve/Reject + wait):
+npx pidge-cli approval --title "Deploy to production?"
 
 # Urgent — breaks through silent/Focus; --escalate forces an AlarmKit alarm:
-npx pidge-cli urgent --title "Saldo caiu de R$ 5k" --escalate
+npx pidge-cli urgent --title "Balance dropped below $5k" --escalate
 
 # A thing with a known time — push at T−lead + a lock-screen countdown to the event:
 npx pidge-cli event \
-  --title "Reunião com o time" --event-at "2026-06-10T15:00:00"
+  --title "Team meeting" --event-at "2026-06-10T15:00:00"
 
 # A chart you generated — uploaded for you, shown on the banner + feed:
-npx pidge-cli message --title "Gráfico pronto" --image ./chart.png
+npx pidge-cli message --title "Chart ready" --image ./chart.png
 
 # A real artifact — the human previews it on the phone, shares it, saves to Files:
-npx pidge-cli important --title "Relatório" --file ./relatorio.xlsx
+npx pidge-cli important --title "Report" --file ./report.xlsx
 ```
 
 `ask`/`approval` (and any `--wait` send) print the chosen action as JSON to
@@ -166,17 +166,17 @@ arrives), then ORTHOGONALLY decide the **response** (buttons? wait or not?).
 
 | Type | For | Clears when |
 |---|---|---|
-| `pidge message` | só avisar, no action | the human OPENS it |
+| `pidge message` | just inform, no action | the human OPENS it |
 | `pidge important` ⭐ | a pendency they should resolve (the DEFAULT) | **Feito** |
 | `pidge urgent` | wake them now (rare, real); `--escalate` = AlarmKit alarm | Feito (cuts the alarm) |
 | `pidge event --event-at <ISO>` | a thing with a known time (countdown LA) | passed / Feito |
 | `pidge live` | track something live (Live Activity) | you end it |
 
-**Axis 2 — response** (composes on ANY type): `--actions sim,nao` / `--custom-action`
+**Axis 2 — response** (composes on ANY type): `--actions yes,no` / `--custom-action`
 add buttons (free text is always available); `--wait` blocks until the human answers
 (else fire-and-forget — the answer arrives later in `pidge listen --all`). Two shortcuts
 bundle both: **`pidge ask`** = `important --wait` (needs `--actions`); **`pidge approval`**
-= `important` + Aprovar/Rejeitar + Face ID + `--wait`.
+= `important` + Approve/Reject + Face ID + `--wait`.
 
 > Old names still work as **aliases**: `fyi`→message, `report`→important, `alert`→urgent.
 
@@ -186,7 +186,7 @@ bundle both: **`pidge ask`** = `important --wait` (needs `--actions`); **`pidge 
 |---|---|
 | `message` / `important` / `urgent` / `event` / `live` | The 5 message types (axis 1). Fire-and-forget by default; add `--actions`/`--wait` (axis 2) to ask for a reply. `important` is the recommended default. |
 | `ask` | `important --wait` shortcut: send **and block** until the human answers; prints the chosen action JSON. Requires a way to answer (`--actions`/`--custom-action`/`--template`). |
-| `approval` | Go/no-go RECIPE: `important` + Aprovar (Face ID) / Rejeitar + `--wait`. Pass your own `--actions` to override the pair. |
+| `approval` | Go/no-go RECIPE: `important` + Approve (Face ID) / Reject + `--wait`. Pass your own `--actions` to override the pair. |
 | `hello` | **v0.11.0 (#217):** your channel's **first-contact WOW** — send the onboarding handshake **and block** until the human confirms. The server narrates a 3-stage Live Activity on the lock screen (Conectando → toque para confirmar → Concluído ✓) so they *see* the agent→human→agent loop close. Run it as your **first** contact on a fresh channel. A thin `ask --template onboarding` wrapper with friendly default copy. |
 | `notify` | **Deprecated** — send without a type (the server picks the channel default). Prefer a typed send. Prints the raw 201 JSON; the `correlation_id` + warnings go to stderr. |
 | `wait <correlation_id>` | Block on an already-sent notification until it's answered. |

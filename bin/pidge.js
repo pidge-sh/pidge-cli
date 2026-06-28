@@ -13,23 +13,23 @@
 //
 //   TWO AXES (perfis, manifest v40+): (1) the TYPE — one married list of 5 the
 //   human configured how to receive: message · important · urgent · event · live;
-//   (2) the RESPONSE — buttons (--actions/--custom-action) + "pedir vs esperar"
+//   (2) the RESPONSE — buttons (--actions/--custom-action) + send-and-go vs wait
 //   (--wait blocks until the human answers). Response composes onto ANY type.
 //
 //   # just inform — fire-and-forget (prints the raw 201)
-//   pidge message --title "Build verde" --body "2m12s"
+//   pidge message --title "Build green" --body "2m12s"
 //
 //   # a pendency the human should resolve (the DEFAULT type) + block on the answer
-//   pidge important --title "Aprovar deploy?" --actions yes,no,reply --wait
+//   pidge important --title "Approve deploy?" --actions yes,no,reply --wait
 //
 //   # a go/no-go decision with Face ID — the approval RECIPE (= important + wait + gate)
-//   pidge approval --title "Deploy em produção?"
+//   pidge approval --title "Deploy to production?"
 //
 //   # urgent: breaks through silent/Focus, escalates to an AlarmKit alarm
-//   pidge urgent --title "Saldo caiu de R$ 5k" --escalate
+//   pidge urgent --title "Balance dropped below $5k" --escalate
 //
 //   # a thing with a known time: push at T−lead + a lock-screen countdown
-//   pidge event --title "Reunião com o time" --event-at "2026-06-10T15:00:00"
+//   pidge event --title "Team meeting" --event-at "2026-06-10T15:00:00"
 //
 //   # block on an already-sent notification (by correlation_id)
 //   pidge wait order-7 --timeout 300
@@ -131,7 +131,7 @@ const OPTIONS = {
   timeout: { type: 'string' },
   interval: { type: 'string' },
   // perfis-S2 response axis: --wait blocks until the human answers (composes on
-  // ANY type — "pedir vs esperar"). ask/approval imply it.
+  // ANY type — send-and-go vs wait). ask/approval imply it.
   wait: { type: 'boolean' },
   // inbox flags (#83)
   pending: { type: 'boolean' },
@@ -178,16 +178,16 @@ USAGE
                                           (Conectando → toque para confirmar → Concluído ✓). send + wait
                                           in one — run it as your FIRST contact on a fresh channel.
   AXIS 1 — TYPE (the married list of 5; the human configured how each arrives):
-  pidge message   [options]               só avisar, no action — clears when the human OPENS it
-  pidge important [options]  ⭐DEFAULT     a pendency the human should resolve (card "aguardando você")
+  pidge message   [options]               just inform, no action — clears when the human OPENS it
+  pidge important [options]  ⭐DEFAULT     a pendency the human should resolve ("waiting-for-you" card)
   pidge urgent    [options]               breaks through silent/Focus; --escalate forces an AlarmKit alarm
   pidge event     [options]               a scheduled thing — needs --event-at (countdown Live Activity)
   pidge live      [options]               an in-flight task with incremental updates (Live Activity)
   AXIS 2 — RESPONSE (composes on ANY type above): --actions/--custom-action add
   buttons; text reply is ALWAYS available; --wait blocks until the human answers
-  (pedir = mande e siga; esperar = --wait). Two shortcuts bundle both axes:
+  (send-and-go vs --wait). Two shortcuts bundle both axes:
   pidge ask      [options]                = important + --wait; needs --actions (prints chosen_action JSON)
-  pidge approval [options]                = important + Aprovar/Rejeitar + Face ID + --wait (a go/no-go)
+  pidge approval [options]                = important + Approve/Reject + Face ID + --wait (a go/no-go)
   COMPAT aliases (old names still work → mapped to the new type):
   pidge fyi→message · report→important · alert→urgent  (event/live unchanged)
   pidge notify [options]                  DEPRECATED — send without a type; prefer a TYPE above
@@ -392,13 +392,13 @@ const HELP = {
   // AXIS 1 — the married catalog of 5 (perfis-S1/S2). The TYPE you pick IS how the
   // human configured it to arrive. RESPONSE (--actions/--wait) composes on any of them.
   message: {
-    summary: 'só avisar — passive info the human reads when they want; no action (clears when they OPEN it).',
+    summary: 'just inform — passive info the human reads when they want; no action (clears when they OPEN it).',
     usage: 'pidge message --title TEXT [--body TEXT | --body-markdown MD] [--image PATH] [--url URL]',
     body: 'Fire-and-forget by default (stdout is the raw 201). Use it for logs, registros and neutral summaries. Need a decision? add --actions + --wait, or use `pidge important`/`pidge approval`. (Replaces the old `fyi`.)',
     opts: [...SEND_OPTS],
   },
   important: {
-    summary: '⭐ the DEFAULT — a pendency the human should resolve (card "aguardando você"; clears on Feito).',
+    summary: '⭐ the DEFAULT — a pendency the human should resolve ("waiting-for-you" card; clears on Done).',
     usage: 'pidge important --title TEXT [--actions yes,no,reply] [--wait] [--body-markdown MD]',
     body: 'Fire-and-forget by default; add --actions/--custom-action for quick-tap buttons and --wait to block until the human answers (prints chosen_action JSON). The most-used type — on the fence between informing and asking, pick this. (Replaces the old `report`.)',
     opts: [...SEND_OPTS],
@@ -429,9 +429,9 @@ const HELP = {
     opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
   },
   approval: {
-    summary: 'a go/no-go RECIPE — = important + Aprovar/Rejeitar + Face ID on Aprovar + --wait.',
+    summary: 'a go/no-go RECIPE — = important + Approve/Reject + Face ID on Approve + --wait.',
     usage: 'pidge approval --title TEXT [--body-markdown MD] [options]',
-    body: 'The easy shortcut for an explicit approval: injects an Aprovar (Face-ID gated) / Rejeitar pair and blocks on the answer. Pass your own --actions/--custom-action to override the default pair. A gated action is detail-screen only (the banner shows no quick buttons by design — gotcha #19).',
+    body: 'The easy shortcut for an explicit approval: injects an Approve (Face-ID gated) / Reject pair and blocks on the answer. Pass your own --actions/--custom-action to override the default pair. A gated action is detail-screen only (the banner shows no quick buttons by design — gotcha #19).',
     opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
   },
   // COMPAT aliases — old names map to the new type (kept so scripts don't break).
@@ -997,12 +997,12 @@ const hasAnswerAffordance = () =>
 // The `approval` recipe's default button pair (perfis-S2 follow-up). Sent as
 // CUSTOM actions, NOT built-ins: only custom_actions can carry `biometric` (Face
 // ID), and a custom id may NOT reuse a built-in id like approve/reject (the server
-// 422s "collides with a built-in") — so the ids are aprovar/rejeitar. Face ID gates
-// the consequential "Aprovar"; "Rejeitar" is the safe (destructive-styled) out. A
-// gated action is detail-screen only (no banner buttons — gotcha #19), by design.
+// 422s "collides with a built-in") — so the ids are grant/deny. Face ID gates the
+// consequential "Approve"; "Reject" is the safe (destructive-styled) out. A gated
+// action is detail-screen only (no banner buttons — gotcha #19), by design.
 const APPROVAL_ACTIONS = [
-  { id: 'aprovar', label: 'Aprovar', biometric: true, terminal: true },
-  { id: 'rejeitar', label: 'Rejeitar', style: 'destructive', terminal: true },
+  { id: 'grant', label: 'Approve', biometric: true, terminal: true },
+  { id: 'deny', label: 'Reject', style: 'destructive', terminal: true },
 ];
 
 // The married catalog of 5 (perfis-S1): one send, stamped with the canonical
@@ -1679,7 +1679,7 @@ async function runSkillInstall() {
   const exits = (m.cli && m.cli.output) || '';
   const skill = `---
 name: pidge
-description: Send rich, actionable iPhone notifications to your human and get their decision back (Pidge). Pick a type (message/important/urgent/event/live) and, orthogonally, a response (buttons + pedir-vs-esperar). Use when finishing long tasks, needing a decision/approval, sending updates with substance, or anything time-anchored. Also covers reading the human's replies/messages back.
+description: Send rich, actionable iPhone notifications to your human and get their decision back (Pidge). Pick a type (message/important/urgent/event/live) and, orthogonally, a response (buttons + send-and-go vs wait). Use when finishing long tasks, needing a decision/approval, sending updates with substance, or anything time-anchored. Also covers reading the human's replies/messages back.
 ---
 
 # Pidge — notify your human, get answers back
@@ -1698,12 +1698,12 @@ decide the **response** (buttons? wait or not?).
 
 | You want to... | Use | The human sees / clears when |
 |---|---|---|
-| só avisar, no action | \`pidge message\` | quiet banner; clears when they OPEN it |
-| a pendency they should resolve ⭐ DEFAULT | \`pidge important\` | card "aguardando você"; clears on **Feito** |
-| a go/no-go DECISION (approve/choose) | \`pidge approval\` | Aprovar/Rejeitar + **Face ID**; clears when they decide |
-| a thing with a known TIME | \`pidge event --event-at <ISO>\` | countdown + lembrete; passed / Feito |
+| just inform, no action | \`pidge message\` | quiet banner; clears when they OPEN it |
+| a pendency they should resolve ⭐ DEFAULT | \`pidge important\` | "waiting-for-you" card; clears on **Done** |
+| a go/no-go DECISION (approve/choose) | \`pidge approval\` | Approve/Reject + **Face ID**; clears when they decide |
+| a thing with a known TIME | \`pidge event --event-at <ISO>\` | countdown + reminder; passed / Done |
 | TRACK something live | \`pidge live\` | Live Activity on the lock; you end it |
-| WAKE them now (rare, real) | \`pidge urgent\` | **alarm** through silent/Focus; Feito cuts it |
+| WAKE them now (rare, real) | \`pidge urgent\` | **alarm** through silent/Focus; Done cuts it |
 
 ⭐ \`important\` is the default — on the fence between informing and asking, pick it.
 (Forget \`fyi\`/\`report\` — they're gone; every send is title + markdown, only the
@@ -1713,15 +1713,15 @@ DELIVERY differs. The old names still work as aliases → message/important/urge
 
 "Asking for a reply" is separate from the type — you don't need \`approval\` to get a button:
 - **Free text** → ALWAYS available; the human can write back on any notification.
-- **Buttons** → optional, any type: \`--actions sim,nao\` (catalog) or \`--custom-action\` (e.g. \`confirmar/adiar\`).
+- **Buttons** → optional, any type: \`--actions yes,no\` (catalog) or \`--custom-action\` (e.g. \`confirm/postpone\`).
 - **Face ID** → \`:biometric\` locks a sensitive button (\`approval\` turns it on by default). A flag, not a type.
-- **pedir vs esperar** — the choice that decides how YOU work:
-  - **pedir** (send and move on): the answer arrives later in \`pidge listen --all\`. For a turn-based agent.
-  - **esperar** (block until they tap): \`--wait\` (or \`pidge ask\`). For when you can't proceed without the decision.
-- \`approval\` is a RECIPE, not magic: = \`important\` + Aprovar/Rejeitar + Face ID + \`--wait\`.
+- **send-and-go vs wait** — the choice that decides how YOU work:
+  - **send-and-go** (fire and continue): the answer arrives later in \`pidge listen --all\`. For a turn-based agent.
+  - **wait** (block until they tap): \`--wait\` (or \`pidge ask\`). For when you can't proceed without the decision.
+- \`approval\` is a RECIPE, not magic: = \`important\` + Approve/Reject + Face ID + \`--wait\`.
 
 Need a TYPED reply (a time/value/name)? \`--actions reply\` ALONE — never yes/no+reply
-together (the human taps the easy button and you get a useless "Sim"). ONE question per send.
+together (the human taps the easy button and you get a useless "Yes"). ONE question per send.
 
 Available subcommands: \`pidge message · important · urgent · event · live\` (+ the
 \`ask\`/\`approval\` shortcuts; \`fyi/report/alert\` aliases; \`notify\` deprecated). Run \`pidge <type> --help\` for each one's flags.
@@ -1850,8 +1850,8 @@ Each poll is one of your turns: pick up the message, do the work, \`pidge ack --
       warnRenamed('alert', 'urgent');
       await doTypedSend('urgent', { wait: !!v.wait, extra: v.escalate ? { escalate: true } : {}, label: 'alert' });
       break;
-    // `approval` = the RECIPE (perfis-S2 follow-up): important + Aprovar/Rejeitar
-    // (Face ID on Aprovar) + --wait. A shortcut for an explicit go/no-go; the human
+    // `approval` = the RECIPE (perfis-S2 follow-up): important + Approve/Reject
+    // (Face ID on Approve) + --wait. A shortcut for an explicit go/no-go; the human
     // can override the pair with their own --actions/--custom-action.
     case 'approval': {
       const extra = hasAnswerAffordance() ? {} : { custom_actions: APPROVAL_ACTIONS };
