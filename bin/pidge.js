@@ -11,14 +11,25 @@
 //    ~/.config/pidge/env — KEY=VALUE — is read instead, so the key can live
 //    OUTSIDE the agent's chat/context entirely, #57)
 //
-//   # send AND block until the human answers, then print the chosen action as JSON
-//   pidge ask --title "Aprovar deploy?" --actions yes,no,reply --timeout 600
+//   TWO AXES (perfis, manifest v40+): (1) the TYPE — one married list of 5 the
+//   human configured how to receive: message · important · urgent · event · live;
+//   (2) the RESPONSE — buttons (--actions/--custom-action) + send-and-go vs wait
+//   (--wait blocks until the human answers). Response composes onto ANY type.
 //
-//   # urgent: escalates to an AlarmKit alarm if unanswered (see the manifest's profiles)
-//   pidge ask --title "Posso rodar a migration?" --profile escalating --actions yes,no
+//   # just inform — fire-and-forget (prints the raw 201)
+//   pidge message --title "Build green" --body "2m12s"
 //
-//   # a thing with a known time: push at T−lead + a lock-screen countdown to the event
-//   pidge notify --title "Reunião com o time" --profile event --event-at "2026-06-10T15:00:00"
+//   # a pendency the human should resolve (the DEFAULT type) + block on the answer
+//   pidge important --title "Approve deploy?" --actions yes,no,reply --wait
+//
+//   # a go/no-go decision with Face ID — the approval RECIPE (= important + wait + gate)
+//   pidge approval --title "Deploy to production?"
+//
+//   # urgent: breaks through silent/Focus, escalates to an AlarmKit alarm
+//   pidge urgent --title "Balance dropped below $5k" --escalate
+//
+//   # a thing with a known time: push at T−lead + a lock-screen countdown
+//   pidge event --title "Team meeting" --event-at "2026-06-10T15:00:00"
 //
 //   # block on an already-sent notification (by correlation_id)
 //   pidge wait order-7 --timeout 300
@@ -119,6 +130,9 @@ const OPTIONS = {
   param: { type: 'string', multiple: true },   // key=value escape hatch → raw /notify field
   timeout: { type: 'string' },
   interval: { type: 'string' },
+  // perfis-S2 response axis: --wait blocks until the human answers (composes on
+  // ANY type — send-and-go vs wait). ask/approval imply it.
+  wait: { type: 'boolean' },
   // inbox flags (#83)
   pending: { type: 'boolean' },
   summary: { type: 'boolean' },
@@ -163,14 +177,20 @@ USAGE
                                           narrated LIVE on the lock screen by a 3-stage Live Activity
                                           (Conectando → toque para confirmar → Concluído ✓). send + wait
                                           in one — run it as your FIRST contact on a fresh channel.
-  TYPED SENDS (#246 — pick the one that matches your INTENT):
-  pidge fyi    [options]                  passive info, no action — log/registro (template_kind fyi)
-  pidge report [options]                  a curated result the human will want to read now (report)
-  pidge ask    [options]                  a DECISION — send AND wait; needs --actions (prints chosen_action JSON)
-  pidge event  [options]                  a scheduled thing with a time — needs --event-at (event)
-  pidge alert  [options]                  an anomaly/error; --escalate forces an AlarmKit alarm (alert)
-  pidge live   [options]                  an in-flight task with incremental updates (live)
-  pidge notify [options]                  DEPRECATED (0.13.x) — send without a type (server falls back to fyi)
+  AXIS 1 — TYPE (the married list of 5; the human configured how each arrives):
+  pidge message   [options]               just inform, no action — clears when the human OPENS it
+  pidge important [options]  ⭐DEFAULT     a pendency the human should resolve ("waiting-for-you" card)
+  pidge urgent    [options]               breaks through silent/Focus; --escalate forces an AlarmKit alarm
+  pidge event     [options]               a scheduled thing — needs --event-at (countdown Live Activity)
+  pidge live      [options]               an in-flight task with incremental updates (Live Activity)
+  AXIS 2 — RESPONSE (composes on ANY type above): --actions/--custom-action add
+  buttons; text reply is ALWAYS available; --wait blocks until the human answers
+  (send-and-go vs --wait). Two shortcuts bundle both axes:
+  pidge ask      [options]                = important + --wait; needs --actions (prints chosen_action JSON)
+  pidge approval [options]                = important + Approve/Reject + Face ID + --wait (a go/no-go)
+  COMPAT aliases (old names still work → mapped to the new type):
+  pidge fyi→message · report→important · alert→urgent  (event/live unchanged)
+  pidge notify [options]                  DEPRECATED — send without a type; prefer a TYPE above
   pidge wait   <correlation_id> [options] block on an already-sent notification
   pidge cancel <correlation_id>           cancel a still-scheduled notification (#56)
   pidge inbox  [--pending|--summary|--all|--limit N]   what you sent: list, pending slice, or counts+latency (#83)
@@ -220,10 +240,10 @@ OPTIONS (notify / ask)
   --template ID            content/action pattern — WHAT you're asking: context (FYI,
                            no buttons) · decision (yes/no/reply) · approval · reminder ·
                            nudge · sensitive (gated, Face ID). Composes with --profile.
-  --profile ID             delivery profile (the HUMAN owns what it does): default ·
-                           event (needs --event-at; countdown Live Activity) ·
-                           escalating (alarm if unanswered minutes after delivery) ·
-                           the user's custom profiles. See the manifest's \`profiles\`.
+  --profile ID             low-level alias of the TYPE axis (the HUMAN owns what it
+                           does): message · important · urgent · event · live ·
+                           the user's custom profiles. Prefer the typed subcommands
+                           above; an explicit --profile still wins. See the manifest.
   --event-at ISO8601       WHEN the thing happens (a FACT; required by profile event)
   --lead-minutes N         notify/start countdown N min before event_at (5–240)
   --urgency LEVEL          normal | persistent | alarm (low-level — prefer --profile)
@@ -233,9 +253,13 @@ OPTIONS (notify / ask)
                            shares and saves on the phone; uploaded automatically (≤25 MB)
   --url URL                deep link the app opens when the user taps (PR, dashboard, log)
   --copy TEXT              value offered as tap-to-copy on the detail (code, token)
-  --actions LIST           comma list: yes,no,approve,reject,accept,decline,later,
-                           done,snooze,reschedule,reply,mute
+  --actions LIST           RESPONSE axis — comma list: yes,no,approve,reject,accept,
+                           decline,later,done,snooze,reschedule,reply,mute (or a JSON
+                           array of custom {id,label} objects). Composes on ANY type.
   --custom-action SPEC     "id:label[:destructive][:confirm][:biometric][:terminal]" (repeatable)
+  --wait                   RESPONSE axis — block until the human answers (any type),
+                           then print chosen_action JSON. Without it: fire-and-forget
+                           (the answer arrives later in \`pidge listen --all\`). ask/approval imply it.
   --deliver-at ISO8601     schedule for later
   --reply-to URL           also POST the answer to your webhook (HMAC-signed)
   --correlation-id ID      idempotency + routing key (auto-generated if omitted)
@@ -247,7 +271,8 @@ OPTIONS (notify / ask)
   --collapse-key KEY       replace/update a prior notification
   --param KEY=VALUE        pass ANY raw /notify field (repeatable) — future server
                            fields work without a CLI update; the manifest is the contract
-  --timeout SECONDS        ask: 600 · wait: 300
+  --timeout SECONDS        how long --wait blocks (ask/approval: template's suggestion,
+                           ~3600 for a decision · wait: 300) — explicit always wins
   --interval SECONDS       FALLBACK poll cadence (default 30) — normally unused: WS or
                            the server-held long-poll (?wait=25) make answers ~instant
 
@@ -262,17 +287,18 @@ ENV
                 shared ~/.config/pidge/env (single-agent only).
 
 OUTPUT
-  stdout is machine-readable (notify→201 JSON; ask/wait→chosen_action JSON);
-  human notices go to stderr. Exit: 0 answered · 3 timed out (no answer yet,
-  not a failure) · 4 timed out WITHOUT ONE healthy round-trip all session (the
-  CHANNEL looks broken — server/network — not the human ignoring you: surface
-  it instead of retrying blindly, #119) · 2 error · 1 usage.
+  stdout is machine-readable (a fire-and-forget send→the raw 201 JSON; a --wait
+  send / ask / approval / wait→chosen_action JSON); human notices go to stderr.
+  Exit: 0 answered · 3 timed out (no answer yet, not a failure) · 4 timed out
+  WITHOUT ONE healthy round-trip all session (the CHANNEL looks broken —
+  server/network — not the human ignoring you: surface it instead of retrying
+  blindly, #119) · 2 error · 1 usage.
 
-Responses are one-and-done EXCEPT snooze/reschedule (they re-fire); ask/wait keep
-polling through a snooze and print snooze_until. Follow-up = a NEW notification.
-An over-ceiling profile is delivered DEGRADED, never rejected — read the 201's
-degraded/degrade_reason (narrated on stderr). profile "tracking" is Live-Activity-
-only: it never produces an answer, so \`ask\` refuses it.
+Responses are one-and-done EXCEPT snooze/reschedule (they re-fire); a --wait send
+keeps polling through a snooze and prints snooze_until. Follow-up = a NEW
+notification. An over-ceiling type is delivered DEGRADED, never rejected — read
+the 201's degraded/degrade_reason (narrated on stderr). \`live\` is status-only:
+it never produces an answer, so --wait/ask refuse it.
 
 Full spec (the contract — always current): GET $PIDGE_URL/api/v1/manifest`;
 
@@ -290,17 +316,18 @@ const OPTION_DOCS = {
   'body-markdown': '--body-markdown MD       rich body for the tap-through detail screen',
   subtitle: '--subtitle TEXT          a secondary line under the title',
   template: '--template ID            content/action pattern: context · decision · approval · reminder · nudge · sensitive',
-  profile: '--profile ID             delivery profile (the human owns it): default · event · escalating · custom',
-  'event-at': '--event-at ISO8601       WHEN the thing happens (required by profile event)',
+  profile: '--profile ID             low-level alias of the TYPE (the human owns it): message · important · urgent · event · live · custom',
+  'event-at': '--event-at ISO8601       WHEN the thing happens (required by event)',
   'lead-minutes': '--lead-minutes N         notify/countdown N min before event_at (5–240)',
-  urgency: '--urgency LEVEL          normal | persistent | alarm (low-level — prefer --profile)',
-  escalate: '--escalate               alert: force an AlarmKit alarm that breaks through silent/Focus',
+  urgency: '--urgency LEVEL          normal | persistent | alarm (low-level — prefer the typed subcommand)',
+  escalate: '--escalate               urgent: force an AlarmKit alarm that breaks through silent/Focus',
   image: '--image PATH_OR_URL      banner+feed image: a local path is uploaded; an https URL is sent as-is',
   file: '--file PATH              a real artifact (xlsx/pdf/csv…) uploaded for the human (≤25 MB)',
   url: '--url URL                deep link the app opens on tap (PR, dashboard, log)',
   copy: '--copy TEXT              tap-to-copy value on the detail screen',
-  actions: '--actions LIST|JSON      comma list from the catalog (yes,no,reply) OR a JSON array of {"id","label"} custom actions',
+  actions: '--actions LIST|JSON      RESPONSE axis: comma list from the catalog (yes,no,reply) OR a JSON array of {"id","label"} custom actions — composes on ANY type',
   'custom-action': '--custom-action SPEC     "id:label[:destructive][:confirm][:biometric][:terminal]" (repeatable)',
+  wait: '--wait                  RESPONSE axis: block until the human answers (any type), then print chosen_action JSON (ask/approval imply it)',
   'deliver-at': '--deliver-at ISO8601     schedule the send for later',
   'reply-to': '--reply-to URL           also POST the answer to your webhook (HMAC-signed)',
   'correlation-id': '--correlation-id ID      idempotency + routing key (auto-generated if omitted)',
@@ -308,7 +335,7 @@ const OPTION_DOCS = {
   after: '--after CID              decision queue (#157): held until that notification is answered',
   'collapse-key': '--collapse-key KEY       replace/update a prior notification',
   param: '--param KEY=VALUE        pass ANY raw /notify field (repeatable) — the manifest is the contract',
-  timeout: '--timeout SECONDS        how long to block (ask: 600 · wait: 300 · listen: 600)',
+  timeout: '--timeout SECONDS        how long --wait blocks (ask/approval: template suggestion ~3600 · wait: 300 · listen: 600)',
   interval: '--interval SECONDS       FALLBACK poll cadence (default 30) — normally unused (WS/long-poll)',
   realtime: '--realtime               force the realtime WebSocket (warn + fall back to polling if unavailable)',
   'no-realtime': '--no-realtime            polling only (skip the WebSocket)',
@@ -330,11 +357,14 @@ const OPTION_DOCS = {
   window: '--window N               reachability window in seconds (default 30)',
   'quiet-nag': '--quiet-nag              silence the "server has new capabilities" nag for this run',
 };
-// Content flags shared by notify / ask / hello.
+// Content flags shared by every send.
 const CONTENT_OPTS = ['title', 'body', 'body-markdown', 'subtitle', 'template', 'profile',
   'event-at', 'lead-minutes', 'urgency', 'image', 'file', 'url', 'copy', 'actions',
   'custom-action', 'deliver-at', 'reply-to', 'correlation-id', 'thread', 'after',
   'collapse-key', 'param'];
+// Typed sends also carry the RESPONSE axis: --wait (block on the answer) + the
+// blocking knobs. (`live` is status-only — it never answers, so it skips these.)
+const SEND_OPTS = [...CONTENT_OPTS, 'wait', 'timeout', 'interval', 'realtime', 'no-realtime'];
 
 const HELP = {
   setup: {
@@ -359,47 +389,72 @@ const HELP = {
     body: 'A thin wrapper over `ask --template onboarding` with friendly default copy. Run it as your FIRST contact on a fresh channel.',
     opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
   },
-  fyi: {
-    summary: 'send passive info the human can read later — no action (#246 type fyi → profile Mensagem).',
-    usage: 'pidge fyi --title TEXT [--body TEXT | --body-markdown MD] [--image PATH] [--url URL]',
-    body: 'Fire-and-forget: stdout is the raw 201. Use it for logs, registros and neutral summaries — if you need a DECISION use `pidge ask`.',
-    opts: [...CONTENT_OPTS],
+  // AXIS 1 — the married catalog of 5 (perfis-S1/S2). The TYPE you pick IS how the
+  // human configured it to arrive. RESPONSE (--actions/--wait) composes on any of them.
+  message: {
+    summary: 'just inform — passive info the human reads when they want; no action (clears when they OPEN it).',
+    usage: 'pidge message --title TEXT [--body TEXT | --body-markdown MD] [--image PATH] [--url URL]',
+    body: 'Fire-and-forget by default (stdout is the raw 201). Use it for logs, registros and neutral summaries. Need a decision? add --actions + --wait, or use `pidge important`/`pidge approval`. (Replaces the old `fyi`.)',
+    opts: [...SEND_OPTS],
   },
-  report: {
-    summary: 'send a curated result/digest the human will want to read now (#246 type report → Relevante).',
-    usage: 'pidge report --title TEXT [--body-markdown MD] [--image PATH] [--url URL]',
-    body: 'Fire-and-forget, like fyi, but flagged as worth reading now (the feed gives it a highlighted hairline).',
-    opts: [...CONTENT_OPTS],
+  important: {
+    summary: '⭐ the DEFAULT — a pendency the human should resolve ("waiting-for-you" card; clears on Done).',
+    usage: 'pidge important --title TEXT [--actions yes,no,reply] [--wait] [--body-markdown MD]',
+    body: 'Fire-and-forget by default; add --actions/--custom-action for quick-tap buttons and --wait to block until the human answers (prints chosen_action JSON). The most-used type — on the fence between informing and asking, pick this. (Replaces the old `report`.)',
+    opts: [...SEND_OPTS],
   },
-  ask: {
-    summary: 'ask the human a yes/no/choice and block until they answer (#246 type ask → Relevante + ação badge).',
-    usage: 'pidge ask --title TEXT --actions yes,no,reply [--reply-to URL] [options]',
-    body: 'Sends, then holds a WebSocket (or polls) until a TERMINAL answer. REQUIRES a way to answer — --actions (catalog or JSON), --custom-action, or a --template that supplies them. A snooze/reschedule re-fires (ask keeps waiting, prints snooze_until). profile "tracking" is refused (it never produces an answer).',
-    opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
+  urgent: {
+    summary: 'breaks through silent/Focus; --escalate forces an AlarmKit alarm. Use for the real and inadiável (<1/day).',
+    usage: 'pidge urgent --title TEXT [--escalate] [--actions yes,no] [--wait]',
+    body: 'A contract of trust: reserve it for what truly can\'t wait. --escalate asks for an AlarmKit alarm that rings through silent + Focus (the human\'s settings still decide). Once DELIVERED an urgent only stops when answered — you can\'t abort it. (Replaces the old `alert`.)',
+    opts: [...SEND_OPTS, 'escalate'],
   },
   event: {
-    summary: 'surface a scheduled thing with a known time — countdown Live Activity (#246 type event → Evento).',
+    summary: 'a scheduled thing with a known time — countdown Live Activity (needs --event-at).',
     usage: 'pidge event --title TEXT --event-at ISO8601 [--lead-minutes N] [--body-markdown MD]',
     body: 'REQUIRES --event-at (ISO8601, e.g. 2026-06-26T14:00-03:00 — no offset ⇒ the user\'s timezone). --lead-minutes (5–240) starts the countdown N min before.',
-    opts: [...CONTENT_OPTS],
-  },
-  alert: {
-    summary: 'flag an anomaly/error needing attention; --escalate forces an AlarmKit alarm (#246 type alert → Urgente).',
-    usage: 'pidge alert --title TEXT [--body TEXT | --body-markdown MD] [--escalate]',
-    body: 'Fire-and-forget. The channel\'s Urgente profile decides the modality; --escalate asks for an AlarmKit alarm that breaks through silent/Focus (the human\'s profile still has the final say).',
-    opts: [...CONTENT_OPTS, 'escalate'],
+    opts: [...SEND_OPTS],
   },
   live: {
-    summary: 'track an in-flight task (deploy/build/trip) with incremental updates (#246 type live → Live Activity).',
+    summary: 'track an in-flight task (deploy/build/trip) with incremental updates (Live Activity). Status-only — never answers.',
     usage: 'pidge live --title TEXT [--body TEXT] [--lead-minutes N]',
-    body: 'Fire-and-forget. Records the live type; the LA-as-primitive is being built — today the send is delivered as a normal notification.',
+    body: 'Fire-and-forget. Records the live type; the LA-as-primitive is being built — today the send is delivered as a normal notification. Use judgement, not a recipe: show what the human WANTS to watch evolve.',
     opts: [...CONTENT_OPTS],
   },
+  // AXIS 2 — the two response shortcuts (bundle a type + buttons + --wait).
+  ask: {
+    summary: 'a DECISION — = important + --wait; needs --actions. Blocks until the human answers (prints chosen_action JSON).',
+    usage: 'pidge ask --title TEXT --actions yes,no,reply [--reply-to URL] [options]',
+    body: 'Shorthand for `important --wait` that REQUIRES a way to answer — --actions (catalog or JSON), --custom-action, or a --template that supplies them. Holds a WebSocket (or polls) until a TERMINAL answer; a snooze/reschedule re-fires (ask keeps waiting, prints snooze_until). `live` is refused (it never answers).',
+    opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
+  },
+  approval: {
+    summary: 'a go/no-go RECIPE — = important + Approve/Reject + Face ID on Approve + --wait.',
+    usage: 'pidge approval --title TEXT [--body-markdown MD] [options]',
+    body: 'The easy shortcut for an explicit approval: injects an Approve (Face-ID gated) / Reject pair and blocks on the answer. Pass your own --actions/--custom-action to override the default pair. A gated action is detail-screen only (the banner shows no quick buttons by design — gotcha #19).',
+    opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
+  },
+  // COMPAT aliases — old names map to the new type (kept so scripts don't break).
+  fyi: {
+    summary: 'COMPAT alias of `pidge message` (renamed in 0.14 — the married catalog). Still works; prefer `message`.',
+    usage: 'pidge fyi … (→ pidge message …)',
+    opts: [...SEND_OPTS],
+  },
+  report: {
+    summary: 'COMPAT alias of `pidge important` (renamed in 0.14). Still works; prefer `important`.',
+    usage: 'pidge report … (→ pidge important …)',
+    opts: [...SEND_OPTS],
+  },
+  alert: {
+    summary: 'COMPAT alias of `pidge urgent` (renamed in 0.14). Still works; prefer `urgent`.',
+    usage: 'pidge alert … (→ pidge urgent …)',
+    opts: [...SEND_OPTS, 'escalate'],
+  },
   notify: {
-    summary: 'DEPRECATED (0.13.x) — send WITHOUT a type; the server falls back to fyi. Use a typed send instead.',
+    summary: 'DEPRECATED — send WITHOUT a type; the server falls back to its default. Use a typed send instead.',
     usage: 'pidge notify [options]',
-    body: 'Kept for one minor for compat retro — it warns and still sends (template_kind defaults to fyi server-side; 0.14 will 422). Prefer `pidge fyi/report/ask/event/alert/live`.',
-    opts: [...CONTENT_OPTS],
+    body: 'Kept for compat — it warns and still sends (no template_kind; the server picks the channel default). Prefer `pidge message/important/urgent/event/live` (or the `ask`/`approval` shortcuts).',
+    opts: [...SEND_OPTS],
   },
   wait: {
     summary: 'block on an already-sent notification until it is answered (prints chosen_action JSON).',
@@ -504,7 +559,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 36;
+const KNOWN_MANIFEST_VERSION = 42;
 const NAG_TTL_MS = 24 * 60 * 60 * 1000; // #241: at most one nag per 24 h
 let newsWarned = false;
 
@@ -932,23 +987,80 @@ async function doNotify(extra = {}) {
   return { ok, info, raw };
 }
 
-// #246: the typed send subcommands (fyi/report/event/alert/live) share notify's
-// fire-and-forget shape — stamp template_kind, POST, print the raw 201, exit
-// (0 ok / 2 failed). `ask` is the one type that send+waits (it needs a decision)
-// and so keeps its own case. `extra` carries alert's escalate:true.
-async function doTypedNotify(kind, extra = {}) {
-  const { ok, info, raw } = await doNotify({ template_kind: kind, ...extra });
-  console.log(raw);
-  if (ok && info.correlation_id)
-    console.error(`pidge: correlation_id=${info.correlation_id} (use: pidge wait ${info.correlation_id})`);
-  process.exit(ok ? 0 : 2);
+// The RESPONSE axis (perfis-S2): true when the send carries SOME way for the human
+// to answer with a tap — built-in actions, custom actions, or a content --template
+// that supplies them. Free-text reply is ALWAYS available, so this is only about
+// buttons. `ask` requires it; `approval` injects a default pair when it's absent.
+const hasAnswerAffordance = () =>
+  v.actions !== undefined || (v['custom-action'] || []).length > 0 || v.template !== undefined;
+
+// The `approval` recipe's default button pair (perfis-S2 follow-up). Sent as
+// CUSTOM actions, NOT built-ins: only custom_actions can carry `biometric` (Face
+// ID), and a custom id may NOT reuse a built-in id like approve/reject (the server
+// 422s "collides with a built-in") — so the ids are grant/deny. Face ID gates the
+// consequential "Approve"; "Reject" is the safe (destructive-styled) out. A gated
+// action is detail-screen only (no banner buttons — gotcha #19), by design.
+const APPROVAL_ACTIONS = [
+  { id: 'grant', label: 'Approve', biometric: true, terminal: true },
+  { id: 'deny', label: 'Reject', style: 'destructive', terminal: true },
+];
+
+// The married catalog of 5 (perfis-S1): one send, stamped with the canonical
+// `template_kind` (message/important/urgent/event/live). The RESPONSE axis is
+// orthogonal: with `wait:false` it's fire-and-forget (print the raw 201, exit);
+// with `wait:true` it mints a cid, sends, and BLOCKS until a terminal answer
+// (print chosen_action JSON). `requireAnswerable` gates `ask`. `extra` carries
+// raw fields (urgent's escalate:true, approval's injected custom_actions).
+async function doTypedSend(kind, { wait = false, extra = {}, requireAnswerable = false, label = kind } = {}) {
+  if (!v.title) die('pidge: --title is required', 1);
+  // `live` is status-only — it never produces an answer, so --wait would block the
+  // full timeout believing the human is deciding. Refuse it (mirror the old ask guard).
+  if (wait && (kind === 'live' || v.profile === 'tracking'))
+    die(`pidge: \`${label}\`${kind === 'live' ? '' : ' --profile tracking'} can't --wait — ${kind === 'live' ? '`live` is' : 'tracking is'} status-only and never produces an answer (drop --wait, or ask with a real type)`, 1);
+  if (requireAnswerable && !hasAnswerAffordance())
+    die(`pidge: --actions required for ${label}. Use --actions yes,no (or approve,reject), --custom-action, or a --template that supplies them.`, 1);
+
+  if (!wait) {
+    const { ok, info, raw } = await doNotify({ template_kind: kind, ...extra });
+    console.log(raw);
+    if (ok && info.correlation_id)
+      console.error(`pidge: correlation_id=${info.correlation_id} (use: pidge wait ${info.correlation_id})`);
+    process.exit(ok ? 0 : 2);
+  }
+
+  // --wait: the cid is minted CLIENT-side when not given, and printed as the FIRST
+  // stderr line (greppable) — a killed/crashed wait always leaves the handle behind,
+  // so the agent can `pidge wait <cid>` instead of re-sending.
+  const cid = v['correlation-id'] || crypto.randomUUID();
+  v['correlation-id'] = cid;
+  console.error(`pidge: correlation_id=${cid}`);
+  const { ok, info } = await doNotify({ template_kind: kind, ...extra });
+  if (!ok) process.exit(2);
+  console.error(`pidge: sent (${info.registered_devices} device(s)) — waiting on ${cid}`);
+  // #132: no --timeout ⇒ obey the template's suggestion from the 201 echo (human
+  // decisions take 30-40 min; a 600 s default misreads them as silence). Explicit wins.
+  let timeout = num(v.timeout, NaN);
+  if (!Number.isFinite(timeout)) {
+    if (info.suggested_ask_timeout) {
+      timeout = info.suggested_ask_timeout;
+      console.error(`pidge: timeout ${Math.round(timeout / 60)} min — suggested by template ${info.template || v.template} (override with --timeout)`);
+    } else {
+      timeout = 600;
+    }
+  }
+  await waitForAnswer(cid, { timeout, interval: num(v.interval, 30) });
 }
 
-// #246: `pidge notify` / `pidge send` (no type) are deprecated for ONE minor
-// (0.13.x) — they still send, and the server falls back to template_kind "fyi"
-// (soft-rollout). 0.14 will 422 a typeless send. The warning is local (stderr).
+// A compat alias (perfis-S1): the OLD type name still works, mapped to the new
+// canonical one — a one-line note points at the rename so muscle-memory migrates.
+function warnRenamed(oldName, newName) {
+  console.error(`pidge: \`pidge ${oldName}\` was renamed → use \`pidge ${newName}\` (the married catalog of 5; the alias keeps working).`);
+}
+
+// `pidge notify` / `pidge send` (no type) are deprecated — they still send, and the
+// server falls back to the channel default. Prefer a typed send. Warning is local.
 function warnDeprecatedSend(name) {
-  console.error(`pidge: \`pidge ${name}\` is deprecated — use a TYPE instead: fyi · report · ask · event · alert · live (see \`pidge help\`). Server-side fallback to \`fyi\` continues in 0.13.x; will be removed in 0.14.`);
+  console.error(`pidge: \`pidge ${name}\` is deprecated — use a TYPE instead: message · important · urgent · event · live (or the ask/approval shortcuts; see \`pidge help\`). It still sends (no template_kind ⇒ the server picks the channel default).`);
 }
 
 // Poll GET /notifications/:cid until a TERMINAL answer, print chosen_action JSON to
@@ -1567,7 +1679,7 @@ async function runSkillInstall() {
   const exits = (m.cli && m.cli.output) || '';
   const skill = `---
 name: pidge
-description: Send rich, actionable iPhone notifications to your human and get their decision back (Pidge). Use when finishing long tasks (report), needing a decision/approval, sending FYIs with substance, or anything time-anchored. Also covers reading the human's replies/messages back.
+description: Send rich, actionable iPhone notifications to your human and get their decision back (Pidge). Pick a type (message/important/urgent/event/live) and, orthogonally, a response (buttons + send-and-go vs wait). Use when finishing long tasks, needing a decision/approval, sending updates with substance, or anything time-anchored. Also covers reading the human's replies/messages back.
 ---
 
 # Pidge — notify your human, get answers back
@@ -1576,23 +1688,43 @@ Generated from manifest v${m.manifest_version} of ${BASE} — re-run \`pidge ski
 
 All commands: \`npx pidge-cli …\` (Node ≥18; reads ~/.config/pidge/env — no token in context). Not set up? \`pidge doctor\` tells you; onboard with \`pidge setup --claim <code>\` (the human copies the code from the Pidge app).
 
-## Choose the right type (REQUIRED in 0.14+)
+## Two axes: the TYPE + the RESPONSE
 
-Every send needs a type. Pick by intent:
+You and your human speak the SAME language. You pick ONE **type** (how much it may
+intrude — the human already configured how each arrives); then, ORTHOGONALLY, you
+decide the **response** (buttons? wait or not?).
 
-| You want to... | Use | Example |
+### Axis 1 — the type (one married list of 5)
+
+| You want to... | Use | The human sees / clears when |
 |---|---|---|
-| Log something the human can read later, no action | \`pidge fyi\` | "Build completed in 2m12s" |
-| Deliver a curated result/digest worth reading now | \`pidge report\` | "Daily standup summary" |
-| Ask the human a yes/no/choice — block until they answer | \`pidge ask\` | "Approve deploy v3.2?" with \`--actions yes,no\` |
-| Surface a scheduled thing (with time) | \`pidge event\` | "Sprint review 14h" with \`--event-at ...\` |
-| Anomaly/error needing attention; add \`--escalate\` for AlarmKit | \`pidge alert\` | "API 503 errors spiked" |
-| Track an in-flight task with incremental updates | \`pidge live\` | "Deploy v3.2 — building..." |
+| just inform, no action | \`pidge message\` | quiet banner; clears when they OPEN it |
+| a pendency they should resolve ⭐ DEFAULT | \`pidge important\` | "waiting-for-you" card; clears on **Done** |
+| a go/no-go DECISION (approve/choose) | \`pidge approval\` | Approve/Reject + **Face ID**; clears when they decide |
+| a thing with a known TIME | \`pidge event --event-at <ISO>\` | countdown + reminder; passed / Done |
+| TRACK something live | \`pidge live\` | Live Activity on the lock; you end it |
+| WAKE them now (rare, real) | \`pidge urgent\` | **alarm** through silent/Focus; Done cuts it |
 
-If unsure: \`fyi\` for passive info, \`ask\` if you need a decision. NEVER use \`pidge send\`
-without a type — in 0.14 it'll 422. (In 0.13.x it warns locally + server falls back to fyi.)
+⭐ \`important\` is the default — on the fence between informing and asking, pick it.
+(Forget \`fyi\`/\`report\` — they're gone; every send is title + markdown, only the
+DELIVERY differs. The old names still work as aliases → message/important/urgent.)
 
-Available CLI commands (typed sends): \`pidge fyi\` · \`pidge report\` · \`pidge ask\` · \`pidge event\` · \`pidge alert\` · \`pidge live\` (and \`pidge notify\`, deprecated). Run \`pidge <type> --help\` for each one's own flags.
+### Axis 2 — the response (composes on ANY type)
+
+"Asking for a reply" is separate from the type — you don't need \`approval\` to get a button:
+- **Free text** → ALWAYS available; the human can write back on any notification.
+- **Buttons** → optional, any type: \`--actions yes,no\` (catalog) or \`--custom-action\` (e.g. \`confirm/postpone\`).
+- **Face ID** → \`:biometric\` locks a sensitive button (\`approval\` turns it on by default). A flag, not a type.
+- **send-and-go vs wait** — the choice that decides how YOU work:
+  - **send-and-go** (fire and continue): the answer arrives later in \`pidge listen --all\`. For a turn-based agent.
+  - **wait** (block until they tap): \`--wait\` (or \`pidge ask\`). For when you can't proceed without the decision.
+- \`approval\` is a RECIPE, not magic: = \`important\` + Approve/Reject + Face ID + \`--wait\`.
+
+Need a TYPED reply (a time/value/name)? \`--actions reply\` ALONE — never yes/no+reply
+together (the human taps the easy button and you get a useless "Yes"). ONE question per send.
+
+Available subcommands: \`pidge message · important · urgent · event · live\` (+ the
+\`ask\`/\`approval\` shortcuts; \`fyi/report/alert\` aliases; \`notify\` deprecated). Run \`pidge <type> --help\` for each one's flags.
 
 ## Pick the right send (decision table)
 
@@ -1672,12 +1804,21 @@ Each poll is one of your turns: pick up the message, do the work, \`pidge ack --
       await runSkillInstall();
       break;
     }
-    // #246: typed sends — fyi/report/event/alert/live stamp template_kind and
-    // fire-and-forget. ask is separate (it send+waits). notify/send are the
-    // deprecated typeless path (server falls back to fyi during the soft-rollout).
-    case 'fyi':
-    case 'report':
-      await doTypedNotify(command);
+    // === AXIS 1 — the married catalog of 5 (perfis-S1/S2). Each stamps the
+    // canonical template_kind. AXIS 2 (response) is orthogonal: --actions/
+    // --custom-action add buttons, --wait blocks on the answer (else fire-and-
+    // forget). notify/send = the deprecated typeless path; ask/approval = the
+    // two shortcuts that bundle a type + response. ===
+    case 'message':
+      await doTypedSend('message', { wait: !!v.wait });
+      break;
+    case 'important':
+      await doTypedSend('important', { wait: !!v.wait });
+      break;
+    case 'urgent':
+      // --escalate ⇒ escalate:true (ask the Urgente profile for an AlarmKit alarm
+      // that breaks through silent/Focus; the human's profile still decides).
+      await doTypedSend('urgent', { wait: !!v.wait, extra: v.escalate ? { escalate: true } : {} });
       break;
     case 'event': {
       // event needs a TIME — validate locally (ISO8601) so the agent fails fast
@@ -1686,17 +1827,37 @@ Each poll is one of your turns: pick up the message, do the work, \`pidge ack --
         die('pidge: --event-at required for event. Use ISO8601: --event-at 2026-06-26T14:00-03:00', 1);
       if (Number.isNaN(Date.parse(v['event-at'])))
         die(`pidge: --event-at ${JSON.stringify(v['event-at'])} is not a valid ISO8601 datetime. Use e.g. --event-at 2026-06-26T14:00-03:00`, 1);
-      await doTypedNotify('event');
+      await doTypedSend('event', { wait: !!v.wait });
       break;
     }
-    case 'alert':
-      // --escalate ⇒ escalate:true (ask the channel's Urgente profile for an
-      // AlarmKit alarm that breaks through silent/Focus; the human's profile decides).
-      await doTypedNotify('alert', v.escalate ? { escalate: true } : {});
-      break;
     case 'live':
-      await doTypedNotify('live');
+      // status-only — pass --wait through so doTypedSend REFUSES it loudly (it
+      // never produces an answer); without --wait it's fire-and-forget.
+      await doTypedSend('live', { wait: !!v.wait });
       break;
+    // --- compat aliases (perfis-S1): old type names → the new canonical 5. They
+    // map to the new template_kind and still honor --wait/--actions, so scripts
+    // and muscle-memory keep working; a one-line note points at the new name.
+    case 'fyi':
+      warnRenamed('fyi', 'message');
+      await doTypedSend('message', { wait: !!v.wait, label: 'fyi' });
+      break;
+    case 'report':
+      warnRenamed('report', 'important');
+      await doTypedSend('important', { wait: !!v.wait, label: 'report' });
+      break;
+    case 'alert':
+      warnRenamed('alert', 'urgent');
+      await doTypedSend('urgent', { wait: !!v.wait, extra: v.escalate ? { escalate: true } : {}, label: 'alert' });
+      break;
+    // `approval` = the RECIPE (perfis-S2 follow-up): important + Approve/Reject
+    // (Face ID on Approve) + --wait. A shortcut for an explicit go/no-go; the human
+    // can override the pair with their own --actions/--custom-action.
+    case 'approval': {
+      const extra = hasAnswerAffordance() ? {} : { custom_actions: APPROVAL_ACTIONS };
+      await doTypedSend('important', { wait: true, extra, label: 'approval' });
+      break;
+    }
     case 'notify':
     case 'send': {
       warnDeprecatedSend(command);
@@ -1733,40 +1894,11 @@ Each poll is one of your turns: pick up the message, do the work, \`pidge ack --
       break;
     }
     case 'ask': {
-      // Send, then block on the answer in one shot. stdout = ONLY chosen_action JSON.
-      // tracking is Live-Activity-only: it NEVER produces a chosen_action, so an ask
-      // would block the full timeout believing the human is deciding.
-      if (v.profile === 'tracking')
-        die('pidge: `ask --profile tracking` makes no sense — tracking never produces an answer (use the live_activities API; need a decision? send a real profile)', 1);
-      if (!v.title) die('pidge: --title is required', 1);
-      // #246: an ask DECLARES a decision — it must say HOW the human answers.
-      // --actions (catalog or JSON), --custom-action, or a --template that supplies
-      // them all satisfy it; none ⇒ a local error (the spec's "no hidden default").
-      if (v.actions === undefined && !(v['custom-action'] || []).length && v.template === undefined)
-        die('pidge: --actions required for ask. Use --actions yes,no,reply or a JSON array.', 1);
-      // The cid is minted CLIENT-side when not given, and printed as the FIRST
-      // stderr line (greppable) — a killed/crashed ask always leaves the handle
-      // behind, so the agent can `pidge wait <cid>` instead of re-sending.
-      const cid = v['correlation-id'] || crypto.randomUUID();
-      v['correlation-id'] = cid;
-      console.error(`pidge: correlation_id=${cid}`);
-      const { ok, info } = await doNotify({ template_kind: 'ask' });
-      if (!ok) process.exit(2);
-      console.error(`pidge: sent (${info.registered_devices} device(s)) — waiting on ${cid}`);
-      // #132: no --timeout ⇒ obey the template's suggestion from the 201 echo
-      // (human decisions take 30-40 min in the wild; a 600 s default misread
-      // them as silence). Explicit --timeout always wins.
-      let timeout = num(v.timeout, NaN);
-      if (!Number.isFinite(timeout)) {
-        if (info.suggested_ask_timeout) {
-          timeout = info.suggested_ask_timeout;
-          const mins = Math.round(timeout / 60);
-          console.error(`pidge: timeout ${mins} min — suggested by template ${info.template || v.template} (override with --timeout)`);
-        } else {
-          timeout = 600;
-        }
-      }
-      await waitForAnswer(cid, { timeout, interval: num(v.interval, 30) });
+      // `ask` = the preserved shortcut: important + --wait + REQUIRES a way to
+      // answer. There is no `ask` TYPE in the married catalog (manifest v40+) —
+      // asking is "a type + buttons + wait". The legacy alias keeps working because
+      // it always ships with buttons. `live`/tracking is refused (it never answers).
+      await doTypedSend('important', { wait: true, requireAnswerable: true, label: 'ask' });
       break;
     }
     case 'wait': {
@@ -2052,8 +2184,8 @@ Each poll is one of your turns: pick up the message, do the work, \`pidge ack --
       break;
     }
     default:
-      // #246: name the bad command and point at the type catalog (a friendlier
-      // landing than dumping the whole USAGE on a typo).
-      die(`pidge: unknown subcommand '${command}'. Try: fyi · report · ask · event · alert · live · notify (deprecated). pidge --help`, 1);
+      // Name the bad command and point at the married catalog + the two response
+      // shortcuts (a friendlier landing than dumping the whole USAGE on a typo).
+      die(`pidge: unknown subcommand '${command}'. Types: message · important · urgent · event · live (response: --actions/--wait, or the ask/approval shortcuts). pidge --help`, 1);
   }
 })();

@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.14.0 — 2026-06-28
+
+The married vocabulary (perfis) — the CLI now speaks the SAME language as the server
+(manifest v42) and the app: ONE list of 5 message types, with RESPONSE as a separate
+axis. No scripts break — the old names keep working as aliases.
+
+- **feat:** the typed sends are renamed to the canonical 5 — `pidge message` ·
+  `important` · `urgent` · `event` · `live` (message←fyi, important←report, urgent←alert;
+  event/live unchanged). `important` is the recommended default. The wire sends the new
+  `template_kind`. (perfis-S1)
+- **feat (compat):** the OLD names still work as aliases — `pidge fyi`→message,
+  `report`→important, `alert`→urgent — mapped to the new type, with a one-line rename
+  note on stderr. Muscle-memory and existing scripts are untouched. (perfis-S1)
+- **feat:** RESPONSE is now its own axis, composing on ANY type — `--actions`/
+  `--custom-action` (buttons) + the new **`--wait`** (block until the human answers,
+  then print `chosen_action` JSON; without it = fire-and-forget). This is the explicit
+  "send-and-go vs wait". (perfis-S2)
+- **feat:** `pidge ask` is now the shortcut for `important --wait` (still REQUIRES a way
+  to answer; preserved behavior). There is no `ask` TYPE in the married catalog — asking
+  is a type + buttons + wait. (perfis-S2)
+- **feat:** `pidge approval` — a new go/no-go RECIPE = `important` + Approve/Reject +
+  Face ID on Approve + `--wait`. Sent as `custom_actions` (only custom actions carry
+  `biometric`, and a custom id can't reuse a built-in like approve/reject — so the ids
+  are `grant`/`deny`). Pass your own `--actions`/`--custom-action` to override the
+  pair. (perfis-S2)
+- **docs:** USAGE, per-command help and the generated `SKILL.md` rewritten around the two
+  axes (type + response) — mirrors the human's app, drops the dead fyi/report framing.
+- **chore:** `KNOWN_MANIFEST_VERSION` 36 → 42 (the live server), silencing the news nag.
+
 ## 0.13.1 — 2026-06-26
 
 Polish from an agent E2E (2026-06-26). No breaking changes.
