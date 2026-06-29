@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.1 — #274-D skill polish
+
+skill polish — catalog-first actions, write-for-the-lock-screen (banner = title+body; body_markdown is detail-only), good-report guidance; gold examples now set a plain --body.
+
 ## 0.15.0 — #274 CLI redesign (F1)
 
 -m/--body-markdown-file input chain, --gated, English hello, --template off the help menu (still accepted), nag knows v46, --wait defaults to 60 min for decisions.

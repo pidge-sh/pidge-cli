@@ -1748,6 +1748,13 @@ Every send is **a TYPE + a markdown body + an OPTIONAL response**. The TYPE (one
 
 ⭐ \`important\` is the default. On the fence between informing and asking, pick \`important\`. \`message\` is only for a true no-action FYI. (\`fyi\`/\`report\`/\`ask\`/\`alert\` still work as silent aliases → message/important/important/urgent.) Run \`pidge <type> --help\` for each one's flags.
 
+## Write for the lock screen (what the human actually sees)
+
+The banner shows your **\`--title\`** and **\`--body\`** (plain text). **\`--body-markdown\` does NOT appear on the banner** — it's the in-app detail screen only. So:
+- **Always give a concise \`--body\`** — the one-line human-readable gist. A title-only send can show as an empty banner (just your channel name).
+- Put the rich part (tables, lists, code, an image) in **\`--body-markdown\`** (and/or \`--image\`) — the human sees it when they tap in.
+- A good send: **title = the answer at a glance · body = the few facts they need to decide/act · body-markdown = the rich detail · ONE ask.** Never ship a title-only notification.
+
 ## Approval has two paths — know which one you're in
 
 **Path A — YOU request it (\`pidge approval\`).** You decided this needs a human sign-off. \`pidge approval\` = \`important\` + an **Approve** (Face-ID gated) / **Reject** pair + \`--wait\`. You send it, you block, and you get \`chosen_action.action_id: "grant"\` (approved) or \`"deny"\` (rejected) back. Use it for money, deletions, irreversible actions.
@@ -1760,7 +1767,7 @@ Every send is **a TYPE + a markdown body + an OPTIONAL response**. The TYPE (one
 
 Asking for a reply is orthogonal to the type — you don't need \`approval\` to get a button.
 - **Free text** is always available; the human can write back on anything.
-- **Buttons** are optional on any type: \`--actions yes,no\` (catalog) or \`--custom-action id:label\`.
+- **Buttons** — reach for a BUILT-IN catalog action FIRST; they're tappable right on the lock-screen banner. Decisions: \`--actions yes,no\` · \`approve,reject\` · \`accept,decline\` · \`later\`; plus \`done\`, \`snooze\`, \`reply\`. Use \`--custom-action id:label\` ONLY when none fit — **custom labels (and any destructive/Face-ID action) render detail-only**, so the human must open the app to answer instead of tapping the banner.
 - **Face ID** on a consequential action: \`--gated\` injects one confirm-with-Face-ID button (use it for money/deletion). It does NOT change loudness — pair with a louder profile if it must also be loud. A flag, not a type.
 - **send-and-go vs wait** — the choice that decides how YOU work:
   - *send-and-go* (default): fire and continue; the answer arrives later in \`pidge listen --all\`.
@@ -1779,12 +1786,14 @@ Need a TYPED reply (a time/value/name)? \`--actions reply\` ALONE — never \`ye
 6. **Don't spam to signal importance.** Consolidate into one markdown body; use \`--collapse-key\` for self-replacing progress, \`--thread\` only for follow-ups over time.
 7. **Be listening when the answer lands, or you lose it.** Ack only AFTER the work is durably done.
 8. **English only, phone-friendly markdown.** Narrow tables (they render), no emoji-spam.
+9. **Banner-first + catalog-first.** Give a real \`--body\` (the banner shows title+body, never body-markdown), and fit decisions into a catalog action (\`yes,no\`/\`approve,reject\`) before inventing a custom label (custom = a tap-through, not a banner tap).
 
 ## Gold examples (full commands)
 
 Pendency with a real table → \`important\`:
 \`\`\`bash
 pidge important --title "Weekly metrics ready" \\
+  --body "Signups 1,204 (+8%) · churn 1.9% (−0.3pp) · table inside" \\
   --body-markdown $'| Metric | This week | Δ |\\n|---|---|---|\\n| Signups | 1,204 | +8% |\\n| Churn | 1.9% | −0.3pp |' \\
   --actions reply
 \`\`\`
@@ -1792,7 +1801,8 @@ pidge important --title "Weekly metrics ready" \\
 Blocking decision → ask→wait loop (handle exit 3):
 \`\`\`bash
 pidge important --title "Run the schema migration?" \\
-  --body-markdown "Dropping \\\`legacy_orders\\\` (412k rows, archived 2025). Not reversible. Safe mid-deploy?" \\
+  --body "Drops legacy_orders (412k rows), not reversible. Safe mid-deploy?" \\
+  --body-markdown "Dropping \\\`legacy_orders\\\` (412k rows, archived 2025). **Not reversible.** Safe to run mid-deploy?" \\
   --actions yes,no --wait --timeout 3600
 # exit 0 → read chosen_action.action_id (yes|no); exit 3 → no answer, treat as NO / hold, re-ask
 \`\`\`
@@ -1800,19 +1810,22 @@ pidge important --title "Run the schema migration?" \\
 Agent-initiated approval (money) → \`pidge approval\`:
 \`\`\`bash
 pidge approval --title "Place \\$4,200 purchase order?" \\
-  --body-markdown "Vendor: Acme · PO #4471 · moves real money." \\
+  --body "Acme · PO #4471 · \\$4,200 — moves real money" \\
+  --body-markdown "Vendor: Acme · PO #4471 · **\\$4,200**, moves real money." \\
   --wait --timeout 3600
 # = important + Approve(Face ID)/Reject + wait; chosen_action.action_id: grant|deny
 \`\`\`
 
 Time-anchored → \`event\` (needs \`--event-at\` in the human's tz):
 \`\`\`bash
-pidge event --event-at "2026-06-30T15:00:00-03:00" --title "Call with accountant"
+pidge event --event-at "2026-06-30T15:00:00-03:00" --title "Call with accountant" \\
+  --body "3pm tomorrow with the accountant"
 \`\`\`
 
 Long markdown without shell-quoting pain → pipe it:
 \`\`\`bash
-generate_report | pidge important --title "Report ready" --body-markdown-file - --actions reply
+generate_report | pidge important --title "Report ready" \\
+  --body "Q2 report ready — revenue, churn, and 3 risks inside" --body-markdown-file - --actions reply
 \`\`\`
 
 ## Gotchas we already paid for
@@ -1823,6 +1836,7 @@ generate_report | pidge important --title "Report ready" --body-markdown-file - 
 - **The ask reply-vs-yes/no trap.** \`--actions yes,no,reply\` lets the human dodge a typed answer with one tap — use \`--actions reply\` alone when you need text.
 - **\`event\` is quiet today** — \`event --event-at\` schedules; the countdown LA-as-primitive is still being built.
 - **content_template still parses as input** (back-compat) but is OFF the menu — if a legacy habit sends \`--template report\`, it silently maps; don't rely on it, don't teach it.
+- **The banner ≠ the detail screen.** Lock-screen banner = \`title\` + \`body\` (plain). \`body_markdown\`/images render only when the human taps in. A send with only \`--title\` can look empty on the lock screen — always include a \`--body\`.
 
 ## How it intrudes (profiles — the human owns them)
 
