@@ -1426,6 +1426,15 @@ test('#246 — skill install includes the "Choose the right type" catalog table'
   assert.match(skill, /pidge important --actions yes,no --wait/, 'the blocking-decision picker row');
   assert.match(skill, /ack_requires_biometric/, 'Path B names the profile knob');
   assert.match(skill, /--gated/, 'the Face-ID flag is documented');
+  // #274-D skill polish — catalog-first · write-for-the-lock-screen · good reports:
+  assert.match(skill, /Write for the lock screen/, 'the lock-screen guidance section is present');
+  assert.match(skill, /catalog action FIRST/, 'the Buttons bullet is catalog-first');
+  // every gold example now sets a plain --body alongside the rich --body-markdown:
+  assert.match(skill, /--body "Signups 1,204/, 'a gold example sets a plain --body');
+  assert.ok(
+    /--body "Signups 1,204[\s\S]*?--body-markdown \$'\| Metric/.test(skill),
+    'the metrics gold example carries BOTH --body and --body-markdown',
+  );
   // and the GENERATED appendix still renders (the mock profiles.decision_table row) —
   // proves the generated half survives the hand-authored rewrite.
   assert.match(skill, /no answer needed → profile omitted/, 'the profiles appendix renders');
