@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.15.2 — #280 the skill self-heals
+
+#280 — the local skill self-heals: any pidge command silently refreshes
+`.claude/skills/pidge/SKILL.md` when the skill revision or manifest version is newer than
+what's installed, so onboarded agents always run the latest skill.
+
+- **feat:** a bumpable `SKILL_REVISION` constant + the live manifest version are baked into a
+  first-line marker (`<!-- pidge-skill rev=R manifest=N -->`) of every generated `SKILL.md`.
+  `ensureSkillFresh()` (run from `checkManifestNews`, which already fires on every command via
+  the `x-pidge-manifest-version` header) compares the installed marker against this CLI's spine
+  and the server's manifest; when either is newer it silently regenerates the skill and prints
+  one stderr note. Only an EXISTING skill is refreshed (never auto-created), at most once per
+  process, fully best-effort (a refresh failure never breaks your command), and `QUIET_NAG`
+  suppresses the note (the regenerate still happens).
+- **note:** this composes with `@latest` — an agent on `npx pidge-cli@latest` picks up a new
+  `SKILL_REVISION` and self-heals the spine on its next command. A PINNED CLI still self-heals
+  on a server manifest bump (via the header) but can't gain a newer hand-authored spine without
+  updating the CLI. BUMP `SKILL_REVISION` in any future sprint that edits the SKILL.md spine.
+
 ## 0.15.1 — #274-D skill polish
 
 skill polish — catalog-first actions, write-for-the-lock-screen (banner = title+body; body_markdown is detail-only), good-report guidance; gold examples now set a plain --body.
