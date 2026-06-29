@@ -562,8 +562,17 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
 const KNOWN_MANIFEST_VERSION = 46;
+// #280: the hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
+// (the non-generated prose in installSkill) changes — an existing install whose
+// baked marker is older than this self-heals on its next pidge command, so an
+// onboarded agent always runs the latest skill without any human action. Start at 1.
+const SKILL_REVISION = 1;
 const NAG_TTL_MS = 24 * 60 * 60 * 1000; // #241: at most one nag per 24 h
 let newsWarned = false;
+// #280: the self-heal runs at most ONCE per process (one regeneration, even when
+// many commands/poll-ticks call checkManifestNews). Non-stale checks stay cheap +
+// repeatable; this only latches once an actual heal is attempted.
+let skillHealed = false;
 
 // #241: a tiny per-install state cache (~/.config/pidge/state.json, per-agent
 // when PIDGE_AGENT is set — same dir as the env file). Best-effort: a read-only
@@ -581,9 +590,14 @@ function writeState(patch) {
   } catch { /* best-effort — the nag just won't persist its throttle */ }
 }
 
-function checkManifestNews(res) {
-  if (QUIET_NAG || newsWarned) return;
+async function checkManifestNews(res) {
   const ver = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
+  // #280: the self-heal runs on EVERY command (its own once-guard + cheap
+  // first-line read), BEFORE the nag throttle below — it must fire even when the
+  // server isn't ahead of KNOWN_MANIFEST_VERSION (a pure spine bump) and even
+  // under QUIET_NAG (which only silences the stderr note, never the regenerate).
+  await ensureSkillFresh(ver);
+  if (QUIET_NAG || newsWarned) return;
   // (c) only when the server is ahead of what THIS CLI knows.
   if (!(ver > KNOWN_MANIFEST_VERSION)) return;
   // #241 throttle: nag at most once per 24 h, and after that window only when the
@@ -605,6 +619,38 @@ function checkManifestNews(res) {
   // (a key only adds your channel's own config). Updating the CLI is the LAST,
   // optional step (only to gain native flags), never the headline.
   console.error(`pidge: the server has NEW capabilities (manifest v${ver}; this CLI knows v${KNOWN_MANIFEST_VERSION}) — pidge is a thin pipe, so you can use any new /notify field RIGHT NOW via --param KEY=VALUE. Read the catalog (whats_new) in the public manifest:  curl $PIDGE_URL/api/v1/manifest  (public; add -H "Authorization: Bearer $PIDGE_TOKEN" to also see your channel's config). Updating the CLI only matters to gain native flags:  npx pidge-cli@latest  (a pinned ref never self-updates). Silence this with --quiet-nag or PIDGE_QUIET_NAG=1.`);
+}
+
+// #280: STRUCTURAL self-heal — keep the LOCAL skill current with zero human action.
+// The installed .claude/skills/pidge/SKILL.md is written once at onboarding and then
+// goes stale silently (a CLI/skill improvement gives an onboarded agent no signal, so
+// it keeps running the old skill). This silently regenerates it when EITHER trigger
+// fires: this CLI's hand-authored spine moved (SKILL_REVISION > the baked rev) OR the
+// server's manifest moved (serverManifestVersion > the baked manifest) — caught from
+// the x-pidge-manifest-version header that already rides every response. So the agent's
+// NEXT session is always current. Only REFRESHES an existing skill (creating one is
+// onboarding's job, never a side effect of an unrelated command), runs at most once per
+// process, and is wholly best-effort: any failure is swallowed — a skill refresh must
+// NEVER break the user's actual command.
+async function ensureSkillFresh(serverManifestVersion) {
+  if (skillHealed) return;
+  try {
+    // Resolve the path the SAME way installSkill does (cwd-relative).
+    const file = path.join(process.cwd(), '.claude', 'skills', 'pidge', 'SKILL.md');
+    if (!fs.existsSync(file)) return; // don't auto-create — only refresh an existing skill
+    const firstLine = fs.readFileSync(file, 'utf8').split('\n', 1)[0] || '';
+    const revM = firstLine.match(/rev=(\d+)/);
+    const manM = firstLine.match(/manifest=(\d+)/);
+    const installedRev = revM ? parseInt(revM[1], 10) : 0;
+    const installedManifest = manM ? parseInt(manM[1], 10) : 0;
+    const stale = SKILL_REVISION > installedRev || (serverManifestVersion || 0) > installedManifest;
+    if (!stale) return;
+    skillHealed = true; // latch BEFORE the network write — attempt the heal at most once
+    const r = await installSkill(BASE, TOKEN); // silent: it already writes the file
+    // Respect QUIET_NAG/PIDGE_QUIET_NAG for the note only — we STILL regenerated.
+    if (!QUIET_NAG)
+      console.error(`pidge: refreshed your local Pidge skill (rev ${SKILL_REVISION}, manifest v${r.manifest_version}) — your next session will use it.`);
+  } catch { /* best-effort — a skill refresh must never break the user's command */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -976,7 +1022,7 @@ async function doNotify(extra = {}) {
   } catch (e) {
     die(`pidge: send failed (network): ${e.message}`, 2);
   }
-  checkManifestNews(res);
+  await checkManifestNews(res);
   const ok = res.status >= 200 && res.status < 300;
   let info = {};
   try { info = JSON.parse(raw); } catch { /* leave {} */ }
@@ -1100,7 +1146,7 @@ async function doWait(cid, { timeout, interval }) {
     const askedAt = Date.now();
     try {
       const res = await fetchT(url, { headers }, (waitS + 10) * 1000);
-      checkManifestNews(res);
+      await checkManifestNews(res);
       if (res.status === 200) {
         health.ok();
         const data = await res.json().catch(() => ({}));
@@ -1414,7 +1460,7 @@ async function runContract() {
   } catch (e) {
     die(`pidge: contract set failed (network): ${e.message}`, 2);
   }
-  checkManifestNews(res);
+  await checkManifestNews(res);
   if (!(res.status >= 200 && res.status < 300)) die(`pidge: contract set failed (${res.status}): ${body}`, 2);
   // stdout = ONLY the operating_contract, never the raw channel JSON. The
   // /channels PATCH echoes the whole channel — INCLUDING "key":"hld_…" — and
@@ -1464,7 +1510,7 @@ async function doSelftest() {
     const res = await fetchT(`${BASE}/api/v1/selftest`, {
       method: 'POST', headers, body: JSON.stringify({ window_seconds: windowS }),
     });
-    checkManifestNews(res);
+    await checkManifestNews(res);
     if (res.status < 200 || res.status >= 300) die(`pidge: selftest: the server refused (${res.status}) — is your key valid? try \`pidge doctor\``, 2);
     fired = await res.json();
   } catch (e) {
@@ -1537,7 +1583,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     process.exit(2);
   }
   const { res, data } = out;
-  checkManifestNews(res);
+  await checkManifestNews(res);
   if (res.status === 401) {
     console.error('pidge doctor: server reachable but the key is INVALID/REVOKED — re-onboard: ask your human for a fresh claim code (Pidge app → Canais → o canal → copiar prompt de setup)');
     process.exit(2);
@@ -1719,7 +1765,8 @@ async function installSkill(base = BASE, token = TOKEN) {
   const profileTable = (m.profiles && m.profiles.decision_table) || [];
   const notes = m.notes || [];
   const exits = (m.cli && m.cli.output) || '';
-  const skill = `---
+  const skill = `<!-- pidge-skill rev=${SKILL_REVISION} manifest=${m.manifest_version} -->
+---
 name: pidge
 description: Send rich, actionable iPhone notifications to your human and get their decision back (Pidge). Every send is a TYPE (message/important/urgent/event/live) plus an OPTIONAL response (buttons + send-and-go vs wait). Use when finishing long tasks, needing a decision/approval, sending updates with substance, or anything time-anchored. Also covers reading the human's replies back.
 ---
@@ -1881,7 +1928,7 @@ A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE w
     }
     case 'whoami': {
       const { res, data } = await fetchWhoami().catch((e) => { die(`pidge: whoami failed (network): ${e.message}`, 2); });
-      checkManifestNews(res);
+      await checkManifestNews(res);
       if (res.status !== 200) die(`pidge: whoami failed (${res.status}): ${JSON.stringify(data)}`, 2);
       console.log(JSON.stringify(data, null, 2));
       console.error(`pidge: you are canal "${data.channel && data.channel.name}" · ${data.devices ?? '?'} device(s)`);
@@ -2017,7 +2064,7 @@ A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE w
       } catch (e) {
         die(`pidge: cancel failed (network): ${e.message}`, 2);
       }
-      checkManifestNews(res);
+      await checkManifestNews(res);
       console.log(raw);
       if (res.status >= 200 && res.status < 300) {
         console.error(`pidge: cancelled ${cid} — nothing will fire`);
@@ -2046,7 +2093,7 @@ A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE w
       } catch (e) {
         die(`pidge: ack failed (network): ${e.message}`, 2);
       }
-      checkManifestNews(res);
+      await checkManifestNews(res);
       console.log(raw);
       if (!(res.status >= 200 && res.status < 300)) die(`pidge: ack failed (${res.status}): ${raw}`, 2);
       let adata = {};
@@ -2085,7 +2132,7 @@ A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE w
       } catch (e) {
         die(`pidge: inbox failed (network): ${e.message}`, 2);
       }
-      checkManifestNews(res);
+      await checkManifestNews(res);
       console.log(raw);
       if (!(res.status >= 200 && res.status < 300)) die(`pidge: inbox failed (${res.status})`, 2);
       let data = {};
@@ -2194,7 +2241,7 @@ A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE w
           draining = true;
           try {
             const res = await fetchT(`${BASE}/api/v1/messages${queueQs}`, { headers });
-            checkManifestNews(res);
+            await checkManifestNews(res);
             if (res.status === 200) {
               health.ok();
               const msgs = (await res.json().catch(() => ({}))).messages || [];
@@ -2253,7 +2300,7 @@ A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE w
           if (waitS > 0) qs.set('wait', String(waitS));
           if (v.all) qs.set('all', 'true');
           const res = await fetchT(`${BASE}/api/v1/messages${qs.size ? `?${qs}` : ''}`, { headers }, (waitS + 10) * 1000);
-          checkManifestNews(res);
+          await checkManifestNews(res);
           if (res.status === 200) {
             health.ok();
             const data = await res.json().catch(() => ({}));

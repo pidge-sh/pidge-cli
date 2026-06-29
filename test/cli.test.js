@@ -335,6 +335,85 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   assert.match(skill, /manifest v16/);
 });
 
+// --- #280: the local skill self-heals (any pidge command refreshes a stale skill) ---
+// The installed SKILL.md carries a first-line marker `<!-- pidge-skill rev=R manifest=N -->`.
+// On EVERY networked command, checkManifestNews → ensureSkillFresh compares it against the
+// CLI's SKILL_REVISION and the server's x-pidge-manifest-version header; a stale skill is
+// silently regenerated so the agent's NEXT session is current. Only EXISTING skills refresh.
+
+function seedSkill(marker, body = 'OLD SKILL BODY') {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-heal-'));
+  const file = path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${marker}\n---\nname: pidge\n---\n\n# Pidge\n\n${body}\n`);
+  return { dir, file };
+}
+
+test('#280 — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // manifest already current (16), but the baked spine is stale (rev=0 < current 1)
+  const { dir, file } = seedSkill('<!-- pidge-skill rev=0 manifest=16 -->', 'STALE SPINE');
+
+  const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const healed = fs.readFileSync(file, 'utf8');
+  assert.match(healed, /^<!-- pidge-skill rev=1 manifest=16 -->/, 'marker rewritten to the current rev');
+  assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
+  assert.match(healed, /name: pidge/, 'a genuine skill was written');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 1, manifest v16\)/, 'one stderr note');
+});
+
+test('#280 — a MANIFEST bump (server version > installed) self-heals the local skill', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // spine is current (rev=1) but the baked manifest is stale (15 < the mock's 16)
+  const { dir, file } = seedSkill('<!-- pidge-skill rev=1 manifest=15 -->', 'STALE BY MANIFEST');
+
+  const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const healed = fs.readFileSync(file, 'utf8');
+  assert.match(healed, /^<!-- pidge-skill rev=1 manifest=16 -->/, 'marker rewritten to the current manifest');
+  assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
+  assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
+});
+
+test('#280 — a FRESH skill (marker already current) is left byte-for-byte, no note', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { dir, file } = seedSkill('<!-- pidge-skill rev=1 manifest=16 -->', 'SENTINEL FRESH — keep me');
+  const original = fs.readFileSync(file, 'utf8');
+
+  const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.equal(fs.readFileSync(file, 'utf8'), original, 'a current skill must NOT be regenerated');
+  assert.ok(!/refreshed your local Pidge skill/.test(stderr), 'no refresh note when fresh');
+});
+
+test('#280 — NO local skill present: a command runs normally, nothing is auto-created', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-heal-none-'));
+
+  const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.ok(!fs.existsSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md')),
+    'the self-heal must never create a skill that was not already there');
+  assert.ok(!/refreshed your local Pidge skill/.test(stderr), 'no refresh note when there is no skill');
+});
+
 // --- #131: listen --all — the single ear --------------------------------------
 
 test('listen --all hears a notification answer and narrates which notification spoke back', async () => {
