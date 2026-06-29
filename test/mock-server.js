@@ -27,6 +27,7 @@ function createMock() {
     deviceReach: null,       // set by a test to exercise the honesty warning
     operatingContract: {},   // PATCH /channels/:id merges into this
     manifestVersion: 16,     // X-Pidge-Manifest-Version header — a test bumps it to fire the news nudge
+    manifestStatus: 200,     // #274 F4: a test sets 500 to force a manifest read failure (skill fuse degrades)
     selftests: {},           // #205: id → {nonce, window_seconds, created, processed}
     selftestSeq: 100,        // next selftest/message id
   };
@@ -120,8 +121,11 @@ function createMock() {
       return;
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/manifest') {
+      // #274 F4: a test can force a manifest read failure (the skill fuse must degrade).
+      if (state.manifestStatus && state.manifestStatus !== 200) return json(res, state.manifestStatus, { error: 'boom' });
       return json(res, 200, {
         manifest_version: 16,
+        // The dead content_template menu is STILL served — the generator must IGNORE it.
         templates: { decision_table: ['need a decision → template decision'] },
         profiles: { decision_table: ['no answer needed → profile omitted'] },
         notes: ['trust the echo'],

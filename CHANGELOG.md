@@ -4,6 +4,8 @@
 
 -m/--body-markdown-file input chain, --gated, English hello, --template off the help menu (still accepted), nag knows v46, --wait defaults to 60 min for decisions.
 
+F3/F4: skill rewritten (two approval paths, English gold examples, no content_template menu, appendix from v46); setup → skill → hello fuse with graceful-degrade.
+
 ## 0.14.0 — 2026-06-28
 
 The married vocabulary (perfis) — the CLI now speaks the SAME language as the server
