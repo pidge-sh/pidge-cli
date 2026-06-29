@@ -107,7 +107,8 @@ const OPTIONS = {
   help: { type: 'boolean', short: 'h' },
   title: { type: 'string' },
   body: { type: 'string' },
-  'body-markdown': { type: 'string' },
+  'body-markdown': { type: 'string', short: 'm' },
+  'body-markdown-file': { type: 'string' },   // a path, or "-" to read stdin (#274)
   subtitle: { type: 'string' },
   template: { type: 'string' },                // content/action pattern (manifest `templates`)
   profile: { type: 'string' },                 // delivery profile id (manifest `profiles`)
@@ -115,6 +116,7 @@ const OPTIONS = {
   'lead-minutes': { type: 'string' },          // notify/countdown lead before event_at
   urgency: { type: 'string' },                 // normal | persistent | alarm (low-level — prefer --profile)
   escalate: { type: 'boolean' },               // #246: alert type — force an AlarmKit alarm (escalate:true)
+  gated: { type: 'boolean' },                  // #274: one Face-ID confirm action (replaces content_template:sensitive)
   image: { type: 'string' },                   // banner+feed image: local path → uploaded; URL → as-is
   file: { type: 'string' },                    // real artifact (xlsx/pdf/csv…): local path → uploaded
   url: { type: 'string' },                     // deep link the app opens on tap (#45)
@@ -237,9 +239,8 @@ OPTIONS (notify / ask)
   --body TEXT              message shown on the banner
   --body-markdown MD       rich body for the tap-through detail screen
   --subtitle TEXT
-  --template ID            content/action pattern — WHAT you're asking: context (FYI,
-                           no buttons) · decision (yes/no/reply) · approval · reminder ·
-                           nudge · sensitive (gated, Face ID). Composes with --profile.
+  --gated                  add a Face-ID confirm on the consequential action (money/deletion)
+  --body-markdown-file F   read the markdown body from a file (or "-" for stdin)
   --profile ID             low-level alias of the TYPE axis (the HUMAN owns what it
                            does): message · important · urgent · event · live ·
                            the user's custom profiles. Prefer the typed subcommands
@@ -314,8 +315,9 @@ const OPTION_DOCS = {
   title: '--title TEXT             (required) the headline',
   body: '--body TEXT              the message shown on the banner',
   'body-markdown': '--body-markdown MD       rich body for the tap-through detail screen',
+  'body-markdown-file': '--body-markdown-file F   read the markdown body from a file (or "-" for stdin) — avoids shell-quoting long markdown',
   subtitle: '--subtitle TEXT          a secondary line under the title',
-  template: '--template ID            content/action pattern: context · decision · approval · reminder · nudge · sensitive',
+  gated: '--gated                  add a Face-ID confirm on the consequential action (money/deletion). Pair with a louder profile if it must also be loud.',
   profile: '--profile ID             low-level alias of the TYPE (the human owns it): message · important · urgent · event · live · custom',
   'event-at': '--event-at ISO8601       WHEN the thing happens (required by event)',
   'lead-minutes': '--lead-minutes N         notify/countdown N min before event_at (5–240)',
@@ -358,13 +360,13 @@ const OPTION_DOCS = {
   'quiet-nag': '--quiet-nag              silence the "server has new capabilities" nag for this run',
 };
 // Content flags shared by every send.
-const CONTENT_OPTS = ['title', 'body', 'body-markdown', 'subtitle', 'template', 'profile',
+const CONTENT_OPTS = ['title', 'body', 'body-markdown', 'body-markdown-file', 'subtitle', 'template', 'profile',
   'event-at', 'lead-minutes', 'urgency', 'image', 'file', 'url', 'copy', 'actions',
   'custom-action', 'deliver-at', 'reply-to', 'correlation-id', 'thread', 'after',
   'collapse-key', 'param'];
 // Typed sends also carry the RESPONSE axis: --wait (block on the answer) + the
 // blocking knobs. (`live` is status-only — it never answers, so it skips these.)
-const SEND_OPTS = [...CONTENT_OPTS, 'wait', 'timeout', 'interval', 'realtime', 'no-realtime'];
+const SEND_OPTS = [...CONTENT_OPTS, 'gated', 'wait', 'timeout', 'interval', 'realtime', 'no-realtime'];
 
 const HELP = {
   setup: {
@@ -386,7 +388,7 @@ const HELP = {
   hello: {
     summary: 'first-contact WOW (#217): your channel\'s debut handshake, narrated live by a 3-stage Live Activity. send + wait in one.',
     usage: 'pidge hello [options]',
-    body: 'A thin wrapper over `ask --template onboarding` with friendly default copy. Run it as your FIRST contact on a fresh channel.',
+    body: 'First contact on a fresh channel: send the debut handshake and block until your human confirms. The server narrates a 3-stage Live Activity.',
     opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
   },
   // AXIS 1 — the married catalog of 5 (perfis-S1/S2). The TYPE you pick IS how the
@@ -425,7 +427,7 @@ const HELP = {
   ask: {
     summary: 'a DECISION — = important + --wait; needs --actions. Blocks until the human answers (prints chosen_action JSON).',
     usage: 'pidge ask --title TEXT --actions yes,no,reply [--reply-to URL] [options]',
-    body: 'Shorthand for `important --wait` that REQUIRES a way to answer — --actions (catalog or JSON), --custom-action, or a --template that supplies them. Holds a WebSocket (or polls) until a TERMINAL answer; a snooze/reschedule re-fires (ask keeps waiting, prints snooze_until). `live` is refused (it never answers).',
+    body: 'Shorthand for important --wait that REQUIRES a way to answer — --actions (catalog or JSON) or --custom-action. Holds a WebSocket (or polls) until a TERMINAL answer; a snooze/reschedule re-fires.',
     opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
   },
   approval: {
@@ -559,7 +561,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 42;
+const KNOWN_MANIFEST_VERSION = 46;
 const NAG_TTL_MS = 24 * 60 * 60 * 1000; // #241: at most one nag per 24 h
 let newsWarned = false;
 
@@ -836,7 +838,13 @@ function buildBody(extra = {}) {
   if (!v.title) die('pidge: --title is required', 1);
   const body = { title: v.title };
   if (v.body !== undefined) body.body = v.body;
-  if (v['body-markdown'] !== undefined) body.body_markdown = v['body-markdown'];
+  if (v['body-markdown-file'] !== undefined) {
+    body.body_markdown = v['body-markdown-file'] === '-'
+      ? fs.readFileSync(0, 'utf8')
+      : fs.readFileSync(v['body-markdown-file'], 'utf8');
+  } else if (v['body-markdown'] !== undefined) {
+    body.body_markdown = v['body-markdown'];
+  }
   if (v.subtitle !== undefined) body.subtitle = v.subtitle;
   if (v.template !== undefined) body.template = v.template;
   if (v.profile !== undefined) body.profile = v.profile;
@@ -872,6 +880,15 @@ function buildBody(extra = {}) {
   }
   for (const spec of v['custom-action'] || []) customActions.push(customActionFromSpec(spec));
   if (customActions.length) body.custom_actions = customActions;
+
+  // #274: --gated synthesizes ONE Face-ID confirm on the consequential action
+  // (money/deletion) — the replacement for the retired content_template:sensitive.
+  // Skip if the agent already supplied a biometric action (don't double-gate).
+  if (v.gated && !(body.custom_actions || []).some((c) => c.biometric)) {
+    body.custom_actions = (body.custom_actions || []).concat([
+      { id: 'confirm_action', label: 'Confirm', style: 'destructive', confirm: true, biometric: true, terminal: true },
+    ]);
+  }
 
   // #246: subcommand-supplied raw fields (template_kind, alert's escalate). Applied
   // before the --param loop so a raw --param can still override in a pinch.
@@ -1044,6 +1061,9 @@ async function doTypedSend(kind, { wait = false, extra = {}, requireAnswerable =
     if (info.suggested_ask_timeout) {
       timeout = info.suggested_ask_timeout;
       console.error(`pidge: timeout ${Math.round(timeout / 60)} min — suggested by template ${info.template || v.template} (override with --timeout)`);
+    } else if (info.requires_action) {
+      timeout = 3600;   // #274/#132: a human decision (buttons present) takes 30-40 min, not 600 s of "silence"
+      console.error(`pidge: no template suggestion — defaulting --wait to 60 min for a decision (override with --timeout)`);
     } else {
       timeout = 600;
     }
@@ -1878,8 +1898,8 @@ Each poll is one of your turns: pick up the message, do the work, \`pidge ack --
       if (v.profile === 'tracking')
         die('pidge: `hello --profile tracking` makes no sense — the handshake waits for a confirmation, which tracking (Live-Activity-only) never produces', 1);
       v.template = 'onboarding';
-      if (v.title === undefined) v.title = 'Seu agente está pronto 🐦';
-      if (v.body === undefined) v.body = 'Toque em Feito ✓ para confirmar que me recebeu — você vai ver o teste fechar na tela.';
+      if (v.title === undefined) v.title = 'Your agent is ready 🐦';
+      if (v.body === undefined) v.body = 'Tap Done ✓ to confirm you received me — proves the round-trip works.';
       const cid = v['correlation-id'] || crypto.randomUUID();
       v['correlation-id'] = cid;
       console.error(`pidge: correlation_id=${cid}`);
