@@ -1035,7 +1035,7 @@ async function doTypedSend(kind, { wait = false, extra = {}, requireAnswerable =
   if (wait && (kind === 'live' || v.profile === 'tracking'))
     die(`pidge: \`${label}\`${kind === 'live' ? '' : ' --profile tracking'} can't --wait — ${kind === 'live' ? '`live` is' : 'tracking is'} status-only and never produces an answer (drop --wait, or ask with a real type)`, 1);
   if (requireAnswerable && !hasAnswerAffordance())
-    die(`pidge: --actions required for ${label}. Use --actions yes,no (or approve,reject), --custom-action, or a --template that supplies them.`, 1);
+    die(`pidge: --actions required for ${label}. Add buttons with --actions yes,no (or approve,reject) or --custom-action id:label.`, 1);
 
   if (!wait) {
     const { ok, info, raw } = await doNotify({ template_kind: kind, ...extra });
@@ -1589,9 +1589,9 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     console.error(`pidge doctor: realtime: INDISPONÍVEL — ${rt.reason}. O \`listen\` degrada pra polling (funciona, menos instantâneo); use --no-realtime pra fixar o piso.`);
   }
   // #229: lead with `pidge hello` — the first-contact WOW (send + wait in one),
-  // the same debut the /agent-setup guide leads with. It's a thin wrapper over
-  // `ask --template onboarding` (the underlying mechanism, if you need it raw).
-  console.error('pidge doctor: all good — try: pidge hello   (first-contact WOW — send + wait in one; equivalent: pidge ask --template onboarding)');
+  // the same debut the /agent-setup guide leads with. (#274: no --template hint —
+  // `pidge hello` IS the entry point; the content_template surface is off the menu.)
+  console.error('pidge doctor: all good — try: pidge hello   (first-contact WOW — send + wait in one)');
   console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version, realtime }));
   process.exit(0);
 }
@@ -1658,6 +1658,7 @@ async function runSetup() {
     console.log(`export PIDGE_URL=${finalBase}`);
     console.log(`export PIDGE_TOKEN=${data.key}`);
     console.error(`pidge: canal "${channelName}" — modo POR-AGENTE (nada gravado em disco). Cole as duas linhas no ambiente de lançamento DESTE agente (systemd/launcher/cron/profile). Cada agente tem a SUA chave; perdeu, é só pegar outro código no app e re-rodar (a chave do canal é a MESMA). NÃO rode --print de dentro de um agente — a chave apareceria no contexto dele.`);
+    await fuseSkillAndHello(finalBase, data.key);
     await runDoctor(finalBase, data.key, 'fresh claim (per-agent env — not stored on disk)');
     return;
   }
@@ -1678,77 +1679,150 @@ async function runSetup() {
   }
   if (!AGENT_ID)
     console.error('pidge: este é o arquivo COMPARTILHADO (single-agent). Vai rodar 2+ agentes nesta máquina? Dê a cada um PIDGE_AGENT=<id> no launch (arquivo isolado por agente) — senão eles enviam como o mesmo canal.');
+  await fuseSkillAndHello(finalBase, data.key);
   await runDoctor(finalBase, data.key, CONFIG_FILE);
 }
 
-// skill install (#110e): persistent Pidge knowledge for Claude Code agents —
-// a skill generated FROM the live manifest (so it can't drift), versioned with
-// manifest_version (re-run to update; whats_new is the changelog).
-async function runSkillInstall() {
+// #274 F4: setup → skill → hello. Best-effort, run right BEFORE the post-setup
+// doctor (runDoctor process.exit()s, so this can't trail it). A skill-install
+// failure is ONE stderr line — NEVER a `--help`/USAGE dump (the graceful-degrade
+// invariant). `pidge hello` stays a printed NEXT step: we don't auto-fire a push
+// the human didn't ask for. base+key are the freshly-claimed ones (the manifest
+// is public, so this works even on the --print path where no token is on disk).
+async function fuseSkillAndHello(base, token) {
+  try {
+    const r = await installSkill(base, token);
+    console.error(`pidge: skill written to ${r.file} (manifest v${r.manifest_version}) — your future sessions in this project know Pidge now`);
+  } catch (e) {
+    console.error(`pidge: skill install skipped (${e.message}) — run \`pidge skill install\` later.`);
+  }
+  console.error('pidge: next → `pidge hello` to send your first handshake and watch it confirm on the lock screen.');
+}
+
+// skill install (#110e; rewritten #274 F3): persistent Pidge knowledge for AI
+// agents — the live manifest's APPENDIX (profiles / notes / exits) wrapped around
+// a HAND-AUTHORED, failure-mode-first spine. The dead content_template
+// `decision_table` is NEVER pulled again, so even an old manifest can't reinject
+// the v46 collision. Non-exiting: RETURNS {file, manifest_version} and THROWS on
+// failure, so callers (`skill install` AND the setup fuse) choose die-vs-degrade.
+async function installSkill(base = BASE, token = TOKEN) {
+  const hdrs = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
   let res, m;
   try {
-    res = await fetchT(`${BASE}/api/v1/manifest`, { headers });
+    res = await fetchT(`${base}/api/v1/manifest`, { headers: hdrs });
     m = await res.json();
   } catch (e) {
-    die(`pidge: could not read the manifest: ${e.message}`, 2);
+    throw new Error(`could not read the manifest: ${e.message}`);
   }
-  if (res.status !== 200) die(`pidge: manifest read failed (${res.status})`, 2);
-  const table = (m.templates && m.templates.decision_table) || [];
+  if (res.status !== 200) throw new Error(`manifest read failed (${res.status})`);
+  // The ONLY generated parts (the appendix). m.templates.* is deliberately UNREAD.
   const profileTable = (m.profiles && m.profiles.decision_table) || [];
   const notes = m.notes || [];
   const exits = (m.cli && m.cli.output) || '';
   const skill = `---
 name: pidge
-description: Send rich, actionable iPhone notifications to your human and get their decision back (Pidge). Pick a type (message/important/urgent/event/live) and, orthogonally, a response (buttons + send-and-go vs wait). Use when finishing long tasks, needing a decision/approval, sending updates with substance, or anything time-anchored. Also covers reading the human's replies/messages back.
+description: Send rich, actionable iPhone notifications to your human and get their decision back (Pidge). Every send is a TYPE (message/important/urgent/event/live) plus an OPTIONAL response (buttons + send-and-go vs wait). Use when finishing long tasks, needing a decision/approval, sending updates with substance, or anything time-anchored. Also covers reading the human's replies back.
 ---
 
 # Pidge — notify your human, get answers back
 
-Generated from manifest v${m.manifest_version} of ${BASE} — re-run \`pidge skill install\` to update (any API response header X-Pidge-Manifest-Version > ${m.manifest_version} means there's news).
+Generated from manifest v${m.manifest_version} of ${BASE} — re-run \`pidge skill install\` to update (any API response header \`X-Pidge-Manifest-Version\` > ${m.manifest_version} means there's news).
 
-All commands: \`npx pidge-cli …\` (Node ≥18; reads ~/.config/pidge/env — no token in context). Not set up? \`pidge doctor\` tells you; onboard with \`pidge setup --claim <code>\` (the human copies the code from the Pidge app).
+All commands: \`npx pidge-cli …\` (Node ≥18; reads \`~/.config/pidge/env\` — no token in your context). Not set up? Run \`pidge doctor\`. Onboard with \`pidge setup --claim <code>\` (the human copies the code from the Pidge app), then \`pidge hello\`.
 
-## Two axes: the TYPE + the RESPONSE
+## One breath
 
-You and your human speak the SAME language. You pick ONE **type** (how much it may
-intrude — the human already configured how each arrives); then, ORTHOGONALLY, you
-decide the **response** (buttons? wait or not?).
+Every send is **a TYPE + a markdown body + an OPTIONAL response**. The TYPE (one of five) decides how much it may intrude — the human already configured how each arrives. The RESPONSE (buttons? wait or not?) is a second, orthogonal axis. **There is no content "template" to choose.**
 
-### Axis 1 — the type (one married list of 5)
+## THE PICKER — situation → exact command
 
-| You want to... | Use | The human sees / clears when |
-|---|---|---|
-| just inform, no action | \`pidge message\` | quiet banner; clears when they OPEN it |
-| a pendency they should resolve ⭐ DEFAULT | \`pidge important\` | "waiting-for-you" card; clears on **Done** |
-| a go/no-go DECISION (approve/choose) | \`pidge approval\` | Approve/Reject + **Face ID**; clears when they decide |
-| a thing with a known TIME | \`pidge event --event-at <ISO>\` | countdown + reminder; passed / Done |
-| TRACK something live | \`pidge live\` | Live Activity on the lock; you end it |
-| WAKE them now (rare, real) | \`pidge urgent\` | **alarm** through silent/Focus; Done cuts it |
+| Your situation | Run |
+|---|---|
+| Just inform — a result/log, no action needed | \`pidge message\` |
+| A pendency they should act on (can wait) ⭐ DEFAULT | \`pidge important\` |
+| You need a decision and CAN'T proceed without it | \`pidge important --actions yes,no --wait\` |
+| YOU are asking for a formal go/no-go (money/risk) | \`pidge approval\` |
+| A thing with a known TIME | \`pidge event --event-at <ISO8601>\` |
+| A live status you'll keep updating | \`pidge live\` |
+| WAKE them now — rare, real, <1/day | \`pidge urgent\` |
 
-⭐ \`important\` is the default — on the fence between informing and asking, pick it.
-(Forget \`fyi\`/\`report\` — they're gone; every send is title + markdown, only the
-DELIVERY differs. The old names still work as aliases → message/important/urgent.)
+⭐ \`important\` is the default. On the fence between informing and asking, pick \`important\`. \`message\` is only for a true no-action FYI. (\`fyi\`/\`report\`/\`ask\`/\`alert\` still work as silent aliases → message/important/important/urgent.) Run \`pidge <type> --help\` for each one's flags.
 
-### Axis 2 — the response (composes on ANY type)
+## Approval has two paths — know which one you're in
 
-"Asking for a reply" is separate from the type — you don't need \`approval\` to get a button:
-- **Free text** → ALWAYS available; the human can write back on any notification.
-- **Buttons** → optional, any type: \`--actions yes,no\` (catalog) or \`--custom-action\` (e.g. \`confirm/postpone\`).
-- **Face ID** → \`:biometric\` locks a sensitive button (\`approval\` turns it on by default). A flag, not a type.
+**Path A — YOU request it (\`pidge approval\`).** You decided this needs a human sign-off. \`pidge approval\` = \`important\` + an **Approve** (Face-ID gated) / **Reject** pair + \`--wait\`. You send it, you block, and you get \`chosen_action.action_id: "grant"\` (approved) or \`"deny"\` (rejected) back. Use it for money, deletions, irreversible actions.
+
+**Path B — your HUMAN requires it (a profile knob).** In the app, the human can turn ON **"Require approval · Face ID"** on any profile (the \`ack_requires_biometric\` knob — **OFF by default everywhere**). When it's ON for, say, \`important\`, then **every ordinary send on that profile silently becomes an Approve-with-Face-ID decision** — even a plain \`pidge important\` with no buttons. The server injects a single \`approve\` action, so the send reads back \`actions:["approve"], requires_action:true, acknowledgeable:false\`, the banner is detail-only, and **the human's tap reaches you as \`chosen_action.action_id: "approve"\`** (poll / webhook / \`pidge listen --all\`). You didn't ask — they imposed it.
+
+**Same screen ("Approve + Face ID"), opposite origin: you REQUEST (A, ids \`grant\`/\`deny\`) vs they REQUIRE (B, id \`approve\`).** To tell at runtime: a send that comes back \`acknowledgeable:false\` + \`requires_action:true\` when you didn't add buttons means Path B is on for that profile — treat the \`approve\` as the positive decision it is. (To check a profile's knob ahead of time, read \`ack_requires_biometric\` from the live manifest: \`curl $PIDGE_URL/api/v1/manifest -H "Authorization: Bearer $PIDGE_TOKEN"\` → \`profiles\`.) Caution: Path B on a busy profile means one approval per send — the human's deliberate high-trust choice.
+
+## The response axis (composes on ANY type)
+
+Asking for a reply is orthogonal to the type — you don't need \`approval\` to get a button.
+- **Free text** is always available; the human can write back on anything.
+- **Buttons** are optional on any type: \`--actions yes,no\` (catalog) or \`--custom-action id:label\`.
+- **Face ID** on a consequential action: \`--gated\` injects one confirm-with-Face-ID button (use it for money/deletion). It does NOT change loudness — pair with a louder profile if it must also be loud. A flag, not a type.
 - **send-and-go vs wait** — the choice that decides how YOU work:
-  - **send-and-go** (fire and continue): the answer arrives later in \`pidge listen --all\`. For a turn-based agent.
-  - **wait** (block until they tap): \`--wait\` (or \`pidge ask\`). For when you can't proceed without the decision.
-- \`approval\` is a RECIPE, not magic: = \`important\` + Approve/Reject + Face ID + \`--wait\`.
+  - *send-and-go* (default): fire and continue; the answer arrives later in \`pidge listen --all\`.
+  - *wait*: \`--wait\` (or \`pidge ask\`) **blocks** until they tap. Use it when you can't proceed.
+- **Exit codes on a \`--wait\`/\`ask\`:** \`0\` = answered (\`chosen_action\` JSON on stdout) · **\`3\` = no answer yet → NOT a failure** (back off, or treat a blocking go/no-go as "no/hold" and re-ask later) · \`2\` = error.
 
-Need a TYPED reply (a time/value/name)? \`--actions reply\` ALONE — never yes/no+reply
-together (the human taps the easy button and you get a useless "Yes"). ONE question per send.
+Need a TYPED reply (a time/value/name)? \`--actions reply\` ALONE — never \`yes,no,reply\` together (the human taps the easy button and you get a useless "Yes"). ONE question per send.
 
-Available subcommands: \`pidge message · important · urgent · event · live\` (+ the
-\`ask\`/\`approval\` shortcuts; \`fyi/report/alert\` aliases; \`notify\` deprecated). Run \`pidge <type> --help\` for each one's flags.
+## Anti-slop rules (judgment a recipe can't teach)
 
-## Pick the right send (decision table)
+1. **One send = one fact = one ask.** Never two questions in a notification.
+2. **Default to \`important\`.** \`message\` only for true no-action FYIs; \`urgent\` is a contract, not a volume knob — **<1/day**, abuse caps your channel.
+3. **There is no content-template menu.** Every send is type + markdown + optional buttons. If you're reaching for \`--template context/report/digest/sensitive\`, stop — that surface is gone (the field still parses as silent back-compat, but don't teach or rely on it).
+4. **Typed answer? \`--actions reply\` ALONE** — never \`yes,no,reply\` together.
+5. **Trust the 201 echo over your intent** — \`degraded\`/\`render_mode\`/\`registered_devices\`. \`registered_devices:0\` ⇒ it went nowhere; don't wait.
+6. **Don't spam to signal importance.** Consolidate into one markdown body; use \`--collapse-key\` for self-replacing progress, \`--thread\` only for follow-ups over time.
+7. **Be listening when the answer lands, or you lose it.** Ack only AFTER the work is durably done.
+8. **English only, phone-friendly markdown.** Narrow tables (they render), no emoji-spam.
 
-${table.map((r) => `- ${r}`).join('\n')}
+## Gold examples (full commands)
+
+Pendency with a real table → \`important\`:
+\`\`\`bash
+pidge important --title "Weekly metrics ready" \\
+  --body-markdown $'| Metric | This week | Δ |\\n|---|---|---|\\n| Signups | 1,204 | +8% |\\n| Churn | 1.9% | −0.3pp |' \\
+  --actions reply
+\`\`\`
+
+Blocking decision → ask→wait loop (handle exit 3):
+\`\`\`bash
+pidge important --title "Run the schema migration?" \\
+  --body-markdown "Dropping \\\`legacy_orders\\\` (412k rows, archived 2025). Not reversible. Safe mid-deploy?" \\
+  --actions yes,no --wait --timeout 3600
+# exit 0 → read chosen_action.action_id (yes|no); exit 3 → no answer, treat as NO / hold, re-ask
+\`\`\`
+
+Agent-initiated approval (money) → \`pidge approval\`:
+\`\`\`bash
+pidge approval --title "Place \\$4,200 purchase order?" \\
+  --body-markdown "Vendor: Acme · PO #4471 · moves real money." \\
+  --wait --timeout 3600
+# = important + Approve(Face ID)/Reject + wait; chosen_action.action_id: grant|deny
+\`\`\`
+
+Time-anchored → \`event\` (needs \`--event-at\` in the human's tz):
+\`\`\`bash
+pidge event --event-at "2026-06-30T15:00:00-03:00" --title "Call with accountant"
+\`\`\`
+
+Long markdown without shell-quoting pain → pipe it:
+\`\`\`bash
+generate_report | pidge important --title "Report ready" --body-markdown-file - --actions reply
+\`\`\`
+
+## Gotchas we already paid for
+
+- **There is no \`pidge reply\`.** \`reply\` is a built-in action id, not a command. To answer the human's composer message, send a normal \`pidge message --thread <id>\` reusing the message's \`thread_id\`.
+- **\`urgent\` is a trust contract, not a button.** It arms an AlarmKit alarm; once delivered you **cannot abort it** (\`pidge cancel\` → 409). Real + unpostponable only, <1/day. Never test it without warning the human.
+- **A 201 ≠ "seen."** \`registered_devices:0\` goes nowhere; \`delivered\` is APNs dispatch, not eyes; only \`seen_at\`/an answer is the human.
+- **The ask reply-vs-yes/no trap.** \`--actions yes,no,reply\` lets the human dodge a typed answer with one tap — use \`--actions reply\` alone when you need text.
+- **\`event\` is quiet today** — \`event --event-at\` schedules; the countdown LA-as-primitive is still being built.
+- **content_template still parses as input** (back-compat) but is OFF the menu — if a legacy habit sends \`--template report\`, it silently maps; don't rely on it, don't teach it.
 
 ## How it intrudes (profiles — the human owns them)
 
@@ -1760,40 +1834,25 @@ ${notes.map((n) => `- ${n}`).join('\n')}
 
 ## Getting answers
 
-- \`pidge ask …\` blocks and prints chosen_action JSON; \`pidge wait <cid>\` blocks on an existing send.
+- \`pidge ask …\` blocks and prints \`chosen_action\` JSON; \`pidge wait <cid>\` blocks on an existing send.
 - \`pidge listen\` blocks until the human MESSAGES you from the app (composer) — run it when idle.
 - ${exits}
 
-## Stay "always-on" while you're turn-based (#244)
+## Stay "always-on" while you're turn-based
 
-A turn-based agent (Claude Code, ChatGPT, anything that only runs when invoked) can still be COMMANDABLE by your human. Two ways, neither needs a daemon:
-
-### Path 1 — an interactive listening window (active session)
-\`\`\`bash
-pidge listen --follow --timeout 300   # hold for 5 min (--timeout is SECONDS), printing messages as they arrive
-\`\`\`
-Good while you're actively working. You stay online until the window closes. \`--follow\` is supervisor-style — it traps the turn — so only use it when you intend to sit and wait.
-
-### Path 2 — a supervisor that polls, no daemon (24/7)
-A \`cron\` job or \`systemd\` timer invokes you every N minutes; each tick runs ONE one-shot listen and exits:
-\`\`\`bash
-pidge listen --timeout 50   # block up to 50s for a message, print it, exit 0 (exit 3 = nothing this tick)
-\`\`\`
-Each poll is one of your turns: pick up the message, do the work, \`pidge ack --up-to <id>\`, then sleep until the next tick. Real always-on without being a daemon. With Claude Code, the built-in \`/loop\` (auto-wake every N min) drives the same loop.
-
-> \`--timeout\` is always SECONDS (not "5m"). One-shot \`pidge listen\` is the polling primitive — loop it from your supervisor; do NOT background it with \`&\` (an orphaned listener eats the queue).
+A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE without a daemon:
+- **Active session:** \`pidge listen --follow --timeout 300\` holds for 5 min, printing messages as they arrive. \`--follow\` traps the turn — use it only when you intend to sit and wait.
+- **Supervisor poll (24/7):** a cron/systemd timer invokes you every N min; each tick runs ONE one-shot \`pidge listen --timeout 50\` (block up to 50s, print, exit 0; exit 3 = nothing this tick), do the work, \`pidge ack --up-to <id>\`, sleep. \`--timeout\` is always SECONDS. Do NOT background \`pidge listen\` with \`&\`.
 
 ## Full spec
 
-\`curl $PIDGE_URL/api/v1/manifest -H "Authorization: Bearer $PIDGE_TOKEN"\` — the always-current contract (fields, templates, custom actions, media, threads, realtime).
+\`curl $PIDGE_URL/api/v1/manifest -H "Authorization: Bearer $PIDGE_TOKEN"\` — the always-current contract (fields, profiles, custom actions, media, threads, realtime).
 `;
   const dir = path.join(process.cwd(), '.claude', 'skills', 'pidge');
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'SKILL.md');
   fs.writeFileSync(file, skill);
-  console.error(`pidge: skill written to ${file} (manifest v${m.manifest_version}) — your future sessions in this project know Pidge now`);
-  console.log(JSON.stringify({ ok: true, file, manifest_version: m.manifest_version }));
-  process.exit(0);
+  return { file, manifest_version: m.manifest_version };
 }
 
 (async () => {
@@ -1821,8 +1880,11 @@ Each poll is one of your turns: pick up the message, do the work, \`pidge ack --
     }
     case 'skill': {
       if (parsed.positionals[1] !== 'install') die('pidge: usage: pidge skill install', 1);
-      await runSkillInstall();
-      break;
+      let r;
+      try { r = await installSkill(); } catch (e) { die(`pidge: ${e.message}`, 2); }
+      console.error(`pidge: skill written to ${r.file} (manifest v${r.manifest_version}) — your future sessions in this project know Pidge now`);
+      console.log(JSON.stringify({ ok: true, file: r.file, manifest_version: r.manifest_version }));
+      process.exit(0);
     }
     // === AXIS 1 — the married catalog of 5 (perfis-S1/S2). Each stamps the
     // canonical template_kind. AXIS 2 (response) is orthogonal: --actions/

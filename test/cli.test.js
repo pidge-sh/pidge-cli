@@ -14,8 +14,9 @@ const { createMock } = require('./mock-server');
 const CLI = path.join(__dirname, '..', 'bin', 'pidge.js');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function runCli(args, port, env = {}) {
+function runCli(args, port, env = {}, cwd = undefined) {
   const child = spawn(process.execPath, [CLI, ...args], {
+    cwd, // #274 F4: setup's skill fuse writes .claude/skills/pidge into cwd — point it at a tmp dir
     env: {
       ...process.env,
       PIDGE_URL: `http://127.0.0.1:${port}`,
@@ -324,7 +325,13 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   assert.equal(out.code, 0, `stderr: ${out.stderr}`);
   const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
   assert.match(skill, /name: pidge/);
-  assert.match(skill, /template decision/);
+  // #274 F3 INVERTED: the dead content_template MENU is gone. The mock STILL serves
+  // templates.decision_table (row text "template decision") — proof the generator now
+  // IGNORES it — and the old "Pick the right send" menu heading is absent. (--template
+  // now appears ONLY inside the skill's "it's gone, don't use it" warnings — that's the
+  // point, so we assert the dead ROW + heading are absent, not the literal word.)
+  assert.ok(!/template decision/.test(skill), 'mock templates.decision_table row must NOT be pulled');
+  assert.ok(!/Pick the right send/.test(skill), 'the dead content_template menu heading is gone');
   assert.match(skill, /manifest v16/);
 });
 
@@ -571,6 +578,47 @@ test('setup --print emits export lines and writes NO file (per-agent, human-run)
   // 0.8.1: the post-setup doctor must NOT claim a config file it never wrote.
   assert.match(stderr, /not stored on disk/);
   assert.doesNotMatch(stderr, /token found \(.*pidge.*env\)/);
+});
+
+// --- #274 F4: setup → skill → hello fuse (graceful-degrade) -------------------
+
+test('#274 F4 — setup fuses the skill install + a `pidge hello` hint, exit 0', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-fuse-'));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-fuse-cwd-'));
+
+  const { result } = runCli(['setup', '--claim', 'claim-ok', '--print', '--url', `http://127.0.0.1:${port}`], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, cwd);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stderr, /skill written/, 'the skill install ran as part of setup');
+  assert.match(stderr, /pidge hello/, 'setup hints the first-contact handshake');
+  // the skill was actually written into cwd, generated from the (mock) manifest
+  const skill = fs.readFileSync(path.join(cwd, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  assert.match(skill, /Approval has two paths/);
+});
+
+test('#274 F4 — a manifest failure DEGRADES (one-line skip + hello hint), setup STILL exits 0, no USAGE dump', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.manifestStatus = 500; // the skill install can't read the manifest
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-fuse-fail-'));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-fuse-fail-cwd-'));
+
+  const { result } = runCli(['setup', '--claim', 'claim-ok', '--print', '--url', `http://127.0.0.1:${port}`], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, cwd);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `setup must survive a skill-install failure; stderr: ${stderr}`);
+  assert.match(stderr, /skill install skipped/, 'the failure is ONE stderr line');
+  assert.match(stderr, /pidge hello/, 'the hello hint still prints');
+  assert.ok(!fs.existsSync(path.join(cwd, '.claude', 'skills', 'pidge', 'SKILL.md')), 'no SKILL.md when the manifest read fails');
+  // graceful-degrade invariant: never fall through to the global USAGE dump.
+  assert.doesNotMatch(stderr, /send an iPhone notification to a human and block until they answer/);
 });
 
 // --- 0.9.0: Fix 2 (ack-after-work) + Fix 3 (degrade) + #181/#182 -------------
@@ -1362,7 +1410,9 @@ test('#246 — skill install includes the "Choose the right type" catalog table'
 
   assert.equal(out.code, 0, out.stderr);
   const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
-  assert.match(skill, /Two axes: the TYPE \+ the RESPONSE/, 'the two-axes section is present');
+  // #274 F3 (B1): the "Two axes" heading is GONE — the spine now leads with the
+  // two-approval-paths distinction (the eval-harness probe that was failing).
+  assert.match(skill, /Approval has two paths/, 'the two-approval-paths section is present');
   assert.match(skill, /composes on ANY type/i, 'the response axis is explained');
   // the married catalog of 5
   for (const t of ['message', 'important', 'urgent', 'event', 'live']) {
@@ -1371,6 +1421,14 @@ test('#246 — skill install includes the "Choose the right type" catalog table'
   // the two response shortcuts + send-and-go vs wait
   assert.match(skill, /pidge approval/, 'the approval recipe');
   assert.match(skill, /send-and-go vs wait/i, 'teaches send-and-go vs wait');
+  // #274 F3 POSITIVE asserts — the hand-authored spine landed in full:
+  assert.match(skill, /THE PICKER/, 'the situation→command picker table');
+  assert.match(skill, /pidge important --actions yes,no --wait/, 'the blocking-decision picker row');
+  assert.match(skill, /ack_requires_biometric/, 'Path B names the profile knob');
+  assert.match(skill, /--gated/, 'the Face-ID flag is documented');
+  // and the GENERATED appendix still renders (the mock profiles.decision_table row) —
+  // proves the generated half survives the hand-authored rewrite.
+  assert.match(skill, /no answer needed → profile omitted/, 'the profiles appendix renders');
 });
 
 // --- #274 F1 (CLI redesign) -------------------------------------------------
