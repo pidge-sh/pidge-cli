@@ -1372,3 +1372,154 @@ test('#246 — skill install includes the "Choose the right type" catalog table'
   assert.match(skill, /pidge approval/, 'the approval recipe');
   assert.match(skill, /send-and-go vs wait/i, 'teaches send-and-go vs wait');
 });
+
+// --- #274 F1 (CLI redesign) -------------------------------------------------
+
+// EDIT 1 — the input chain: --body-markdown-file reads markdown from a file (or
+// stdin via "-"), killing the long-markdown shell-quoting footgun.
+test('#274 — --body-markdown-file reads the markdown body from a file', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-bmf-'));
+  const f = path.join(dir, 'body.md');
+  const md = '# Deploy report\n\n- one\n- two\n\n`code` and "quotes" that would wreck a shell flag';
+  fs.writeFileSync(f, md);
+
+  const out = await runCli(['important', '--title', 't', '--body-markdown-file', f], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(mock.state.notifies.at(-1).body_markdown, md, 'the POST body_markdown equals the file content');
+});
+
+test('#274 — --body-markdown-file - reads the markdown body from stdin', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const md = '# From stdin\n\npiped markdown — no shell quoting needed';
+
+  const { child, result } = runCli(['important', '--title', 't', '--body-markdown-file', '-'], port);
+  child.stdin.write(md);
+  child.stdin.end();
+  const out = await result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(mock.state.notifies.at(-1).body_markdown, md, 'the POST body_markdown equals the piped stdin');
+});
+
+// EDIT 2 — --gated synthesizes exactly one Face-ID confirm custom action.
+test('#274 — --gated synthesizes one Face-ID confirm custom action', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['important', '--title', 't', '--gated'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  const ca = mock.state.notifies.at(-1).custom_actions;
+  assert.equal(ca.length, 1, 'exactly one gated action');
+  assert.equal(ca[0].id, 'confirm_action');
+  assert.equal(ca[0].biometric, true);
+  assert.equal(ca[0].confirm, true);
+  assert.equal(ca[0].terminal, true);
+});
+
+test('#274 — --gated does NOT double-gate when the agent already sent a biometric action', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(
+    ['important', '--title', 't', '--gated', '--custom-action', 'wire:Wire $10k:biometric'],
+    port,
+  ).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  const ca = mock.state.notifies.at(-1).custom_actions;
+  assert.equal(ca.length, 1, 'the agent\'s own biometric action stands — no confirm_action added on top');
+  assert.equal(ca[0].id, 'wire');
+});
+
+// EDIT 4 — --template is off the help menu (still parses as silent input).
+test('#274 — --help strips --template from discovery but lists --gated + --body-markdown-file', async () => {
+  const out = await runCli(['--help'], 1).result;
+  assert.equal(out.code, 0, out.stderr);
+  assert.doesNotMatch(out.stdout, /--template ID/, '--template is off the help menu');
+  assert.match(out.stdout, /--gated/, '--gated is documented');
+  assert.match(out.stdout, /--body-markdown-file/, '--body-markdown-file is documented');
+});
+
+test('#274 — --template still PARSES as silent input (back-compat) even though it is undocumented', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['notify', '--title', 't', '--template', 'reminder'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(mock.state.notifies.at(-1).template, 'reminder', 'the template field still rides the wire');
+});
+
+// EDIT 3 — `hello` default copy is English (USA-first).
+test('#274 — hello default copy is English (no Portuguese)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['hello-en'] = {
+    responded: true,
+    chosen_action: { kind: 'completed', action_id: 'done', label: 'Done ✓', text: null },
+  };
+  const out = await runCli(['hello', '--no-realtime', '--correlation-id', 'hello-en'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  const sent = mock.state.notifies.at(-1);
+  assert.equal(sent.title, 'Your agent is ready 🐦');
+  assert.match(sent.body, /Tap Done . to confirm/);
+  assert.doesNotMatch(sent.title, /Seu agente/);
+  assert.doesNotMatch(sent.body, /Toque em Feito/);
+});
+
+// EDIT 6 — BLOCKER B2: a --wait send with decision buttons defaults to 60 min,
+// not 600 s, when the 201 carries no suggested_ask_timeout (requires_action key).
+test('#274 B2 — a --wait send WITH decision buttons defaults the timeout to 60 min', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['b2-buttons'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'yes', label: 'Sim', text: null },
+  };
+  const out = await runCli(
+    ['important', '--no-realtime', '--title', 'Approve?', '--actions', 'yes,no', '--wait', '--correlation-id', 'b2-buttons'],
+    port,
+  ).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /defaulting --wait to 60 min for a decision/, 'the decision-timeout default fired');
+});
+
+test('#274 B2 — a no-buttons --wait send still defaults to 600 s (NOT a decision)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['b2-quiet'] = {
+    responded: true,
+    chosen_action: { kind: 'completed', action_id: 'done', label: 'Feito ✓', text: null },
+  };
+  const out = await runCli(
+    ['important', '--no-realtime', '--title', 'FYI', '--wait', '--correlation-id', 'b2-quiet'],
+    port,
+  ).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.doesNotMatch(out.stderr, /60 min for a decision/, 'no buttons ⇒ no decision default');
+  assert.doesNotMatch(out.stderr, /suggested by template/, 'and no template suggestion either ⇒ the 600 s else-branch');
+});
+
+test('#274 B2 — `pidge approval` (injected Face-ID pair) reads requires_action and gets 60 min', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['b2-approval'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'grant', label: 'Approve', text: null },
+  };
+  const out = await runCli(
+    ['approval', '--no-realtime', '--title', 'Deploy to prod?', '--correlation-id', 'b2-approval'],
+    port,
+  ).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  // approval injects APPROVAL_ACTIONS (custom_actions) → the server keys
+  // requires_action:true on them even though hasAnswerAffordance() is local-false.
+  assert.equal(mock.state.notifies.at(-1).custom_actions.length, 2, 'the Approve/Reject pair was injected');
+  assert.match(out.stderr, /defaulting --wait to 60 min for a decision/);
+});

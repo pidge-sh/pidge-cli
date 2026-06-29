@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.0 — #274 CLI redesign (F1)
+
+-m/--body-markdown-file input chain, --gated, English hello, --template off the help menu (still accepted), nag knows v46, --wait defaults to 60 min for decisions.
+
 ## 0.14.0 — 2026-06-28
 
 The married vocabulary (perfis) — the CLI now speaks the SAME language as the server

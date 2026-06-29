@@ -160,11 +160,19 @@ function createMock() {
         let parsed = {};
         try { parsed = JSON.parse(body); } catch { /* keep {} */ }
         state.notifies.push(parsed);
+        // #274/perfis-S2: the real server keys requires_action on the PRESENCE of
+        // decision buttons (any custom_action, or a built-in action beyond a bare
+        // `done`) — NOT on the type. Mirror that so the CLI's B2 timeout default is
+        // exercised exactly as in prod.
+        const acts = Array.isArray(parsed.actions) ? parsed.actions : [];
+        const customs = Array.isArray(parsed.custom_actions) ? parsed.custom_actions : [];
+        const requires_action = customs.length > 0 || acts.some((a) => a !== 'done');
         json(res, 201, {
           id: 1, status: 'pending',
           correlation_id: parsed.correlation_id || 'mock-cid',
           registered_devices: 1, render_mode: 'banner',
           template: parsed.template || null,
+          requires_action,
           // #132: per-template suggestion the real server echoes
           suggested_ask_timeout: parsed.template === 'approval' ? 3600 : null,
         });
