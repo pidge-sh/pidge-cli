@@ -335,13 +335,19 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   assert.match(skill, /manifest v16/);
 });
 
-// --- #280: the local skill self-heals (any pidge command refreshes a stale skill) ---
-// The installed SKILL.md carries a first-line marker `<!-- pidge-skill rev=R manifest=N -->`.
-// On EVERY networked command, checkManifestNews → ensureSkillFresh compares it against the
-// CLI's SKILL_REVISION and the server's x-pidge-manifest-version header; a stale skill is
-// silently regenerated so the agent's NEXT session is current. Only EXISTING skills refresh.
+// --- #280 + #33 fix: the local skill self-heals (any pidge command refreshes a stale skill) ---
+// The installed SKILL.md carries the marker `# pidge-skill rev=R manifest=N` as a YAML COMMENT
+// INSIDE the frontmatter (0.15.3+). It must NOT precede the opening `---`: a first line that
+// isn't `---` fails the YAML frontmatter parse, so Claude Code loads the skill with a garbage
+// description (proven on a live headless run) — the 0.15.2 marker-first format was exactly that
+// bug. On EVERY networked command, checkManifestNews → ensureSkillFresh reads the marker (from
+// the new position, and tolerating the OLD line-1 `<!-- … -->` so a 0.15.2 install still heals),
+// compares it against the CLI's SKILL_REVISION and the server's x-pidge-manifest-version header,
+// and silently regenerates a stale skill so the agent's NEXT session is current. Only EXISTING
+// skills refresh.
 
-function seedSkill(marker, body = 'OLD SKILL BODY') {
+// Simulates a 0.15.2 install: the marker sits on line 1, ABOVE the `---` (the broken format).
+function seedOldSkill(marker, body = 'OLD SKILL BODY') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-heal-'));
   const file = path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md');
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -349,11 +355,21 @@ function seedSkill(marker, body = 'OLD SKILL BODY') {
   return { dir, file };
 }
 
-test('#280 — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
+// The corrected 0.15.3+ format: `---` on line 1, the marker a `#` comment inside the frontmatter.
+function seedNewSkill(rev, manifest, body = 'OLD SKILL BODY') {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-heal-'));
+  const file = path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=${rev} manifest=${manifest}\n---\n\n# Pidge\n\n${body}\n`);
+  return { dir, file };
+}
+
+test('#33 — a 0.15.2 marker-first install self-heals into the fixed in-frontmatter format', async () => {
   const mock = createMock();
   const port = await mock.start();
-  // manifest already current (16), but the baked spine is stale (rev=0 < current 1)
-  const { dir, file } = seedSkill('<!-- pidge-skill rev=0 manifest=16 -->', 'STALE SPINE');
+  // The real-world broken install: marker ABOVE the `---`, rev=1 (0.15.2's SKILL_REVISION).
+  // manifest is current (16) but the spine bumped (2 > 1), so the heal fires and REPAIRS format.
+  const { dir, file } = seedOldSkill('<!-- pidge-skill rev=1 manifest=16 -->', 'BROKEN 0.15.2 SKILL');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
   const { code, stderr } = await result;
@@ -361,17 +377,40 @@ test('#280 — a SPINE bump (SKILL_REVISION > installed) self-heals the local sk
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /^<!-- pidge-skill rev=1 manifest=16 -->/, 'marker rewritten to the current rev');
+  // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
+  assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
+  assert.ok(!/<!-- pidge-skill/.test(healed), 'the old HTML-comment marker is gone');
+  assert.match(healed, /\n# pidge-skill rev=2 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
+  assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 2, manifest v16\)/, 'one stderr note');
+});
+
+test('#280 — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // New-format skill, manifest current (16), spine stale (rev=0 < current 2) — reads the
+  // marker from its new in-frontmatter position and heals on the spine trigger.
+  const { dir, file } = seedNewSkill(0, 16, 'STALE SPINE');
+
+  const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const healed = fs.readFileSync(file, 'utf8');
+  assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
+  assert.match(healed, /\n# pidge-skill rev=2 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 1, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 2, manifest v16\)/, 'one stderr note');
 });
 
 test('#280 — a MANIFEST bump (server version > installed) self-heals the local skill', async () => {
   const mock = createMock();
   const port = await mock.start();
-  // spine is current (rev=1) but the baked manifest is stale (15 < the mock's 16)
-  const { dir, file } = seedSkill('<!-- pidge-skill rev=1 manifest=15 -->', 'STALE BY MANIFEST');
+  // New-format skill, spine current (rev=2) but the baked manifest is stale (15 < the mock's 16).
+  const { dir, file } = seedNewSkill(2, 15, 'STALE BY MANIFEST');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
   const { code, stderr } = await result;
@@ -379,15 +418,17 @@ test('#280 — a MANIFEST bump (server version > installed) self-heals the local
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /^<!-- pidge-skill rev=1 manifest=16 -->/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=2 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
 });
 
-test('#280 — a FRESH skill (marker already current) is left byte-for-byte, no note', async () => {
+test('#280 — a FRESH skill (new-format marker current) is left byte-for-byte, no note', async () => {
   const mock = createMock();
   const port = await mock.start();
-  const { dir, file } = seedSkill('<!-- pidge-skill rev=1 manifest=16 -->', 'SENTINEL FRESH — keep me');
+  // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
+  // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
+  const { dir, file } = seedNewSkill(2, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
