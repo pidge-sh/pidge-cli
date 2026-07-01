@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.16.0 — #34 `pidge approve` (hook-shaped gate) + lote-5 polish
+
+**`pidge approve "<question>"`** — a new, hook-shaped permission gate for wrapping an agent's
+OWN risky actions behind a human Face-ID tap. It sends an important/sensitive notification with
+two gated custom actions (`allow` = Face-ID confirm, `deny` = destructive), blocks on the same
+long-poll as `pidge ask`, and maps the answer to an **exit code, DENY-DEFAULT**: only an explicit
+`allow` is exit 0; deny, timeout, a dead channel, or any ambiguity is non-zero — so a Claude Code
+`PreToolUse` hook fails CLOSED. `chosen_action` JSON is printed to stdout. Zero server change (a
+thin wrapper over the existing send + wait). `--help` documents a runnable `PreToolUse` hook.
+
+- **feat (#34):** `pidge approve` verb + `--allow-label`/`--deny-label`. `doWait`/`realtimeWait`/
+  `waitForAnswer` gained optional `onAnswer`/`onTimeout` callbacks so a caller can map the
+  outcome to an exit code instead of the default print-and-exit-0.
+- **feat (lote-5 #2):** the CLI now REFUSES a decision button + `reply` in one send (e.g.
+  `--actions yes,no,reply`) — exit 1, no round-trip. The human would tap the easy Yes/No and you'd
+  get a useless "Yes" instead of the typed text (the skill's anti-slop rule #4, now enforced).
+  `reply` alongside a non-decision (e.g. `done,reply`) stays allowed.
+- **fix (lote-5 #3):** `pidge <type> --help` no longer prints a bare, description-less `template`
+  line (`template` is intentionally off the menu; it stays a silent back-compat input).
+- **feat (lote-5 #4):** `setup --quiet` collapses onboarding to a single status line (the full
+  doctor stays the default; `--quiet` is opt-in and never hides a broken setup — warnings/errors
+  still print).
+- **feat (lote-5 #5):** `listen --all` now WARNS when its first quick batch is old backlog
+  ("N message(s) were ALREADY queued when this listen started … NOT fresh arrivals"), so a
+  resurfaced notification answer isn't mistaken for a new event. Within-channel — NOT the
+  cross-channel leak (#289).
+- **note (lote-5 #1):** the `ask`/`wait` fallback poll cadence is already 30 s (aligned to the
+  server's suggestion); `--interval` still overrides. No change needed.
+- **chore:** `SKILL_REVISION` 2 → 3 — the installed skill spine now teaches `pidge approve` and
+  the decision-vs-reply refusal, so onboarded agents self-heal to it on their next command.
+
 ## 0.15.3 — #33 fix: the self-heal marker no longer corrupts the skill
 
 The 0.15.2 marker was written as the FIRST line of `SKILL.md`, ABOVE the opening `---`. A

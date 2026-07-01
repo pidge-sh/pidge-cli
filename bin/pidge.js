@@ -20,7 +20,7 @@
 //   pidge message --title "Build green" --body "2m12s"
 //
 //   # a pendency the human should resolve (the DEFAULT type) + block on the answer
-//   pidge important --title "Approve deploy?" --actions yes,no,reply --wait
+//   pidge important --title "Approve deploy?" --actions yes,no --wait
 //
 //   # a go/no-go decision with Face ID — the approval RECIPE (= important + wait + gate)
 //   pidge approval --title "Deploy to production?"
@@ -157,6 +157,12 @@ const OPTIONS = {
   renew: { type: 'boolean' },                  // ack: heartbeat the visibility-timeout lease (state=delivered)
   'ack-on-read': { type: 'boolean' },          // listen: restore the pre-0.9 immediate-consume
   window: { type: 'string' },                  // selftest: reachability window in seconds (default 30)
+  // #34 approve: the two gated-action labels (default Allow / Deny)
+  'allow-label': { type: 'string' },
+  'deny-label': { type: 'string' },
+  // lote-5 #4: collapse `setup` onboarding to a single status line (the full
+  // doctor stays the default; --quiet is opt-in, never the default).
+  quiet: { type: 'boolean' },
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -327,7 +333,7 @@ const OPTION_DOCS = {
   file: '--file PATH              a real artifact (xlsx/pdf/csv…) uploaded for the human (≤25 MB)',
   url: '--url URL                deep link the app opens on tap (PR, dashboard, log)',
   copy: '--copy TEXT              tap-to-copy value on the detail screen',
-  actions: '--actions LIST|JSON      RESPONSE axis: comma list from the catalog (yes,no,reply) OR a JSON array of {"id","label"} custom actions — composes on ANY type',
+  actions: '--actions LIST|JSON      RESPONSE axis: comma list from the catalog (e.g. yes,no · or reply ALONE — never mix a decision with reply) OR a JSON array of {"id","label"} custom actions — composes on ANY type',
   'custom-action': '--custom-action SPEC     "id:label[:destructive][:confirm][:biometric][:terminal]" (repeatable)',
   wait: '--wait                  RESPONSE axis: block until the human answers (any type), then print chosen_action JSON (ask/approval imply it)',
   'deliver-at': '--deliver-at ISO8601     schedule the send for later',
@@ -358,9 +364,15 @@ const OPTION_DOCS = {
   renew: '--renew                  heartbeat the visibility-timeout lease instead of processing',
   window: '--window N               reachability window in seconds (default 30)',
   'quiet-nag': '--quiet-nag              silence the "server has new capabilities" nag for this run',
+  'allow-label': '--allow-label TEXT       approve: label on the Face-ID allow button (default "Allow")',
+  'deny-label': '--deny-label TEXT        approve: label on the deny button (default "Deny")',
+  quiet: '--quiet                  setup: collapse onboarding to one status line (the full doctor stays the default)',
 };
 // Content flags shared by every send.
-const CONTENT_OPTS = ['title', 'body', 'body-markdown', 'body-markdown-file', 'subtitle', 'template', 'profile',
+// lote-5 #3: `template` is intentionally OFF the menu (#274 — content_template is
+// undocumented back-compat). It stays a parseable OPTION but is NOT listed here,
+// so `pidge <type> --help` no longer prints a bare, description-less `template` line.
+const CONTENT_OPTS = ['title', 'body', 'body-markdown', 'body-markdown-file', 'subtitle', 'profile',
   'event-at', 'lead-minutes', 'urgency', 'image', 'file', 'url', 'copy', 'actions',
   'custom-action', 'deliver-at', 'reply-to', 'correlation-id', 'thread', 'after',
   'collapse-key', 'param'];
@@ -372,8 +384,8 @@ const HELP = {
   setup: {
     summary: 'one-shot onboarding (#110): exchange a single-use claim code for the channel key, store it, run doctor.',
     usage: 'pidge setup --claim CODE [--url BASE] [--print] [--force] [--listen-mode MODE]',
-    body: 'The CLI writes the key itself (chmod 600) — it never appears on screen or in the agent\'s chat. MULTI-AGENT: set PIDGE_AGENT=<id> at each agent\'s launch for an isolated config.',
-    opts: ['claim', 'url-base', 'print', 'force', 'listen-mode'],
+    body: 'The CLI writes the key itself (chmod 600) — it never appears on screen or in the agent\'s chat. MULTI-AGENT: set PIDGE_AGENT=<id> at each agent\'s launch for an isolated config. --quiet collapses the onboarding to one status line.',
+    opts: ['claim', 'url-base', 'print', 'force', 'listen-mode', 'quiet'],
   },
   doctor: {
     summary: 'validate the setup WITHOUT exposing secrets (env source, server, key, device reach, realtime probe).',
@@ -401,7 +413,7 @@ const HELP = {
   },
   important: {
     summary: '⭐ the DEFAULT — a pendency the human should resolve ("waiting-for-you" card; clears on Done).',
-    usage: 'pidge important --title TEXT [--actions yes,no,reply] [--wait] [--body-markdown MD]',
+    usage: 'pidge important --title TEXT [--actions yes,no] [--wait] [--body-markdown MD]',
     body: 'Fire-and-forget by default; add --actions/--custom-action for quick-tap buttons and --wait to block until the human answers (prints chosen_action JSON). The most-used type — on the fence between informing and asking, pick this. (Replaces the old `report`.)',
     opts: [...SEND_OPTS],
   },
@@ -426,8 +438,8 @@ const HELP = {
   // AXIS 2 — the two response shortcuts (bundle a type + buttons + --wait).
   ask: {
     summary: 'a DECISION — = important + --wait; needs --actions. Blocks until the human answers (prints chosen_action JSON).',
-    usage: 'pidge ask --title TEXT --actions yes,no,reply [--reply-to URL] [options]',
-    body: 'Shorthand for important --wait that REQUIRES a way to answer — --actions (catalog or JSON) or --custom-action. Holds a WebSocket (or polls) until a TERMINAL answer; a snooze/reschedule re-fires.',
+    usage: 'pidge ask --title TEXT --actions yes,no [--reply-to URL] [options]',
+    body: 'Shorthand for important --wait that REQUIRES a way to answer — --actions (catalog or JSON) or --custom-action. For a typed answer use --actions reply ALONE (never a decision + reply together). Holds a WebSocket (or polls) until a TERMINAL answer; a snooze/reschedule re-fires.',
     opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
   },
   approval: {
@@ -435,6 +447,31 @@ const HELP = {
     usage: 'pidge approval --title TEXT [--body-markdown MD] [options]',
     body: 'The easy shortcut for an explicit approval: injects an Approve (Face-ID gated) / Reject pair and blocks on the answer. Pass your own --actions/--custom-action to override the default pair. A gated action is detail-screen only (the banner shows no quick buttons by design — gotcha #19).',
     opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
+  },
+  // #34 — the HOOK-shaped gate. DENY-DEFAULT: exit 0 ONLY on an explicit allow;
+  // deny, timeout, a dead channel or any ambiguity is non-zero, so a permission
+  // hook fails CLOSED. Built for PreToolUse (see the runnable example below).
+  approve: {
+    summary: 'ask the human to authorize a risky action (Face ID) and BLOCK — deny-default: exit 0 ONLY on explicit allow.',
+    usage: 'pidge approve "<question>" [--body TEXT] [--timeout N] [--allow-label L] [--deny-label L]',
+    body: [
+      'Sends an important/sensitive notification with two gated custom actions — allow (Face-ID confirm) and deny — then blocks on the answer (the same long-poll as `pidge ask`).',
+      'DENY-DEFAULT (the security rule): only an explicit allow is exit 0. deny → exit 1; timeout / no answer / a broken channel → exit 1. A send that never left the ground → exit 2. NON-ZERO ALWAYS MEANS "not approved" — treat it as a deny.',
+      'chosen_action JSON is printed to stdout; human notices go to stderr.',
+      '',
+      'PreToolUse hook (Claude Code) — gate a risky tool behind a human Face-ID tap, fail-closed:',
+      '  #!/usr/bin/env bash',
+      '  input=$(cat)                                   # the hook JSON on stdin',
+      '  tool=$(printf %s "$input" | jq -r .tool_name)',
+      '  cmd=$(printf %s "$input" | jq -r ".tool_input.command // (.tool_input|tostring)")',
+      '  if pidge approve "Allow $tool?" --body "$cmd" --timeout 300 >/dev/null 2>&1; then',
+      '    exit 0            # human approved (Face ID) → let the tool run',
+      '  else',
+      '    echo "Blocked: no human approval for $tool" >&2',
+      '    exit 2            # exit 2 = PreToolUse BLOCK; fail-closed on deny/timeout/error',
+      '  fi',
+    ].join('\n'),
+    opts: [...CONTENT_OPTS, 'allow-label', 'deny-label', 'timeout', 'interval', 'realtime', 'no-realtime'],
   },
   // COMPAT aliases — old names map to the new type (kept so scripts don't break).
   fyi: {
@@ -529,6 +566,11 @@ const command = parsed.positionals[0];
 // #241: silence the manifest-version nag entirely (per run via --quiet-nag, or
 // per environment via PIDGE_QUIET_NAG=1) — for scripts and CI where the nudge is noise.
 const QUIET_NAG = !!v['quiet-nag'] || process.env.PIDGE_QUIET_NAG === '1';
+// lote-5 #4: `--quiet` collapses setup/doctor NARRATION to a single status line.
+// `note()` prints an informational line only when NOT quiet; WARNINGS and ERRORS
+// keep using console.error directly, so --quiet never hides a broken setup.
+const QUIET = !!v.quiet;
+const note = (msg) => { if (!QUIET) console.error(msg); };
 
 // Help on stdout, exit 0. #240: `pidge <cmd> --help` / `pidge help <cmd>` show the
 // FOCUSED help for that command (its synopsis + own flags); `pidge --help` / `help`
@@ -569,7 +611,9 @@ const KNOWN_MANIFEST_VERSION = 46;
 // Bumped to 2 in 0.15.3 so every 0.15.2 install (which baked the marker ABOVE the `---`,
 // corrupting the skill's description) is detected as stale and self-heals into the fixed
 // in-frontmatter format on the next command. Bump this whenever the hand-authored spine moves.
-const SKILL_REVISION = 2;
+// Bumped to 3 in 0.16.0: the spine now teaches `pidge approve` (the hook-shaped gate)
+// and notes the CLI now REFUSES a decision + reply in one send (lote-5 #2).
+const SKILL_REVISION = 3;
 const NAG_TTL_MS = 24 * 60 * 60 * 1000; // #241: at most one nag per 24 h
 let newsWarned = false;
 // #280: the self-heal runs at most ONCE per process (one regeneration, even when
@@ -926,7 +970,7 @@ function buildBody(extra = {}) {
     if (trimmed.startsWith('[')) {
       let arr;
       try { arr = JSON.parse(trimmed); }
-      catch (e) { die(`pidge: --actions looks like JSON but didn't parse (${e.message}). Use a JSON array of {"id","label"} objects, or the short form yes,no,reply`, 1); }
+      catch (e) { die(`pidge: --actions looks like JSON but didn't parse (${e.message}). Use a JSON array of {"id","label"} objects, or the short form yes,no (or reply alone)`, 1); }
       if (!Array.isArray(arr)) die('pidge: --actions JSON must be an ARRAY of {"id","label"} objects', 1);
       arr.forEach((item, i) => customActions.push(customActionFromJson(item, i)));
     } else {
@@ -935,6 +979,18 @@ function buildBody(extra = {}) {
   }
   for (const spec of v['custom-action'] || []) customActions.push(customActionFromSpec(spec));
   if (customActions.length) body.custom_actions = customActions;
+
+  // lote-5 #2: REFUSE a decision button + `reply` in the same send (the skill's
+  // anti-slop rule #4). The human taps the easy Yes/No and you get a useless
+  // "Yes" instead of the typed text you wanted. One question per send — enforce
+  // it locally (exit 1, no round-trip), don't warn-and-send. (`reply` alongside a
+  // non-decision like done/snooze is fine — DONE_REPLY is a real category.)
+  if (Array.isArray(body.actions) && body.actions.includes('reply')) {
+    const DECISION_ACTIONS = ['yes', 'no', 'approve', 'reject', 'accept', 'decline', 'later'];
+    const decisions = body.actions.filter((a) => DECISION_ACTIONS.includes(a));
+    if (decisions.length)
+      die(`pidge: --actions can't combine a decision button (${decisions.join(',')}) with \`reply\` — the human taps the easy button and you get a useless "${decisions[0]}" instead of the text you wanted. Use \`--actions reply\` ALONE for a typed answer, or drop \`reply\` for a button decision. One question per send.`, 1);
+  }
 
   // #274: --gated synthesizes ONE Face-ID confirm on the consequential action
   // (money/deletion) — the replacement for the retired content_template:sensitive.
@@ -1126,6 +1182,57 @@ async function doTypedSend(kind, { wait = false, extra = {}, requireAnswerable =
   await waitForAnswer(cid, { timeout, interval: num(v.interval, 30) });
 }
 
+// `pidge approve` (#34) — a hook-shaped, DENY-DEFAULT permission gate. Sends a
+// Face-ID approval and BLOCKS, then maps the human's tap to an exit code: ONLY an
+// explicit allow is exit 0; deny, timeout, a dead channel or any ambiguity is
+// non-zero (exit 1) so a PreToolUse hook fails CLOSED. A thin wrapper over the
+// ask/wait long-poll: it fixes the two gated actions and swaps print-and-exit-0
+// for the exit-code mapping (via waitForAnswer's onAnswer/onTimeout).
+async function doApprove() {
+  const question = parsed.positionals[1] || v.title;
+  if (!question)
+    die('pidge: usage: pidge approve "<question>" [--body TEXT] [--timeout N] [--allow-label L] [--deny-label L]', 1);
+  v.title = question;
+  const allowLabel = v['allow-label'] || 'Allow';
+  const denyLabel = v['deny-label'] || 'Deny';
+  // allow = Face-ID confirm (both confirm+biometric) · deny = destructive out.
+  // Both terminal, both gated ⇒ the banner is detail-only (resolve_push_category →
+  // HERALD_OPEN): approving is a deliberate in-app Face-ID tap, never a one-tap banner.
+  const customActions = [
+    { id: 'allow', label: allowLabel, confirm: true, biometric: true, terminal: true },
+    { id: 'deny', label: denyLabel, style: 'destructive', terminal: true },
+  ];
+  const cid = v['correlation-id'] || crypto.randomUUID();
+  v['correlation-id'] = cid;
+  console.error(`pidge: correlation_id=${cid}`);
+  const { ok, info } = await doNotify({ template_kind: 'important', custom_actions: customActions });
+  if (!ok) {
+    // Couldn't even ask the human ⇒ fail closed. (doNotify already narrated the
+    // HTTP failure; a raw network error exits 2 inside doNotify — also non-zero.)
+    console.error('pidge: could NOT send the approval — DENIED (deny-default; nothing was approved). exit 1');
+    process.exit(1);
+  }
+  console.error(`pidge: approval sent (${info.registered_devices} device(s)) — waiting on ${cid} (only an explicit "${allowLabel}" is exit 0)`);
+  await waitForAnswer(cid, {
+    timeout: num(v.timeout, 300),
+    interval: num(v.interval, 30),
+    onAnswer: (chosen) => {
+      console.log(JSON.stringify(chosen, null, 2)); // machine output on stdout
+      if (chosen && chosen.action_id === 'allow') {
+        console.error('pidge: ALLOWED — the human approved (Face ID). exit 0');
+        process.exit(0);
+      }
+      console.error(`pidge: DENIED — the human chose "${(chosen && chosen.action_id) || '?'}" (deny-default: only an explicit allow is exit 0). exit 1`);
+      process.exit(1);
+    },
+    onTimeout: () => {
+      console.log(JSON.stringify({ decision: 'deny', reason: 'timeout', correlation_id: cid }));
+      console.error('pidge: no answer before the timeout — DENIED (deny-default; a gate must fail closed). exit 1');
+      process.exit(1);
+    },
+  });
+}
+
 // A compat alias (perfis-S1): the OLD type name still works, mapped to the new
 // canonical one — a one-line note points at the rename so muscle-memory migrates.
 function warnRenamed(oldName, newName) {
@@ -1144,7 +1251,10 @@ function warnDeprecatedSend(name) {
 // Long-poll (#45): each GET carries ?wait=N (≤55 s) and the SERVER holds it until
 // the user acts — answer latency ~instant, ~1 request/min. --interval is only the
 // fallback pace against an old server that ignores `wait` (returns immediately).
-async function doWait(cid, { timeout, interval }) {
+// #34: onAnswer(chosen)/onTimeout() let a caller (approve) MAP the outcome to an
+// exit code instead of the default print-chosen+exit-0 / exitTimeout. Both
+// callbacks MUST exit the process; when omitted the wait/ask behavior stands.
+async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
   const deadline = Date.now() + timeout * 1000;
   let firedNotice = false;
   for (;;) {
@@ -1163,6 +1273,8 @@ async function doWait(cid, { timeout, interval }) {
           const chosen = data.chosen_action || {};
           if (chosen.kind === 'snoozed') {
             console.error(`pidge: snoozed until ${chosen.snooze_until || chosen.at} — re-fires then, still waiting`);
+          } else if (onAnswer) {
+            return onAnswer(chosen);
           } else {
             console.log(JSON.stringify(chosen, null, 2));
             process.exit(0);
@@ -1188,6 +1300,7 @@ async function doWait(cid, { timeout, interval }) {
     }
 
     if (Date.now() >= deadline) {
+      if (onTimeout) return onTimeout();
       health.exitTimeout(`no answer on ${cid}`);
     }
     // A server WITH long-poll just held us for waitS — loop right back. One that
@@ -1203,7 +1316,7 @@ async function doWait(cid, { timeout, interval }) {
 // for OUR cid as a wake-up; the durable answer is always re-read over HTTP
 // (doWait prints + exits). A safety re-check every 60 s covers a frame lost in
 // a reconnect gap. Returns only when WS can't carry us — caller falls back.
-async function realtimeWait(cid, { timeout, interval }) {
+async function realtimeWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
   const deadline = Date.now() + timeout * 1000;
   const answered = async () => {
     try {
@@ -1234,13 +1347,15 @@ async function realtimeWait(cid, { timeout, interval }) {
   });
   clearInterval(safety);
   if (outcome === 'answered') {
-    // fetch + print + exit via the poller (one quick authoritative read)
-    await doWait(cid, { timeout: Math.max(10, Math.ceil((deadline - Date.now()) / 1000)), interval });
+    // fetch + resolve (print+exit, or the caller's onAnswer/onTimeout mapping) via
+    // the poller (one quick authoritative read)
+    await doWait(cid, { timeout: Math.max(10, Math.ceil((deadline - Date.now()) / 1000)), interval, onAnswer, onTimeout });
   }
   // Only exit-as-timeout if the REAL deadline genuinely passed. An EARLY
   // 'deadline' (a spurious guard, a WS oddity) must degrade to polling for the
   // remaining budget, NOT exit lying that the full timeout elapsed (#119).
   if (outcome === 'deadline' && Date.now() >= deadline - 1500) {
+    if (onTimeout) return onTimeout();
     health.exitTimeout(`no answer on ${cid}`);
   }
   console.error('pidge: realtime unavailable — falling back to HTTP polling (same contract, less instant)');
@@ -1248,10 +1363,12 @@ async function realtimeWait(cid, { timeout, interval }) {
 }
 
 // wait/ask entry: WS when we can, polling as the universal fallback (#118/#119).
-async function waitForAnswer(cid, { timeout, interval }) {
+// #34: onAnswer/onTimeout thread through to both paths so `approve` can map the
+// outcome to an exit code; omit them for the default print-and-exit-0 behavior.
+async function waitForAnswer(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
   let budget = timeout;
-  if (wantRealtime()) budget = await realtimeWait(cid, { timeout, interval });
-  await doWait(cid, { timeout: budget, interval });
+  if (wantRealtime()) budget = await realtimeWait(cid, { timeout, interval, onAnswer, onTimeout });
+  await doWait(cid, { timeout: budget, interval, onAnswer, onTimeout });
 }
 
 const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback);
@@ -1582,8 +1699,8 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     console.error('pidge doctor: NO TOKEN — set PIDGE_TOKEN, or onboard with `pidge setup --claim <code>` (the human copies the code from the Pidge app)');
     process.exit(2);
   }
-  console.error(`pidge doctor: token found (${source || 'passed in'}) — never displayed`);
-  console.error(`pidge doctor: server ${base}`);
+  note(`pidge doctor: token found (${source || 'passed in'}) — never displayed`);
+  note(`pidge doctor: server ${base}`);
   let out;
   try {
     out = await fetchWhoami(base, token);
@@ -1613,7 +1730,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     process.exit(2);
   }
   const devices = data.devices ?? 0;
-  console.error(`pidge doctor: key valid — canal "${data.channel && data.channel.name}" · ${devices} device(s)`);
+  note(`pidge doctor: key valid — canal "${data.channel && data.channel.name}" · ${devices} device(s)`);
   if (devices === 0)
     console.error('pidge doctor: WARNING — 0 devices: sends will reach NOBODY until the human installs/opens the Pidge app on their iPhone');
   // #182 device-reach honesty (gotcha #9) + #181 ownership — shared with whoami.
@@ -1635,18 +1752,22 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   let realtime;
   if (rt.skipped) {
     realtime = 'skipped';
-    console.error('pidge doctor: realtime: skipped — this Node lacks a native WebSocket (need Node ≥22); `listen` will poll. Upgrade Node for instant delivery.');
+    note('pidge doctor: realtime: skipped — this Node lacks a native WebSocket (need Node ≥22); `listen` will poll. Upgrade Node for instant delivery.');
   } else if (rt.ok) {
     realtime = 'ok';
-    console.error(`pidge doctor: realtime: ok (ws connect + subscribe em ${rt.ms}ms)`);
+    note(`pidge doctor: realtime: ok (ws connect + subscribe em ${rt.ms}ms)`);
   } else {
     realtime = 'unavailable';
-    console.error(`pidge doctor: realtime: INDISPONÍVEL — ${rt.reason}. O \`listen\` degrada pra polling (funciona, menos instantâneo); use --no-realtime pra fixar o piso.`);
+    note(`pidge doctor: realtime: INDISPONÍVEL — ${rt.reason}. O \`listen\` degrada pra polling (funciona, menos instantâneo); use --no-realtime pra fixar o piso.`);
   }
   // #229: lead with `pidge hello` — the first-contact WOW (send + wait in one),
   // the same debut the /agent-setup guide leads with. (#274: no --template hint —
   // `pidge hello` IS the entry point; the content_template surface is off the menu.)
-  console.error('pidge doctor: all good — try: pidge hello   (first-contact WOW — send + wait in one)');
+  // lote-5 #4: --quiet collapses ALL of the above to this single status line.
+  if (QUIET)
+    console.error(`pidge: ✓ setup ok — canal "${data.channel && data.channel.name}" · ${devices} device(s) · realtime ${realtime} (run \`pidge doctor\` for the full check)`);
+  else
+    console.error('pidge doctor: all good — try: pidge hello   (first-contact WOW — send + wait in one)');
   console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version, realtime }));
   process.exit(0);
 }
@@ -1723,17 +1844,17 @@ async function runSetup() {
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(CONFIG_FILE, `PIDGE_URL=${finalBase}\nPIDGE_TOKEN=${data.key}\n`, { mode: 0o600 });
   try { fs.chmodSync(CONFIG_FILE, 0o600); } catch { /* mode set on create */ }
-  console.error(`pidge: canal "${channelName}" configurado — chave em ${CONFIG_FILE} (chmod 600, nunca exibida)`);
+  note(`pidge: canal "${channelName}" configurado — chave em ${CONFIG_FILE} (chmod 600, nunca exibida)`);
   // #181: claim ownership of the channel for THIS install and record the
   // generation locally, so a later `pidge doctor` can DETECT a silent key swap
   // by a different agent (the v25 incident, now caught in code). Best-effort.
   const claim = await claimOwnership(finalBase, data.key);
   if (claim) {
     fs.appendFileSync(CONFIG_FILE, `PIDGE_CLAIM_GENERATION=${claim.claim_generation}\nPIDGE_FINGERPRINT=${agentFingerprint()}\n`, { mode: 0o600 });
-    console.error(`pidge: ownership claimed as "${agentLabel()}" (generation ${claim.claim_generation}) — doctor WARNS if another agent takes this channel.`);
+    note(`pidge: ownership claimed as "${agentLabel()}" (generation ${claim.claim_generation}) — doctor WARNS if another agent takes this channel.`);
   }
   if (!AGENT_ID)
-    console.error('pidge: este é o arquivo COMPARTILHADO (single-agent). Vai rodar 2+ agentes nesta máquina? Dê a cada um PIDGE_AGENT=<id> no launch (arquivo isolado por agente) — senão eles enviam como o mesmo canal.');
+    note('pidge: este é o arquivo COMPARTILHADO (single-agent). Vai rodar 2+ agentes nesta máquina? Dê a cada um PIDGE_AGENT=<id> no launch (arquivo isolado por agente) — senão eles enviam como o mesmo canal.');
   await fuseSkillAndHello(finalBase, data.key);
   await runDoctor(finalBase, data.key, CONFIG_FILE);
 }
@@ -1747,11 +1868,11 @@ async function runSetup() {
 async function fuseSkillAndHello(base, token) {
   try {
     const r = await installSkill(base, token);
-    console.error(`pidge: skill written to ${r.file} (manifest v${r.manifest_version}) — your future sessions in this project know Pidge now`);
+    note(`pidge: skill written to ${r.file} (manifest v${r.manifest_version}) — your future sessions in this project know Pidge now`);
   } catch (e) {
     console.error(`pidge: skill install skipped (${e.message}) — run \`pidge skill install\` later.`);
   }
-  console.error('pidge: next → `pidge hello` to send your first handshake and watch it confirm on the lock screen.');
+  note('pidge: next → `pidge hello` to send your first handshake and watch it confirm on the lock screen.');
 }
 
 // skill install (#110e; rewritten #274 F3): persistent Pidge knowledge for AI
@@ -1805,6 +1926,7 @@ Every send is **a TYPE + a markdown body + an OPTIONAL response**. The TYPE (one
 | A pendency they should act on (can wait) ⭐ DEFAULT | \`pidge important\` |
 | You need a decision and CAN'T proceed without it | \`pidge important --actions yes,no --wait\` |
 | YOU are asking for a formal go/no-go (money/risk) | \`pidge approval\` |
+| Gate your OWN risky tool behind a human OK (a hook) | \`pidge approve "<question>"\` (exit 0 = allow) |
 | A thing with a known TIME | \`pidge event --event-at <ISO8601>\` |
 | A live status you'll keep updating | \`pidge live\` |
 | WAKE them now — rare, real, <1/day | \`pidge urgent\` |
@@ -1826,6 +1948,8 @@ The banner shows your **\`--title\`** and **\`--body\`** (plain text). **\`--bod
 
 **Same screen ("Approve + Face ID"), opposite origin: you REQUEST (A, ids \`grant\`/\`deny\`) vs they REQUIRE (B, id \`approve\`).** To tell at runtime: a send that comes back \`acknowledgeable:false\` + \`requires_action:true\` when you didn't add buttons means Path B is on for that profile — treat the \`approve\` as the positive decision it is. (To check a profile's knob ahead of time, read \`ack_requires_biometric\` from the live manifest: \`curl $PIDGE_URL/api/v1/manifest -H "Authorization: Bearer $PIDGE_TOKEN"\` → \`profiles\`.) Caution: Path B on a busy profile means one approval per send — the human's deliberate high-trust choice.
 
+**\`pidge approve "<question>"\` — the hook-shaped gate (for permission hooks).** When YOU need the human to authorize one of YOUR OWN risky actions before you take it — and you want the answer as an EXIT CODE, not JSON to parse — use \`pidge approve\`. It sends a Face-ID allow / deny pair, blocks, and is **DENY-DEFAULT: exit 0 ONLY on an explicit allow; deny, timeout, or a broken channel → non-zero.** Perfect for a Claude Code \`PreToolUse\` hook that must fail CLOSED (see \`pidge approve --help\` for a runnable hook). \`pidge approval\` is the JSON-answer sibling (Path A); \`pidge approve\` is the exit-code gate.
+
 ## The response axis (composes on ANY type)
 
 Asking for a reply is orthogonal to the type — you don't need \`approval\` to get a button.
@@ -1837,14 +1961,14 @@ Asking for a reply is orthogonal to the type — you don't need \`approval\` to 
   - *wait*: \`--wait\` (or \`pidge ask\`) **blocks** until they tap. Use it when you can't proceed.
 - **Exit codes on a \`--wait\`/\`ask\`:** \`0\` = answered (\`chosen_action\` JSON on stdout) · **\`3\` = no answer yet → NOT a failure** (back off, or treat a blocking go/no-go as "no/hold" and re-ask later) · \`2\` = error.
 
-Need a TYPED reply (a time/value/name)? \`--actions reply\` ALONE — never \`yes,no,reply\` together (the human taps the easy button and you get a useless "Yes"). ONE question per send.
+Need a TYPED reply (a time/value/name)? \`--actions reply\` ALONE — never a decision + \`reply\` together (the human taps the easy button and you get a useless "Yes"). The CLI now **refuses** \`yes,no,reply\` (exit 1) so you can't ship the trap by accident. ONE question per send.
 
 ## Anti-slop rules (judgment a recipe can't teach)
 
 1. **One send = one fact = one ask.** Never two questions in a notification.
 2. **Default to \`important\`.** \`message\` only for true no-action FYIs; \`urgent\` is a contract, not a volume knob — **<1/day**, abuse caps your channel.
 3. **There is no content-template menu.** Every send is type + markdown + optional buttons. If you're reaching for \`--template context/report/digest/sensitive\`, stop — that surface is gone (the field still parses as silent back-compat, but don't teach or rely on it).
-4. **Typed answer? \`--actions reply\` ALONE** — never \`yes,no,reply\` together.
+4. **Typed answer? \`--actions reply\` ALONE** — never a decision + \`reply\` together (the CLI refuses it, exit 1).
 5. **Trust the 201 echo over your intent** — \`degraded\`/\`render_mode\`/\`registered_devices\`. \`registered_devices:0\` ⇒ it went nowhere; don't wait.
 6. **Don't spam to signal importance.** Consolidate into one markdown body; use \`--collapse-key\` for self-replacing progress, \`--thread\` only for follow-ups over time.
 7. **Be listening when the answer lands, or you lose it.** Ack only AFTER the work is durably done.
@@ -1896,7 +2020,7 @@ generate_report | pidge important --title "Report ready" \\
 - **There is no \`pidge reply\`.** \`reply\` is a built-in action id, not a command. To answer the human's composer message, send a normal \`pidge message --thread <id>\` reusing the message's \`thread_id\`.
 - **\`urgent\` is a trust contract, not a button.** It arms an AlarmKit alarm; once delivered you **cannot abort it** (\`pidge cancel\` → 409). Real + unpostponable only, <1/day. Never test it without warning the human.
 - **A 201 ≠ "seen."** \`registered_devices:0\` goes nowhere; \`delivered\` is APNs dispatch, not eyes; only \`seen_at\`/an answer is the human.
-- **The ask reply-vs-yes/no trap.** \`--actions yes,no,reply\` lets the human dodge a typed answer with one tap — use \`--actions reply\` alone when you need text.
+- **The ask reply-vs-yes/no trap.** \`--actions yes,no,reply\` let the human dodge a typed answer with one tap — so the CLI now REFUSES a decision + \`reply\` in one send (exit 1). Use \`--actions reply\` alone when you need text.
 - **\`event\` is quiet today** — \`event --event-at\` schedules; the countdown LA-as-primitive is still being built.
 - **content_template still parses as input** (back-compat) but is OFF the menu — if a legacy habit sends \`--template report\`, it silently maps; don't rely on it, don't teach it.
 - **The banner ≠ the detail screen.** Lock-screen banner = \`title\` + \`body\` (plain). \`body_markdown\`/images render only when the human taps in. A send with only \`--title\` can look empty on the lock screen — always include a \`--body\`.
@@ -2015,6 +2139,12 @@ A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE w
     case 'approval': {
       const extra = hasAnswerAffordance() ? {} : { custom_actions: APPROVAL_ACTIONS };
       await doTypedSend('important', { wait: true, extra, label: 'approval' });
+      break;
+    }
+    // #34 — the hook-shaped, deny-default permission gate (allow→0, everything
+    // else→non-zero). See doApprove + `pidge approve --help` (PreToolUse example).
+    case 'approve': {
+      await doApprove();
       break;
     }
     case 'notify':
@@ -2178,8 +2308,15 @@ A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE w
       // composer-only contract stands (no double-consumption for ask/wait users).
       installOrphanWatchdog(); // §3c: a killed-parent orphan exits instead of eating the queue
       const timeout = num(v.timeout, 600);
+      const listenStartedAt = Date.now();
       let deadline = Date.now() + timeout * 1000;
       const queueQs = v.all ? '?all=true' : '';
+      // lote-5 #5: the FIRST batch that comes back QUICKLY was already sitting in
+      // the queue when this listen started — with --all that includes answers to
+      // EARLIER notifications, which read as "new" if we don't say otherwise. A
+      // batch that arrives after a real hold (a long-poll that waited) is fresh.
+      const BACKLOG_WINDOW_MS = 5000;
+      let firstBatch = true;
       // §2.6: --follow is SUPERVISOR-ONLY — warn LOUDLY at startup. A turn-based
       // agent that uses it traps its turn (the process keeps listening); the
       // default one-shot, looped from the supervisor, is what almost everyone wants.
@@ -2210,6 +2347,14 @@ A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE w
       // Print + (conditionally) ack — shared by the WS and polling paths.
       const printAndAck = async (msgs) => {
         console.log(JSON.stringify(msgs, null, 2));
+        // lote-5 #5: heads-up on ORPHANED backlog served on the first quick read
+        // (--all only). It's within-channel — NOT the cross-channel leak (#289).
+        if (v.all && firstBatch && (Date.now() - listenStartedAt) < BACKLOG_WINDOW_MS) {
+          const replies = msgs.filter((m) => m.kind === 'notification_reply').length;
+          const detail = replies ? ` (${replies} of them are answers to EARLIER notifications)` : '';
+          console.error(`pidge: --all — ${msgs.length} message(s) were ALREADY queued when this listen started${detail}: OLD backlog (sent while you weren't listening), NOT fresh arrivals. This is your OWN channel's backlog, not a cross-channel leak (#289).`);
+        }
+        firstBatch = false;
         // #131: narrate answers so the agent knows WHICH notification spoke back.
         for (const m of msgs) {
           if (m.kind === 'notification_reply' && m.ref) {

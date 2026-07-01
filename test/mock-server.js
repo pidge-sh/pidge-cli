@@ -28,6 +28,7 @@ function createMock() {
     operatingContract: {},   // PATCH /channels/:id merges into this
     manifestVersion: 16,     // X-Pidge-Manifest-Version header — a test bumps it to fire the news nudge
     manifestStatus: 200,     // #274 F4: a test sets 500 to force a manifest read failure (skill fuse degrades)
+    notifyStatus: 201,       // #34: a test forces a non-2xx to exercise approve's fail-closed send
     selftests: {},           // #205: id → {nonce, window_seconds, created, processed}
     selftestSeq: 100,        // next selftest/message id
   };
@@ -164,6 +165,9 @@ function createMock() {
         let parsed = {};
         try { parsed = JSON.parse(body); } catch { /* keep {} */ }
         state.notifies.push(parsed);
+        // #34: a test forces a non-2xx so `approve` fails CLOSED on a send error.
+        if (state.notifyStatus && state.notifyStatus !== 201)
+          return json(res, state.notifyStatus, { error: 'notify_failed' });
         // #274/perfis-S2: the real server keys requires_action on the PRESENCE of
         // decision buttons (any custom_action, or a built-in action beyond a bare
         // `done`) — NOT on the type. Mirror that so the CLI's B2 timeout default is

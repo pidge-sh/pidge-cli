@@ -368,7 +368,7 @@ test('#33 — a 0.15.2 marker-first install self-heals into the fixed in-frontma
   const mock = createMock();
   const port = await mock.start();
   // The real-world broken install: marker ABOVE the `---`, rev=1 (0.15.2's SKILL_REVISION).
-  // manifest is current (16) but the spine bumped (2 > 1), so the heal fires and REPAIRS format.
+  // manifest is current (16) but the spine bumped (3 > 1), so the heal fires and REPAIRS format.
   const { dir, file } = seedOldSkill('<!-- pidge-skill rev=1 manifest=16 -->', 'BROKEN 0.15.2 SKILL');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -380,16 +380,16 @@ test('#33 — a 0.15.2 marker-first install self-heals into the fixed in-frontma
   // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
   assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
   assert.ok(!/<!-- pidge-skill/.test(healed), 'the old HTML-comment marker is gone');
-  assert.match(healed, /\n# pidge-skill rev=2 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=3 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
   assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
   assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 2, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 3, manifest v16\)/, 'one stderr note');
 });
 
 test('#280 — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
   const mock = createMock();
   const port = await mock.start();
-  // New-format skill, manifest current (16), spine stale (rev=0 < current 2) — reads the
+  // New-format skill, manifest current (16), spine stale (rev=0 < current 3) — reads the
   // marker from its new in-frontmatter position and heals on the spine trigger.
   const { dir, file } = seedNewSkill(0, 16, 'STALE SPINE');
 
@@ -400,17 +400,17 @@ test('#280 — a SPINE bump (SKILL_REVISION > installed) self-heals the local sk
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
-  assert.match(healed, /\n# pidge-skill rev=2 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=3 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 2, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 3, manifest v16\)/, 'one stderr note');
 });
 
 test('#280 — a MANIFEST bump (server version > installed) self-heals the local skill', async () => {
   const mock = createMock();
   const port = await mock.start();
-  // New-format skill, spine current (rev=2) but the baked manifest is stale (15 < the mock's 16).
-  const { dir, file } = seedNewSkill(2, 15, 'STALE BY MANIFEST');
+  // New-format skill, spine current (rev=3) but the baked manifest is stale (15 < the mock's 16).
+  const { dir, file } = seedNewSkill(3, 15, 'STALE BY MANIFEST');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
   const { code, stderr } = await result;
@@ -418,7 +418,7 @@ test('#280 — a MANIFEST bump (server version > installed) self-heals the local
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=2 manifest=16\n/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=3 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
 });
@@ -428,7 +428,7 @@ test('#280 — a FRESH skill (new-format marker current) is left byte-for-byte, 
   const port = await mock.start();
   // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
   // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
-  const { dir, file } = seedNewSkill(2, 16, 'SENTINEL FRESH — keep me');
+  const { dir, file } = seedNewSkill(3, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -1173,11 +1173,12 @@ test('#242 — --actions accepts a JSON array of custom {id,label} actions', asy
 test('#242 — the short comma form still works (compat retro)', async () => {
   const mock = createMock();
   const port = await mock.start();
-  const out = await runCli(['notify', '--title', 'x', '--actions', 'yes,no,reply'], port).result;
+  // (yes,no,reply would now be REFUSED by lote-5 #2 — use a decision-only combo.)
+  const out = await runCli(['notify', '--title', 'x', '--actions', 'yes,no,later'], port).result;
   await mock.stop();
   assert.equal(out.code, 0, out.stderr);
   const sent = mock.state.notifies.at(-1);
-  assert.deepEqual(sent.actions, ['yes', 'no', 'reply']);
+  assert.deepEqual(sent.actions, ['yes', 'no', 'later']);
   assert.equal(sent.custom_actions, undefined);
 });
 
@@ -1709,4 +1710,213 @@ test('#274 B2 — `pidge approval` (injected Face-ID pair) reads requires_action
   // requires_action:true on them even though hasAnswerAffordance() is local-false.
   assert.equal(mock.state.notifies.at(-1).custom_actions.length, 2, 'the Approve/Reject pair was injected');
   assert.match(out.stderr, /defaulting --wait to 60 min for a decision/);
+});
+
+// --- #34: `pidge approve` — the hook-shaped, deny-default gate -----------------
+
+test('#34 — approve: human taps allow → exit 0, chosen_action JSON on stdout, gated pair in the payload', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['appr-allow'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'allow', label: 'Allow', text: null },
+  };
+  const out = await runCli(
+    ['approve', 'Run `rm -rf build/`?', '--no-realtime', '--correlation-id', 'appr-allow'],
+    port,
+  ).result;
+  await mock.stop();
+
+  assert.equal(out.code, 0, `expected exit 0 on allow; stderr: ${out.stderr}`);
+  assert.equal(JSON.parse(out.stdout).action_id, 'allow', 'chosen_action JSON on stdout');
+  const sent = mock.state.notifies.at(-1);
+  assert.equal(sent.title, 'Run `rm -rf build/`?', 'the positional question is the title');
+  assert.equal(sent.template_kind, 'important', 'approve rides the important type');
+  assert.deepEqual(sent.custom_actions, [
+    { id: 'allow', label: 'Allow', confirm: true, biometric: true, terminal: true },
+    { id: 'deny', label: 'Deny', style: 'destructive', terminal: true },
+  ], 'the gated allow(Face-ID)/deny pair is on the wire');
+  assert.equal(sent.actions, undefined, 'approve uses custom_actions, not built-in actions');
+});
+
+test('#34 — approve: human taps deny → exit 1 (deny explicit, never a false allow)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['appr-deny'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'deny', label: 'Deny', text: null },
+  };
+  const out = await runCli(
+    ['approve', 'Wire $10k?', '--no-realtime', '--correlation-id', 'appr-deny'],
+    port,
+  ).result;
+  await mock.stop();
+
+  assert.equal(out.code, 1, `expected exit 1 on deny; stderr: ${out.stderr}`);
+  assert.equal(JSON.parse(out.stdout).action_id, 'deny', 'chosen_action still printed');
+  assert.match(out.stderr, /DENIED/);
+});
+
+test('#34 — approve: no answer before timeout → exit 1 (deny-default, fail closed)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // never responds → the wait runs to the (short) deadline
+  const out = await runCli(
+    ['approve', 'Deploy to prod?', '--no-realtime', '--timeout', '2', '--interval', '1', '--correlation-id', 'appr-to'],
+    port,
+  ).result;
+  await mock.stop();
+
+  assert.equal(out.code, 1, `expected exit 1 on timeout; stderr: ${out.stderr}`);
+  assert.match(out.stderr, /DENIED|deny-default/);
+  assert.equal(JSON.parse(out.stdout).decision, 'deny', 'a machine-readable deny on stdout');
+});
+
+test('#34 — approve: a send that never lands → non-zero (fail closed on error)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifyStatus = 500; // the notify POST fails
+  const out = await runCli(
+    ['approve', 'Anything?', '--no-realtime', '--timeout', '2', '--correlation-id', 'appr-err'],
+    port,
+  ).result;
+  await mock.stop();
+
+  assert.notEqual(out.code, 0, `a failed send must NOT be exit 0; stderr: ${out.stderr}`);
+  assert.equal(out.code, 1, 'approve maps an HTTP send failure to exit 1 (deny-default)');
+});
+
+test('#34 — approve over the realtime socket resolves allow → exit 0 (onAnswer threads through WS)', async (t) => {
+  if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.onSubscribe = (channel) => {
+    if (channel !== 'InboxChannel') return;
+    const cid = mock.state.notifies[0].correlation_id;
+    setTimeout(() => {
+      mock.state.notifications[cid] = {
+        responded: true,
+        chosen_action: { kind: 'acted', action_id: 'allow', label: 'Allow', text: null },
+      };
+      mock.broadcast('InboxChannel', {
+        type: 'event', kind: 'acted', action_id: 'allow', responded: true, correlation_id: cid,
+      });
+    }, 400);
+  };
+  const { result } = runCli(['approve', 'Ship it?', '--realtime', '--timeout', '30'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stdout, /"action_id": "allow"/);
+});
+
+test('#34 — approve: --allow-label / --deny-label rename the buttons', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['appr-lbl'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'allow', label: 'Ship it', text: null },
+  };
+  const out = await runCli(
+    ['approve', 'Ship?', '--no-realtime', '--allow-label', 'Ship it', '--deny-label', 'Hold', '--correlation-id', 'appr-lbl'],
+    port,
+  ).result;
+  await mock.stop();
+
+  assert.equal(out.code, 0, out.stderr);
+  const ca = mock.state.notifies.at(-1).custom_actions;
+  assert.equal(ca[0].label, 'Ship it');
+  assert.equal(ca[1].label, 'Hold');
+});
+
+// --- lote-5 #2: refuse a decision button + reply in one send ------------------
+
+test('lote-5 #2 — --actions yes,no,reply is REFUSED locally (exit 1, no send)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['important', '--title', 'x', '--actions', 'yes,no,reply'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, out.stderr);
+  assert.match(out.stderr, /can't combine a decision button/);
+  assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
+});
+
+test('lote-5 #2 — --actions reply ALONE is fine (sends)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['important', '--title', 'x', '--actions', 'reply'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.deepEqual(mock.state.notifies.at(-1).actions, ['reply']);
+});
+
+test('lote-5 #2 — done,reply is ALLOWED (done is not a decision; DONE_REPLY is a real category)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['important', '--title', 'x', '--actions', 'done,reply'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.deepEqual(mock.state.notifies.at(-1).actions, ['done', 'reply']);
+});
+
+// --- lote-5 #3: no stray, description-less `template` line in subcommand help --
+
+test('lote-5 #3 — `pidge important --help` no longer prints a bare `template` line', async () => {
+  const out = await runCli(['important', '--help'], 1).result;
+  assert.equal(out.code, 0, out.stderr);
+  assert.doesNotMatch(out.stdout, /^\s*template\s*$/m, 'no bare description-less template line');
+  assert.match(out.stdout, /--subtitle TEXT/, 'the real flags still render');
+});
+
+// --- lote-5 #4: --quiet collapses setup to a single status line ---------------
+
+test('lote-5 #4 — setup --quiet collapses onboarding to ONE status line (verbose lines suppressed)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-quiet-'));
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`, '--quiet'],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, home,
+  );
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stderr, /✓ setup ok — canal "mock"/, 'the single status line');
+  assert.doesNotMatch(stderr, /doctor: token found/, 'verbose doctor lines are suppressed');
+  assert.doesNotMatch(stderr, /doctor: all good/, 'the verbose all-good line is replaced');
+  // the file is still written + the key still never printed
+  const written = fs.readFileSync(path.join(home, 'pidge', 'env'), 'utf8');
+  assert.match(written, /PIDGE_TOKEN=hld_minted_by_claim/);
+  assert.ok(!stderr.includes('hld_minted_by_claim') && !stdout.includes('hld_minted_by_claim'), 'key never leaks');
+});
+
+// --- lote-5 #5: listen --all warns on orphaned backlog -------------------------
+
+test('lote-5 #5 — listen --all WARNS that a quick first batch is old backlog, not new arrivals', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // pre-existing queue: a composer message + an old notification answer
+  mock.state.messages = [
+    { id: 20, channel_id: 1, body: 'oi', created_at: 'x', consumed_at: null },
+    { id: 21, channel_id: 1, kind: 'notification_reply', body: 'sim', text: 'sim', action_id: 'reply', ref: { correlation_id: 'old-1', title: 'Q antigo', event_kind: 'replied' } },
+  ];
+  const out = await runCli(['listen', '--all', '--ack-on-read', '--no-realtime', '--timeout', '10', '--interval', '1'], port).result;
+  await mock.stop();
+
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /ALREADY queued when this listen started/, 'the orphan-backlog heads-up');
+  assert.match(out.stderr, /1 of them are answers to EARLIER notifications/, 'counts the resurfaced notification answers');
+  assert.match(out.stderr, /not a cross-channel leak/, 'clarifies it is within-channel, not the #289 leak');
+});
+
+test('lote-5 #5 — listen WITHOUT --all does not print the backlog heads-up', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 30, channel_id: 1, body: 'oi', created_at: 'x', consumed_at: null }];
+  const out = await runCli(['listen', '--ack-on-read', '--no-realtime', '--timeout', '10', '--interval', '1'], port).result;
+  await mock.stop();
+
+  assert.equal(out.code, 0, out.stderr);
+  assert.doesNotMatch(out.stderr, /ALREADY queued when this listen started/, 'no --all ⇒ no backlog heads-up');
 });
