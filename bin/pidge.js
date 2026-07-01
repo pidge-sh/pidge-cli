@@ -566,7 +566,10 @@ const KNOWN_MANIFEST_VERSION = 46;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action. Start at 1.
-const SKILL_REVISION = 1;
+// Bumped to 2 in 0.15.3 so every 0.15.2 install (which baked the marker ABOVE the `---`,
+// corrupting the skill's description) is detected as stale and self-heals into the fixed
+// in-frontmatter format on the next command. Bump this whenever the hand-authored spine moves.
+const SKILL_REVISION = 2;
 const NAG_TTL_MS = 24 * 60 * 60 * 1000; // #241: at most one nag per 24 h
 let newsWarned = false;
 // #280: the self-heal runs at most ONCE per process (one regeneration, even when
@@ -638,9 +641,15 @@ async function ensureSkillFresh(serverManifestVersion) {
     // Resolve the path the SAME way installSkill does (cwd-relative).
     const file = path.join(process.cwd(), '.claude', 'skills', 'pidge', 'SKILL.md');
     if (!fs.existsSync(file)) return; // don't auto-create — only refresh an existing skill
-    const firstLine = fs.readFileSync(file, 'utf8').split('\n', 1)[0] || '';
-    const revM = firstLine.match(/rev=(\d+)/);
-    const manM = firstLine.match(/manifest=(\d+)/);
+    // #33 fix: the marker now rides a `# pidge-skill rev=N manifest=M` YAML comment INSIDE
+    // the frontmatter (0.15.3+); pre-0.15.3 installs put `<!-- pidge-skill … -->` as line 1.
+    // Scan for the marker line either way — the token `pidge-skill` appears ONLY there in a
+    // generated skill — so a stale OLD-format install is still detected and healed into the
+    // corrected format (its garbage-description bug repaired) on the next command.
+    const content = fs.readFileSync(file, 'utf8');
+    const markerLine = content.split('\n').find((l) => l.includes('pidge-skill')) || '';
+    const revM = markerLine.match(/rev=(\d+)/);
+    const manM = markerLine.match(/manifest=(\d+)/);
     const installedRev = revM ? parseInt(revM[1], 10) : 0;
     const installedManifest = manM ? parseInt(manM[1], 10) : 0;
     const stale = SKILL_REVISION > installedRev || (serverManifestVersion || 0) > installedManifest;
@@ -1765,10 +1774,17 @@ async function installSkill(base = BASE, token = TOKEN) {
   const profileTable = (m.profiles && m.profiles.decision_table) || [];
   const notes = m.notes || [];
   const exits = (m.cli && m.cli.output) || '';
-  const skill = `<!-- pidge-skill rev=${SKILL_REVISION} manifest=${m.manifest_version} -->
----
+  // #33 fix (0.15.3): the self-heal marker rides a `# pidge-skill …` YAML COMMENT INSIDE
+  // the frontmatter — it MUST NOT precede the opening `---`. A SKILL.md whose first line
+  // isn't `---` fails the YAML frontmatter parse, so Claude Code loads the skill with a
+  // GARBAGE description (the HTML comment leaked in as the description, the real one lost)
+  // — proven on a live headless run. A `#` comment line is valid YAML and invisible to
+  // name/description, so the marker survives without corrupting the load. ensureSkillFresh
+  // reads it from this position (and still tolerates the old line-1 marker to heal it).
+  const skill = `---
 name: pidge
 description: Send rich, actionable iPhone notifications to your human and get their decision back (Pidge). Every send is a TYPE (message/important/urgent/event/live) plus an OPTIONAL response (buttons + send-and-go vs wait). Use when finishing long tasks, needing a decision/approval, sending updates with substance, or anything time-anchored. Also covers reading the human's replies back.
+# pidge-skill rev=${SKILL_REVISION} manifest=${m.manifest_version}
 ---
 
 # Pidge — notify your human, get answers back

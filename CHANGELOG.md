@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.15.3 — #33 fix: the self-heal marker no longer corrupts the skill
+
+The 0.15.2 marker was written as the FIRST line of `SKILL.md`, ABOVE the opening `---`. A
+SKILL.md whose first line isn't `---` fails Claude Code's YAML frontmatter parse: the skill
+still appears, but with a GARBAGE description (the HTML comment leaks in as the description and
+the real `name`/`description` are lost) — so the agent's Claude Code never learns WHEN to use
+Pidge. Verified on a live headless `claude` run: a marker-first probe skill loaded with its
+description showing `<!-- pidge-skill … -->` instead of its real text, while an identical
+`---`-first control loaded correctly.
+
+- **fix:** the marker now rides a `# pidge-skill rev=R manifest=N` YAML COMMENT INSIDE the
+  frontmatter (a `#` comment is valid YAML and invisible to `name`/`description`), so the
+  frontmatter opens on line 1 and parses cleanly while the marker still travels with the file.
+- **fix:** `ensureSkillFresh()` reads the marker from its new in-frontmatter position and still
+  tolerates the old line-1 `<!-- … -->` marker, so a 0.15.2 install is detected as stale.
+- **fix:** `SKILL_REVISION` bumped 1 → 2, so every 0.15.2 install (all rev=1, all broken) is
+  seen as stale and self-heals into the corrected format on the next command — zero human action.
+
 ## 0.15.2 — #280 the skill self-heals
 
 #280 — the local skill self-heals: any pidge command silently refreshes
