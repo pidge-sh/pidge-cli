@@ -103,6 +103,132 @@ function die(msg, code = 1) { console.error(msg); process.exit(code); }
 // NB: the TOKEN requirement is enforced AFTER help/usage handling (below) — a
 // first-time `npx pidge-cli --help` must work without any setup.
 
+// ---------------------------------------------------------------------------
+// E2E crypto (E0 — #180; the contract is e2e-spec-v1.md, ratified 2026-07-02).
+// AES-256-GCM · 32-byte per-channel key · ONE independent envelope per field:
+//   field envelope  "v1:" + base64url( nonce(12) || ciphertext || tag(16) )
+//   blob framing    [0x01][nonce 12B][ciphertext][tag 16B]  (binary, no base64)
+//   AAD             "ch<channel_id>:<correlation_id>:<field_name>"    (ASCII)
+//   kf              base64url(SHA-256(key)[0..3])    (4-byte key fingerprint)
+// E0 ships the PURE functions + the shared fixture (test/e2e_vectors.json)
+// ONLY — no command encrypts yet (server passthrough is E1; send/receive
+// integration is E2/E3). The nonce parameter exists ONLY for the deterministic
+// fixture; production callers omit it (crypto.randomBytes(12) per envelope).
+// ---------------------------------------------------------------------------
+const E2E_FIELD_PREFIX = 'v1:';
+const E2E_BLOB_VERSION = 0x01;
+const E2E_NONCE_BYTES = 12;
+const E2E_TAG_BYTES = 16;
+
+function e2eKey(key) {
+  if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('e2e key must be a 32-byte Buffer');
+  return key;
+}
+function e2eNonce(nonce) {
+  if (nonce === undefined) return crypto.randomBytes(E2E_NONCE_BYTES);
+  if (!Buffer.isBuffer(nonce) || nonce.length !== E2E_NONCE_BYTES) {
+    throw new Error('e2e nonce must be a 12-byte Buffer (deterministic tests only — omit it in production)');
+  }
+  return nonce;
+}
+
+// The AAD binds a ciphertext to ITS channel + notification + field (anti-swap/
+// anti-replay: a ciphertext moved to any other slot fails the tag). channel_id
+// is the PUBLIC id (whoami/manifest) — never the secret.
+function e2eAad(channelId, correlationId, fieldName) {
+  if (channelId === undefined || channelId === null || channelId === '') throw new Error('e2e AAD needs a channel_id');
+  if (!correlationId) throw new Error('e2e AAD needs a correlation_id');
+  if (!fieldName) throw new Error('e2e AAD needs a field_name');
+  return `ch${channelId}:${correlationId}:${fieldName}`;
+}
+
+function e2eSeal(key, aad, plaintext, nonce) {
+  const iv = e2eNonce(nonce);
+  const cipher = crypto.createCipheriv('aes-256-gcm', e2eKey(key), iv);
+  cipher.setAAD(Buffer.from(aad));
+  const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return { iv, ct, tag: cipher.getAuthTag() };
+}
+function e2eOpen(key, aad, raw, what) {
+  const iv = raw.subarray(0, E2E_NONCE_BYTES);
+  const ct = raw.subarray(E2E_NONCE_BYTES, raw.length - E2E_TAG_BYTES);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', e2eKey(key), iv);
+  decipher.setAAD(Buffer.from(aad));
+  decipher.setAuthTag(raw.subarray(raw.length - E2E_TAG_BYTES));
+  try {
+    return Buffer.concat([decipher.update(ct), decipher.final()]);
+  } catch {
+    // GCM gives ONE failure signal for all of these — don't guess further.
+    throw new Error(`e2e ${what} failed to authenticate: wrong key, wrong AAD, or corrupted data`);
+  }
+}
+
+function e2eEncryptField(key, aad, plaintext, nonce) {
+  const { iv, ct, tag } = e2eSeal(key, aad, Buffer.from(String(plaintext), 'utf8'), nonce);
+  return E2E_FIELD_PREFIX + Buffer.concat([iv, ct, tag]).toString('base64url');
+}
+
+function e2eDecryptField(key, aad, envelope) {
+  if (typeof envelope !== 'string') throw new Error('e2e envelope must be a string');
+  if (!envelope.startsWith(E2E_FIELD_PREFIX)) {
+    const ver = /^(v\d+):/.exec(envelope);
+    throw new Error(ver ? `unknown e2e envelope version "${ver[1]}" — this CLI speaks v1`
+      : 'not an e2e field envelope (missing "v1:" prefix)');
+  }
+  const b64 = envelope.slice(E2E_FIELD_PREFIX.length);
+  // Buffer.from(_, 'base64url') silently SKIPS invalid chars — a mangled
+  // envelope must fail loud here, not decode to garbage that then fails the
+  // tag with a misleading "wrong key" story. Trailing '=' padding tolerated.
+  if (!/^[A-Za-z0-9_-]+={0,2}$/.test(b64)) throw new Error('invalid base64url in e2e envelope');
+  const raw = Buffer.from(b64, 'base64url');
+  if (raw.length < E2E_NONCE_BYTES + E2E_TAG_BYTES) throw new Error('e2e envelope too short');
+  return e2eOpen(key, aad, raw, 'field').toString('utf8');
+}
+
+function e2eEncryptBlob(key, aad, buffer, nonce) {
+  if (!Buffer.isBuffer(buffer)) throw new Error('e2e blob plaintext must be a Buffer');
+  const { iv, ct, tag } = e2eSeal(key, aad, buffer, nonce);
+  return Buffer.concat([Buffer.from([E2E_BLOB_VERSION]), iv, ct, tag]);
+}
+
+function e2eDecryptBlob(key, aad, buffer) {
+  if (!Buffer.isBuffer(buffer)) throw new Error('e2e blob must be a Buffer');
+  if (buffer.length < 1 + E2E_NONCE_BYTES + E2E_TAG_BYTES) throw new Error('e2e blob too short');
+  if (buffer[0] !== E2E_BLOB_VERSION) {
+    throw new Error(`unknown e2e blob version 0x${buffer[0].toString(16).padStart(2, '0')} — this CLI speaks 0x01`);
+  }
+  return e2eOpen(key, aad, buffer.subarray(1), 'blob');
+}
+
+// kf — 4 bytes of SHA-256(key), base64url. Rides CLEAR next to `enc:"v1"` so
+// the device can say "sent with another key" PRECISELY instead of showing
+// garbage (kills the token-of-one-channel + secret-of-another pitfall).
+function e2eKeyFingerprint(key) {
+  return crypto.createHash('sha256').update(e2eKey(key)).digest().subarray(0, 4).toString('base64url');
+}
+
+// PIDGE_SECRET reads from the SAME slot/precedence as PIDGE_TOKEN: env var wins
+// over the config file (per-agent aware via PIDGE_AGENT/XDG_CONFIG_HOME) — the
+// {TOKEN, SECRET} pair always travels together from one source. E0: only the
+// read exists; no command uses it yet.
+function e2eLoadSecret() {
+  return process.env.PIDGE_SECRET || FILE_ENV.PIDGE_SECRET || null;
+}
+
+// ---------------------------------------------------------------------------
+// Test seam (E0): require()ing this file exports the pure e2e helpers and
+// stops HERE — none of the CLI machinery below (parseArgs, the TOKEN check,
+// command dispatch) may run under a test runner's argv. Executed as a binary
+// (require.main === module) it skips the export and runs the CLI unchanged.
+// ---------------------------------------------------------------------------
+if (require.main !== module) {
+  module.exports = {
+    e2eAad, e2eKeyFingerprint, e2eLoadSecret,
+    e2eEncryptField, e2eDecryptField, e2eEncryptBlob, e2eDecryptBlob,
+  };
+  return;
+}
+
 const OPTIONS = {
   help: { type: 'boolean', short: 'h' },
   title: { type: 'string' },
