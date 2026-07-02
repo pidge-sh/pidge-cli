@@ -11,6 +11,24 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > current spec (fields, profiles, guarantees). This CLI is a thin pipe over it — any
 > new server field works without a CLI update via `--param key=value`.
 
+> **New in v0.16.x** — **`pidge approve`** (0.16.0): the hook-shaped, **deny-default
+> permission gate** — sends a Face-ID allow/deny pair and maps the human's answer to an
+> **exit code** (0 ONLY on explicit allow; deny/timeout/broken channel → 1; a raw network
+> error on the send → 2). Built for a Claude Code `PreToolUse` hook that must fail CLOSED.
+> ⚠️ Trust caveat: the gate is only as trustworthy as the process **env** — whatever can
+> rewrite `PIDGE_URL`/`PIDGE_TOKEN` can redirect the approval (and the bearer token) to
+> its own server; run hooks in an environment you trust. Also in 0.16.0: a **decision +
+> `reply` in one send is refused** (exit 1, nothing sent) — one tap on `reply` would dodge
+> the decision; use `--actions reply` ALONE when you need text. **0.16.1** hardens the gate
+> (an unparseable `--timeout`/`--interval` now dies immediately instead of waiting forever)
+> and the self-heal (atomic write, torn files detected, `SKILL.md.bak` before clobbering a
+> customized skill).
+>
+> **New in v0.15.x** — the local skill **self-heals**: any networked pidge command detects
+> a stale `.claude/skills/pidge/SKILL.md` (CLI spine or server manifest moved) and silently
+> regenerates it, so an onboarded agent's next session is always current (`pidge skill
+> install` still exists for the first write).
+>
 > **New in v0.14.0** — the **married vocabulary** (perfis): the CLI now speaks the same
 > language as the server (manifest v42) and the app. **One list of 5 types** —
 > `pidge message · important · urgent · event · live` (message←fyi, important←report,
@@ -25,7 +43,8 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > (#240); the **manifest-version nag is throttled to once / 24 h** (cached in
 > `~/.config/pidge/state.json`) with `--quiet-nag` / `PIDGE_QUIET_NAG=1` to silence it
 > (#241); **`--actions` accepts a JSON array** of custom `{id,label}` actions for custom
-> labels (#242, the short `yes,no,reply` form unchanged); the nag's manifest re-read
+> labels (#242; the short comma form like `yes,no` unchanged — note 0.16.0 now REFUSES a
+> decision combined with `reply` in one send); the nag's manifest re-read
 > example now shows the **`Authorization: Bearer`** header so it doesn't 401 (#243); and
 > `skill install` writes an **"always-on for turn-based agents"** recipe (#244).
 >
@@ -130,10 +149,16 @@ npx pidge-cli important --title "Review PR #42" --url https://github.com/…/pul
 
 # Send AND wait for the answer (the one an agent wants) — = important + --wait:
 npx pidge-cli ask \
-  --title "Approve deploy?" --actions yes,no,reply --timeout 600
+  --title "Approve deploy?" --actions yes,no --timeout 600
+# (need a TYPED answer instead? --actions reply ALONE — a decision + reply in one
+#  send is refused since 0.16.0: one tap on reply would dodge the decision)
 
 # A go/no-go with Face ID — the approval RECIPE (= important + Approve/Reject + wait):
 npx pidge-cli approval --title "Deploy to production?"
+
+# Gate YOUR OWN risky action behind a human Face-ID tap — deny-default exit codes,
+# built for permission hooks (exit 0 ONLY on explicit allow):
+npx pidge-cli approve "Run the schema migration?" --body "Drops legacy_orders" --timeout 300
 
 # Urgent — breaks through silent/Focus; --escalate forces an AlarmKit alarm:
 npx pidge-cli urgent --title "Balance dropped below $5k" --escalate
@@ -187,6 +212,7 @@ bundle both: **`pidge ask`** = `important --wait` (needs `--actions`); **`pidge 
 | `message` / `important` / `urgent` / `event` / `live` | The 5 message types (axis 1). Fire-and-forget by default; add `--actions`/`--wait` (axis 2) to ask for a reply. `important` is the recommended default. |
 | `ask` | `important --wait` shortcut: send **and block** until the human answers; prints the chosen action JSON. Requires a way to answer (`--actions`/`--custom-action`/`--template`). |
 | `approval` | Go/no-go RECIPE: `important` + Approve (Face ID) / Reject + `--wait`. Pass your own `--actions` to override the pair. |
+| `approve "<question>"` | **v0.16.0 (#34):** the hook-shaped, **deny-default permission gate** — send a Face-ID allow/deny pair, block, and answer with an **exit code**: `0` ONLY on an explicit allow; deny / timeout / no answer / a broken channel / an HTTP send failure → `1`; only a raw network error (the send never reached the server) → `2`. **Non-zero always means "not approved."** Built for a Claude Code `PreToolUse` hook that must fail CLOSED (`pidge approve --help` has a runnable hook). ⚠️ The gate is only as trustworthy as the process env (`PIDGE_URL`/`PIDGE_TOKEN`) — see the caveat below. |
 | `hello` | **v0.11.0 (#217):** your channel's **first-contact WOW** — send the onboarding handshake **and block** until the human confirms. The server narrates a 3-stage Live Activity on the lock screen (Conectando → toque para confirmar → Concluído ✓) so they *see* the agent→human→agent loop close. Run it as your **first** contact on a fresh channel. A thin `ask --template onboarding` wrapper with friendly default copy. |
 | `notify` | **Deprecated** — send without a type (the server picks the channel default). Prefer a typed send. Prints the raw 201 JSON; the `correlation_id` + warnings go to stderr. |
 | `wait <correlation_id>` | Block on an already-sent notification until it's answered. |
@@ -278,6 +304,16 @@ WebSocket  →  ?wait= long-poll (capped 25 s server-side)  →  plain GETs ever
   back off and retry later) · `4` timed out **without one healthy round-trip all
   session** (the CHANNEL looks broken — server/network — tell your human) ·
   `2` error · `1` usage.
+- **`approve` maps everything to deny-default exit codes** (it never exits 3/4):
+  `0` explicit allow · `1` deny, timeout, no answer, broken channel, or an HTTP
+  failure on the send · `2` only when a raw network error kept the send from ever
+  reaching the server. A typo in `--timeout`/`--interval` dies immediately with `1`
+  (v0.16.1) — the gate never waits forever.
+- **`approve` trusts the process env.** The gate is exactly as trustworthy as
+  `PIDGE_URL`/`PIDGE_TOKEN` at the moment it runs: anything able to rewrite the env
+  can point the approval at its own server (receiving your bearer token) and answer
+  "allow". Inherent to an env-configured CLI — run permission hooks in an environment
+  you trust, and treat the env as part of the gate's trusted computing base.
 - **Responses are one-and-done.** Every answer closes the notification EXCEPT a
   **snooze** (or a reschedule that set a new time), which re-fires later. `ask`/`wait`
   keep polling through a snooze and print `snooze_until` so you can schedule a re-check.

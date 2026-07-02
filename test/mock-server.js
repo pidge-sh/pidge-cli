@@ -189,6 +189,12 @@ function createMock() {
     }
     const m = url.pathname.match(/^\/api\/v1\/notifications\/([^/]+)$/);
     if (req.method === 'GET' && m) {
+      // #39: a test forces a MALFORMED 200 body — the poller must read it as
+      // "no answer yet" and a blocked approve must still fail CLOSED on timeout.
+      if (state.pollGarbage) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end('{{{ not json');
+      }
       const cid = decodeURIComponent(m[1]);
       return json(res, 200, state.notifications[cid] || { responded: false, correlation_id: cid });
     }
