@@ -2479,9 +2479,11 @@ For a long job whose progress the human wants to GLANCE at, you have two honest 
   \`\`\`
 - **Lighter: ONE \`pidge message\` re-sent with the same \`--collapse-key\`** — each update replaces
   the previous banner (1 slot, not N pings).
-Heads-up: \`pidge live\` as a SEND currently 422s with a pointer to the endpoints above (\`live\` is
-Live-Activity-only). Either path: a live surface never answers (no \`--wait\`); if the finished job
-leaves a pendency, that's a separate \`important\` at the end.
+Heads-up: \`pidge live\` as a SEND silently degrades today — the server treats the bare type as a
+default and delivers a normal \`message\`-profile 201 (check \`profile\` in the echo); **no card ever
+starts**. Use the endpoints above (\`$PIDGE_URL\`/\`$PIDGE_TOKEN\` live in \`~/.config/pidge/env\` if you
+set up via claim — source it before curling). Either path: a live surface never answers (no
+\`--wait\`); if the finished job leaves a pendency, that's a separate \`important\` at the end.
 
 ## Anti-slop rules (judgment a recipe can't teach)
 

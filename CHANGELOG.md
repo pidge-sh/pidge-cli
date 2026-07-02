@@ -9,8 +9,8 @@
     digests but never attached the artifact);
   - **Live progress** section: the real Live Activity endpoints (upsert handle +
     explicit `end`) + the lighter `--collapse-key` path; heads-up that `pidge
-    live` as a send currently 422s with a pointer (see #47 for the wiring);
-    picker row updated accordingly;
+    live` as a send silently degrades to a normal `message`-profile 201 today —
+    no card ever starts (see #47 for the wiring); picker row updated accordingly;
   - supervisor-poll example now `listen --all` + explicit note that a pending
     notification's answer never surfaces in plain `listen` (recover via
     `wait <cid>` or `listen --all`);
