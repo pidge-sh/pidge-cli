@@ -11,6 +11,14 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > current spec (fields, profiles, guarantees). This CLI is a thin pipe over it — any
 > new server field works without a CLI update via `--param key=value`.
 
+> **New in v0.17.0** — **end-to-end encryption on the wire** (#43, E2E v1). When your
+> human turns E2E on for a channel, the setup prompt hands you a **`PIDGE_SECRET`**
+> (same slot/precedence as `PIDGE_TOKEN`) and every send seals its content
+> (title/body/markdown + custom-action labels) into AES-256-GCM envelopes **the server
+> cannot read**; `listen`/`wait`/`ask` decrypt the human's sealed messages and answers
+> back to plaintext locally. No secret? Sends go clear and the app marks them
+> "⚠️ sem criptografia" — never blocked. See **End-to-end encryption** below.
+>
 > **New in v0.16.x** — **`pidge approve`** (0.16.0): the hook-shaped, **deny-default
 > permission gate** — sends a Face-ID allow/deny pair and maps the human's answer to an
 > **exit code** (0 ONLY on explicit allow; deny/timeout/broken channel → 1; a raw network
@@ -249,6 +257,43 @@ WebSocket  →  ?wait= long-poll (capped 25 s server-side)  →  plain GETs ever
 - **Deafness exits LOUD**: a session that times out with **zero** healthy round-trips
   exits `4` (≠ `3`, "the human didn't answer") — the channel itself looks broken;
   surface it instead of retrying blindly.
+
+## End-to-end encryption (v0.17.0)
+
+When the human flips **E2E on** for a channel (in the Pidge app), a 32-byte key is
+generated **on their device** — the server never sees it. You receive it as
+**`PIDGE_SECRET`** (base64url) inside the channel's **setup prompt**, right next to
+`PIDGE_TOKEN`: same slot, same precedence (env var wins, else
+`~/.config/pidge[/agents/<id>]/env`; `setup --claim` stores the pair together, and
+`--print` emits both export lines). The `{TOKEN, SECRET}` pair always travels from ONE
+source — mixing a token from one channel with a secret from another is exactly the
+mixup the `kf` fingerprint catches.
+
+What changes, concretely:
+
+- **Sends seal themselves.** With the secret set and the channel E2E, every send's
+  `title`/`subtitle`/`body`/`body_markdown` + custom-action **labels** leave your
+  machine as `v1:` envelopes with `enc:"v1"` + `kf` alongside (action IDs, profile,
+  urgency, cid and timestamps stay clear — the server needs them to route). The 201
+  echo prints decrypted for display. Media (`--image`/`--file`) still rides clear
+  until phase E3.
+- **`listen` decrypts the human's sealed messages.** A `kind:"message"` row carrying
+  `enc:"v1"` opens locally before printing; answers to your notifications
+  (`listen --all`, `wait`, `ask`) decrypt too. Rows **without** `enc` are clear
+  history and render exactly as before.
+- **Errors are precise, never garbage.** A sealed row the CLI can't open is blanked
+  with an `e2e_error` naming the reason — "sealed with ANOTHER key" (kf mismatch),
+  missing `correlation_id`, unknown version, missing secret — base64 never reaches
+  your terminal.
+- **No secret ⇒ nothing breaks.** Sends go clear and the app marks them
+  "⚠️ sem criptografia"; run `pidge doctor` — it validates the secret (32 bytes, shows
+  the kf), warns on an orphan secret, and exits 2 when an E2E channel's secret is
+  invalid.
+
+Honest scope (from the server manifest's `e2e` section): this protects content against
+the **server** (infra, DB dumps, the operator). It does NOT protect against a
+compromised agent machine — `PIDGE_SECRET` sits in your env/config in the clear; the
+"ends" are the human's device and **your agent**.
 
 ## Options (for `notify` / `ask`)
 

@@ -1,10 +1,72 @@
 # Changelog
 
-## Unreleased — E2E phase E0 (#180): crypto lib + shared test vectors (no wire change)
+## 0.17.0 — E2E v1 ON THE WIRE (#43, phase E2-CLI): sends seal, listen/wait decrypt
 
-The first increment of E2E encryption (contract: `e2e-spec-v1.md`, ratified 2026-07-02).
-**Nothing on the wire changes** — no command encrypts yet (server passthrough is E1;
-send/receive integration is E2/E3). This ships the pure primitives + the cross-repo fixture.
+The send/receive wiring of end-to-end encryption (contract: `e2e-spec-v1.md`; server
+manifest **v49** notifications passthrough + **v51** sealed `/messages`). With
+`PIDGE_SECRET` configured and the channel E2E, content leaves the machine as ciphertext
+the server cannot read, and sealed answers/messages decrypt back to plaintext locally.
+Includes the E0 crypto lib + shared fixture (below), previously unreleased.
+
+- **feat (send):** with a valid `PIDGE_SECRET` (same slot/precedence as `PIDGE_TOKEN`;
+  the pair travels together) AND `e2e_enabled` on the channel (whoami says — never a
+  guess), EVERY send path (`message/important/urgent/event/live`, `ask`, `approval`,
+  `approve`, `hello`, deprecated `notify/send`) seals `title`/`subtitle`/`body`/
+  `body_markdown` + **custom-action LABELS** (`action_label_<id>`; action IDs stay
+  clear) and rides `enc:"v1"` + `kf` alongside. The `correlation_id` is ALWAYS minted
+  client-side under E2E (the AAD needs it before the server sees the payload). No
+  secret / non-E2E channel / whoami unreachable ⇒ the clear send of always — a missing
+  secret must NEVER block a notification (the app marks it "⚠️ sem criptografia"). An
+  INVALID secret warns loud and degrades to clear. Media note: `--image`/`--file` bytes
+  + filename still ride CLEAR (phase E3) — narrated on stderr when sealing.
+  The 201/upsert echo on stdout shows OUR OWN envelopes **decrypted for display**
+  (trust-the-echo keeps meaning something; `enc`/`kf` stay printed as the wire truth).
+- **feat (receive):** every read gates on the EXPLICIT `enc` flag — never on sniffing
+  the `v1:` prefix. `listen` (WS and polling paths) opens sealed `kind:"message"` rows
+  (E1.5: field ALWAYS `"message"`, AAD `ch<channel_id>:<correlation_id>:message` — the
+  cid comes on the row) and `notification_reply` rows whose `ref.enc` is set (text =
+  field `"reply"` with `ref.correlation_id`; `ref.title` = field `"title"`; a body that
+  mirrors a custom-action label = `action_label_<action_id>`). `wait`/`ask`/`approve`/
+  `hello` open the poll's `chosen_action` (text = `"reply"`, custom label =
+  `action_label_<id>`) — the poll payload has no channel id, so whoami resolves it once.
+  On success the plaintext replaces the ciphertext and `enc`/`kf` become
+  `e2e:"decrypted"`; rows WITHOUT `enc` render exactly as before (pre-E2E history stays
+  clear — honest degradation).
+- **feat (precise errors — never garbage):** a sealed thing the CLI can't open is
+  BLANKED (`body`/`text` → `null` + `e2e_error`) with ONE precise stderr line per
+  distinct reason — base64 never reaches the terminal (follow-up A1). The reasons are
+  named: **kf mismatch** ("sealed with ANOTHER key", both fingerprints shown — the
+  token-of-one-channel + secret-of-another mixup), **enc without correlation_id**
+  (server predates E1.5 / bug), **unknown envelope version**, **no (valid)
+  PIDGE_SECRET**, and a failed tag. A NON-envelope value inside a sealed context is
+  readable text and passes through (a built-in action label, or a clear reply typed on
+  a pre-E2E app — the same accept-and-mark honesty the iOS app shows).
+- **feat (doctor):** validates `PIDGE_SECRET` when present (base64url, exactly 32
+  bytes; narrates the kf = `base64url(SHA-256(key)[0..3])`, never the secret) and
+  crosses it with the channel: `e2e_enabled` + no secret → points at re-running the
+  setup prompt (warning); secret + non-E2E channel → ORPHAN-secret warning; E2E channel
+  + invalid/mismatched secret → **BROKEN, exit 2**. The stdout JSON gains
+  `e2e: {channel, secret, kf}`.
+- **feat (setup):** the `{TOKEN, SECRET}` pair travels together — `setup --claim`
+  persists `PIDGE_SECRET` from the environment (the human's setup prompt embeds it)
+  next to the token in the config file, and `--print` emits the
+  `export PIDGE_SECRET=…` line alongside the other two. A secret already in the file
+  is never silently dropped on a re-claim.
+- **test:** `test/e2e-wire.test.js` — 17 wire tests against the mock server: sealed
+  send (envelopes + enc/kf/cid + clear IDs + echo decrypt), the three clear-send
+  degrades, sealed-message listen, `--all` reply-ref decrypt (text/title/label +
+  narration), chosen_action decrypt (text, custom label, built-in passthrough), the
+  precise-error matrix (kf mismatch, missing cid, unknown version, missing secret),
+  and the A1 safety net (an unattributable envelope is blanked, never printed). The
+  frozen fixture (`test/e2e_vectors.json`, sha `7bdacd01…`) is untouched; the mock
+  gains `e2e_enabled` on whoami + the prod-shaped 201 content echo.
+- **docs:** README E2E section + `PIDGE_SECRET` in `--help`'s ENV;
+  `KNOWN_MANIFEST_VERSION` 46 → 51.
+
+### E0 (#180), first released here: crypto lib + shared test vectors
+
+The first increment of E2E encryption (contract: `e2e-spec-v1.md`, ratified 2026-07-02) —
+the pure primitives + the cross-repo fixture the wiring above builds on.
 
 - **feat (E0):** AES-256-GCM primitives inside `bin/pidge.js` (single-file, Node `crypto`
   only — zero new deps): `e2eEncryptField`/`e2eDecryptField` (`"v1:" + base64url(nonce ||
@@ -13,7 +75,8 @@ send/receive integration is E2/E3). This ships the pure primitives + the cross-r
   (`ch<channel_id>:<correlation_id>:<field_name>` — anti-swap binding),
   `e2eKeyFingerprint` (`kf` = 4 bytes of SHA-256(key), base64url) and `e2eLoadSecret`
   (`PIDGE_SECRET` from the SAME slot/precedence as `PIDGE_TOKEN`: env wins over the
-  per-agent-aware config file — no command reads it yet). Decrypt fails LOUD and precisely:
+  per-agent-aware config file — wired into the commands by E2-CLI above). Decrypt fails
+  LOUD and precisely:
   wrong AAD/corrupted tag, unknown version prefix (`v9:`), invalid base64url, wrong sizes.
   The nonce is `crypto.randomBytes(12)` in production; injectable ONLY for the fixture.
 - **test (E0):** `test/e2e_vectors.json` — the SHARED deterministic fixture (committed

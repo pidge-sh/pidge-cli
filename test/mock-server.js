@@ -71,7 +71,9 @@ function createMock() {
       // corpse be overwritten without --force).
       if (!/^Bearer hld_/.test(auth) || auth === 'Bearer hld_revoked') return json(res, 401, { error: 'unauthorized' });
       return json(res, 200, {
-        channel: { id: 1, name: 'mock', icon: 'bot', color: 'violet' },
+        // E2E (E2-CLI): e2e_enabled mirrors prod whoami — the ONLY signal that
+        // turns the CLI's send-side sealing on (a test flips state.e2eEnabled).
+        channel: { id: 1, name: 'mock', icon: 'bot', color: 'violet', e2e_enabled: !!state.e2eEnabled },
         operating_contract: state.operatingContract,         // #182
         user: { name: 'Thiago', timezone: 'America/Sao_Paulo' },
         claim: state.claim,                                  // #181
@@ -181,6 +183,13 @@ function createMock() {
           registered_devices: 1, render_mode: 'banner',
           template: parsed.template || null,
           requires_action,
+          // E2E (E1): prod echoes the content byte-identical, enc/kf alongside —
+          // the CLI's trust-the-echo display decrypt is exercised against this.
+          title: parsed.title ?? null,
+          subtitle: parsed.subtitle ?? null,
+          body: parsed.body ?? null,
+          enc: parsed.enc || null,
+          kf: parsed.kf || null,
           // #132: per-template suggestion the real server echoes
           suggested_ask_timeout: parsed.template === 'approval' ? 3600 : null,
         });
