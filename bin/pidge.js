@@ -348,6 +348,8 @@ USAGE
   (send-and-go vs --wait). Two shortcuts bundle both axes:
   pidge ask      [options]                = important + --wait; needs --actions (prints chosen_action JSON)
   pidge approval [options]                = important + Approve/Reject + Face ID + --wait (a go/no-go)
+  pidge approve "<question>" [options]    exit-code gate for hooks: Face-ID allow/deny, DENY-DEFAULT —
+                                          exit 0 ONLY on explicit allow (deny/timeout/error → non-zero)
   COMPAT aliases (old names still work → mapped to the new type):
   pidge fyi→message · report→important · alert→urgent  (event/live unchanged)
   pidge notify [options]                  DEPRECATED — send without a type; prefer a TYPE above
@@ -774,7 +776,7 @@ const KNOWN_MANIFEST_VERSION = 51;
 // and notes the CLI now REFUSES a decision + reply in one send (lote-5 #2).
 // Bumped to 4 in 0.16.1 (#38): the generated skill now ends with SKILL_END_MARKER (the
 // cheap integrity check) — the bump heals every pre-marker install into the new format.
-const SKILL_REVISION = 4;
+const SKILL_REVISION = 5;
 // #38: the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -2424,7 +2426,7 @@ Every send is **a TYPE + a markdown body + an OPTIONAL response**. The TYPE (one
 | YOU are asking for a formal go/no-go (money/risk) | \`pidge approval\` |
 | Gate your OWN risky tool behind a human OK (a hook) | \`pidge approve "<question>"\` (exit 0 = allow) |
 | A thing with a known TIME | \`pidge event --event-at <ISO8601>\` |
-| A live status you'll keep updating | \`pidge live\` |
+| A live status you'll keep updating | Live Activity endpoints (see **Live progress** below) |
 | WAKE them now — rare, real, <1/day | \`pidge urgent\` |
 
 ⭐ \`important\` is the default. On the fence between informing and asking, pick \`important\`. \`message\` is only for a true no-action FYI. (\`fyi\`/\`report\`/\`ask\`/\`alert\` still work as silent aliases → message/important/important/urgent.) Run \`pidge <type> --help\` for each one's flags.
@@ -2435,6 +2437,7 @@ The banner shows your **\`--title\`** and **\`--body\`** (plain text). **\`--bod
 - **Always give a concise \`--body\`** — the one-line human-readable gist. A title-only send can show as an empty banner (just your channel name).
 - Put the rich part (tables, lists, code, an image) in **\`--body-markdown\`** (and/or \`--image\`) — the human sees it when they tap in.
 - A good send: **title = the answer at a glance · body = the few facts they need to decide/act · body-markdown = the rich detail · ONE ask.** Never ship a title-only notification.
+- **A real artifact rides as an attachment, never as pasted text.** A log, xlsx, pdf, csv → \`--file <path>\` (the human gets a Quick Look preview + share/save on the phone); a picture → \`--image <path>\`. One image + one file can ride the same send. Long output (a build log, a report): distilled digest in \`--body-markdown\`, raw thing attached with \`--file\` — never paste hundreds of lines into the markdown.
 
 ## Approval has two paths — know which one you're in
 
@@ -2459,13 +2462,34 @@ Asking for a reply is orthogonal to the type — you don't need \`approval\` to 
 
 Need a TYPED reply (a time/value/name)? \`--actions reply\` ALONE — never a decision + \`reply\` together (the human taps the easy button and you get a useless "Yes"). The CLI now **refuses** \`yes,no,reply\` (exit 1) so you can't ship the trap by accident. ONE question per send.
 
+## Live progress (a status card you update in place)
+
+For a long job whose progress the human wants to GLANCE at, you have two honest paths:
+- **Live Activity (the real lock-screen card):** three HTTP endpoints; the handle is YOUR
+  \`correlation_id\` (re-POST = upsert; PATCH updates in place). **ALWAYS end it** — an orphan
+  card stuck at "stage 3/4" is slop.
+  \`\`\`bash
+  curl -X POST $PIDGE_URL/api/v1/live_activities -H "Authorization: Bearer $PIDGE_TOKEN" \\
+    -H "Content-Type: application/json" \\
+    -d '{"correlation_id":"backfill-1","title":"Backfill","status":"Stage 1/4","progress":0.25}'
+  curl -X PATCH $PIDGE_URL/api/v1/live_activities/backfill-1 -H "Authorization: Bearer $PIDGE_TOKEN" \\
+    -H "Content-Type: application/json" -d '{"status":"Stage 3/4","progress":0.75}'
+  curl -X POST $PIDGE_URL/api/v1/live_activities/backfill-1/end -H "Authorization: Bearer $PIDGE_TOKEN" \\
+    -H "Content-Type: application/json" -d '{"status":"Done ✓","progress":1,"done":true}'
+  \`\`\`
+- **Lighter: ONE \`pidge message\` re-sent with the same \`--collapse-key\`** — each update replaces
+  the previous banner (1 slot, not N pings).
+Heads-up: \`pidge live\` as a SEND currently 422s with a pointer to the endpoints above (\`live\` is
+Live-Activity-only). Either path: a live surface never answers (no \`--wait\`); if the finished job
+leaves a pendency, that's a separate \`important\` at the end.
+
 ## Anti-slop rules (judgment a recipe can't teach)
 
 1. **One send = one fact = one ask.** Never two questions in a notification.
 2. **Default to \`important\`.** \`message\` only for true no-action FYIs; \`urgent\` is a contract, not a volume knob — **<1/day**, abuse caps your channel.
 3. **There is no content-template menu.** Every send is type + markdown + optional buttons. If you're reaching for \`--template context/report/digest/sensitive\`, stop — that surface is gone (the field still parses as silent back-compat, but don't teach or rely on it).
 4. **Typed answer? \`--actions reply\` ALONE** — never a decision + \`reply\` together (the CLI refuses it, exit 1).
-5. **Trust the 201 echo over your intent** — \`degraded\`/\`render_mode\`/\`registered_devices\`. \`registered_devices:0\` ⇒ it went nowhere; don't wait.
+5. **Trust the 201 echo over your intent** — \`degraded\`/\`render_mode\`/\`registered_devices\`. \`registered_devices:0\` ⇒ it went nowhere; ABORT a blocking \`--wait\` on it (kill it, don't let it burn its timeout) and run \`pidge doctor\`.
 6. **Don't spam to signal importance.** Consolidate into one markdown body; use \`--collapse-key\` for self-replacing progress, \`--thread\` only for follow-ups over time.
 7. **Be listening when the answer lands, or you lose it.** Ack only AFTER the work is durably done.
 8. **English only, phone-friendly markdown.** Narrow tables (they render), no emoji-spam.
@@ -2533,13 +2557,16 @@ ${notes.map((n) => `- ${n}`).join('\n')}
 
 - \`pidge ask …\` blocks and prints \`chosen_action\` JSON; \`pidge wait <cid>\` blocks on an existing send.
 - \`pidge listen\` blocks until the human MESSAGES you from the app (composer) — run it when idle.
+- **A pending notification's answer does NOT surface in plain \`pidge listen\`** (messages only).
+  To collect the answer to a question you already sent: \`pidge wait <cid>\` (you printed the cid
+  on stderr at send time) or \`pidge listen --all\` (replies + messages). Park the cid, never re-send.
 - ${exits}
 
 ## Stay "always-on" while you're turn-based
 
 A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE without a daemon:
 - **Active session:** \`pidge listen --follow --timeout 300\` holds for 5 min, printing messages as they arrive. \`--follow\` traps the turn — use it only when you intend to sit and wait.
-- **Supervisor poll (24/7):** a cron/systemd timer invokes you every N min; each tick runs ONE one-shot \`pidge listen --timeout 50\` (block up to 50s, print, exit 0; exit 3 = nothing this tick), do the work, \`pidge ack --up-to <id>\`, sleep. \`--timeout\` is always SECONDS. Do NOT background \`pidge listen\` with \`&\`.
+- **Supervisor poll (24/7):** a cron/systemd timer invokes you every N min; each tick runs ONE one-shot \`pidge listen --all --timeout 50\` (block up to 50s, print, exit 0; exit 3 = nothing this tick — the \`--all\` ear also catches answers to questions you fire-and-forgot), do the work, \`pidge ack --up-to <id>\`, sleep. \`--timeout\` is always SECONDS. Do NOT background \`pidge listen\` with \`&\`.
 
 ## Full spec
 
