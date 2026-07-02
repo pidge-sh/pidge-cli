@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.17.1 — builtin/system action labels never seal (#313)
+
+- **fix (send, E2E):** the label of a custom action whose id is a builtin or
+  system id — the server's 12 built-ins + `dismiss` + `acknowledge`
+  (`Notification::RESERVED_ACTION_IDS`) — is NEVER sealed. Clients treat these
+  ids as built-ins and SKIP label decrypt for them, so a sealed label (possible
+  pre-fix only with id `acknowledge`, which the server didn't reject until
+  manifest v52 closed the collision) would render raw `v1:…` on the button.
+  Action IDs already rode clear; E3 will seal only CUSTOM labels. The never-seal
+  list is exported (`E2E_NEVER_SEAL_LABEL_IDS`) and pinned by test to match the
+  server's list.
+
 ## 0.17.0 — E2E v1 ON THE WIRE (#43, phase E2-CLI): sends seal, listen/wait decrypt
 
 The send/receive wiring of end-to-end encryption (contract: `e2e-spec-v1.md`; server
