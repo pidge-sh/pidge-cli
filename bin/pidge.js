@@ -456,7 +456,8 @@ const HELP = {
     usage: 'pidge approve "<question>" [--body TEXT] [--timeout N] [--allow-label L] [--deny-label L]',
     body: [
       'Sends an important/sensitive notification with two gated custom actions — allow (Face-ID confirm) and deny — then blocks on the answer (the same long-poll as `pidge ask`).',
-      'DENY-DEFAULT (the security rule): only an explicit allow is exit 0. deny → exit 1; timeout / no answer / a broken channel → exit 1. A send that never left the ground → exit 2. NON-ZERO ALWAYS MEANS "not approved" — treat it as a deny.',
+      'DENY-DEFAULT (the security rule): only an explicit allow is exit 0. deny → exit 1; timeout / no answer / a broken channel / an HTTP failure on the send → exit 1. ONLY a raw network error (the send never reached the server at all) → exit 2. NON-ZERO ALWAYS MEANS "not approved" — treat it as a deny.',
+      'TRUST CAVEAT: the gate is only as trustworthy as this process\'s env — whatever can rewrite PIDGE_URL/PIDGE_TOKEN can redirect the approval (and your bearer token) to its own server and answer "allow". Run permission hooks in an environment you trust.',
       'chosen_action JSON is printed to stdout; human notices go to stderr.',
       '',
       'PreToolUse hook (Claude Code) — gate a risky tool behind a human Face-ID tap, fail-closed:',

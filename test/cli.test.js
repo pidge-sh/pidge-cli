@@ -2019,6 +2019,24 @@ test('#39 — SIGINT mid-wait: approve exits 1 (deny-default), never 0', async (
   assert.match(stderr, /interrupted before an answer — DENIED/);
 });
 
+// --- #41: docs drift guards ----------------------------------------------------
+
+test('#41 — the README never re-teaches the refused decision+reply combo and documents approve', () => {
+  const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+  assert.ok(!/--actions yes,no,reply/.test(readme), 'README must not showcase a send the CLI refuses since 0.16.0');
+  assert.match(readme, /pidge approve/, 'the approve gate is documented');
+  assert.match(readme, /only as trustworthy as/, 'the env trust caveat is spelled out');
+});
+
+test('#41 — approve --help tells the true exit-code story (HTTP fail → 1, raw network → 2) + the env caveat', async () => {
+  const out = await runCli(['approve', '--help'], 1).result;
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stdout, /an HTTP failure on the send → exit 1/);
+  assert.match(out.stdout, /ONLY a raw network error \(the send never reached the server at all\) → exit 2/);
+  assert.match(out.stdout, /TRUST CAVEAT/);
+  assert.ok(!/A send that never left the ground → exit 2/.test(out.stdout), 'the old over-promise is gone');
+});
+
 // --- lote-5 #2: refuse a decision button + reply in one send ------------------
 
 test('lote-5 #2 — --actions yes,no,reply is REFUSED locally (exit 1, no send)', async () => {
