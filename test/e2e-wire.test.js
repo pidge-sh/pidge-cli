@@ -88,6 +88,41 @@ test('E2E send: secret + E2E channel ⇒ content fields + custom labels sealed, 
   assert.ok(!stdout.includes('v1:'), `no envelope may reach stdout:\n${stdout}`);
 });
 
+test('E2E send: a builtin/system action id NEVER gets its label sealed (#313 — never-seal = server RESERVED_ACTION_IDS)', async () => {
+  // The list must match the server's Notification::RESERVED_ACTION_IDS (the 12
+  // built-ins + "dismiss" + "acknowledge", manifest v52) — the iOS builtin set
+  // skips label decrypt for these ids, so a sealed label on one would render
+  // raw "v1:…" on the button.
+  assert.deepStrictEqual([...e2e.E2E_NEVER_SEAL_LABEL_IDS].sort(), [
+    'snooze', 'done', 'reschedule', 'mute', 'reply',
+    'yes', 'no', 'approve', 'reject', 'accept', 'decline', 'later',
+    'dismiss', 'acknowledge',
+  ].sort());
+
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+
+  const { result } = runCli(['message',
+    '--title', 'Escolha',
+    '--custom-action', 'acknowledge:Confirmar',
+    '--custom-action', 'ship_it:Ship it now',
+  ], port, { PIDGE_SECRET: SECRET });
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const sent = mock.state.notifies[0];
+  const cid = sent.correlation_id;
+  assert.match(sent.title, /^v1:/, 'content fields still seal');
+  // The builtin/system-id label rides CLEAR (a client would skip its decrypt)…
+  const ack = sent.custom_actions.find((c) => c.id === 'acknowledge');
+  assert.equal(ack.label, 'Confirmar', 'a builtin/system id label must NOT be sealed');
+  // …while a genuinely custom label seals exactly as before.
+  const ship = sent.custom_actions.find((c) => c.id === 'ship_it');
+  assert.equal(e2e.e2eDecryptField(KEY, aad(cid, 'action_label_ship_it'), ship.label), 'Ship it now');
+});
+
 test('E2E send: NO secret on an E2E channel ⇒ the clear send of always (never blocked)', async () => {
   const mock = createMock();
   const port = await mock.start();

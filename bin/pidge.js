@@ -226,6 +226,20 @@ function e2eParseSecret(raw) {
   return key;
 }
 
+// Action ids whose LABELS must NEVER be sealed (#313): the server's 12
+// built-ins + the two system ids "dismiss"/"acknowledge". Mirrors the server's
+// Notification::RESERVED_ACTION_IDS and the iOS builtin set (E2EContent),
+// which SKIPS label decrypt for these ids — a sealed label on one would
+// render raw "v1:…" on the button. Built-in ids ride CLEAR everywhere (the
+// action contract runs on ids); E3 seals only CUSTOM labels. The server 422s
+// a custom action with one of these ids anyway (manifest v52) — this is the
+// fail-safe for older servers.
+const E2E_NEVER_SEAL_LABEL_IDS = new Set([
+  'snooze', 'done', 'reschedule', 'mute', 'reply',
+  'yes', 'no', 'approve', 'reject', 'accept', 'decline', 'later',
+  'dismiss', 'acknowledge',
+]);
+
 // ---------------------------------------------------------------------------
 // Test seam (E0): require()ing this file exports the pure e2e helpers and
 // stops HERE — none of the CLI machinery below (parseArgs, the TOKEN check,
@@ -236,6 +250,7 @@ if (require.main !== module) {
   module.exports = {
     e2eAad, e2eKeyFingerprint, e2eLoadSecret, e2eParseSecret,
     e2eEncryptField, e2eDecryptField, e2eEncryptBlob, e2eDecryptBlob,
+    E2E_NEVER_SEAL_LABEL_IDS,
   };
   return;
 }
@@ -1206,6 +1221,7 @@ async function e2eMaybeSeal(payload) {
     if (payload[f] !== undefined && payload[f] !== null && payload[f] !== '') payload[f] = seal(f, payload[f]);
   }
   for (const ca of payload.custom_actions || []) {
+    if (E2E_NEVER_SEAL_LABEL_IDS.has(ca.id)) continue; // builtin/system id — the label rides CLEAR (#313)
     if (typeof ca.label === 'string' && ca.label !== '') ca.label = seal(`action_label_${ca.id}`, ca.label);
   }
   payload.enc = 'v1';
