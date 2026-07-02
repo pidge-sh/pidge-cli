@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — E2E phase E0 (#180): crypto lib + shared test vectors (no wire change)
+
+The first increment of E2E encryption (contract: `e2e-spec-v1.md`, ratified 2026-07-02).
+**Nothing on the wire changes** — no command encrypts yet (server passthrough is E1;
+send/receive integration is E2/E3). This ships the pure primitives + the cross-repo fixture.
+
+- **feat (E0):** AES-256-GCM primitives inside `bin/pidge.js` (single-file, Node `crypto`
+  only — zero new deps): `e2eEncryptField`/`e2eDecryptField` (`"v1:" + base64url(nonce ||
+  ct || tag)`, one independent envelope per field), `e2eEncryptBlob`/`e2eDecryptBlob`
+  (binary framing `[0x01][nonce][ct][tag]`, no base64), `e2eAad`
+  (`ch<channel_id>:<correlation_id>:<field_name>` — anti-swap binding),
+  `e2eKeyFingerprint` (`kf` = 4 bytes of SHA-256(key), base64url) and `e2eLoadSecret`
+  (`PIDGE_SECRET` from the SAME slot/precedence as `PIDGE_TOKEN`: env wins over the
+  per-agent-aware config file — no command reads it yet). Decrypt fails LOUD and precisely:
+  wrong AAD/corrupted tag, unknown version prefix (`v9:`), invalid base64url, wrong sizes.
+  The nonce is `crypto.randomBytes(12)` in production; injectable ONLY for the fixture.
+- **test (E0):** `test/e2e_vectors.json` — the SHARED deterministic fixture (committed
+  byte-identical in the product repo too; server/iOS assert the SAME bytes — the cross-SDK
+  gate) + its generator `test/gen-e2e-vectors.js` (not published). Cases: short field,
+  unicode/emoji, >10 KB markdown, small binary blob, reply, wrong AAD, corrupted tag,
+  unknown version, kf mismatch. `test/e2e.test.js` round-trips every vector, asserts every
+  failure case, pins the fixture against drift, and covers `e2eLoadSecret` precedence.
+  A require() test seam exports the pure helpers without running the CLI (`require.main`
+  guard) — executing `pidge` as a binary is byte-for-byte unchanged.
+
 ## 0.16.1 — hardening lote (#38 #39 #40 #41): atomic self-heal, NaN fail-closed, CI, docs
 
 Coordination-review batch (2026-07-01): two proven correctness holes closed, the repo's
