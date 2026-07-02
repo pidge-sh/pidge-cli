@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.16.1 — hardening lote (#38 #39 #40 #41): atomic self-heal, NaN fail-closed, CI, docs
+
+Coordination-review batch (2026-07-01): two proven correctness holes closed, the repo's
+first CI, and the docs reconciled with what 0.16.0 actually does.
+
+- **fix (#38):** the skill self-heal is now ATOMIC — `SKILL.md` is written to a per-process
+  tmp file + `renameSync`, so a killed process/full disk leaves the old skill intact and
+  concurrent heals can't tear each other. The marker scan is ANCHORED (line 1 or inside the
+  opening frontmatter block) — body prose like `pidge-skill rev=99` can't suppress a heal.
+  Every generated skill now ends with a `<!-- pidge-skill-end -->` trailer: a marker without
+  the trailer = a TORN write, detected and re-healed (pre-#38 it read as "fresh" forever).
+  Overwriting a differing `SKILL.md` saves `SKILL.md.bak` + one stderr line — customizations
+  are never clobbered silently. `SKILL_REVISION` 3 → 4.
+- **fix (#39):** `--timeout`/`--interval` typos no longer hang the blocking commands FOREVER.
+  `parseInt('abc')` → NaN made `doWait`'s deadline unreachable, so wait/ask/approve/hello/
+  listen polled eternally and `approve`'s deny-default timeout branch was dead code. Now an
+  unparseable value dies immediately (exit 1, fail-closed) BEFORE anything is sent — no ghost
+  approval on the phone. `approve` also traps SIGINT → exit 1 with the deny-default narration.
+- **ci (#40):** first CI — GitHub Actions runs `npm ci && node --test` on Node 18/20/22 for
+  every push to main + every PR (no secrets; the suite uses the local mock server).
+- **docs (#41):** the README showcase `ask --actions yes,no,reply` (broken since 0.16.0's
+  decision+reply refusal) is fixed; `pidge approve` is documented (commands table, quick-start,
+  "New in" banner through 0.16.x); the env TRUST CAVEAT is spelled out in `--help` and README
+  (the gate is only as trustworthy as `PIDGE_URL`/`PIDGE_TOKEN`); the approve exit-code doc now
+  tells the truth (HTTP failure on the send → 1; ONLY a raw network error → 2); the GitHub repo
+  description no longer says "Herald". Two docs-drift guard tests keep it that way.
+
 ## 0.16.0 — #34 `pidge approve` (hook-shaped gate) + lote-5 polish
 
 **`pidge approve "<question>"`** — a new, hook-shaped permission gate for wrapping an agent's
