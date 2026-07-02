@@ -1,6 +1,24 @@
 # Changelog
 
-## 0.17.1 — builtin/system action labels never seal (#313)
+## 0.17.1 — builtin/system action labels never seal (#313) · skill rev 5 (eval F1)
+
+- **skill (SKILL_REVISION 4 → 5):** five surgical spine fixes, each one killing a
+  failure PROVEN by the F1 eval baseline (16 fresh-agent scenarios, 2026-07-02 —
+  all five re-ran PASS on the new text before this commit):
+  - `--file`/`--image` documented (the media axis was absent — agents pasted
+    digests but never attached the artifact);
+  - **Live progress** section: the real Live Activity endpoints (upsert handle +
+    explicit `end`) + the lighter `--collapse-key` path; heads-up that `pidge
+    live` as a send silently degrades to a normal `message`-profile 201 today —
+    no card ever starts (see #47 for the wiring); picker row updated accordingly;
+  - supervisor-poll example now `listen --all` + explicit note that a pending
+    notification's answer never surfaces in plain `listen` (recover via
+    `wait <cid>` or `listen --all`);
+  - `registered_devices:0` guidance says ABORT the blocking wait (not "don't
+    wait" ambiguity);
+  - (the "finishing a long task" nuance ships server-side in the manifest notes.)
+- **usage (#44 item 1):** `pidge approve` now listed in the main `--help` USAGE
+  (deny-default exit-code gate was undiscoverable from the top-level help).
 
 - **fix (send, E2E):** the label of a custom action whose id is a builtin or
   system id — the server's 12 built-ins + `dismiss` + `acknowledge`
