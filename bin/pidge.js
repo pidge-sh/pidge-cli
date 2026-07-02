@@ -613,7 +613,13 @@ const KNOWN_MANIFEST_VERSION = 46;
 // in-frontmatter format on the next command. Bump this whenever the hand-authored spine moves.
 // Bumped to 3 in 0.16.0: the spine now teaches `pidge approve` (the hook-shaped gate)
 // and notes the CLI now REFUSES a decision + reply in one send (lote-5 #2).
-const SKILL_REVISION = 3;
+// Bumped to 4 in 0.16.1 (#38): the generated skill now ends with SKILL_END_MARKER (the
+// cheap integrity check) — the bump heals every pre-marker install into the new format.
+const SKILL_REVISION = 4;
+// #38: the LAST line of every generated skill. A file that carries the frontmatter
+// marker but not this trailer was torn mid-write (partial write / full disk) —
+// ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
+const SKILL_END_MARKER = '<!-- pidge-skill-end -->';
 const NAG_TTL_MS = 24 * 60 * 60 * 1000; // #241: at most one nag per 24 h
 let newsWarned = false;
 // #280: the self-heal runs at most ONCE per process (one regeneration, even when
@@ -679,24 +685,45 @@ async function checkManifestNews(res) {
 // onboarding's job, never a side effect of an unrelated command), runs at most once per
 // process, and is wholly best-effort: any failure is swallowed — a skill refresh must
 // NEVER break the user's actual command.
+// #38: locate the self-heal marker ONLY where a generated skill ever put it —
+// line 1 (the pre-0.15.3 `<!-- pidge-skill … -->` HTML comment, above the `---`)
+// or a line inside the OPENING frontmatter block (the 0.15.3+ `# pidge-skill …`
+// YAML comment). Body prose mentioning "pidge-skill" is invisible to this scan.
+function findSkillMarker(content) {
+  const lines = content.split('\n');
+  if (lines[0] && lines[0].includes('pidge-skill')) return lines[0];
+  if (lines[0] !== '---') return '';
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].trim() === '---') break; // closing fence — the marker lives above it
+    if (lines[i].includes('pidge-skill')) return lines[i];
+  }
+  return '';
+}
+
 async function ensureSkillFresh(serverManifestVersion) {
   if (skillHealed) return;
   try {
     // Resolve the path the SAME way installSkill does (cwd-relative).
     const file = path.join(process.cwd(), '.claude', 'skills', 'pidge', 'SKILL.md');
     if (!fs.existsSync(file)) return; // don't auto-create — only refresh an existing skill
-    // #33 fix: the marker now rides a `# pidge-skill rev=N manifest=M` YAML comment INSIDE
+    // #33 fix + #38: the marker rides a `# pidge-skill rev=N manifest=M` YAML comment INSIDE
     // the frontmatter (0.15.3+); pre-0.15.3 installs put `<!-- pidge-skill … -->` as line 1.
-    // Scan for the marker line either way — the token `pidge-skill` appears ONLY there in a
-    // generated skill — so a stale OLD-format install is still detected and healed into the
-    // corrected format (its garbage-description bug repaired) on the next command.
+    // #38: the scan is ANCHORED to those two positions (line 1, or inside the opening `---`
+    // block) — a prose line in the body like "see pidge-skill rev=99" must never be read as
+    // the marker and suppress a legitimate heal.
     const content = fs.readFileSync(file, 'utf8');
-    const markerLine = content.split('\n').find((l) => l.includes('pidge-skill')) || '';
+    const markerLine = findSkillMarker(content);
     const revM = markerLine.match(/rev=(\d+)/);
     const manM = markerLine.match(/manifest=(\d+)/);
     const installedRev = revM ? parseInt(revM[1], 10) : 0;
     const installedManifest = manM ? parseInt(manM[1], 10) : 0;
-    const stale = SKILL_REVISION > installedRev || (serverManifestVersion || 0) > installedManifest;
+    // #38 integrity: a generated skill always ends with SKILL_END_MARKER. A marker whose
+    // rev looks current but whose trailer is missing = a TORN write (the marker survived
+    // on line ~4, the tail didn't) — without this check the tear would read as "fresh"
+    // and never heal. Pre-#38 installs lack the trailer too, but their rev < 4 already
+    // marks them stale, so the two triggers compose instead of fighting.
+    const torn = installedRev > 0 && !content.trimEnd().endsWith(SKILL_END_MARKER);
+    const stale = torn || SKILL_REVISION > installedRev || (serverManifestVersion || 0) > installedManifest;
     if (!stale) return;
     skillHealed = true; // latch BEFORE the network write — attempt the heal at most once
     const r = await installSkill(BASE, TOKEN); // silent: it already writes the file
@@ -2048,11 +2075,34 @@ A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE w
 ## Full spec
 
 \`curl $PIDGE_URL/api/v1/manifest -H "Authorization: Bearer $PIDGE_TOKEN"\` — the always-current contract (fields, profiles, custom actions, media, threads, realtime).
+
+${SKILL_END_MARKER}
 `;
   const dir = path.join(process.cwd(), '.claude', 'skills', 'pidge');
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'SKILL.md');
-  fs.writeFileSync(file, skill);
+  // #38: never clobber silently — the installed skill may have been customized.
+  // When the file being replaced differs from what we're writing, keep the old
+  // content as SKILL.md.bak and say so in one stderr line.
+  const bak = path.join(dir, 'SKILL.md.bak');
+  let previous = null;
+  try { previous = fs.readFileSync(file, 'utf8'); } catch { /* no existing file */ }
+  if (previous !== null && previous !== skill) {
+    fs.writeFileSync(bak, previous);
+    console.error(`pidge: the previous SKILL.md differed from the regenerated one — saved to ${bak}`);
+  }
+  // #38: ATOMIC replace — write a per-process tmp, then rename. A killed process or
+  // a full disk leaves the OLD skill intact instead of a torn file whose surviving
+  // marker reads as "fresh" (the 0.15.2→0.15.3 corruption class, one version on);
+  // concurrent heals each rename a WHOLE file (last one wins), never interleaved bytes.
+  const tmp = path.join(dir, `.SKILL.md.${process.pid}.${crypto.randomUUID().slice(0, 8)}.tmp`);
+  try {
+    fs.writeFileSync(tmp, skill);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+    throw e;
+  }
   return { file, manifest_version: m.manifest_version };
 }
 
