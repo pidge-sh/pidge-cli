@@ -209,10 +209,21 @@ function e2eKeyFingerprint(key) {
 
 // PIDGE_SECRET reads from the SAME slot/precedence as PIDGE_TOKEN: env var wins
 // over the config file (per-agent aware via PIDGE_AGENT/XDG_CONFIG_HOME) — the
-// {TOKEN, SECRET} pair always travels together from one source. E0: only the
-// read exists; no command uses it yet.
+// {TOKEN, SECRET} pair always travels together from one source.
 function e2eLoadSecret() {
   return process.env.PIDGE_SECRET || FILE_ENV.PIDGE_SECRET || null;
+}
+
+// PIDGE_SECRET is the channel's 32-byte key, base64url. Returns the key Buffer,
+// null when absent, and THROWS a named error on a malformed value — the caller
+// decides warn-and-send-clear (send path) vs BROKEN (doctor on an E2E channel).
+function e2eParseSecret(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  if (!/^[A-Za-z0-9_-]+={0,2}$/.test(s)) throw new Error('PIDGE_SECRET is not base64url');
+  const key = Buffer.from(s, 'base64url');
+  if (key.length !== 32) throw new Error(`PIDGE_SECRET decodes to ${key.length} bytes — the channel key is exactly 32`);
+  return key;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +234,7 @@ function e2eLoadSecret() {
 // ---------------------------------------------------------------------------
 if (require.main !== module) {
   module.exports = {
-    e2eAad, e2eKeyFingerprint, e2eLoadSecret,
+    e2eAad, e2eKeyFingerprint, e2eLoadSecret, e2eParseSecret,
     e2eEncryptField, e2eDecryptField, e2eEncryptBlob, e2eDecryptBlob,
   };
   return;
@@ -418,6 +429,12 @@ ENV
                 so N agents on one machine never share an identity (the CLI still
                 writes the key — no secret in the agent's chat). Unset ⇒ the legacy
                 shared ~/.config/pidge/env (single-agent only).
+  PIDGE_SECRET  the channel's E2E key (base64url, 32 bytes) — comes from the human's
+                setup prompt when they turn on end-to-end encryption. Same slot and
+                precedence as PIDGE_TOKEN (the pair travels together). With it set
+                and the channel E2E, sends are sealed and sealed answers/messages
+                decrypt automatically; without it, sends go clear and the app marks
+                them "⚠️ sem criptografia". Validate with \`pidge doctor\`.
 
 OUTPUT
   stdout is machine-readable (a fire-and-forget send→the raw 201 JSON; a --wait
@@ -730,7 +747,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 46;
+const KNOWN_MANIFEST_VERSION = 51;
 // #280: the hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
@@ -1084,6 +1101,217 @@ function customActionFromJson(item, i) {
   return ca;
 }
 
+// ---------------------------------------------------------------------------
+// E2E wire layer (E2-CLI, #43 — contract: e2e-spec-v1.md + manifest v49/v51).
+// SEND: with a valid PIDGE_SECRET AND an E2E channel (whoami says — never a
+// guess), the content fields leave this machine as envelopes with enc:"v1"+kf;
+// otherwise the send is the clear send of always (the server accepts-and-marks
+// — a missing secret must NEVER block a notification).
+// RECEIVE: every read path gates on the EXPLICIT `enc` flag (never on sniffing
+// the "v1:" prefix). Inside a sealed context, an envelope MUST open — a kf that
+// isn't ours / a failed tag / a missing AAD anchor is a PRECISE error and the
+// field is BLANKED (base64 never reaches the terminal — follow-up A1); a value
+// that is NOT an envelope is readable text and passes through untouched (a
+// built-in action label, or a clear reply typed on a pre-E2E app — the same
+// accept-and-mark honesty the iOS app shows).
+// ---------------------------------------------------------------------------
+const E2E_CONTENT_FIELDS = ['title', 'subtitle', 'body', 'body_markdown'];
+const isEnvelope = (s) => typeof s === 'string' && /^v\d+:/.test(s);
+
+// Parse PIDGE_SECRET ONCE per process. null = absent or invalid (invalid warns
+// loudly — the send degrades to clear and the app marks it "⚠️ sem criptografia").
+let e2eMat; // undefined = not yet computed
+function e2eKeyMaterial() {
+  if (e2eMat !== undefined) return e2eMat;
+  try {
+    const key = e2eParseSecret(e2eLoadSecret());
+    e2eMat = key ? { key, kf: e2eKeyFingerprint(key) } : null;
+  } catch (e) {
+    console.error(`pidge: WARNING — PIDGE_SECRET is INVALID (${e.message}). E2E is OFF for this run: sends go CLEAR (the app marks them "⚠️ sem criptografia") and sealed content can't be opened. Fix: re-run the setup prompt from the app (it embeds the secret next to the token).`);
+    e2eMat = null;
+  }
+  return e2eMat;
+}
+
+// The channel's PUBLIC id + e2e_enabled, from whoami — the AAD binds to the id,
+// and e2e_enabled is the ONLY thing that turns sealing on (a secret pointing at
+// a non-E2E channel is an orphan: send clear; `pidge doctor` warns). Cached per
+// process; a failure is NOT cached so a later call may retry.
+let e2eChannelCache = null;
+async function e2eChannelInfo() {
+  if (e2eChannelCache) return e2eChannelCache;
+  const { res, data } = await fetchWhoami();
+  if (res.status !== 200 || !data.channel) throw new Error(`whoami answered ${res.status}`);
+  e2eChannelCache = { id: data.channel.id, e2eEnabled: !!data.channel.e2e_enabled };
+  return e2eChannelCache;
+}
+
+// One stderr line per DISTINCT reason per process — a 50-row backlog sealed
+// with another key is one loud line, not 50.
+const e2eNoted = new Set();
+function e2eNote(msg) {
+  if (e2eNoted.has(msg)) return;
+  e2eNoted.add(msg);
+  console.error(`pidge: E2E — ${msg}`);
+}
+
+// The precise pre-flight reason a sealed context can't be opened, or null when
+// the key material looks right and the decrypt should be attempted.
+function e2eSealedError(enc, theirKf) {
+  if (enc !== 'v1') return `sealed with an unknown envelope version ${JSON.stringify(enc)} — this CLI speaks v1 (update pidge-cli)`;
+  const mat = e2eKeyMaterial();
+  if (!mat) return 'sealed, but no (valid) PIDGE_SECRET is configured — ask your human to re-run the setup prompt from the app (it embeds the secret next to the token)';
+  if (theirKf && theirKf !== mat.kf) return `sealed with ANOTHER key (its kf ${theirKf}, your PIDGE_SECRET's kf ${mat.kf}) — your token and secret likely belong to different channels; re-run the setup prompt`;
+  return null;
+}
+
+// Open ONE value found inside a sealed context (the enc flag gated us in).
+// Returns the plaintext; the value UNCHANGED when it isn't an envelope
+// (readable text); or null after reporting a precise reason via onError.
+function e2eOpenValue({ enc, kf, channelId, cid, field, value, onError }) {
+  if (!isEnvelope(value)) return value;
+  const reason = e2eSealedError(enc, kf)
+    || (!cid && 'sealed but the row carries NO correlation_id (the AAD anchor) — the server predates E1.5, or a bug: it can never be decrypted')
+    || (channelId == null && 'sealed but the channel id is unknown (whoami failed) — the AAD needs it; retry when the server is reachable')
+    || null;
+  if (reason) { onError(reason); return null; }
+  try {
+    return e2eDecryptField(e2eKeyMaterial().key, e2eAad(channelId, cid, field), value);
+  } catch (e) {
+    onError(`${field} failed to open: ${e.message}`);
+    return null;
+  }
+}
+
+// SEND-side sealing, called by doNotify on the final payload. Mutates it:
+// content fields + custom-action LABELS become envelopes (action IDs stay
+// clear — the action contract runs on ids), enc:"v1" + kf ride alongside, and
+// the correlation_id is ALWAYS minted client-side (the AAD needs it BEFORE the
+// server ever sees the payload).
+async function e2eMaybeSeal(payload) {
+  const mat = e2eKeyMaterial();
+  if (!mat) return;
+  let ch;
+  try {
+    ch = await e2eChannelInfo();
+  } catch (e) {
+    console.error(`pidge: WARNING — couldn't confirm the channel's E2E state (${e.message}); sending CLEAR (an E2E channel accepts-and-marks it "⚠️ sem criptografia")`);
+    return;
+  }
+  if (!ch.e2eEnabled) return; // orphan secret — clear send is the contract; `pidge doctor` warns
+  if (!payload.correlation_id) payload.correlation_id = crypto.randomUUID();
+  const seal = (field, value) =>
+    e2eEncryptField(mat.key, e2eAad(ch.id, payload.correlation_id, field), String(value));
+  for (const f of E2E_CONTENT_FIELDS) {
+    if (payload[f] !== undefined && payload[f] !== null && payload[f] !== '') payload[f] = seal(f, payload[f]);
+  }
+  for (const ca of payload.custom_actions || []) {
+    if (typeof ca.label === 'string' && ca.label !== '') ca.label = seal(`action_label_${ca.id}`, ca.label);
+  }
+  payload.enc = 'v1';
+  payload.kf = mat.kf;
+  if (payload.image !== undefined || payload.file !== undefined)
+    console.error('pidge: E2E note — media BYTES and the filename still ride CLEAR (encrypted media is phase E3); the text fields are sealed');
+  console.error(`pidge: E2E — content sealed (kf ${mat.kf}); the server stores and relays ciphertext only`);
+}
+
+// Decrypt OUR OWN envelopes in the 201/upsert echo so "trust the echo" keeps
+// meaning something on stdout (the wire echo is ciphertext by design). enc/kf
+// stay in the printed JSON — they are the wire truth of the send.
+function e2eOpenEcho(info, payload) {
+  const mat = e2eKeyMaterial();
+  if (!mat || !e2eChannelCache || !info || typeof info !== 'object') return null;
+  const cid = info.correlation_id || payload.correlation_id;
+  if (!cid) return null;
+  try {
+    for (const f of E2E_CONTENT_FIELDS) {
+      if (isEnvelope(info[f])) info[f] = e2eDecryptField(mat.key, e2eAad(e2eChannelCache.id, cid, f), info[f]);
+    }
+    return JSON.stringify(info);
+  } catch { return null; } // an un-openable echo prints as the server sent it
+}
+
+// RECEIVE: one row of GET /api/v1/messages. Two sealed shapes exist —
+//   kind:"message" (E1.5): the row's own enc/kf/correlation_id; body opens with
+//     field ALWAYS "message" (composer AND late-reply — the late reply reuses
+//     the answered notification's cid as its correlation_id);
+//   kind:"notification_reply": the envelope rides ref/ref_payload (E2) — ref.enc
+//     gates; text opens with field "reply", ref.title with "title", and a body
+//     that is a custom-action LABEL with "action_label_<action_id>".
+// On success the plaintext replaces the ciphertext and enc/kf are swapped for
+// e2e:"decrypted" (an agent re-gating on `enc` must never mistake plaintext for
+// an envelope); on failure the sealed fields are BLANKED and e2e_error says why.
+function e2eOpenMessageRow(m) {
+  const refEnc = m.ref && m.ref.enc;
+  if (!m.enc && !refEnc) return m; // a clear line renders as always (pre-E2E history)
+  const out = { ...m };
+  const fail = (reason) => { if (!out.e2e_error) out.e2e_error = reason; e2eNote(reason); };
+  if (m.enc) {
+    out.body = e2eOpenValue({
+      enc: m.enc, kf: m.kf, channelId: m.channel_id, cid: m.correlation_id,
+      field: 'message', value: m.body, onError: fail,
+    });
+  }
+  if (refEnc) {
+    out.ref = { ...m.ref };
+    const ctx = { enc: m.ref.enc, kf: m.ref.kf, channelId: m.channel_id, cid: m.ref.correlation_id, onError: fail };
+    if (m.text !== undefined && m.text !== null) {
+      out.text = e2eOpenValue({ ...ctx, field: 'reply', value: m.text });
+      if (m.body === m.text) out.body = out.text; // body mirrors the reply text
+    }
+    if (m.ref.title !== undefined && m.ref.title !== null) {
+      out.ref.title = e2eOpenValue({ ...ctx, field: 'title', value: m.ref.title });
+    }
+    // No text: the body mirrors the tapped action's LABEL — sealed only for a
+    // custom action (a built-in label is server-side clear and passes through).
+    if (isEnvelope(out.body) && m.action_id) {
+      out.body = e2eOpenValue({ ...ctx, field: `action_label_${m.action_id}`, value: out.body });
+    }
+    // A1 safety net: an envelope we could not ATTRIBUTE to a field (a label-
+    // derived body with no action_id) is still never printed. Compared to the
+    // ORIGINAL value so a decrypted plaintext that happens to start with "v1:"
+    // can never be blanked by mistake.
+    if (isEnvelope(out.body) && out.body === m.body) {
+      fail('a sealed field could not be attributed (no action_id on the answer) — not printing ciphertext');
+      out.body = null;
+    }
+  }
+  if (!out.e2e_error) {
+    delete out.enc; delete out.kf;
+    if (out.ref) { delete out.ref.enc; delete out.ref.kf; }
+    out.e2e = 'decrypted';
+  }
+  return out;
+}
+
+// RECEIVE: the poll's chosen_action (wait/ask/approve/hello). The notification-
+// level enc/kf gate (the poll payload carries them); text opens with field
+// "reply", a custom action's label with "action_label_<action_id>". The poll
+// payload has no channel id, so whoami resolves it once (cached).
+async function e2eOpenChosen(data) {
+  const chosen = data.chosen_action;
+  if (!data.enc || !chosen) return;
+  const fail = (reason) => { if (!chosen.e2e_error) chosen.e2e_error = reason; e2eNote(reason); };
+  let channelId = null;
+  if (e2eKeyMaterial()) {
+    try { channelId = (await e2eChannelInfo()).id; } catch { /* e2eOpenValue names it */ }
+  }
+  const ctx = { enc: data.enc, kf: data.kf, channelId, cid: data.correlation_id, onError: fail };
+  if (chosen.text !== undefined && chosen.text !== null) {
+    chosen.text = e2eOpenValue({ ...ctx, field: 'reply', value: chosen.text });
+  }
+  if (chosen.label !== undefined && chosen.label !== null) {
+    if (chosen.action_id) {
+      chosen.label = e2eOpenValue({ ...ctx, field: `action_label_${chosen.action_id}`, value: chosen.label });
+    } else if (isEnvelope(chosen.label)) {
+      // A1 safety net: a sealed label with no action_id can't be attributed —
+      // blank it rather than print ciphertext.
+      fail('label is sealed but the answer carries no action_id — not printing ciphertext');
+      chosen.label = null;
+    }
+  }
+}
+
 // Map CLI flags → the /notify JSON body, including only what was provided. `extra`
 // carries subcommand-supplied raw fields (#246: the typed sends' template_kind and
 // alert's escalate) — merged below, before the --param escape hatch.
@@ -1232,6 +1460,10 @@ async function resolveMedia(body) {
 async function doNotify(extra = {}) {
   const payload = buildBody(extra);
   await resolveMedia(payload);
+  // E2E (E2-CLI): seal the content AFTER everything else composed the payload —
+  // typed sends, approval/approve/hello custom actions, --param, media refs all
+  // pass through here, so every send path is covered by this one call.
+  await e2eMaybeSeal(payload);
   let res, raw;
   try {
     res = await fetch(`${BASE}/api/v1/notify`, {
@@ -1245,6 +1477,12 @@ async function doNotify(extra = {}) {
   const ok = res.status >= 200 && res.status < 300;
   let info = {};
   try { info = JSON.parse(raw); } catch { /* leave {} */ }
+  if (ok && payload.enc === 'v1') {
+    // stdout keeps "trust the echo" meaningful: our own envelopes, decrypted
+    // for display (the wire/server saw only ciphertext — enc/kf stay printed).
+    const display = e2eOpenEcho(info, payload);
+    if (display) raw = display;
+  }
   if (ok) {
     // #56: the same correlation_id while still scheduled EDITS in place.
     if (info.updated)
@@ -1438,6 +1676,7 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
         health.ok();
         const data = await res.json().catch(() => ({}));
         if (data.responded) {
+          await e2eOpenChosen(data); // sealed answer → plaintext (gated on data.enc)
           const chosen = data.chosen_action || {};
           if (chosen.kind === 'snoozed') {
             console.error(`pidge: snoozed until ${chosen.snooze_until || chosen.at} — re-fires then, still waiting`);
@@ -1916,6 +2155,12 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   // #182 device-reach honesty (gotcha #9) + #181 ownership — shared with whoami.
   const unreachable = reportDeviceReach(data);
   reportClaimMismatch(data);
+  // E2E (E2-CLI): validate PIDGE_SECRET when present (32 bytes after base64url;
+  // kf = base64url(SHA-256(key)[0..3])) and cross-check it against the channel:
+  //   e2e_enabled + no secret   → sends go CLEAR-and-marked; point at the setup prompt
+  //   secret + non-E2E channel  → an ORPHAN secret (never used); warn
+  //   e2e_enabled + bad/mismatched secret → BROKEN (exit 2): the seal promise can't hold
+  const e2e = reportE2eHealth(data);
   if (ON_SHARED_FILE)
     console.error(`pidge doctor: WARNING — reading the SHARED file ${CONFIG_FILE}. If another agent runs on this machine, it reads the SAME key and you'll send as each other (the 2026-06-13 incident). Isolate: set PIDGE_AGENT=<id> at this agent's launch (config → ~/.config/pidge/agents/<id>/env) or give it its own PIDGE_TOKEN.`);
   // #182: devices exist but 0 are deliverable ⇒ a send reaches NOBODY — BROKEN
@@ -1924,6 +2169,10 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   // — the warning is the contract (§4.6: the severity split is a judgment call).
   if (unreachable) {
     console.error('pidge doctor: BROKEN (exit 2) — devices exist but 0 are reachable (all disabled or on the wrong APNs environment): a send reaches nobody.');
+    process.exit(2);
+  }
+  if (e2e.broken) {
+    console.error('pidge doctor: BROKEN (exit 2) — this channel is E2E but the PIDGE_SECRET cannot seal/open anything on it. Re-run the setup prompt from the app (it embeds the secret next to the token).');
     process.exit(2);
   }
   // #171: probe the realtime path (the #119 failure class an HTTP-only doctor
@@ -1948,8 +2197,48 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     console.error(`pidge: ✓ setup ok — canal "${data.channel && data.channel.name}" · ${devices} device(s) · realtime ${realtime} (run \`pidge doctor\` for the full check)`);
   else
     console.error('pidge doctor: all good — try: pidge hello   (first-contact WOW — send + wait in one)');
-  console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version, realtime }));
+  console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version, realtime, e2e: { channel: e2e.channelOn, secret: e2e.status, kf: e2e.kf } }));
   process.exit(0);
+}
+
+// doctor's E2E block: validate the secret locally, cross it with the channel's
+// e2e_enabled (whoami), and — when the server exposes the channel's expected
+// fingerprint — compare kfs so a token-of-one-channel + secret-of-another mixup
+// is named BEFORE the first garbled send. Returns {status, kf, channelOn, broken}.
+function reportE2eHealth(data) {
+  const channelOn = !!(data.channel && data.channel.e2e_enabled);
+  const raw = e2eLoadSecret();
+  const out = { status: 'absent', kf: null, channelOn, broken: false };
+  if (!raw) {
+    if (channelOn)
+      console.error('pidge doctor: WARNING — this channel is E2E (e2e_enabled) but NO PIDGE_SECRET is configured: sends go CLEAR and the app marks them "⚠️ sem criptografia". Ask your human to re-run the setup prompt from the app (it embeds PIDGE_SECRET next to the token).');
+    return out;
+  }
+  const source = process.env.PIDGE_SECRET ? 'env var' : 'config file';
+  let key;
+  try {
+    key = e2eParseSecret(raw);
+  } catch (e) {
+    out.status = 'invalid';
+    out.broken = channelOn;
+    console.error(`pidge doctor: ${channelOn ? 'BROKEN' : 'WARNING'} — PIDGE_SECRET (${source}) is INVALID: ${e.message}. ${channelOn ? 'Sends go CLEAR on an E2E channel.' : ''} Re-run the setup prompt from the app.`);
+    return out;
+  }
+  out.status = 'ok';
+  out.kf = e2eKeyFingerprint(key);
+  note(`pidge doctor: e2e secret found (${source}, 32 bytes, kf ${out.kf}) — never displayed`);
+  // Compare with the channel's own fingerprint when the server exposes one
+  // (additive/forward-compatible — whoami serves only e2e_enabled today).
+  const serverKf = data.channel && (data.channel.e2e_kf || data.channel.key_fingerprint);
+  if (channelOn && serverKf && serverKf !== out.kf) {
+    out.broken = true;
+    console.error(`pidge doctor: BROKEN — your PIDGE_SECRET (kf ${out.kf}) is NOT this channel's key (kf ${serverKf}): the token and the secret belong to different channels. Re-run the setup prompt.`);
+  } else if (channelOn) {
+    note('pidge doctor: e2e ON — sends are sealed end-to-end (the server relays ciphertext only)');
+  } else {
+    console.error('pidge doctor: WARNING — PIDGE_SECRET present but this channel is NOT E2E (secret órfão): sends stay CLEAR and the secret is never used. Either the human turns on E2E for this channel in the app, or drop the secret.');
+  }
+  return out;
 }
 
 // setup --claim: exchange the single-use code for the key, store it ourselves
@@ -2013,6 +2302,9 @@ async function runSetup() {
   if (v.print) {
     console.log(`export PIDGE_URL=${finalBase}`);
     console.log(`export PIDGE_TOKEN=${data.key}`);
+    // E2E: the {TOKEN, SECRET} pair travels together from ONE source — when the
+    // setup prompt put PIDGE_SECRET in this environment, emit it alongside.
+    if (process.env.PIDGE_SECRET) console.log(`export PIDGE_SECRET=${process.env.PIDGE_SECRET}`);
     console.error(`pidge: canal "${channelName}" — modo POR-AGENTE (nada gravado em disco). Cole as duas linhas no ambiente de lançamento DESTE agente (systemd/launcher/cron/profile). Cada agente tem a SUA chave; perdeu, é só pegar outro código no app e re-rodar (a chave do canal é a MESMA). NÃO rode --print de dentro de um agente — a chave apareceria no contexto dele.`);
     await fuseSkillAndHello(finalBase, data.key);
     await runDoctor(finalBase, data.key, 'fresh claim (per-agent env — not stored on disk)');
@@ -2021,10 +2313,18 @@ async function runSetup() {
 
   // File path (default): the CLI writes the key — the agent never sees it
   // (#57). Per-agent when PIDGE_AGENT is set; otherwise the legacy shared file.
+  // E2E: the {TOKEN, SECRET} pair travels together from ONE source — persist
+  // PIDGE_SECRET next to the token when the setup prompt put it in this env
+  // (and never silently DROP a secret the file already held: the human may be
+  // re-claiming the same E2E channel with a fresh code).
+  const e2eSecret = process.env.PIDGE_SECRET || FILE_ENV.PIDGE_SECRET || null;
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(CONFIG_FILE, `PIDGE_URL=${finalBase}\nPIDGE_TOKEN=${data.key}\n`, { mode: 0o600 });
+  fs.writeFileSync(CONFIG_FILE,
+    `PIDGE_URL=${finalBase}\nPIDGE_TOKEN=${data.key}\n${e2eSecret ? `PIDGE_SECRET=${e2eSecret}\n` : ''}`,
+    { mode: 0o600 });
   try { fs.chmodSync(CONFIG_FILE, 0o600); } catch { /* mode set on create */ }
   note(`pidge: canal "${channelName}" configurado — chave em ${CONFIG_FILE} (chmod 600, nunca exibida)`);
+  if (e2eSecret) note('pidge: PIDGE_SECRET stored next to the token (the {TOKEN, SECRET} pair travels together) — E2E sends seal automatically when the channel is E2E');
   // #181: claim ownership of the channel for THIS install and record the
   // generation locally, so a later `pidge doctor` can DETECT a silent key swap
   // by a different agent (the v25 incident, now caught in code). Best-effort.
@@ -2499,6 +2799,11 @@ ${SKILL_END_MARKER}
         const rows = data.notifications || [];
         const pendingCount = rows.filter((r) => r.status === 'delivered' && !r.responded).length;
         console.error(`pidge: ${rows.length} notification(s)${v.pending ? ' pending' : ` — ${pendingCount} pending`} (add --summary for counts+latency)`);
+        // E2E: the index is a raw passthrough by design — sealed rows echo YOUR
+        // OWN envelopes as stored. Say so instead of letting it read as garbage.
+        const sealed = rows.filter((r) => r.enc).length;
+        if (sealed)
+          console.error(`pidge: ${sealed} of them are E2E-sealed — the index echoes your envelopes as stored (ciphertext); \`pidge wait <cid>\` decrypts an answer, the app shows plaintext`);
       }
       process.exit(0);
       break;
@@ -2555,7 +2860,11 @@ ${SKILL_END_MARKER}
       // doesn't repeat it across batches before the stamp write is observed.
       let ackNoticeShownThisProcess = false;
       // Print + (conditionally) ack — shared by the WS and polling paths.
-      const printAndAck = async (msgs) => {
+      const printAndAck = async (msgsRaw) => {
+        // E2E: open sealed rows BEFORE anything prints (stdout JSON and the
+        // stderr narration below both read the decrypted values — a row we
+        // can't open is blanked with a precise e2e_error, never base64).
+        const msgs = msgsRaw.map(e2eOpenMessageRow);
         console.log(JSON.stringify(msgs, null, 2));
         // lote-5 #5: heads-up on ORPHANED backlog served on the first quick read
         // (--all only). It's within-channel — NOT the cross-channel leak (#289).
