@@ -1929,6 +1929,96 @@ test('#34 — approve: --allow-label / --deny-label rename the buttons', async (
   assert.equal(ca[1].label, 'Hold');
 });
 
+// --- #39: NaN in --timeout/--interval must fail CLOSED, never hang forever ----
+// parseInt('abc') → NaN made doWait's deadline NaN (never reached): wait/ask/
+// approve/hello/listen polled FOREVER and approve's deny-default timeout branch
+// was unreachable. A typo must die IMMEDIATELY (exit 1), before anything is sent.
+
+test('#39 — wait --timeout abc dies immediately (exit 1), never entering the poll loop', async () => {
+  // No server at all (port 1): the strict parse must die BEFORE any network happens.
+  const { code, stderr } = await runCli(['wait', 'cid-nan', '--no-realtime', '--timeout', 'abc'], 1).result;
+  assert.equal(code, 1, `stderr: ${stderr}`);
+  assert.match(stderr, /--timeout "abc" is not a number/);
+});
+
+test('#39 — wait --interval abc dies the same way', async () => {
+  const { code, stderr } = await runCli(['wait', 'cid-nan', '--no-realtime', '--interval', 'abc'], 1).result;
+  assert.equal(code, 1, `stderr: ${stderr}`);
+  assert.match(stderr, /--interval "abc" is not a number/);
+});
+
+test('#39 — approve --timeout abc fails CLOSED (exit 1) BEFORE sending the approval', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { code, stderr } = await runCli(['approve', 'Deploy?', '--no-realtime', '--timeout', 'abc'], port).result;
+  await mock.stop();
+  assert.equal(code, 1, `stderr: ${stderr}`);
+  assert.match(stderr, /is not a number/);
+  assert.equal(mock.state.notifies.length, 0, 'nothing was sent — no ghost approval on the phone');
+});
+
+test('#39 — ask --timeout abc refuses before the send too', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { code, stderr } = await runCli(
+    ['ask', '--title', 'x', '--actions', 'yes,no', '--no-realtime', '--timeout', 'abc'], port,
+  ).result;
+  await mock.stop();
+  assert.equal(code, 1, `stderr: ${stderr}`);
+  assert.equal(mock.state.notifies.length, 0, 'nothing was sent');
+});
+
+test('#39 — hello --interval abc refuses before the send', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { code, stderr } = await runCli(['hello', '--no-realtime', '--interval', 'abc'], port).result;
+  await mock.stop();
+  assert.equal(code, 1, `stderr: ${stderr}`);
+  assert.equal(mock.state.notifies.length, 0, 'nothing was sent');
+});
+
+test('#39 — listen --timeout abc refuses (same eternal-deadline class)', async () => {
+  const { code, stderr } = await runCli(['listen', '--no-realtime', '--timeout', 'abc'], 1).result;
+  assert.equal(code, 1, `stderr: ${stderr}`);
+  assert.match(stderr, /is not a number/);
+});
+
+test('#39 — approve on a MALFORMED poll body: deny-default holds, exit 1 on timeout', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.pollGarbage = true;
+  const { code, stdout, stderr } = await runCli(
+    ['approve', 'Ship?', '--no-realtime', '--timeout', '2', '--interval', '1', '--correlation-id', 'appr-garbage'], port,
+  ).result;
+  await mock.stop();
+  assert.equal(code, 1, `stderr: ${stderr}`);
+  assert.match(stdout, /"decision":"deny"/, 'the machine-readable deny lands on stdout');
+});
+
+test('#39 — approve when the server is unreachable: exit 2 (the send never left the ground)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  await mock.stop(); // nothing listening — the send throws a raw network error
+  const { code, stderr } = await runCli(['approve', 'Anything?', '--no-realtime', '--timeout', '2'], port).result;
+  assert.equal(code, 2, `stderr: ${stderr}`);
+  assert.match(stderr, /send failed \(network\)/);
+});
+
+test('#39 — SIGINT mid-wait: approve exits 1 (deny-default), never 0', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { child, result } = runCli(
+    ['approve', 'Danger?', '--no-realtime', '--timeout', '30', '--interval', '1', '--correlation-id', 'appr-sigint'], port,
+  );
+  while (mock.state.notifies.length === 0) await sleep(25); // the approval is in flight
+  await sleep(300); // and the wait loop is holding
+  child.kill('SIGINT');
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 1, `stderr: ${stderr}`);
+  assert.match(stderr, /interrupted before an answer — DENIED/);
+});
+
 // --- lote-5 #2: refuse a decision button + reply in one send ------------------
 
 test('lote-5 #2 — --actions yes,no,reply is REFUSED locally (exit 1, no send)', async () => {
