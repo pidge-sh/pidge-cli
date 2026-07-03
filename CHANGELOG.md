@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.17.2 — E2E remediation texts point at the app's terminal step (#315-A, strings only)
+
+- **help/doctor/error texts (no logic change):** the PIDGE_SECRET no longer travels
+  in the setup prompt the human pastes in chat (app PR #328 made it a separate
+  TERMINAL step on the Connect screen that writes `~/.config/pidge/env`). Every
+  remediation string that said "re-run the setup prompt (it embeds the secret next
+  to the token)" now points at that terminal step instead — and says NEVER to paste
+  the secret in chat (a chat prompt is a log). Touched: `--help` ENV section,
+  the invalid-secret runtime warning, the sealed-content pre-flight errors
+  (`e2eSealedError`), and all four doctor E2E texts. Matches server manifest v54 —
+  the two halves tell the same story. Wire format, sealing and exit codes unchanged.
+
 ## 0.17.1 — builtin/system action labels never seal (#313) · skill rev 5 (eval F1)
 
 - **skill (SKILL_REVISION 4 → 5):** five surgical spine fixes, each one killing a

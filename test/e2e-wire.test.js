@@ -401,7 +401,7 @@ test('doctor: valid secret + E2E channel ⇒ kf narrated, e2e ok in the JSON, ex
   assert.deepEqual(out.e2e, { channel: true, secret: 'ok', kf: FIXTURE.kf });
 });
 
-test('doctor: E2E channel but NO secret ⇒ instruct re-running the setup prompt (warning, exit 0 — clear sends still work)', async () => {
+test('doctor: E2E channel but NO secret ⇒ point at the app\'s Connect-screen terminal step (warning, exit 0 — clear sends still work)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.e2eEnabled = true;
@@ -411,7 +411,8 @@ test('doctor: E2E channel but NO secret ⇒ instruct re-running the setup prompt
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   assert.match(stderr, /NO PIDGE_SECRET is configured/);
-  assert.match(stderr, /re-run the setup prompt/);
+  assert.match(stderr, /Connect screen shows a separate TERMINAL step/);
+  assert.match(stderr, /never paste the secret in chat/);
   assert.deepEqual(JSON.parse(stdout).e2e, { channel: true, secret: 'absent', kf: null });
 });
 
