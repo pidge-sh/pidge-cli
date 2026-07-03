@@ -446,12 +446,15 @@ ENV
                 so N agents on one machine never share an identity (the CLI still
                 writes the key — no secret in the agent's chat). Unset ⇒ the legacy
                 shared ~/.config/pidge/env (single-agent only).
-  PIDGE_SECRET  the channel's E2E key (base64url, 32 bytes) — comes from the human's
-                setup prompt when they turn on end-to-end encryption. Same slot and
-                precedence as PIDGE_TOKEN (the pair travels together). With it set
-                and the channel E2E, sends are sealed and sealed answers/messages
-                decrypt automatically; without it, sends go clear and the app marks
-                them "⚠️ sem criptografia". Validate with \`pidge doctor\`.
+  PIDGE_SECRET  the channel's E2E key (base64url, 32 bytes). When the human turns
+                on end-to-end encryption, the app's Connect screen shows a separate
+                TERMINAL step that writes it to ~/.config/pidge/env — the secret
+                never travels in the chat prompt (never paste it in chat). Same
+                slot and precedence as PIDGE_TOKEN (the pair travels together).
+                With it set and the channel E2E, sends are sealed and sealed
+                answers/messages decrypt automatically; without it, sends go clear
+                and the app marks them "⚠️ sem criptografia". Validate with
+                \`pidge doctor\`.
 
 OUTPUT
   stdout is machine-readable (a fire-and-forget send→the raw 201 JSON; a --wait
@@ -1144,7 +1147,7 @@ function e2eKeyMaterial() {
     const key = e2eParseSecret(e2eLoadSecret());
     e2eMat = key ? { key, kf: e2eKeyFingerprint(key) } : null;
   } catch (e) {
-    console.error(`pidge: WARNING — PIDGE_SECRET is INVALID (${e.message}). E2E is OFF for this run: sends go CLEAR (the app marks them "⚠️ sem criptografia") and sealed content can't be opened. Fix: re-run the setup prompt from the app (it embeds the secret next to the token).`);
+    console.error(`pidge: WARNING — PIDGE_SECRET is INVALID (${e.message}). E2E is OFF for this run: sends go CLEAR (the app marks them "⚠️ sem criptografia") and sealed content can't be opened. Fix: the app's Connect screen shows a separate TERMINAL step that writes PIDGE_SECRET to ~/.config/pidge/env — ask your human to run THAT (never paste the secret in chat); \`pidge doctor\` then confirms it.`);
     e2eMat = null;
   }
   return e2eMat;
@@ -1177,8 +1180,8 @@ function e2eNote(msg) {
 function e2eSealedError(enc, theirKf) {
   if (enc !== 'v1') return `sealed with an unknown envelope version ${JSON.stringify(enc)} — this CLI speaks v1 (update pidge-cli)`;
   const mat = e2eKeyMaterial();
-  if (!mat) return 'sealed, but no (valid) PIDGE_SECRET is configured — ask your human to re-run the setup prompt from the app (it embeds the secret next to the token)';
-  if (theirKf && theirKf !== mat.kf) return `sealed with ANOTHER key (its kf ${theirKf}, your PIDGE_SECRET's kf ${mat.kf}) — your token and secret likely belong to different channels; re-run the setup prompt`;
+  if (!mat) return 'sealed, but no (valid) PIDGE_SECRET is configured — the app\'s Connect screen shows a separate TERMINAL step that writes PIDGE_SECRET to ~/.config/pidge/env; ask your human to run THAT (never paste the secret in chat), then `pidge doctor` confirms it';
+  if (theirKf && theirKf !== mat.kf) return `sealed with ANOTHER key (its kf ${theirKf}, your PIDGE_SECRET's kf ${mat.kf}) — your token and secret likely belong to different channels; ask your human to run THIS channel's terminal step from the app's Connect screen (never paste the secret in chat)`;
   return null;
 }
 
@@ -2175,7 +2178,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   reportClaimMismatch(data);
   // E2E (E2-CLI): validate PIDGE_SECRET when present (32 bytes after base64url;
   // kf = base64url(SHA-256(key)[0..3])) and cross-check it against the channel:
-  //   e2e_enabled + no secret   → sends go CLEAR-and-marked; point at the setup prompt
+  //   e2e_enabled + no secret   → sends go CLEAR-and-marked; point at the app's Connect-screen terminal step
   //   secret + non-E2E channel  → an ORPHAN secret (never used); warn
   //   e2e_enabled + bad/mismatched secret → BROKEN (exit 2): the seal promise can't hold
   const e2e = reportE2eHealth(data);
@@ -2190,7 +2193,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     process.exit(2);
   }
   if (e2e.broken) {
-    console.error('pidge doctor: BROKEN (exit 2) — this channel is E2E but the PIDGE_SECRET cannot seal/open anything on it. Re-run the setup prompt from the app (it embeds the secret next to the token).');
+    console.error('pidge doctor: BROKEN (exit 2) — this channel is E2E but the PIDGE_SECRET cannot seal/open anything on it. The app\'s Connect screen shows a separate TERMINAL step that writes PIDGE_SECRET to ~/.config/pidge/env — ask your human to run THAT (never paste the secret in chat), then re-run `pidge doctor`.');
     process.exit(2);
   }
   // #171: probe the realtime path (the #119 failure class an HTTP-only doctor
@@ -2229,7 +2232,7 @@ function reportE2eHealth(data) {
   const out = { status: 'absent', kf: null, channelOn, broken: false };
   if (!raw) {
     if (channelOn)
-      console.error('pidge doctor: WARNING — this channel is E2E (e2e_enabled) but NO PIDGE_SECRET is configured: sends go CLEAR and the app marks them "⚠️ sem criptografia". Ask your human to re-run the setup prompt from the app (it embeds PIDGE_SECRET next to the token).');
+      console.error('pidge doctor: WARNING — this channel is E2E (e2e_enabled) but NO PIDGE_SECRET is configured: sends go CLEAR and the app marks them "⚠️ sem criptografia". The app\'s Connect screen shows a separate TERMINAL step that writes PIDGE_SECRET to ~/.config/pidge/env — ask your human to run THAT (never paste the secret in chat); `pidge doctor` then confirms it.');
     return out;
   }
   const source = process.env.PIDGE_SECRET ? 'env var' : 'config file';
@@ -2239,7 +2242,7 @@ function reportE2eHealth(data) {
   } catch (e) {
     out.status = 'invalid';
     out.broken = channelOn;
-    console.error(`pidge doctor: ${channelOn ? 'BROKEN' : 'WARNING'} — PIDGE_SECRET (${source}) is INVALID: ${e.message}. ${channelOn ? 'Sends go CLEAR on an E2E channel.' : ''} Re-run the setup prompt from the app.`);
+    console.error(`pidge doctor: ${channelOn ? 'BROKEN' : 'WARNING'} — PIDGE_SECRET (${source}) is INVALID: ${e.message}. ${channelOn ? 'Sends go CLEAR on an E2E channel.' : ''} Fix: the app's Connect screen shows a separate TERMINAL step that rewrites PIDGE_SECRET in ~/.config/pidge/env (never paste the secret in chat).`);
     return out;
   }
   out.status = 'ok';
@@ -2250,7 +2253,7 @@ function reportE2eHealth(data) {
   const serverKf = data.channel && (data.channel.e2e_kf || data.channel.key_fingerprint);
   if (channelOn && serverKf && serverKf !== out.kf) {
     out.broken = true;
-    console.error(`pidge doctor: BROKEN — your PIDGE_SECRET (kf ${out.kf}) is NOT this channel's key (kf ${serverKf}): the token and the secret belong to different channels. Re-run the setup prompt.`);
+    console.error(`pidge doctor: BROKEN — your PIDGE_SECRET (kf ${out.kf}) is NOT this channel's key (kf ${serverKf}): the token and the secret belong to different channels. Ask your human to run THIS channel's terminal step from the app's Connect screen (never paste the secret in chat).`);
   } else if (channelOn) {
     note('pidge doctor: e2e ON — sends are sealed end-to-end (the server relays ciphertext only)');
   } else {
@@ -2320,8 +2323,10 @@ async function runSetup() {
   if (v.print) {
     console.log(`export PIDGE_URL=${finalBase}`);
     console.log(`export PIDGE_TOKEN=${data.key}`);
-    // E2E: the {TOKEN, SECRET} pair travels together from ONE source — when the
-    // setup prompt put PIDGE_SECRET in this environment, emit it alongside.
+    // E2E: the {TOKEN, SECRET} pair travels together from ONE source — when this
+    // environment already carries PIDGE_SECRET (the human exported it before
+    // running setup), emit it alongside. (#315: the secret comes from the app's
+    // Connect-screen terminal step, never from the chat prompt.)
     if (process.env.PIDGE_SECRET) console.log(`export PIDGE_SECRET=${process.env.PIDGE_SECRET}`);
     console.error(`pidge: canal "${channelName}" — modo POR-AGENTE (nada gravado em disco). Cole as duas linhas no ambiente de lançamento DESTE agente (systemd/launcher/cron/profile). Cada agente tem a SUA chave; perdeu, é só pegar outro código no app e re-rodar (a chave do canal é a MESMA). NÃO rode --print de dentro de um agente — a chave apareceria no contexto dele.`);
     await fuseSkillAndHello(finalBase, data.key);
@@ -2332,9 +2337,10 @@ async function runSetup() {
   // File path (default): the CLI writes the key — the agent never sees it
   // (#57). Per-agent when PIDGE_AGENT is set; otherwise the legacy shared file.
   // E2E: the {TOKEN, SECRET} pair travels together from ONE source — persist
-  // PIDGE_SECRET next to the token when the setup prompt put it in this env
-  // (and never silently DROP a secret the file already held: the human may be
-  // re-claiming the same E2E channel with a fresh code).
+  // PIDGE_SECRET next to the token when this env already carries it (#315: it
+  // gets there via the app's Connect-screen terminal step, never the chat
+  // prompt), and never silently DROP a secret the file already held: the human
+  // may be re-claiming the same E2E channel with a fresh code.
   const e2eSecret = process.env.PIDGE_SECRET || FILE_ENV.PIDGE_SECRET || null;
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(CONFIG_FILE,
