@@ -19,6 +19,7 @@ function createMock() {
     messages: [],          // served by GET /api/v1/messages
     notifications: {},     // cid → body for GET /api/v1/notifications/:cid
     acks: [],
+    ackBodies: [], // #51: the parsed ack payloads, so tests can assert up_to/ids exactly
     notifies: [],
     claimCode: 'claim-ok',   // #110: POST /api/v1/claim exchanges this once
     devices: 1,
@@ -67,6 +68,17 @@ function createMock() {
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/whoami') {
       const auth = req.headers.authorization || '';
+      // #52: server v57 made whoami either-track — a ses_ token gets a 200 with
+      // the HUMAN view (no channel block). Mirrored here so doctor's branch is testable.
+      if (/^Bearer ses_/.test(auth)) {
+        return json(res, 200, {
+          user: { name: 'Thiago', timezone: 'America/Sao_Paulo' },
+          devices: state.devices ?? 1,
+          device_reach: state.deviceReach,
+          transport_budgets: { scope: 'process', ws_sockets: { held: 0, cap: 32 }, longpoll: { held: 0, capacity: 6 } },
+          manifest_version: 16,
+        });
+      }
       // 'hld_revoked' simulates a dead key (the shared-config guard lets a
       // corpse be overwritten without --force).
       if (!/^Bearer hld_/.test(auth) || auth === 'Bearer hld_revoked') return json(res, 401, { error: 'unauthorized' });
@@ -148,6 +160,7 @@ function createMock() {
       req.on('end', () => {
         let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
         state.acks.push(req.url);
+        state.ackBodies.push(p);
         if (state.hangAck) return; // simulate a wedged proxy stalling the ack POST
         // #170: state=delivered RENEWS the lease (not consumed); else PROCESS it.
         if (p.state === 'delivered') return json(res, 200, { renewed: 1 });

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.3 — 2026-07-04
+
+- **#51 (fix, at-least-once):** `ack --up-to`/`--ids` agora exigem id NUMÉRICO inteiro (full-string)
+  e morrem ALTO antes de qualquer HTTP. Antes, `parseInt` preguiçoso transformava um correlation_id
+  colado ali ("9f2e…" → 9) num watermark errado que ackava mensagens nunca tratadas — perda
+  silenciosa; e `--ids 12,abc` dropava o inválido em silêncio. A mensagem de erro ensina o
+  namespace ("the NUMERIC id from listen output, never the correlation_id").
+- **#52 (fix, doctor):** com o server ≥v57 (whoami either-track), `pidge doctor` com um SESSION
+  token (`ses_`) no env dizia `key valid — canal "undefined"` e saía 0, escondendo a
+  misconfiguração até o primeiro send 401ar. Agora diz "this is a SESSION token, not a channel
+  key" e sai 2.
 ## 0.17.2 — E2E remediation texts point at the app's terminal step (#315-A, strings only)
 
 - **help/doctor/error texts (no logic change):** the PIDGE_SECRET no longer travels

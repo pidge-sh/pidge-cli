@@ -2128,3 +2128,56 @@ test('lote-5 #5 — listen WITHOUT --all does not print the backlog heads-up', a
   assert.equal(out.code, 0, out.stderr);
   assert.doesNotMatch(out.stderr, /ALREADY queued when this listen started/, 'no --all ⇒ no backlog heads-up');
 });
+
+
+// --- #51: strict message ids on ack (a lazy parseInt acked the WRONG watermark) ---
+
+test('#51: ack --up-to with a correlation_id dies loud BEFORE any HTTP — no wrong watermark', async () => {
+  const mock = createMock();
+  await mock.start();
+  try {
+    const { result } = runCli(['ack', '--up-to', '9f2e7c31-ab40-4f11-9e01-77d21c55aa02'], mock.port);
+    const { code, stderr } = await result;
+    assert.equal(code, 1, 'must exit 1 (fail-closed), not silently ack ids 1..9');
+    assert.match(stderr, /numeric message id/i, 'the error must teach the id namespace');
+    assert.match(stderr, /correlation_id/i);
+    assert.equal(mock.state.acks.length, 0, 'NO ack request may reach the server');
+  } finally { await mock.stop(); }
+});
+
+test('#51: ack --ids with one bad entry dies loud (no silent drop of the bad id)', async () => {
+  const mock = createMock();
+  await mock.start();
+  try {
+    const { result } = runCli(['ack', '--ids', '12,abc,14'], mock.port);
+    const { code } = await result;
+    assert.equal(code, 1);
+    assert.equal(mock.state.acks.length, 0, 'the old .filter() silently acked [12,14]; now nothing goes');
+  } finally { await mock.stop(); }
+});
+
+test('#51 positive control: a real numeric --up-to still acks normally', async () => {
+  const mock = createMock();
+  await mock.start();
+  try {
+    const { result } = runCli(['ack', '--up-to', '103'], mock.port);
+    const { code } = await result;
+    assert.equal(code, 0);
+    assert.equal(mock.state.acks.length, 1);
+    assert.equal(mock.state.ackBodies[0].up_to, 103);
+  } finally { await mock.stop(); }
+});
+
+// --- #52: doctor with a SESSION token must fail loud, not "canal undefined" ---
+
+test('#52: doctor with a ses_ token says SESSION token + exits 2 (server v57 either-track whoami)', async () => {
+  const mock = createMock();
+  await mock.start();
+  try {
+    const { result } = runCli(['doctor'], mock.port, { PIDGE_TOKEN: 'ses_abc123' });
+    const { code, stderr } = await result;
+    assert.equal(code, 2, 'a session token is a misconfig — doctor must not bless it');
+    assert.match(stderr, /SESSION token/i);
+    assert.doesNotMatch(stderr, /canal "undefined"/, 'the undefined-channel print is the bug');
+  } finally { await mock.stop(); }
+});
