@@ -37,6 +37,9 @@ function runCli(args, port, env = {}, cwd = undefined) {
       PIDGE_URL: `http://127.0.0.1:${port}`,
       PIDGE_TOKEN: 'hld_test',
       PIDGE_SECRET: '', // explicit: no ambient secret leaks into a test
+      // Isolate per spawn: state.json (manifest nag, #313 e2e pins) must never
+      // touch the REAL ~/.config/pidge — nor leak between tests.
+      XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-test-')),
       ...env,
     },
   });
@@ -51,6 +54,33 @@ function runCli(args, port, env = {}, cwd = undefined) {
 }
 
 // --- SEND ------------------------------------------------------------------
+
+// v59/#351: copy (the token field) and url joined the seal; "seen" is a system
+// id (the app's opened-signal) whose label must ride CLEAR like the built-ins.
+test('E2E send: copy/url sealed with their own AAD field names; a "seen" label rides CLEAR', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+
+  const { result } = runCli(['message',
+    '--title', 'token rotated',
+    '--copy', 'sk-live-9f3a',
+    '--url', 'https://dash.example/keys',
+    '--custom-action', 'seen:Visto',
+  ], port, { PIDGE_SECRET: SECRET });
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const sent = mock.state.notifies[0];
+  const cid = sent.correlation_id;
+  for (const [field, plain] of [['copy', 'sk-live-9f3a'], ['url', 'https://dash.example/keys']]) {
+    assert.match(sent[field], /^v1:/, `${field} must be sealed (v59 — it is the secret-bearing field)`);
+    assert.equal(e2e.e2eDecryptField(KEY, aad(cid, field), sent[field]), plain, `${field} round-trip`);
+  }
+  assert.equal(sent.custom_actions[0].label, 'Visto', 'a system id ("seen") label must never be sealed');
+});
+
 
 test('E2E send: secret + E2E channel ⇒ content fields + custom labels sealed, enc/kf/cid on the wire, action IDs clear', async () => {
   const mock = createMock();
@@ -90,13 +120,13 @@ test('E2E send: secret + E2E channel ⇒ content fields + custom labels sealed, 
 
 test('E2E send: a builtin/system action id NEVER gets its label sealed (#313 — never-seal = server RESERVED_ACTION_IDS)', async () => {
   // The list must match the server's Notification::RESERVED_ACTION_IDS (the 12
-  // built-ins + "dismiss" + "acknowledge", manifest v52) — the iOS builtin set
-  // skips label decrypt for these ids, so a sealed label on one would render
-  // raw "v1:…" on the button.
+  // built-ins + "dismiss" + "acknowledge" (v52) + "seen" (v59, #313/F7 — the
+  // app's opened-signal id) — the iOS builtin set skips label decrypt for
+  // these ids, so a sealed label on one would render raw "v1:…" on the button.
   assert.deepStrictEqual([...e2e.E2E_NEVER_SEAL_LABEL_IDS].sort(), [
     'snooze', 'done', 'reschedule', 'mute', 'reply',
     'yes', 'no', 'approve', 'reject', 'accept', 'decline', 'later',
-    'dismiss', 'acknowledge',
+    'dismiss', 'acknowledge', 'seen',
   ].sort());
 
   const mock = createMock();
@@ -398,7 +428,7 @@ test('doctor: valid secret + E2E channel ⇒ kf narrated, e2e ok in the JSON, ex
   assert.match(stderr, new RegExp(`e2e secret found \\(env var, 32 bytes, kf ${FIXTURE.kf}\\)`));
   assert.match(stderr, /e2e ON — sends are sealed/);
   const out = JSON.parse(stdout);
-  assert.deepEqual(out.e2e, { channel: true, secret: 'ok', kf: FIXTURE.kf });
+  assert.deepEqual(out.e2e, { channel: true, secret: 'ok', kf: FIXTURE.kf, pinned: true }); // doctor CONFIRMED the sealed context ⇒ the #313 pin latches
 });
 
 test('doctor: E2E channel but NO secret ⇒ point at the app\'s Connect-screen terminal step (warning, exit 0 — clear sends still work)', async () => {
@@ -413,7 +443,7 @@ test('doctor: E2E channel but NO secret ⇒ point at the app\'s Connect-screen t
   assert.match(stderr, /NO PIDGE_SECRET is configured/);
   assert.match(stderr, /Connect screen shows a separate TERMINAL step/);
   assert.match(stderr, /never paste the secret in chat/);
-  assert.deepEqual(JSON.parse(stdout).e2e, { channel: true, secret: 'absent', kf: null });
+  assert.deepEqual(JSON.parse(stdout).e2e, { channel: true, secret: 'absent', kf: null, pinned: false }); // no secret ⇒ nothing confirmed, no pin
 });
 
 test('doctor: INVALID secret on an E2E channel is BROKEN (exit 2); orphan secret on a clear channel is a warning (exit 0)', async () => {

@@ -1,0 +1,175 @@
+---
+name: pidge
+description: Send rich, actionable iPhone notifications to your human and get their decision back (Pidge). Every send is a TYPE (message/important/urgent/event/live) plus an OPTIONAL response (buttons + send-and-go vs wait). Use when finishing long tasks, needing a decision/approval, sending updates with substance, or anything time-anchored. Also covers reading the human's replies back.
+# pidge-skill rev=5 manifest=16
+---
+
+# Pidge — notify your human, get answers back
+
+Generated from manifest v16 of http://127.0.0.1:43249 — re-run `pidge skill install` to update (any API response header `X-Pidge-Manifest-Version` > 16 means there's news).
+
+All commands: `npx pidge-cli …` (Node ≥18; reads `~/.config/pidge/env` — no token in your context). Not set up? Run `pidge doctor`. Onboard with `pidge setup --claim <code>` (the human copies the code from the Pidge app), then `pidge hello`.
+
+## One breath
+
+Every send is **a TYPE + a markdown body + an OPTIONAL response**. The TYPE (one of five) decides how much it may intrude — the human already configured how each arrives. The RESPONSE (buttons? wait or not?) is a second, orthogonal axis. **There is no content "template" to choose.**
+
+## THE PICKER — situation → exact command
+
+| Your situation | Run |
+|---|---|
+| Just inform — a result/log, no action needed | `pidge message` |
+| A pendency they should act on (can wait) ⭐ DEFAULT | `pidge important` |
+| You need a decision and CAN'T proceed without it | `pidge important --actions yes,no --wait` |
+| YOU are asking for a formal go/no-go (money/risk) | `pidge approval` |
+| Gate your OWN risky tool behind a human OK (a hook) | `pidge approve "<question>"` (exit 0 = allow) |
+| A thing with a known TIME | `pidge event --event-at <ISO8601>` |
+| A live status you'll keep updating | Live Activity endpoints (see **Live progress** below) |
+| WAKE them now — rare, real, <1/day | `pidge urgent` |
+
+⭐ `important` is the default. On the fence between informing and asking, pick `important`. `message` is only for a true no-action FYI. (`fyi`/`report`/`ask`/`alert` still work as silent aliases → message/important/important/urgent.) Run `pidge <type> --help` for each one's flags.
+
+## Write for the lock screen (what the human actually sees)
+
+The banner shows your **`--title`** and **`--body`** (plain text). **`--body-markdown` does NOT appear on the banner** — it's the in-app detail screen only. So:
+- **Always give a concise `--body`** — the one-line human-readable gist. A title-only send can show as an empty banner (just your channel name).
+- Put the rich part (tables, lists, code, an image) in **`--body-markdown`** (and/or `--image`) — the human sees it when they tap in.
+- A good send: **title = the answer at a glance · body = the few facts they need to decide/act · body-markdown = the rich detail · ONE ask.** Never ship a title-only notification.
+- **A real artifact rides as an attachment, never as pasted text.** A log, xlsx, pdf, csv → `--file <path>` (the human gets a Quick Look preview + share/save on the phone); a picture → `--image <path>`. One image + one file can ride the same send. Long output (a build log, a report): distilled digest in `--body-markdown`, raw thing attached with `--file` — never paste hundreds of lines into the markdown.
+
+## Approval has two paths — know which one you're in
+
+**Path A — YOU request it (`pidge approval`).** You decided this needs a human sign-off. `pidge approval` = `important` + an **Approve** (Face-ID gated) / **Reject** pair + `--wait`. You send it, you block, and you get `chosen_action.action_id: "grant"` (approved) or `"deny"` (rejected) back. Use it for money, deletions, irreversible actions.
+
+**Path B — your HUMAN requires it (a profile knob).** In the app, the human can turn ON **"Require approval · Face ID"** on any profile (the `ack_requires_biometric` knob — **OFF by default everywhere**). When it's ON for, say, `important`, then **every ordinary send on that profile silently becomes an Approve-with-Face-ID decision** — even a plain `pidge important` with no buttons. The server injects a single `approve` action, so the send reads back `actions:["approve"], requires_action:true, acknowledgeable:false`, the banner is detail-only, and **the human's tap reaches you as `chosen_action.action_id: "approve"`** (poll / webhook / `pidge listen --all`). You didn't ask — they imposed it.
+
+**Same screen ("Approve + Face ID"), opposite origin: you REQUEST (A, ids `grant`/`deny`) vs they REQUIRE (B, id `approve`).** To tell at runtime: a send that comes back `acknowledgeable:false` + `requires_action:true` when you didn't add buttons means Path B is on for that profile — treat the `approve` as the positive decision it is. (To check a profile's knob ahead of time, read `ack_requires_biometric` from the live manifest: `curl $PIDGE_URL/api/v1/manifest -H "Authorization: Bearer $PIDGE_TOKEN"` → `profiles`.) Caution: Path B on a busy profile means one approval per send — the human's deliberate high-trust choice.
+
+**`pidge approve "<question>"` — the hook-shaped gate (for permission hooks).** When YOU need the human to authorize one of YOUR OWN risky actions before you take it — and you want the answer as an EXIT CODE, not JSON to parse — use `pidge approve`. It sends a Face-ID allow / deny pair, blocks, and is **DENY-DEFAULT: exit 0 ONLY on an explicit allow; deny, timeout, or a broken channel → non-zero.** Perfect for a Claude Code `PreToolUse` hook that must fail CLOSED (see `pidge approve --help` for a runnable hook). `pidge approval` is the JSON-answer sibling (Path A); `pidge approve` is the exit-code gate.
+
+## The response axis (composes on ANY type)
+
+Asking for a reply is orthogonal to the type — you don't need `approval` to get a button.
+- **Free text** is always available; the human can write back on anything.
+- **Buttons** — reach for a BUILT-IN catalog action FIRST; they're tappable right on the lock-screen banner. Decisions: `--actions yes,no` · `approve,reject` · `accept,decline` · `later`; plus `done`, `snooze`, `reply`. Use `--custom-action id:label` ONLY when none fit — **custom labels (and any destructive/Face-ID action) render detail-only**, so the human must open the app to answer instead of tapping the banner.
+- **Face ID** on a consequential action: `--gated` injects one confirm-with-Face-ID button (use it for money/deletion). It does NOT change loudness — pair with a louder profile if it must also be loud. A flag, not a type.
+- **send-and-go vs wait** — the choice that decides how YOU work:
+  - *send-and-go* (default): fire and continue; the answer arrives later in `pidge listen --all`.
+  - *wait*: `--wait` (or `pidge ask`) **blocks** until they tap. Use it when you can't proceed.
+- **Exit codes on a `--wait`/`ask`:** `0` = answered (`chosen_action` JSON on stdout) · **`3` = no answer yet → NOT a failure** (back off, or treat a blocking go/no-go as "no/hold" and re-ask later) · `2` = error.
+
+Need a TYPED reply (a time/value/name)? `--actions reply` ALONE — never a decision + `reply` together (the human taps the easy button and you get a useless "Yes"). The CLI now **refuses** `yes,no,reply` (exit 1) so you can't ship the trap by accident. ONE question per send.
+
+## Live progress (a status card you update in place)
+
+For a long job whose progress the human wants to GLANCE at, you have two honest paths:
+- **Live Activity (the real lock-screen card):** three HTTP endpoints; the handle is YOUR
+  `correlation_id` (re-POST = upsert; PATCH updates in place). **ALWAYS end it** — an orphan
+  card stuck at "stage 3/4" is slop.
+  ```bash
+  curl -X POST $PIDGE_URL/api/v1/live_activities -H "Authorization: Bearer $PIDGE_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"correlation_id":"backfill-1","title":"Backfill","status":"Stage 1/4","progress":0.25}'
+  curl -X PATCH $PIDGE_URL/api/v1/live_activities/backfill-1 -H "Authorization: Bearer $PIDGE_TOKEN" \
+    -H "Content-Type: application/json" -d '{"status":"Stage 3/4","progress":0.75}'
+  curl -X POST $PIDGE_URL/api/v1/live_activities/backfill-1/end -H "Authorization: Bearer $PIDGE_TOKEN" \
+    -H "Content-Type: application/json" -d '{"status":"Done ✓","progress":1,"done":true}'
+  ```
+- **Lighter: ONE `pidge message` re-sent with the same `--collapse-key`** — each update replaces
+  the previous banner (1 slot, not N pings).
+Heads-up: `pidge live` as a SEND silently degrades today — the server treats the bare type as a
+default and delivers a normal `message`-profile 201 (check `profile` in the echo); **no card ever
+starts**. Use the endpoints above (`$PIDGE_URL`/`$PIDGE_TOKEN` live in `~/.config/pidge/env` if you
+set up via claim — source it before curling). Either path: a live surface never answers (no
+`--wait`); if the finished job leaves a pendency, that's a separate `important` at the end.
+
+## Anti-slop rules (judgment a recipe can't teach)
+
+1. **One send = one fact = one ask.** Never two questions in a notification.
+2. **Default to `important`.** `message` only for true no-action FYIs; `urgent` is a contract, not a volume knob — **<1/day**, abuse caps your channel.
+3. **There is no content-template menu.** Every send is type + markdown + optional buttons. If you're reaching for `--template context/report/digest/sensitive`, stop — that surface is gone (the field still parses as silent back-compat, but don't teach or rely on it).
+4. **Typed answer? `--actions reply` ALONE** — never a decision + `reply` together (the CLI refuses it, exit 1).
+5. **Trust the 201 echo over your intent** — `degraded`/`render_mode`/`registered_devices`. `registered_devices:0` ⇒ it went nowhere; ABORT a blocking `--wait` on it (kill it, don't let it burn its timeout) and run `pidge doctor`.
+6. **Don't spam to signal importance.** Consolidate into one markdown body; use `--collapse-key` for self-replacing progress, `--thread` only for follow-ups over time.
+7. **Be listening when the answer lands, or you lose it.** Ack only AFTER the work is durably done.
+8. **English only, phone-friendly markdown.** Narrow tables (they render), no emoji-spam.
+9. **Banner-first + catalog-first.** Give a real `--body` (the banner shows title+body, never body-markdown), and fit decisions into a catalog action (`yes,no`/`approve,reject`) before inventing a custom label (custom = a tap-through, not a banner tap).
+
+## Gold examples (full commands)
+
+Pendency with a real table → `important`:
+```bash
+pidge important --title "Weekly metrics ready" \
+  --body "Signups 1,204 (+8%) · churn 1.9% (−0.3pp) · table inside" \
+  --body-markdown $'| Metric | This week | Δ |\n|---|---|---|\n| Signups | 1,204 | +8% |\n| Churn | 1.9% | −0.3pp |' \
+  --actions reply
+```
+
+Blocking decision → ask→wait loop (handle exit 3):
+```bash
+pidge important --title "Run the schema migration?" \
+  --body "Drops legacy_orders (412k rows), not reversible. Safe mid-deploy?" \
+  --body-markdown "Dropping \`legacy_orders\` (412k rows, archived 2025). **Not reversible.** Safe to run mid-deploy?" \
+  --actions yes,no --wait --timeout 3600
+# exit 0 → read chosen_action.action_id (yes|no); exit 3 → no answer, treat as NO / hold, re-ask
+```
+
+Agent-initiated approval (money) → `pidge approval`:
+```bash
+pidge approval --title "Place \$4,200 purchase order?" \
+  --body "Acme · PO #4471 · \$4,200 — moves real money" \
+  --body-markdown "Vendor: Acme · PO #4471 · **\$4,200**, moves real money." \
+  --wait --timeout 3600
+# = important + Approve(Face ID)/Reject + wait; chosen_action.action_id: grant|deny
+```
+
+Time-anchored → `event` (needs `--event-at` in the human's tz):
+```bash
+pidge event --event-at "2026-06-30T15:00:00-03:00" --title "Call with accountant" \
+  --body "3pm tomorrow with the accountant"
+```
+
+Long markdown without shell-quoting pain → pipe it:
+```bash
+generate_report | pidge important --title "Report ready" \
+  --body "Q2 report ready — revenue, churn, and 3 risks inside" --body-markdown-file - --actions reply
+```
+
+## Gotchas we already paid for
+
+- **There is no `pidge reply`.** `reply` is a built-in action id, not a command. To answer the human's composer message, send a normal `pidge message --thread <id>` reusing the message's `thread_id`.
+- **`urgent` is a trust contract, not a button.** It arms an AlarmKit alarm; once delivered you **cannot abort it** (`pidge cancel` → 409). Real + unpostponable only, <1/day. Never test it without warning the human.
+- **A 201 ≠ "seen."** `registered_devices:0` goes nowhere; `delivered` is APNs dispatch, not eyes; only `seen_at`/an answer is the human.
+- **The ask reply-vs-yes/no trap.** `--actions yes,no,reply` let the human dodge a typed answer with one tap — so the CLI now REFUSES a decision + `reply` in one send (exit 1). Use `--actions reply` alone when you need text.
+- **`event` is quiet today** — `event --event-at` schedules; the countdown LA-as-primitive is still being built.
+- **content_template still parses as input** (back-compat) but is OFF the menu — if a legacy habit sends `--template report`, it silently maps; don't rely on it, don't teach it.
+- **The banner ≠ the detail screen.** Lock-screen banner = `title` + `body` (plain). `body_markdown`/images render only when the human taps in. A send with only `--title` can look empty on the lock screen — always include a `--body`.
+
+## How it intrudes (profiles — the human owns them)
+
+- no answer needed → profile omitted
+
+## The contract
+
+- trust the echo
+
+## Getting answers
+
+- `pidge ask …` blocks and prints `chosen_action` JSON; `pidge wait <cid>` blocks on an existing send.
+- `pidge listen` blocks until the human MESSAGES you from the app (composer) — run it when idle.
+- **A pending notification's answer does NOT surface in plain `pidge listen`** (messages only).
+  To collect the answer to a question you already sent: `pidge wait <cid>` (you printed the cid
+  on stderr at send time) or `pidge listen --all` (replies + messages). Park the cid, never re-send.
+- exit 0 answered · 3 timed out
+
+## Stay "always-on" while you're turn-based
+
+A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE without a daemon:
+- **Active session:** `pidge listen --follow --timeout 300` holds for 5 min, printing messages as they arrive. `--follow` traps the turn — use it only when you intend to sit and wait.
+- **Supervisor poll (24/7):** a cron/systemd timer invokes you every N min; each tick runs ONE one-shot `pidge listen --all --timeout 50` (block up to 50s, print, exit 0; exit 3 = nothing this tick — the `--all` ear also catches answers to questions you fire-and-forgot), do the work, `pidge ack --up-to <id>`, sleep. `--timeout` is always SECONDS. Do NOT background `pidge listen` with `&`.
+
+## Full spec
+
+`curl $PIDGE_URL/api/v1/manifest -H "Authorization: Bearer $PIDGE_TOKEN"` — the always-current contract (fields, profiles, custom actions, media, threads, realtime).
+
+<!-- pidge-skill-end -->

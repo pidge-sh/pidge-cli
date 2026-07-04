@@ -22,6 +22,9 @@ function runCli(args, port, env = {}, cwd = undefined) {
       PIDGE_URL: `http://127.0.0.1:${port}`,
       PIDGE_TOKEN: 'hld_test',
       PIDGE_DEGRADED_INTERVAL: '1', // keep the degraded pace test-fast
+      // Isolate per spawn: state.json (manifest nag, #313 e2e pins) must never
+      // touch the REAL ~/.config/pidge — nor leak between tests.
+      XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-test-')),
       ...env,
     },
   });

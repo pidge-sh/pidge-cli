@@ -227,7 +227,10 @@ function e2eParseSecret(raw) {
 }
 
 // Action ids whose LABELS must NEVER be sealed (#313): the server's 12
-// built-ins + the two system ids "dismiss"/"acknowledge". Mirrors the server's
+// built-ins + the system ids "dismiss"/"acknowledge"/"seen" (#313/F7 — "seen"
+// is the app's opened-signal: the server intercepts it before act!, so a custom
+// "seen" button never reaches the agent; server 422s it since manifest v59).
+// Mirrors the server's
 // Notification::RESERVED_ACTION_IDS and the iOS builtin set (E2EContent),
 // which SKIPS label decrypt for these ids — a sealed label on one would
 // render raw "v1:…" on the button. Built-in ids ride CLEAR everywhere (the
@@ -237,7 +240,7 @@ function e2eParseSecret(raw) {
 const E2E_NEVER_SEAL_LABEL_IDS = new Set([
   'snooze', 'done', 'reschedule', 'mute', 'reply',
   'yes', 'no', 'approve', 'reject', 'accept', 'decline', 'later',
-  'dismiss', 'acknowledge',
+  'dismiss', 'acknowledge', 'seen',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -250,7 +253,7 @@ if (require.main !== module) {
   module.exports = {
     e2eAad, e2eKeyFingerprint, e2eLoadSecret, e2eParseSecret,
     e2eEncryptField, e2eDecryptField, e2eEncryptBlob, e2eDecryptBlob,
-    E2E_NEVER_SEAL_LABEL_IDS,
+    E2E_NEVER_SEAL_LABEL_IDS, e2ePinKeyFor,
   };
   return;
 }
@@ -767,7 +770,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 51;
+const KNOWN_MANIFEST_VERSION = 59;
 // #280: the hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
@@ -1135,7 +1138,10 @@ function customActionFromJson(item, i) {
 // built-in action label, or a clear reply typed on a pre-E2E app — the same
 // accept-and-mark honesty the iOS app shows).
 // ---------------------------------------------------------------------------
-const E2E_CONTENT_FIELDS = ['title', 'subtitle', 'body', 'body_markdown'];
+// v59/#351: `copy` (tap-to-copy — the field MADE for tokens/codes) and `url`
+// (deep link) joined the seal. AAD field names are the payload names verbatim
+// ("copy"/"url") — the iOS tap paths decrypt with the same names.
+const E2E_CONTENT_FIELDS = ['title', 'subtitle', 'body', 'body_markdown', 'copy', 'url'];
 const isEnvelope = (s) => typeof s === 'string' && /^v\d+:/.test(s);
 
 // Parse PIDGE_SECRET ONCE per process. null = absent or invalid (invalid warns
@@ -1203,6 +1209,44 @@ function e2eOpenValue({ enc, kf, channelId, cid, field, value, onError }) {
   }
 }
 
+// #313 local pin — the anti-downgrade latch. The seal decision used to trust
+// server-served flags in BOTH directions: a lying/compromised server answering
+// e2e_enabled=false (or just failing whoami) made this CLI send PLAINTEXT
+// despite holding the key — breaking the feature's own threat model ("protects
+// against the server"). So: the first CONFIRMED sealed context stamps
+// state.json (same per-agent dir as the env file), and from then on a clear
+// send here is REFUSED (exit 2) unless the human unpins LOCALLY with
+// PIDGE_E2E=off (env var or the env file). A server response alone can never
+// unpin — that's the whole point.
+function e2eOverrideOff() {
+  return String(process.env.PIDGE_E2E || FILE_ENV.PIDGE_E2E || '').toLowerCase() === 'off';
+}
+// The pin is keyed by a HASH of the channel token — per CHANNEL, not per
+// install (one machine can drive an E2E channel and a clear one from the same
+// config dir), resolvable with ZERO server help (a whoami-failed refusal must
+// still find it), and the token itself never lands in state.json. A re-claim
+// rotates the token ⇒ the new token starts unpinned and re-latches on its
+// first confirmed seal (the stale entry is inert).
+function e2ePinKeyFor(token) {
+  return token ? crypto.createHash('sha256').update(String(token)).digest('base64url').slice(0, 12) : null;
+}
+function e2ePinned() {
+  const k = e2ePinKeyFor(TOKEN);
+  const pins = readState().e2ePins;
+  const p = k && pins && pins[k];
+  return !!(p && p.v === 1);
+}
+function e2eStampPin(kf) {
+  const k = e2ePinKeyFor(TOKEN);
+  if (!k) return;
+  const pins = readState().e2ePins || {};
+  const cur = pins[k];
+  if (cur && cur.v === 1 && cur.kf === kf) return;
+  writeState({ e2ePins: { ...pins, [k]: { v: 1, kf, at: new Date().toISOString() } } });
+  e2eNote('channel PINNED as E2E on this machine (#313) — clear sends here are now refused even if the server claims E2E is off. Genuine toggle-off ⇒ unpin locally with PIDGE_E2E=off (env var or the env file).');
+}
+const E2E_UNPIN_HINT = 'If your human GENUINELY turned E2E off in the app, unpin locally: PIDGE_E2E=off (env var, or a line in the env file next to PIDGE_TOKEN). A server response alone can never unpin.';
+
 // SEND-side sealing, called by doNotify on the final payload. Mutates it:
 // content fields + custom-action LABELS become envelopes (action IDs stay
 // clear — the action contract runs on ids), enc:"v1" + kf ride alongside, and
@@ -1210,15 +1254,23 @@ function e2eOpenValue({ enc, kf, channelId, cid, field, value, onError }) {
 // server ever sees the payload).
 async function e2eMaybeSeal(payload) {
   const mat = e2eKeyMaterial();
-  if (!mat) return;
+  const pinned = e2ePinned() && !e2eOverrideOff();
+  if (!mat) {
+    if (pinned) die(`pidge: REFUSING to send CLEAR (exit 2) — this channel is locally PINNED as E2E (#313) but PIDGE_SECRET is missing/invalid. Fix the secret (the app's Connect screen has the terminal step that writes it). ${E2E_UNPIN_HINT}`, 2);
+    return;
+  }
   let ch;
   try {
     ch = await e2eChannelInfo();
   } catch (e) {
+    if (pinned) die(`pidge: REFUSING to send CLEAR (exit 2) — this channel is locally PINNED as E2E (#313) and the server won't confirm its E2E state (${e.message}). A server that can't answer whoami must not be able to downgrade you to plaintext; retry when it's reachable. ${E2E_UNPIN_HINT}`, 2);
     console.error(`pidge: WARNING — couldn't confirm the channel's E2E state (${e.message}); sending CLEAR (an E2E channel accepts-and-marks it "⚠️ sem criptografia")`);
     return;
   }
-  if (!ch.e2eEnabled) return; // orphan secret — clear send is the contract; `pidge doctor` warns
+  if (!ch.e2eEnabled) {
+    if (pinned) die(`pidge: REFUSING to send CLEAR (exit 2) — the server says this channel is NOT E2E, but this machine PINNED it as E2E (#313: a lying/compromised server could be downgrading you to plaintext). ${E2E_UNPIN_HINT}`, 2);
+    return; // orphan secret — clear send is the contract; `pidge doctor` warns
+  }
   if (!payload.correlation_id) payload.correlation_id = crypto.randomUUID();
   const seal = (field, value) =>
     e2eEncryptField(mat.key, e2eAad(ch.id, payload.correlation_id, field), String(value));
@@ -1231,8 +1283,9 @@ async function e2eMaybeSeal(payload) {
   }
   payload.enc = 'v1';
   payload.kf = mat.kf;
+  e2eStampPin(mat.kf); // a CONFIRMED sealed context latches the anti-downgrade pin (#313)
   if (payload.image !== undefined || payload.file !== undefined)
-    console.error('pidge: E2E note — media BYTES and the filename still ride CLEAR (encrypted media is phase E3); the text fields are sealed');
+    console.error('pidge: E2E note — media BYTES and the filename still ride CLEAR (encrypted media is phase E3); the text fields, copy and url are sealed');
   console.error(`pidge: E2E — content sealed (kf ${mat.kf}); the server stores and relays ciphertext only`);
 }
 
@@ -2239,7 +2292,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     console.error(`pidge: ✓ setup ok — canal "${data.channel && data.channel.name}" · ${devices} device(s) · realtime ${realtime} (run \`pidge doctor\` for the full check)`);
   else
     console.error('pidge doctor: all good — try: pidge hello   (first-contact WOW — send + wait in one)');
-  console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version, realtime, e2e: { channel: e2e.channelOn, secret: e2e.status, kf: e2e.kf } }));
+  console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version, realtime, e2e: { channel: e2e.channelOn, secret: e2e.status, kf: e2e.kf, pinned: !!e2e.pinned } }));
   process.exit(0);
 }
 
@@ -2277,9 +2330,13 @@ function reportE2eHealth(data) {
     console.error(`pidge doctor: BROKEN — your PIDGE_SECRET (kf ${out.kf}) is NOT this channel's key (kf ${serverKf}): the token and the secret belong to different channels. Ask your human to run THIS channel's terminal step from the app's Connect screen (never paste the secret in chat).`);
   } else if (channelOn) {
     note('pidge doctor: e2e ON — sends are sealed end-to-end (the server relays ciphertext only)');
+    e2eStampPin(out.kf); // doctor CONFIRMED the sealed context — latch the pin (#313)
+  } else if (e2ePinned() && !e2eOverrideOff()) {
+    console.error(`pidge doctor: WARNING — the server says this channel is NOT E2E, but this machine PINNED it as E2E (#313): every send here is REFUSED (exit 2) instead of going clear — a lying server must not downgrade you to plaintext. ${E2E_UNPIN_HINT}`);
   } else {
     console.error('pidge doctor: WARNING — PIDGE_SECRET present but this channel is NOT E2E (secret órfão): sends stay CLEAR and the secret is never used. Either the human turns on E2E for this channel in the app, or drop the secret.');
   }
+  out.pinned = e2ePinned() && !e2eOverrideOff();
   return out;
 }
 
