@@ -33,6 +33,10 @@ function createMock() {
     notifyStatus: 201,       // #34: a test forces a non-2xx to exercise approve's fail-closed send
     selftests: {},           // #205: id → {nonce, window_seconds, created, processed}
     selftestSeq: 100,        // next selftest/message id
+    // cli#47 / pidge#284 (LA v2): the /live_activities wire.
+    liveWrites: [],          // every {method, path, body} the CLI sent
+    liveCards: {},           // cid → true (existence drives started|updated + PATCH 404)
+    liveDegrade: false,      // a test forces the dedicated-budget degrade echo
   };
   let server = null;
   let wss = null;
@@ -183,6 +187,64 @@ function createMock() {
       req.on('end', () => {
         state.uploads.push({ bytes: n });
         json(res, 201, { ref: 'upload-ref-mock' });
+      });
+      return;
+    }
+    // cli#47 / pidge#284: the three Live Activity endpoints (LA v2 shapes).
+    const laEnd = url.pathname.match(/^\/api\/v1\/live_activities\/([^/]+)\/end$/);
+    const laOne = url.pathname.match(/^\/api\/v1\/live_activities\/([^/]+)$/);
+    if (url.pathname === '/api/v1/live_activities' && req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(body); } catch { /* keep {} */ }
+        state.liveWrites.push({ method: 'POST', path: url.pathname, body: parsed });
+        const cid = parsed.correlation_id || 'gen-la-cid';
+        const op = state.liveCards[cid] ? 'updated' : 'started';
+        state.liveCards[cid] = true;
+        const degraded = state.liveDegrade && parsed.presentation === 'dedicated';
+        json(res, 201, {
+          id: 1, correlation_id: cid, state: 'active', title: parsed.title || 'Pidge',
+          content: {}, presentation: degraded ? 'consolidated' : (parsed.presentation || 'consolidated'),
+          linger_seconds: null, operation: op,
+          ...(degraded ? { degraded: true, reason: 'dedicated_budget_exhausted' } : {}),
+          started_at: 'x', ended_at: null, created_at: 'x', renderable_devices: 1,
+        });
+      });
+      return;
+    }
+    if (laEnd && req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(body); } catch { /* keep {} */ }
+        const cid = decodeURIComponent(laEnd[1]);
+        state.liveWrites.push({ method: 'POST', path: url.pathname, body: parsed });
+        if (!state.liveCards[cid]) return json(res, 404, { error: 'not_found' });
+        json(res, 200, {
+          id: 1, correlation_id: cid, state: 'ended', title: 'T', content: parsed,
+          presentation: 'consolidated', linger_seconds: parsed.linger_seconds ?? null,
+          operation: 'ended', started_at: 'x', ended_at: 'x', created_at: 'x', renderable_devices: 1,
+        });
+      });
+      return;
+    }
+    if (laOne && req.method === 'PATCH') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(body); } catch { /* keep {} */ }
+        const cid = decodeURIComponent(laOne[1]);
+        state.liveWrites.push({ method: 'PATCH', path: url.pathname, body: parsed });
+        if (!state.liveCards[cid]) return json(res, 404, { error: 'not_found' });
+        json(res, 200, {
+          id: 1, correlation_id: cid, state: 'active', title: 'T', content: parsed,
+          presentation: 'consolidated', linger_seconds: null, operation: 'updated',
+          started_at: 'x', ended_at: null, created_at: 'x', renderable_devices: 1,
+        });
       });
       return;
     }
