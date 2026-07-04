@@ -1813,6 +1813,18 @@ const numStrict = (val, flag, fallback) => {
   return n;
 };
 
+// #51: message-queue ids are STRICT integers. parseInt alone is lazy —
+// parseInt("9f2e7c31-…") === 9 — so an agent that pastes a correlation_id where
+// the numeric listen id belongs would silently ack messages 1..9 it never
+// handled (at-least-once loss, the exact class #39 killed for --timeout).
+// Full-string digits or die loud, BEFORE any HTTP.
+const idStrict = (val, flag) => {
+  const s = String(val).trim();
+  if (!/^\d+$/.test(s))
+    die(`pidge: ${flag} ${JSON.stringify(val)} is not a numeric message id — it takes the NUMERIC id from listen output, never the correlation_id. exit 1`, 1);
+  return parseInt(s, 10);
+};
+
 // ---------------------------------------------------------------------------
 // Onboarding v2 (#110): setup --claim / doctor / whoami / skill install.
 // ---------------------------------------------------------------------------
@@ -2167,6 +2179,15 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   }
   if (res.status !== 200) {
     console.error(`pidge doctor: unexpected ${res.status} from /whoami — ${JSON.stringify(data)}`);
+    process.exit(2);
+  }
+  // #52: since server v57 /whoami is either-track — a SESSION token (ses_) gets
+  // a 200 with NO channel block. Pre-v57 that misconfig 401ed loudly; without
+  // this branch the doctor would print key valid — canal "undefined" and exit 0,
+  // hiding the error until the first send 401s.
+  if (!data.channel) {
+    console.error('pidge doctor: this token is a SESSION token (ses_), not a channel key — the CLI needs the hld_ channel key (Pidge app → Canais → your channel). Sends would 401.');
+    console.log(JSON.stringify({ ok: false, reason: 'session_token_not_channel_key' }));
     process.exit(2);
   }
   const devices = data.devices ?? 0;
@@ -2787,8 +2808,10 @@ ${SKILL_END_MARKER}
       const ackBody = {};
       if (v['up-to'] !== undefined && v.ids !== undefined)
         die('pidge: pass EITHER --up-to <id> OR --ids a,b, not both', 1);
-      if (v['up-to'] !== undefined) ackBody.up_to = parseInt(v['up-to'], 10);
-      else if (v.ids !== undefined) ackBody.ids = v.ids.split(',').map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite);
+      // #51: strict ids — a lazy parse here silently acks the wrong watermark
+      // (and the old .filter(Number.isFinite) silently DROPPED bad ids).
+      if (v['up-to'] !== undefined) ackBody.up_to = idStrict(v['up-to'], '--up-to');
+      else if (v.ids !== undefined) ackBody.ids = v.ids.split(',').map((s) => idStrict(s, '--ids'));
       else die('pidge: usage: pidge ack --up-to <id> | --ids a,b [--renew]', 1);
       if (v.renew) ackBody.state = 'delivered';
       let res, raw;
