@@ -21,6 +21,7 @@ function createMock() {
     acks: [],
     ackBodies: [], // #51: the parsed ack payloads, so tests can assert up_to/ids exactly
     notifies: [],
+    uploads: [],
     claimCode: 'claim-ok',   // #110: POST /api/v1/claim exchanges this once
     devices: 1,
     // #181 ownership + #182 contract/device_reach surfaces (v27).
@@ -170,6 +171,18 @@ function createMock() {
         for (const st of Object.values(state.selftests)) if (ackedIds.includes(st.id)) st.processed = true;
         state.messages = Array.isArray(p.ids) ? state.messages.filter((mm) => !p.ids.includes(mm.id)) : [];
         json(res, 200, { acked: 1 });
+      });
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/uploads') {
+      // Just record THAT an upload arrived (the CLI's #313 pin must refuse
+      // BEFORE any bytes reach here — cross-audit HIGH). Body is multipart; we
+      // only need the count, not the parse.
+      let n = 0;
+      req.on('data', (c) => { n += c.length; });
+      req.on('end', () => {
+        state.uploads.push({ bytes: n });
+        json(res, 201, { ref: 'upload-ref-mock' });
       });
       return;
     }

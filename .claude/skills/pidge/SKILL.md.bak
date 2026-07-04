@@ -6,7 +6,7 @@ description: Send rich, actionable iPhone notifications to your human and get th
 
 # Pidge — notify your human, get answers back
 
-Generated from manifest v16 of http://127.0.0.1:43249 — re-run `pidge skill install` to update (any API response header `X-Pidge-Manifest-Version` > 16 means there's news).
+Generated from manifest v16 of http://127.0.0.1:33881 — re-run `pidge skill install` to update (any API response header `X-Pidge-Manifest-Version` > 16 means there's news).
 
 All commands: `npx pidge-cli …` (Node ≥18; reads `~/.config/pidge/env` — no token in your context). Not set up? Run `pidge doctor`. Onboard with `pidge setup --claim <code>` (the human copies the code from the Pidge app), then `pidge hello`.
 

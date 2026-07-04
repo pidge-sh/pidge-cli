@@ -149,3 +149,44 @@ test('unpinned machines keep the old contract: server-off ⇒ clear send, no ref
   assert.equal(mock.state.notifies[0].title, 'orphan secret');
   assert.equal(readPin(xdg), undefined, 'a clear send never latches the pin');
 });
+
+// cross-audit HIGH: --file/--image used to upload the bytes BEFORE the pin
+// refused the /notify — so a lying server captured the file even on a "refusal".
+// The preflight now dies BEFORE resolveMedia: nothing reaches the wire.
+test('pinned + server-off + --file ⇒ exit 2 and NO upload reached the server (nothing on the wire)', async () => {
+  const xdg = freshXdg();
+  writePin(xdg, FIXTURE.kf);
+  const secretFile = path.join(xdg, 'canary.txt');
+  fs.writeFileSync(secretFile, 'AWS_SECRET=THE-LEAK-CANARY');
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = false; // the downgrade lie
+
+  const { code, stderr } = await runCli(['message', '--title', 'x', '--file', secretFile], port,
+    { PIDGE_SECRET: SECRET, XDG_CONFIG_HOME: xdg });
+  await mock.stop();
+
+  assert.equal(code, 2, `stderr: ${stderr}`);
+  assert.equal(mock.state.uploads.length, 0, 'the file must NOT be uploaded before the pin refuses');
+  assert.equal(mock.state.notifies.length, 0);
+  assert.match(stderr, /REFUSING to send CLEAR/);
+});
+
+// cross-audit MEDIUM: a copy value that fits in CLEAR (≤512) can exceed the cap
+// once the seal inflates it ~33% — refuse locally with a CAUSE-naming message
+// instead of letting the server 422 with a bare "too long".
+test('a copy value too long ONCE sealed is refused locally, naming the cause', async () => {
+  const xdg = freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+
+  const bigCopy = 'x'.repeat(500); // 500 clear → ~700 sealed → over the 512 cap
+  const { code, stderr } = await runCli(['message', '--title', 'x', '--copy', bigCopy], port,
+    { PIDGE_SECRET: SECRET, XDG_CONFIG_HOME: xdg });
+  await mock.stop();
+
+  assert.equal(code, 2, `stderr: ${stderr}`);
+  assert.match(stderr, /too long to send ENCRYPTED/);
+  assert.equal(mock.state.notifies.length, 0, 'the over-cap sealed send never leaves the machine');
+});
