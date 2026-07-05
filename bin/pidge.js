@@ -800,7 +800,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 60;
+const KNOWN_MANIFEST_VERSION = 61;
 // #280: the hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
