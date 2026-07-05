@@ -1,12 +1,12 @@
 ---
 name: pidge
 description: Send rich, actionable iPhone notifications to your human and get their decision back (Pidge). Every send is a TYPE (message/important/urgent/event/live) plus an OPTIONAL response (buttons + send-and-go vs wait). Use when finishing long tasks, needing a decision/approval, sending updates with substance, or anything time-anchored. Also covers reading the human's replies back.
-# pidge-skill rev=5 manifest=16
+# pidge-skill rev=6 manifest=16
 ---
 
 # Pidge — notify your human, get answers back
 
-Generated from manifest v16 of http://127.0.0.1:33881 — re-run `pidge skill install` to update (any API response header `X-Pidge-Manifest-Version` > 16 means there's news).
+Generated from manifest v16 of http://127.0.0.1:51523 — re-run `pidge skill install` to update (any API response header `X-Pidge-Manifest-Version` > 16 means there's news).
 
 All commands: `npx pidge-cli …` (Node ≥18; reads `~/.config/pidge/env` — no token in your context). Not set up? Run `pidge doctor`. Onboard with `pidge setup --claim <code>` (the human copies the code from the Pidge app), then `pidge hello`.
 
@@ -63,25 +63,26 @@ Need a TYPED reply (a time/value/name)? `--actions reply` ALONE — never a deci
 ## Live progress (a status card you update in place)
 
 For a long job whose progress the human wants to GLANCE at, you have two honest paths:
-- **Live Activity (the real lock-screen card):** three HTTP endpoints; the handle is YOUR
-  `correlation_id` (re-POST = upsert; PATCH updates in place). **ALWAYS end it** — an orphan
-  card stuck at "stage 3/4" is slop.
+- **`pidge live` — the real lock-screen card (LA v2, #284).** By default your card is an ENTRY
+  of the user's ONE consolidated status-center Live Activity (all agents share it — cards never
+  stack). Fields drive the render: `--step 3/5` (sugar → progress + fraction) or `--progress`
+  → bar; `--ends-at` → native countdown the SERVER concludes at zero; `--end` → ✓ + outcome,
+  lingers ~30 s, leaves the card. The handle is the correlation_id you pass (or the one echoed
+  back) — reuse it to update/end.
   ```bash
-  curl -X POST $PIDGE_URL/api/v1/live_activities -H "Authorization: Bearer $PIDGE_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"correlation_id":"backfill-1","title":"Backfill","status":"Stage 1/4","progress":0.25}'
-  curl -X PATCH $PIDGE_URL/api/v1/live_activities/backfill-1 -H "Authorization: Bearer $PIDGE_TOKEN" \
-    -H "Content-Type: application/json" -d '{"status":"Stage 3/4","progress":0.75}'
-  curl -X POST $PIDGE_URL/api/v1/live_activities/backfill-1/end -H "Authorization: Bearer $PIDGE_TOKEN" \
-    -H "Content-Type: application/json" -d '{"status":"Done ✓","progress":1,"done":true}'
+  pidge live backfill-1 --title "Backfill" --status "Stage 1/4" --step 1/4
+  pidge live backfill-1 --status "Stage 3/4" --step 3/4
+  pidge live backfill-1 --end --outcome "Backfill ok ✓"
   ```
+  Trust the echo: `operation` (started/updated/noop/rotated/ended) says what happened;
+  `degraded:true` means an over-budget `--dedicated` landed as a consolidated entry. Updates
+  are cheap (identical re-writes are a `noop` that refreshes your staleness TTL), and the
+  server retires what you forget (stale after a TTL, concluded at `--ends-at`) — but **end
+  what you started anyway**: an explicit `--outcome` beats a timeout.
 - **Lighter: ONE `pidge message` re-sent with the same `--collapse-key`** — each update replaces
   the previous banner (1 slot, not N pings).
-Heads-up: `pidge live` as a SEND silently degrades today — the server treats the bare type as a
-default and delivers a normal `message`-profile 201 (check `profile` in the echo); **no card ever
-starts**. Use the endpoints above (`$PIDGE_URL`/`$PIDGE_TOKEN` live in `~/.config/pidge/env` if you
-set up via claim — source it before curling). Either path: a live surface never answers (no
-`--wait`); if the finished job leaves a pendency, that's a separate `important` at the end.
+Either path: a live surface never answers (no `--wait`); if the finished job leaves a pendency,
+that's a separate `important` at the end.
 
 ## Anti-slop rules (judgment a recipe can't teach)
 
@@ -141,7 +142,7 @@ generate_report | pidge important --title "Report ready" \
 - **`urgent` is a trust contract, not a button.** It arms an AlarmKit alarm; once delivered you **cannot abort it** (`pidge cancel` → 409). Real + unpostponable only, <1/day. Never test it without warning the human.
 - **A 201 ≠ "seen."** `registered_devices:0` goes nowhere; `delivered` is APNs dispatch, not eyes; only `seen_at`/an answer is the human.
 - **The ask reply-vs-yes/no trap.** `--actions yes,no,reply` let the human dodge a typed answer with one tap — so the CLI now REFUSES a decision + `reply` in one send (exit 1). Use `--actions reply` alone when you need text.
-- **`event` is quiet today** — `event --event-at` schedules; the countdown LA-as-primitive is still being built.
+- **`event` is quiet today** — `event --event-at` schedules the notification + countdown; for hand-driven progress use `pidge live`.
 - **content_template still parses as input** (back-compat) but is OFF the menu — if a legacy habit sends `--template report`, it silently maps; don't rely on it, don't teach it.
 - **The banner ≠ the detail screen.** Lock-screen banner = `title` + `body` (plain). `body_markdown`/images render only when the human taps in. A send with only `--title` can look empty on the lock screen — always include a `--body`.
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.19.0 — 2026-07-04
+
+- **cli#47 / pidge#284 (LA v2): `pidge live` agora dirige os endpoints REAIS de Live Activity**
+  (`POST/PATCH /api/v1/live_activities` + `/end`) — o degrade silencioso (`template_kind:live`
+  → um 201 message-profile SEM card) morreu ([[cli-truth]]: nunca mais). Por default o card é
+  uma ENTRADA do status center consolidado do usuário (decisão A do #284); `--dedicated` opta
+  por card próprio (orçamento 2 — estourou, degrada ALTO com eco `degraded`/`reason` narrado
+  no stderr). Novas flags: `--status --step N/M --progress --ends-at --starts-at --paused
+  --resume --detail --symbol --dedicated --end --outcome --linger`. **`--step 3/5` é açúcar**:
+  vira `progress: 0.6` + `progress_label` — não existe campo steps no wire. `--title` = POST
+  (upsert por correlation_id); CID sem `--title` = PATCH (404 → dica de `--title`); `--end`
+  conclui (✓ + outcome, linger default 30s). O JSON completo da resposta (com
+  `operation: started|updated|noop|rotated|ended`) sai no stdout; `--wait` segue recusado.
+- **Skill spine rev 6:** ensina o `pidge live` ligado (fields-drive-o-render, omit-to-preserve
+  do timer, staleness server-side) e remove o aviso "silently degrades" + o bloco de curl cru.
+- `KNOWN_MANIFEST_VERSION` → **60** (manifest do status center).
+
+
 ## 0.17.3 — 2026-07-04
 
 - **#51 (fix, at-least-once):** `ack --up-to`/`--ids` agora exigem id NUMÉRICO inteiro (full-string)

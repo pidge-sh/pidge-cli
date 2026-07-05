@@ -318,6 +318,21 @@ const OPTIONS = {
   // lote-5 #4: collapse `setup` onboarding to a single status line (the full
   // doctor stays the default; --quiet is opt-in, never the default).
   quiet: { type: 'boolean' },
+  // cli#47 / pidge#284 (LA v2): the `pidge live` verb drives the REAL Live
+  // Activity endpoints (status center) — no more silent degrade to /notify.
+  status: { type: 'string' },                  // live: short status line on the card
+  symbol: { type: 'string' },                  // live: SF Symbol name
+  detail: { type: 'string' },                  // live: small trailing value
+  progress: { type: 'string' },                // live: 0..1 → progress bar
+  step: { type: 'string' },                    // live: "3/5" sugar → progress + fraction label
+  'ends-at': { type: 'string' },               // live: ISO8601 → native countdown (server concludes at zero)
+  'starts-at': { type: 'string' },             // live: ISO8601 → elapsed count-up
+  paused: { type: 'boolean' },                 // live: is_running=false (pause the timer)
+  resume: { type: 'boolean' },                 // live: is_running=true (resume the timer)
+  dedicated: { type: 'boolean' },              // live: own device card (budget 2 — over budget degrades loudly)
+  end: { type: 'boolean' },                    // live: end the entry (shows done + outcome, lingers, leaves)
+  outcome: { type: 'string' },                 // live --end: the line shown next to the ✓
+  linger: { type: 'string' },                  // live --end: seconds the final snapshot stays (default 30)
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -345,7 +360,9 @@ USAGE
   pidge important [options]  ⭐DEFAULT     a pendency the human should resolve ("waiting-for-you" card)
   pidge urgent    [options]               breaks through silent/Focus; --escalate forces an AlarmKit alarm
   pidge event     [options]               a scheduled thing — needs --event-at (countdown Live Activity)
-  pidge live      [options]               an in-flight task with incremental updates (Live Activity)
+  pidge live [CID] [options]              a REAL lock-screen card (Live Activity, #284): entry of the
+                                          user's consolidated status center. --title starts/upserts;
+                                          CID without --title updates; --end concludes (✓ + outcome)
   AXIS 2 — RESPONSE (composes on ANY type above): --actions/--custom-action add
   buttons; text reply is ALWAYS available; --wait blocks until the human answers
   (send-and-go vs --wait). Two shortcuts bundle both axes:
@@ -533,6 +550,19 @@ const OPTION_DOCS = {
   'allow-label': '--allow-label TEXT       approve: label on the Face-ID allow button (default "Allow")',
   'deny-label': '--deny-label TEXT        approve: label on the deny button (default "Deny")',
   quiet: '--quiet                  setup: collapse onboarding to one status line (the full doctor stays the default)',
+  status: '--status TEXT            short status line on the card ("copiando índices")',
+  symbol: '--symbol NAME            SF Symbol (hammer.fill, arrow.down.circle)',
+  detail: '--detail TEXT            small trailing value on the card',
+  progress: '--progress N             0..1 → progress bar (or use --step)',
+  step: '--step N/M               steps sugar: "3/5" → progress 0.6 + the fraction label (no steps field on the wire)',
+  'ends-at': '--ends-at ISO8601        countdown — the SERVER concludes the entry when it hits zero',
+  'starts-at': '--starts-at ISO8601      elapsed count-up from this instant',
+  paused: '--paused                 pause the timer (is_running:false); omit-to-preserve — updates never reset it',
+  resume: '--resume                 resume a paused timer (is_running:true)',
+  dedicated: '--dedicated              own device card instead of a status-center entry (budget 2 — the 3rd degrades loudly)',
+  end: '--end                    end the entry: done ✓ + outcome, lingers --linger seconds, then leaves the card',
+  outcome: '--outcome TEXT           end: the line shown next to the ✓ (falls back to the final --status)',
+  linger: '--linger N               end: seconds the final snapshot stays visible (default 30)',
 };
 // Content flags shared by every send.
 // lote-5 #3: `template` is intentionally OFF the menu (#274 — content_template is
@@ -596,10 +626,10 @@ const HELP = {
     opts: [...SEND_OPTS],
   },
   live: {
-    summary: 'track an in-flight task (deploy/build/trip) with incremental updates (Live Activity). Status-only — never answers.',
-    usage: 'pidge live --title TEXT [--body TEXT] [--lead-minutes N]',
-    body: 'Fire-and-forget. Records the live type; the LA-as-primitive is being built — today the send is delivered as a normal notification. Use judgement, not a recipe: show what the human WANTS to watch evolve.',
-    opts: [...CONTENT_OPTS],
+    summary: 'track an in-flight task (deploy/build/trip) on a REAL lock-screen Live Activity. Status-only — never answers.',
+    usage: 'pidge live [CID] --title TEXT [--status "…"] [--step 3/5 | --progress 0.6 | --ends-at ISO] · pidge live CID --end [--outcome "…"] [--linger N]',
+    body: 'Drives the /live_activities endpoints (LA v2 #284) — by default an ENTRY of the user\'s ONE consolidated status-center card (cards never stack; --dedicated opts into an own card, budget 2). FIELDS DRIVE THE RENDER: --step/--progress → bar + fraction · --ends-at → native countdown (the server concludes it at zero) · --end → ✓ + --outcome, lingers --linger seconds, then leaves. The handle is the CID (positional or --correlation-id; auto-generated on first POST — reuse it to update/end). Updates are cheap: identical re-writes echo operation:"noop"; a stale entry is retired by the server. ALWAYS --end what you started anyway — outcome beats timeout.',
+    opts: ['title', 'status', 'step', 'progress', 'ends-at', 'starts-at', 'paused', 'resume', 'detail', 'symbol', 'dedicated', 'end', 'outcome', 'linger', 'correlation-id'],
   },
   // AXIS 2 — the two response shortcuts (bundle a type + buttons + --wait).
   ask: {
@@ -770,7 +800,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 59;
+const KNOWN_MANIFEST_VERSION = 61;
 // #280: the hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
@@ -782,7 +812,9 @@ const KNOWN_MANIFEST_VERSION = 59;
 // and notes the CLI now REFUSES a decision + reply in one send (lote-5 #2).
 // Bumped to 4 in 0.16.1 (#38): the generated skill now ends with SKILL_END_MARKER (the
 // cheap integrity check) — the bump heals every pre-marker install into the new format.
-const SKILL_REVISION = 5;
+// Bumped to 6 in 0.19.0 (cli#47 / pidge#284): the spine now teaches the WIRED `pidge live`
+// (status center, --step sugar, --end/--outcome) and drops the "silently degrades" warning.
+const SKILL_REVISION = 6;
 // #38: the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -1698,6 +1730,98 @@ async function doTypedSend(kind, { wait = false, extra = {}, requireAnswerable =
   await waitForAnswer(cid, { timeout, interval: intervalArg });
 }
 
+// `pidge live` (cli#47 / pidge#284, LA v2) — the wrapper over the three
+// /live_activities endpoints. By default the write lands as an ENTRY of the
+// user's consolidated status-center card; the response's `operation` echo
+// (started|updated|noop|rotated|ended) is the truth of what happened. The old
+// behavior (template_kind:live → a silently-degraded message-profile /notify)
+// is dead — [[cli-truth]]: nunca mais.
+async function doLive() {
+  if (v.wait)
+    die("pidge: `live` can't --wait — a status card never produces an answer (drop --wait, or ask with a real type)", 1);
+  if (v.paused && v.resume) die('pidge: pass --paused OR --resume, not both', 1);
+  const cid = parsed.positionals[1] || v['correlation-id'];
+
+  // --step N/M is SUGAR: there is no steps field on the wire — it becomes
+  // progress + the fraction label the bar renders (decision B, #284).
+  let progress; let progressLabel;
+  if (v.step !== undefined) {
+    if (v.progress !== undefined) die('pidge: pass --step OR --progress, not both', 1);
+    const m = String(v.step).match(/^(\d+)\s*\/\s*(\d+)$/);
+    if (!m || Number(m[2]) === 0) die('pidge: --step must look like 3/5 (done/total)', 1);
+    progress = Math.min(1, Number(m[1]) / Number(m[2]));
+    progressLabel = `${m[1]}/${m[2]}`;
+  } else if (v.progress !== undefined) {
+    progress = Number(v.progress);
+    if (!Number.isFinite(progress)) die(`pidge: --progress ${JSON.stringify(v.progress)} is not a number (0..1)`, 1);
+  }
+
+  const prune = (obj) => Object.fromEntries(Object.entries(obj).filter(([, x]) => x !== undefined));
+  let method; let apiPath;
+  let body;
+  if (v.end) {
+    if (!cid) die('pidge: usage: pidge live <correlation_id> --end [--outcome "…"] [--linger N]', 1);
+    method = 'POST';
+    apiPath = `/api/v1/live_activities/${encodeURIComponent(cid)}/end`;
+    body = prune({
+      status: v.status, symbol: v.symbol, detail: v.detail, progress,
+      outcome: v.outcome,
+      linger_seconds: v.linger !== undefined ? numStrict(v.linger, '--linger', undefined) : undefined,
+    });
+  } else {
+    body = prune({
+      correlation_id: cid,
+      title: v.title, status: v.status, symbol: v.symbol, detail: v.detail,
+      progress, progress_label: progressLabel,
+      started_at: v['starts-at'], ends_at: v['ends-at'],
+      is_running: v.paused ? false : (v.resume ? true : undefined),
+      presentation: v.dedicated ? 'dedicated' : undefined,
+    });
+    if (v.title !== undefined) {
+      // POST upserts by correlation_id — start OR update in one shape.
+      method = 'POST';
+      apiPath = '/api/v1/live_activities';
+    } else {
+      if (!cid)
+        die('pidge: pass --title to start a card, or <correlation_id> (or --correlation-id) to update one', 1);
+      method = 'PATCH';
+      apiPath = `/api/v1/live_activities/${encodeURIComponent(cid)}`;
+      delete body.correlation_id;
+    }
+  }
+
+  let res; let raw;
+  try {
+    res = await fetch(`${BASE}${apiPath}`, { method, headers, body: JSON.stringify(body) });
+    raw = await res.text();
+  } catch (e) {
+    die(`pidge: live ${v.end ? 'end' : 'write'} failed (network): ${e.message}`, 2);
+  }
+  await checkManifestNews(res);
+  console.log(raw); // machine output: the full response JSON (operation/degraded included)
+  const ok = res.status >= 200 && res.status < 300;
+  let info = {};
+  try { info = JSON.parse(raw); } catch { /* leave {} */ }
+  if (!ok) {
+    if (res.status === 404 && method === 'PATCH')
+      console.error(`pidge: no card with correlation_id=${cid} on this channel — add --title to START it (POST upserts)`);
+    else
+      console.error(`pidge: live ${v.end ? 'end' : 'write'} failed (${res.status})`);
+    process.exit(2);
+  }
+  if (info.correlation_id)
+    console.error(`pidge: correlation_id=${info.correlation_id} (update: pidge live ${info.correlation_id} --status "…" · end: pidge live ${info.correlation_id} --end --outcome "…")`);
+  if (info.degraded)
+    console.error(`pidge: DEGRADED — ${info.reason || 'over budget'}: the card landed as a status-center entry, not a dedicated one (nothing was dropped)`);
+  if (info.operation === 'noop')
+    console.error('pidge: noop — identical to the current state (your staleness TTL was refreshed; no push burned)');
+  if (info.operation === 'rotated')
+    console.error('pidge: rotated — the device card had been dismissed; it was re-created via push-to-start');
+  if (info.renderable_devices === 0)
+    console.error('pidge: 0 devices can render Live Activities — the card goes nowhere (open the app once to register)');
+  process.exit(0);
+}
+
 // `pidge approve` (#34) — a hook-shaped, DENY-DEFAULT permission gate. Sends a
 // Face-ID approval and BLOCKS, then maps the human's tap to an exit code: ONLY an
 // explicit allow is exit 0; deny, timeout, a dead channel or any ambiguity is
@@ -2595,25 +2719,26 @@ Need a TYPED reply (a time/value/name)? \`--actions reply\` ALONE — never a de
 ## Live progress (a status card you update in place)
 
 For a long job whose progress the human wants to GLANCE at, you have two honest paths:
-- **Live Activity (the real lock-screen card):** three HTTP endpoints; the handle is YOUR
-  \`correlation_id\` (re-POST = upsert; PATCH updates in place). **ALWAYS end it** — an orphan
-  card stuck at "stage 3/4" is slop.
+- **\`pidge live\` — the real lock-screen card (LA v2, #284).** By default your card is an ENTRY
+  of the user's ONE consolidated status-center Live Activity (all agents share it — cards never
+  stack). Fields drive the render: \`--step 3/5\` (sugar → progress + fraction) or \`--progress\`
+  → bar; \`--ends-at\` → native countdown the SERVER concludes at zero; \`--end\` → ✓ + outcome,
+  lingers ~30 s, leaves the card. The handle is the correlation_id you pass (or the one echoed
+  back) — reuse it to update/end.
   \`\`\`bash
-  curl -X POST $PIDGE_URL/api/v1/live_activities -H "Authorization: Bearer $PIDGE_TOKEN" \\
-    -H "Content-Type: application/json" \\
-    -d '{"correlation_id":"backfill-1","title":"Backfill","status":"Stage 1/4","progress":0.25}'
-  curl -X PATCH $PIDGE_URL/api/v1/live_activities/backfill-1 -H "Authorization: Bearer $PIDGE_TOKEN" \\
-    -H "Content-Type: application/json" -d '{"status":"Stage 3/4","progress":0.75}'
-  curl -X POST $PIDGE_URL/api/v1/live_activities/backfill-1/end -H "Authorization: Bearer $PIDGE_TOKEN" \\
-    -H "Content-Type: application/json" -d '{"status":"Done ✓","progress":1,"done":true}'
+  pidge live backfill-1 --title "Backfill" --status "Stage 1/4" --step 1/4
+  pidge live backfill-1 --status "Stage 3/4" --step 3/4
+  pidge live backfill-1 --end --outcome "Backfill ok ✓"
   \`\`\`
+  Trust the echo: \`operation\` (started/updated/noop/rotated/ended) says what happened;
+  \`degraded:true\` means an over-budget \`--dedicated\` landed as a consolidated entry. Updates
+  are cheap (identical re-writes are a \`noop\` that refreshes your staleness TTL), and the
+  server retires what you forget (stale after a TTL, concluded at \`--ends-at\`) — but **end
+  what you started anyway**: an explicit \`--outcome\` beats a timeout.
 - **Lighter: ONE \`pidge message\` re-sent with the same \`--collapse-key\`** — each update replaces
   the previous banner (1 slot, not N pings).
-Heads-up: \`pidge live\` as a SEND silently degrades today — the server treats the bare type as a
-default and delivers a normal \`message\`-profile 201 (check \`profile\` in the echo); **no card ever
-starts**. Use the endpoints above (\`$PIDGE_URL\`/\`$PIDGE_TOKEN\` live in \`~/.config/pidge/env\` if you
-set up via claim — source it before curling). Either path: a live surface never answers (no
-\`--wait\`); if the finished job leaves a pendency, that's a separate \`important\` at the end.
+Either path: a live surface never answers (no \`--wait\`); if the finished job leaves a pendency,
+that's a separate \`important\` at the end.
 
 ## Anti-slop rules (judgment a recipe can't teach)
 
@@ -2673,7 +2798,7 @@ generate_report | pidge important --title "Report ready" \\
 - **\`urgent\` is a trust contract, not a button.** It arms an AlarmKit alarm; once delivered you **cannot abort it** (\`pidge cancel\` → 409). Real + unpostponable only, <1/day. Never test it without warning the human.
 - **A 201 ≠ "seen."** \`registered_devices:0\` goes nowhere; \`delivered\` is APNs dispatch, not eyes; only \`seen_at\`/an answer is the human.
 - **The ask reply-vs-yes/no trap.** \`--actions yes,no,reply\` let the human dodge a typed answer with one tap — so the CLI now REFUSES a decision + \`reply\` in one send (exit 1). Use \`--actions reply\` alone when you need text.
-- **\`event\` is quiet today** — \`event --event-at\` schedules; the countdown LA-as-primitive is still being built.
+- **\`event\` is quiet today** — \`event --event-at\` schedules the notification + countdown; for hand-driven progress use \`pidge live\`.
 - **content_template still parses as input** (back-compat) but is OFF the menu — if a legacy habit sends \`--template report\`, it silently maps; don't rely on it, don't teach it.
 - **The banner ≠ the detail screen.** Lock-screen banner = \`title\` + \`body\` (plain). \`body_markdown\`/images render only when the human taps in. A send with only \`--title\` can look empty on the lock screen — always include a \`--body\`.
 
@@ -2792,9 +2917,10 @@ ${SKILL_END_MARKER}
       break;
     }
     case 'live':
-      // status-only — pass --wait through so doTypedSend REFUSES it loudly (it
-      // never produces an answer); without --wait it's fire-and-forget.
-      await doTypedSend('live', { wait: !!v.wait });
+      // cli#47: the verb drives the REAL /live_activities endpoints now — the
+      // old silent degrade (template_kind:live → a message-profile /notify 201
+      // with no card) is dead. --wait is refused inside (status never answers).
+      await doLive();
       break;
     // --- compat aliases (perfis-S1): old type names → the new canonical 5. They
     // map to the new template_kind and still honor --wait/--actions, so scripts
