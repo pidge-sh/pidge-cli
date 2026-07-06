@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.21.0 — 2026-07-06
+
+- **cli#58: `pidge catchup` — o verbo READ-ONLY sobre `GET /messages?history=true&all=true`.**
+  Imprime a conversa inteira (JSON, mais novo primeiro), respostas de notificação incluídas, e
+  **NUNCA consome**: sem ack, sem carimbo delivered, sem lease (o servidor já expõe `history=true`
+  desde o #186; o CLI é que não expunha). É como uma sessão interativa se SITUA ao subir num canal
+  cujo consumidor real é OUTRO runtime (uma bridge/daemon 24/7) — lê o que já foi tratado sem
+  roubar mensagem da fila do consumidor. `--limit N` / `--before ID` paginam. Exit `0` (imprimiu,
+  mesmo vazio `{"messages":[]}`) / `2` erro — sem espera, logo sem 3/4. Rows E2E são abertas
+  localmente (mesmo caminho do `listen`). *(Item 4 do #58 — exibir `acked_by`/`handler_summary` —
+  fica FORA: depende do server thiagoc77/pidge#380; há um TODO no código.)*
+- **Regra 1-consumidor-por-canal, agora ESCRITA** (era folclore). Quem roda `listen`/`ack`
+  **consome** cada mensagem; um segundo runtime que também roda `listen` rouba mensagens do
+  consumidor (double-consume — o incidente 2026-07-06). Contrato: situe-se com `catchup`
+  (read-only), rode `listen`/`ack` só quando VOCÊ é o único consumidor do canal. Documentada no
+  README (seção Contract + tabela de comandos) e na skill.
+- **Skill spine rev 7:** nova seção "Subindo numa sessão interativa" (catchup antes de oferecer
+  trabalho; NUNCA `listen` se outro runtime é o consumidor) + linha no PICKER.
+- **`pidge skill install --target claude|agents|gemini`:** o mesmo conteúdo agnóstico, destino
+  diferente — `claude` (default) → `.claude/skills/pidge/SKILL.md` · `agents` → `AGENTS.md` ·
+  `gemini` → `GEMINI.md` (ambos na raiz). Um arquivo existente que difere vai pro `<dest>.bak`.
+
 ## 0.20.0 — 2026-07-06
 
 - **pidge#367 F1 (E3): mídia SELADA agente→você, atrás do gate de deploy.** Num canal E2E com o
