@@ -341,3 +341,62 @@ test('listen: a CLEAR attachment passes through with its url; --download saves i
   assert.ok(out.attachment.path);
   assert.deepEqual(fs.readFileSync(out.attachment.path), plain);
 });
+
+// --- Regression: cross-audit findings (coord 2026-07-06) ------------------------
+
+test('listen: a traversal MESSAGE ID (server-chosen) cannot steer the plaintext outside the downloads dir', async () => {
+  // BLOCKER regression: destFor interpolated String(m.id) raw — a hostile server
+  // (the #367/#313 threat model) could ship "../.." to write the decrypted
+  // plaintext anywhere. The id segment is sanitized like any wire string now.
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-idtrav-'));
+  mock.state.messages = [sealedAttachmentRow(mock, { id: '../../../../../../tmp/pidge-pwned-marker' })];
+
+  const { code, stdout, stderr } = await runCli(
+    ['listen', '--no-realtime', '--timeout', '20', '--interval', '1'],
+    port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const row = JSON.parse(stdout)[0];
+  const downloads = path.join(xdg, 'pidge', 'downloads');
+  assert.ok(row.attachment.path.startsWith(downloads + path.sep),
+    `plaintext must stay INSIDE ${downloads}, got ${row.attachment.path}`);
+  assert.ok(!fs.existsSync('/tmp/pidge-pwned-marker'), 'the traversal target must NOT be created');
+});
+
+test('media pin: a re-key (new kf, same token) PRESERVES the media latch — a text send cannot silently re-open the downgrade lever', async () => {
+  // MAJOR regression: e2eStampPin rewrote the pin WITHOUT spreading cur, dropping
+  // media:true. A secret rotation (new kf, same token) + one text send wiped the
+  // media latch and re-armed the server-driven media-downgrade lever.
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.e2eMediaReady = true;
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-rekey-'));
+
+  // a SECOND valid secret: same 32-byte shape, one byte flipped ⇒ a different kf.
+  const key2 = Buffer.from(KEY); key2[key2.length - 1] ^= 0xff;
+  const SECRET2 = key2.toString('base64url');
+
+  const file = tmpFile('a.bin', Buffer.from('aaa'));
+  // 1. sealed-media send with key #1 → latches the media pin.
+  let r = await runCli(['message', '--title', 'a', '--file', file], port, { PIDGE_SECRET: SECRET }, xdg);
+  assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+  assert.match(r.stderr, /PINNED as SEALED-MEDIA/);
+
+  // 2. a re-key: a TEXT-only send with key #2 (new kf, same token) rewrites the
+  //    E2E pin. It must NOT drop media:true.
+  r = await runCli(['message', '--title', 'just text'], port, { PIDGE_SECRET: SECRET2 }, xdg);
+  assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+
+  // 3. server now claims the media gate closed — the latch must STILL refuse.
+  mock.state.e2eMediaReady = false;
+  const uploadsBefore = mock.state.uploads.length;
+  r = await runCli(['message', '--title', 'c', '--file', file], port, { PIDGE_SECRET: SECRET2 }, xdg);
+  await mock.stop();
+  assert.equal(r.code, 2, `the media latch must survive the re-key; stderr: ${r.stderr}`);
+  assert.match(r.stderr, /REFUSING to send CLEAR MEDIA/);
+  assert.equal(mock.state.uploads.length, uploadsBefore, 'refused before upload');
+});

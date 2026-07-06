@@ -1298,7 +1298,10 @@ function e2eStampPin(kf) {
   const pins = readState().e2ePins || {};
   const cur = pins[k];
   if (cur && cur.v === 1 && cur.kf === kf) return;
-  writeState({ e2ePins: { ...pins, [k]: { v: 1, kf, at: new Date().toISOString() } } });
+  // Spread `cur`: a re-key (new kf, same token) must PRESERVE the media latch
+  // (#367) — dropping `media:true` here would re-arm the exact server-driven
+  // media-downgrade lever the pin exists to deny. e2eStampMediaPin spreads too.
+  writeState({ e2ePins: { ...pins, [k]: { ...cur, v: 1, kf, at: new Date().toISOString() } } });
   e2eNote('channel PINNED as E2E on this machine (#313) — clear sends here are now refused even if the server claims E2E is off. Genuine toggle-off ⇒ unpin locally with PIDGE_E2E=off (env var or the env file).');
 }
 const E2E_UNPIN_HINT = 'If your human GENUINELY turned E2E off in the app, unpin locally: PIDGE_E2E=off (env var, or a line in the env file next to PIDGE_TOKEN). A server response alone can never unpin.';
@@ -1564,8 +1567,13 @@ async function e2eProcessAttachment(m, out, fail) {
   };
   const destFor = (filename) => {
     const dir = v['download-dir'] || path.join(pidgeConfigDir(), 'downloads');
-    const name = sanitizeAttachmentName(filename) || `attachment-${m.id}`;
-    return path.join(dir, String(m.id), name);
+    // m.id comes off the wire — a hostile server (the #367/#313 threat model)
+    // could ship "../.." to steer the decrypted plaintext OUTSIDE the downloads
+    // dir. Sanitize the id segment AND the fallback name exactly like any other
+    // attacker-influenceable wire string, so both path parts are contained.
+    const idSeg = sanitizeAttachmentName(String(m.id)) || 'msg';
+    const name = sanitizeAttachmentName(filename) || `attachment-${idSeg}`;
+    return path.join(dir, idSeg, name);
   };
   if (att.enc) {
     if (att.enc !== 'v1') {
