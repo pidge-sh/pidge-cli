@@ -17,6 +17,7 @@ function createMock() {
     waitMode: 'ok',
     wsMode: 'ok',          // '1006' = drop every WS abruptly (the #119 prod failure)
     messages: [],          // served by GET /api/v1/messages
+    messageReads: [],      // #58: every GET /api/v1/messages req.url (assert catchup's history=true&all=true)
     notifications: {},     // cid → body for GET /api/v1/notifications/:cid
     acks: [],
     ackBodies: [], // #51: the parsed ack payloads, so tests can assert up_to/ids exactly
@@ -156,8 +157,14 @@ function createMock() {
       });
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/messages') {
+      // #58: record every read so a test can assert catchup's query (history/all).
+      state.messageReads.push(req.url);
       // #131: notification_reply rows are served only on the unified queue.
       const all = url.searchParams.get('all') === 'true';
+      // #58: history=true is the READ-ONLY thread read (server never consumes/stamps
+      // delivered/opens a lease — it just returns the conversation). The mock never
+      // deletes on GET anyway, so the observable contract under test is that catchup
+      // NEVER POSTs an ack (state.acks stays empty).
       const rows = all ? state.messages
         : state.messages.filter((m) => !m.kind || m.kind === 'message');
       return json(res, 200, { messages: rows });

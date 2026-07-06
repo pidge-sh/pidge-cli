@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.21.0 — 2026-07-06
+
+- **cli#58: `pidge catchup` — o verbo READ-ONLY sobre `GET /messages?history=true&all=true`.**
+  Imprime a conversa inteira (JSON, mais novo primeiro), respostas de notificação incluídas, e
+  **NUNCA consome**: sem ack, sem carimbo delivered, sem lease (o servidor já expõe `history=true`
+  desde o #186; o CLI é que não expunha). É como uma sessão interativa se SITUA ao subir num canal
+  cujo consumidor real é OUTRO runtime (uma bridge/daemon 24/7) — lê o que já foi tratado sem
+  roubar mensagem da fila do consumidor. `--limit N` / `--before ID` paginam. Exit `0` (imprimiu,
+  mesmo vazio `{"messages":[]}`) / `2` erro — sem espera, logo sem 3/4. Rows E2E são abertas
+  localmente (mesmo caminho do `listen`). `--limit N` é enforçado **client-side** (o servidor
+  ignora `limit` no caminho `?history=true`) — fatia os N mais novos após ordenar; `--before ID`
+  é honrado pelo servidor. **Item 4 do #58 (server v63 em produção):** uma row PROCESSADA carrega
+  `acked_by_label` + `handler_summary`, então o catchup narra `handled by <quem>: <o quê>` no
+  stderr por row — o leitor VÊ o que o outro consumidor já fez, não só que a mensagem existe.
+  `KNOWN_MANIFEST_VERSION` → **63**.
+- **Regra 1-consumidor-por-canal, agora ESCRITA** (era folclore). Quem roda `listen`/`ack`
+  **consome** cada mensagem; um segundo runtime que também roda `listen` rouba mensagens do
+  consumidor (double-consume — o incidente 2026-07-06). Contrato: situe-se com `catchup`
+  (read-only), rode `listen`/`ack` só quando VOCÊ é o único consumidor do canal. Documentada no
+  README (seção Contract + tabela de comandos) e na skill.
+- **Skill spine rev 8:** a seção multi-runtime é a prosa VERBATIM do comentário da issue #58
+  ("Waking up in an interactive session" — título EN, o heurístico do `listen_mode`, o passo
+  "Only then speak") + linha no PICKER.
+- **`pidge skill install --target claude|agents|gemini`:** o mesmo conteúdo agnóstico, destino
+  diferente — `claude` (default) → `.claude/skills/pidge/SKILL.md` · `agents` → `AGENTS.md` ·
+  `gemini` → `GEMINI.md` (ambos na raiz). Um arquivo existente que difere vai pro `<dest>.bak`;
+  se o `.bak` já existe (re-install), vai pro `<dest>.bak.<timestamp>` — um re-install **nunca**
+  destrói o backup original do usuário. A mensagem nomeia o arquivo de destino real (não "SKILL.md").
+  **Só o alvo `claude` se auto-cura** (self-heal cobre só `.claude/`); `AGENTS.md`/`GEMINI.md` não
+  auto-atualizam — re-rode `pidge skill install --target agents|gemini` pra refrescá-los.
+
 ## 0.20.0 — 2026-07-06
 
 - **pidge#367 F1 (E3): mídia SELADA agente→você, atrás do gate de deploy.** Num canal E2E com o

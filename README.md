@@ -226,14 +226,15 @@ bundle both: **`pidge ask`** = `important --wait` (needs `--actions`); **`pidge 
 | `wait <correlation_id>` | Block on an already-sent notification until it's answered. |
 | `cancel <correlation_id>` | Cancel a **still-scheduled** notification before it fires (idempotent; 409 once it reached the phone). |
 | `inbox` | What you sent: list, `--pending` slice, or `--summary` (counts + answer latency). |
-| `listen` | Block until the human **messages you** from the app; prints them, exits `0`. One-shot — loop it. **v0.9.0:** a read message is DELIVERED (gray ✓✓), **not** done — `ack` it after the work (`--ack-on-read` for the old immediate-consume). |
+| `catchup` | **v0.21.0 (#58):** a **READ-ONLY** peek at the whole conversation (`GET /messages?history=true&all=true`) — the thread newest-first, notification answers included. **NEVER consumes**: no ack, no delivered stamp, no lease. Run it to **situate yourself** at the start of an interactive session on a channel whose real consumer is **another runtime** (a bridge/daemon) — so you learn what's already handled without stealing a message. `--limit N` / `--before ID` to page. Exit `0` (printed, even empty) / `2`. **One consumer per channel** — if another runtime consumes this channel, `catchup` here and **never `listen`** (that double-consumes). |
+| `listen` | Block until the human **messages you** from the app; prints them, exits `0`. One-shot — loop it. **v0.9.0:** a read message is DELIVERED (gray ✓✓), **not** done — `ack` it after the work (`--ack-on-read` for the old immediate-consume). ⚠️ `listen` **consumes** — run it only on a channel YOU are the sole consumer of; to read a channel another runtime consumes, use `catchup`. |
 | `ack --up-to <id>` | **v0.9.0:** mark messages PROCESSED (green ✓✓) **after** you've handled them; `--renew` heartbeats the visibility-timeout lease on a long task. |
 | `contract set <k>=<v>` / `contract show` | **v0.9.0:** DECLARE how you operate (`keep_connection_alive`, `mirror_in_origin_session`, `listen_mode=turn_based\|persistent\|external_daemon`, `quiet_when_idle`). **Advisory, never policy** — you declare, the human registers their expectation and *sees* if you honor it; Pidge enforces nothing. An unknown key/bad value is rejected locally (exit 1). |
 | `selftest [--window N]` | **v0.10.0 (#205):** prove your listener works by ROUND-TRIP — fire a nonce, run the listener, confirm it picks it up + acks in time. PASS exit `0` / FAIL exit `2` with the likely cause (timeout / orphan / transport). Run it as the last onboarding step + whenever sends seem to go unheard. |
 | `setup --claim <code>` | One-shot onboarding (v0.7.0): exchange the single-use code for the key, store it in `~/.config/pidge/env` (600), run doctor. **v0.9.0** also claims channel ownership so `doctor` can warn on a silent key swap. **v0.9.1+** declares your `operating_contract` (default `listen_mode=turn_based`; `--listen-mode persistent\|external_daemon` for a supervisor/daemon). |
 | `doctor` | Validate the setup **without exposing secrets**: env source, server reachable, key valid, **honest device reach**, channel ownership, and (**v0.11.1, #171**) a **realtime probe** (`realtime: ok / INDISPONÍVEL` — exit stays 0; an unavailable WS just degrades `listen` to polling). Exit 0/2. |
 | `whoami` | Which channel does this key speak for (JSON). |
-| `skill install` | Write `.claude/skills/pidge/SKILL.md` generated from the live manifest — persistent Pidge knowledge for Claude Code agents; re-run to update. |
+| `skill install [--target T]` | Write the generated Pidge skill from the live manifest — persistent Pidge knowledge for an AI agent; re-run to update. **v0.21.0 (#58):** `--target` picks the destination (same content): `claude` (default) → `.claude/skills/pidge/SKILL.md` · `agents` → `AGENTS.md` · `gemini` → `GEMINI.md`. An existing file whose content differs is backed up to `<dest>.bak` first (or `<dest>.bak.<timestamp>` if that backup already exists, so a re-install never destroys your original). ⚠️ **Only the `claude` target self-heals** (any pidge command silently refreshes a stale `.claude` skill); `AGENTS.md`/`GEMINI.md` do **not** auto-update — re-run `pidge skill install --target agents\|gemini` yourself to refresh them. |
 | `--version` | Print the CLI version. |
 
 ## Realtime (v0.6.0)
@@ -369,6 +370,14 @@ compromised agent machine — `PIDGE_SECRET` sits in your env/config in the clea
   an answer.
 - A genuine follow-up question is a **new** notification, never a second answer on
   the same one.
+- **One consumer per channel (#58).** A channel's inbound queue is served ONCE:
+  whoever runs `listen`/`ack` **consumes** each message (delivered stamp → visibility
+  lease → green ✓✓). If a **24/7 bridge/daemon is the channel's consumer**, a second
+  runtime that also runs `listen` **steals messages out from under it** (double-consume)
+  — the incident that motivated this: an interactive session woke on a bridged channel,
+  ran `listen`, and offered to redo work the bridge had already handled, because it had
+  no way to read the thread without consuming it. **Situate with `catchup` (read-only,
+  never consumes); run `listen`/`ack` only when YOU are the channel's sole consumer.**
 
 ENV: `PIDGE_URL` / `PIDGE_TOKEN` (the old `HERALD_URL` / `HERALD_TOKEN` still work);
 with neither set, `~/.config/pidge/env` (KEY=VALUE) is read — the key-free path.
