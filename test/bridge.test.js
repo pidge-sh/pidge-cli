@@ -387,6 +387,101 @@ test('#61: stale_from_prior_claim — warned ONCE on the listen header, on catch
   await mock.stop();
 });
 
+// #64: the handler tells the next session WHAT it did via a marker line on stdout
+// — `pidge-summary: <text>`. The bridge tees stdout to its log AND scans it
+// (streamed, never buffered) for the LAST such line, then acks with that summary.
+// A helper: a handler that drains stdin, prints the given lines, exits 0. The JS
+// uses SINGLE-quoted string literals so it survives the outer `-e "…"` double
+// quotes (JSON.stringify would inject double quotes that close the shell arg — a
+// `syntax error near '('` on any line with parens). No process.exit() — node
+// drains stdout and exits naturally (a force-exit can truncate the pipe write).
+// Lines must not contain single quotes (none of the tests below do).
+const summaryHandler = (lines) =>
+  `${process.execPath} -e "require('fs').readFileSync(0); ${lines.map((l) => `console.log('${l}')`).join('; ')}"`;
+
+test('#64: a handler that prints `pidge-summary:` → the ack carries that summary', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 7, kind: 'message', body: 'oi', created_at: 'x' }];
+  const handler = summaryHandler(['fiz um trabalho qualquer (log normal)', 'pidge-summary: reiniciei o worker e limpei a fila']);
+
+  const { child, result, out } = runCli(['bridge', '--exec', handler, '--no-realtime', '--interval', '1'], port);
+  assert.ok(await waitFor(() => mock.state.ackBodies.length >= 1), `stderr:\n${out.stderr}`);
+  assert.deepEqual(mock.state.ackBodies[0].ids, [7], 'the exact batch ids still ack');
+  assert.equal(mock.state.ackBodies[0].summary, 'reiniciei o worker e limpei a fila', 'the summary rides the ack');
+  assert.match(out.stdout, /log normal/, 'the handler stdout is still teed to the bridge log (not swallowed)');
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
+});
+
+test('#64: NO marker → the ack has no summary field (never invented)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 7, kind: 'message', body: 'oi', created_at: 'x' }];
+  const handler = summaryHandler(['just some logs', 'nothing to attribute here']);
+
+  const { child, result, out } = runCli(['bridge', '--exec', handler, '--no-realtime', '--interval', '1'], port);
+  assert.ok(await waitFor(() => mock.state.ackBodies.length >= 1), `stderr:\n${out.stderr}`);
+  assert.deepEqual(mock.state.ackBodies[0], { ids: [7] }, 'no summary key when the handler prints no marker');
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
+});
+
+test('#64: a marker in the MIDDLE of the output — the LAST one wins', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 7, kind: 'message', body: 'oi', created_at: 'x' }];
+  const handler = summaryHandler(['pidge-summary: primeira tentativa', 'mais output no meio', 'pidge-summary: versao final', 'rodape irrelevante']);
+
+  const { child, result, out } = runCli(['bridge', '--exec', handler, '--no-realtime', '--interval', '1'], port);
+  assert.ok(await waitFor(() => mock.state.ackBodies.length >= 1), `stderr:\n${out.stderr}`);
+  assert.equal(mock.state.ackBodies[0].summary, 'versao final', 'the LAST marker line is the summary');
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
+});
+
+test('#64: a marker longer than 1000 chars is truncated without error', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 7, kind: 'message', body: 'oi', created_at: 'x' }];
+  const handler = `${process.execPath} -e "require('fs').readFileSync(0); console.log('pidge-summary: ' + 'y'.repeat(1500)); process.exit(0)"`;
+
+  const { child, result, out } = runCli(['bridge', '--exec', handler, '--no-realtime', '--interval', '1'], port);
+  assert.ok(await waitFor(() => mock.state.ackBodies.length >= 1), `stderr:\n${out.stderr}`);
+  assert.equal(mock.state.ackBodies[0].summary.length, 1000, 'the summary is capped at 1000 before it leaves the machine');
+  assert.ok(/^y+$/.test(mock.state.ackBodies[0].summary), 'the capped value is the marker content');
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
+});
+
+test('#64 (adversarial): a handler that dumps MB of output then a trailing marker — no wedge, no OOM, marker still captured', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 7, kind: 'message', body: 'oi', created_at: 'x' }];
+  // ~4MB on a SINGLE unterminated line, then a newline, then the marker line.
+  // The scanner must bound the unterminated tail (stream, not buffer) and still
+  // catch the marker that follows. No process.exit() — let node drain stdout and
+  // exit naturally (a force-exit would truncate the async pipe write, which is the
+  // handler's bug to avoid, not the bridge's; a real LLM CLI flushes before exit).
+  const handler = `${process.execPath} -e "require('fs').readFileSync(0); const big='z'.repeat(200000); for(let i=0;i<20;i++) process.stdout.write(big); process.stdout.write('\\npidge-summary: sobrevivi ao dump\\n')"`;
+
+  const { child, result, out } = runCli(['bridge', '--exec', handler, '--no-realtime', '--interval', '1'], port);
+  assert.ok(await waitFor(() => mock.state.ackBodies.length >= 1, 12000), `the loop must not wedge on a big dump; stderr:\n${out.stderr}`);
+  assert.equal(mock.state.ackBodies[0].summary, 'sobrevivi ao dump', 'the trailing marker survives a multi-MB stream');
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
+});
+
 test('#61: no warning when the flag is absent/false (the default)', async () => {
   const mock = createMock();
   const port = await mock.start();

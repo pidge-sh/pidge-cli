@@ -909,6 +909,65 @@ test('ack --up-to processes (green); ack --renew heartbeats the lease', async ()
   assert.match(out.stderr, /lease renewed on 1 message/);
 });
 
+// #63: `--summary` is a global BOOLEAN (inbox counts+latency). The ack command
+// needs it as a STRING (attribution) — before the fix it parsed as boolean-true
+// and dropped the text to an ignored positional (a SILENT no-op). Now the ack
+// case re-parses its own argv so the value survives, and a bare --summary throws.
+test('#63: ack --ids --summary carries the summary into the ack body (never a silent no-op)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['ack', '--ids', '41,42', '--summary', 'reiniciei o worker'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.deepEqual(mock.state.ackBodies[0].ids, [41, 42], 'the ids still parse alongside the string summary');
+  assert.equal(mock.state.ackBodies[0].summary, 'reiniciei o worker', 'the summary reaches the server');
+  assert.match(out.stderr, /with a summary/);
+});
+
+test('#63: ack --up-to --summary works too, and the summary is capped at 1000 chars', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const big = 'x'.repeat(1500);
+  const out = await runCli(['ack', '--up-to', '9', '--summary', big], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(mock.state.ackBodies[0].up_to, 9);
+  assert.equal(mock.state.ackBodies[0].summary.length, 1000, 'the CLI caps the summary before it leaves the machine');
+});
+
+test('#63: ack --summary with NO value is a usage error (exit 1), never a silent no-op', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // --summary immediately followed by another recognized flag → parseArgs sees
+  // "argument missing" for the string option → usage error, no ack fired.
+  const out = await runCli(['ack', '--ids', '5', '--summary'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, `a valueless --summary must fail loud; stderr: ${out.stderr}`);
+  assert.match(out.stderr, /summary/i);
+  assert.equal(mock.state.ackBodies.length, 0, 'nothing was acked on the usage error');
+});
+
+test('#63: ack --summary "" (empty string) is a usage error too — no blank attribution', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['ack', '--ids', '5', '--summary', '   '], port).result;
+  await mock.stop();
+  assert.equal(out.code, 1, `a blank --summary must fail loud; stderr: ${out.stderr}`);
+  assert.match(out.stderr, /needs a value/);
+  assert.equal(mock.state.ackBodies.length, 0, 'nothing was acked');
+});
+
+test('#63: `inbox --summary` still works (the boolean flag was not broken by the ack fix)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.inboxSummary = { total: 7, scope: 'channel', pending: 2, avg_response_seconds: 300 };
+  const out = await runCli(['inbox', '--summary'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stdout, /"total":\s*7/, 'it hit the summary endpoint, not the list');
+  assert.match(out.stderr, /7 sent \(channel\) — 2 pending/);
+});
+
 test('contract set declares operating_contract; contract show reads it back', async () => {
   const mock = createMock();
   const port = await mock.start();
@@ -1179,6 +1238,69 @@ test('selftest — a non-numeric --window falls back to the default, never a fal
   await mock.stop();
   assert.equal(code, 0, `a typo'd window must not masquerade as a dead listener; stderr: ${stderr}`);
   assert.match(stderr, /SELF-TEST PASSED/);
+});
+
+// #65: the T2 blackout — the selftest read the real queue with lease=60 and any
+// bystander it served went dark for ~60s from every OTHER listen. The fix scopes
+// the read to since=<nonce id − 1> so the pre-existing backlog is excluded by
+// construction, and drops the lease=60 mitigation entirely.
+test('#65: selftest excludes the pre-existing backlog from the read (since=nonce-1) — never served, never leased', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.leaseMs = 60000; // model the server visibility lease — a served row goes dark for 60s
+  // A real human message already in the queue, with a LOWER id than the nonce the
+  // selftest is about to mint (selftestSeq starts at 100).
+  mock.state.messages = [{ id: 42, kind: 'message', body: 'resposta real do humano', created_at: 'x' }];
+
+  const { result } = runCli(['selftest', '--window', '10', '--no-realtime'], port);
+  const { code, stderr } = await result;
+  assert.equal(code, 0, `the selftest itself must still PASS; stderr: ${stderr}`);
+
+  const real = mock.state.messages.find((m) => m.id === 42);
+  assert.ok(real, 'the real message is still in the queue (never consumed by the selftest)');
+  assert.equal(real._leasedUntil, undefined,
+    'the pre-existing backlog (id < nonce) is excluded by since= — never served, never leased');
+  const reads = mock.state.messageReads;
+  assert.ok(reads.some((u) => /[?&]since=/.test(u)), `the reachability read must carry since=; reads:\n${reads.join('\n')}`);
+  await mock.stop();
+});
+
+// PR #66 cross-audit: since= only excludes the PRE-EXISTING backlog. A message with
+// id > nonce (a real arrival during the selftest window) IS served — so lease=60
+// must ride along to cap its blackout at ~60s, never the server's ~10-min default.
+test('#65: a served message with id > nonce gets a ~60s lease (lease=60), never the ~10-min default', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.leaseMs = 600000; // the server's DEFAULT stamp_delivered lease = 10 min
+  // id 200 > the nonce the selftest will mint (selftestSeq starts at 100): since=
+  // does NOT exclude it, so the selftest serves it — and must bound its lease.
+  mock.state.messages = [{ id: 200, kind: 'message', body: 'chegou durante a janela', created_at: 'x' }];
+
+  const t0 = Date.now();
+  const { result } = runCli(['selftest', '--window', '10', '--no-realtime'], port);
+  const { code, stderr } = await result;
+  assert.equal(code, 0, `the selftest itself must still PASS; stderr: ${stderr}`);
+
+  const served = mock.state.messages.find((m) => m.id === 200);
+  assert.ok(served, 'the higher-id message is still in the queue (the selftest acks only the nonce)');
+  assert.ok(served._leasedUntil, 'it WAS served (since= includes id > nonce), so it carries a lease');
+  const leaseFromStart = served._leasedUntil - t0;
+  assert.ok(leaseFromStart < 120000,
+    `lease=60 must cap the blackout (~60s), never the ~10-min default; got ${Math.round(leaseFromStart / 1000)}s`);
+  assert.ok(leaseFromStart >= 55000,
+    `the ~60s lease must actually be applied; got ${Math.round(leaseFromStart / 1000)}s`);
+  await mock.stop();
+});
+
+test('#65: listen exit 3 points at `pidge catchup` (a message may be under another read\'s lease)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '2', '--interval', '1'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 3, `stderr: ${stderr}`);
+  assert.match(stderr, /pidge catchup/, 'the exit-3 hint names the read-only diagnostic');
+  assert.match(stderr, /lease/i, 'and explains WHY a message might be invisible');
 });
 
 // --- 0.12.0 — CLI bugs batch (#240/#241/#242/#243/#244) -----------------------

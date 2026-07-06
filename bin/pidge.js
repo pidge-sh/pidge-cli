@@ -296,6 +296,12 @@ const OPTIONS = {
   wait: { type: 'boolean' },
   // inbox flags (#83)
   pending: { type: 'boolean' },
+  // #83 inbox uses `--summary` as a valueless BOOLEAN (counts+latency). #63: the
+  // `ack` command needs `--summary "<what you did>"` as a STRING. One global
+  // OPTIONS map can't be both, so this stays boolean (for inbox) and the `ack`
+  // case RE-PARSES its own argv with `summary` typed as a string — otherwise the
+  // global parse would swallow the value as a stray positional (a silent no-op on
+  // an attribution field, the worst failure mode).
   summary: { type: 'boolean' },
   all: { type: 'boolean' },
   limit: { type: 'string' },
@@ -578,6 +584,7 @@ const OPTION_DOCS = {
   'up-to': '--up-to ID               process every message up to this id',
   ids: '--ids a,b                process this comma-list of ids',
   renew: '--renew                  heartbeat the visibility-timeout lease instead of processing',
+  'ack-summary': '--summary "TEXT"         ack: attribution — WHAT you did (a successor session sees it via `pidge catchup`; capped ~1000 chars)',
   window: '--window N               reachability window in seconds (default 30)',
   exec: "--exec CMD               the handler: run ONCE per batch with the batch JSON on stdin; exit 0 = batch acked (its EXACT ids), non-zero = NOT acked (the server lease re-serves — make it idempotent)",
   'handler-timeout': '--handler-timeout N      bridge: max seconds ONE handler run may take (default 1800 = 30 min) — over it: SIGTERM (SIGKILL 5s later), treated as a FAILED batch (not acked)',
@@ -755,6 +762,7 @@ const HELP = {
       'The productized "paste a prompt and the agent stays online". The bridge is deliberately DUMB — no local queue, no own retry ledger: durability is the SERVER\'s ack/lease.',
       '',
       'LOOP: long-poll GET /messages?all=true (the robust #119 floor; a realtime socket, when available, adds presence — "ouvindo agora" — and early wake-ups, never the data path) → your --exec command runs ONCE per batch with the batch JSON on stdin ({"messages":[…]} + "history_hint":true on the first batch since boot — the handler may want `pidge catchup` to situate) → handler exit 0 ⇒ ack of the batch\'s EXACT ids (never a --up-to watermark: that would stamp rows under lease from an EARLIER batch the handler FAILED on) · non-zero ⇒ NOT acked: the ~10-min server lease re-serves the batch. At-least-once is the contract — make the handler IDEMPOTENT. One run is capped by --handler-timeout (default 30 min): over it the handler is SIGTERMed (SIGKILL 5s later) and the batch counts as FAILED; while it runs, a heartbeat line lands on stderr every 5 min.',
+      'SUMMARY (#64): the handler tells the NEXT session WHAT it did by printing a marker line to stdout — `pidge-summary: <one sentence>`. The bridge tees the handler\'s stdout to its own log AND scans it (streamed, never buffered) for the LAST such line; found ⇒ the ack carries that summary (capped ~1000 chars) so `pidge catchup` shows "handled by X: <summary>"; not found ⇒ acked without one (never invented). An LLM handler is instructable in its own prompt: end with `echo "pidge-summary: <what you did>"` (or have the model print it). Only a line that STARTS with the marker counts — incidental output never becomes attribution.',
       'Model-agnostic by construction: --exec \'claude -p "…"\' | \'codex exec "…"\' | \'gemini "…"\' | any script. This is the multi-LLM answer: no dependence on a harness that wakes on background-task exit.',
       'ONE INSTANCE PER CHANNEL: a lockfile keyed by hash(token) (~/.config/pidge/bridge-<hash>.lock, PID-checked so a crashed bridge never wedges the channel) — a second bridge, or a `listen`, on the same channel is REFUSED (exit 2). Read with `pidge catchup` instead.',
       'FAILURES: 401 → narrated + LOCAL alert + LONG jittered backoff (a rotated key only a human can fix — the bridge never dies silent, never re-loops blind); a channel with no healthy round-trip (the exit-4 class) → same alert + long backoff; every retry sleep is jittered. SIGTERM/SIGINT → clean shutdown: the in-flight batch is NOT acked (the lease re-serves it), the lock is released, exit 0.',
@@ -764,8 +772,9 @@ const HELP = {
   },
   ack: {
     summary: 'mark messages PROCESSED (green ✓✓) after you handled them, or --renew the lease on a long task (#170).',
-    usage: 'pidge ack --up-to <id> | --ids a,b [--renew]',
-    opts: ['up-to', 'ids', 'renew'],
+    usage: 'pidge ack --up-to <id> | --ids a,b [--renew] [--summary "<what you did>"]',
+    body: '--summary attaches a one-line note (WHAT you did) to the acked messages — a successor session sees it as "handled by X: <summary>" in `pidge catchup` (#63/server #380). A bare --summary with no value is a usage error, never a silent no-op.',
+    opts: ['up-to', 'ids', 'renew', 'ack-summary'],
   },
   contract: {
     summary: 'DECLARE how you operate (#182) — ADVISORY, never policy (the human SEES if you honor it).',
@@ -1048,11 +1057,20 @@ const health = {
       console.error(`pidge: deaf for ${mins} min — ${this.fails} consecutive failure(s) (latest: ${what})`);
     }
   },
-  exitTimeout(message) {
+  exitTimeout(message, hint) {
     // REAL elapsed wall-clock — never the configured deadline (the 2026-06-14
     // "timed out after 28800s" lie). If only seconds passed, the number says so.
     const elapsed = Math.round((performance.now() - SESSION_START_MONO) / 1000);
-    if (this.okEver) { console.error(`pidge: ${message} after ${elapsed}s (= 'no answer yet', not a failure)`); process.exit(3); }
+    if (this.okEver) {
+      // #65: a healthy channel that heard nothing on exit 3 might not be empty —
+      // a message can be UNDER A VISIBILITY LEASE from another read (a selftest,
+      // a crashed listener, a bridge), invisible until the lease lapses. Point at
+      // the read-only diagnostic that sees the whole queue regardless. Only on
+      // exit 3 (channel proven healthy) — on exit 4 (channel broken) it's noise.
+      console.error(`pidge: ${message} after ${elapsed}s (= 'no answer yet', not a failure)`);
+      if (hint) console.error(`pidge: ${hint}`);
+      process.exit(3);
+    }
     console.error(`pidge: ${message} after ${elapsed}s — and NOT ONE healthy round-trip all session: the CHANNEL looks broken (server/network), not the human ignoring you. Surface this to your human.`);
     process.exit(4);
   },
@@ -2823,13 +2841,17 @@ async function runBridge() {
   // lease from an EARLIER batch the handler FAILED on (or never saw): a later
   // success would stamp "processed" on work that never happened. ids:[…] can
   // only stamp what this handler demonstrably just handled.
-  const ackBatch = async (ids) => {
+  const ackBatch = async (ids, summary) => {
+    const body = { ids };
+    // #64: attribution — WHAT the handler did, captured from its stdout marker
+    // line (below). Absent ⇒ no field (never invent one). Server slices; we cap.
+    if (summary) body.summary = String(summary).slice(0, 1000);
     try {
       const res = await fetchT(`${BASE}/api/v1/messages/ack`, {
-        method: 'POST', headers, body: JSON.stringify({ ids }),
+        method: 'POST', headers, body: JSON.stringify(body),
       });
       if (res.status >= 200 && res.status < 300) {
-        console.error(`pidge: bridge — acked ${ids.length} message(s) (exact ids of the batch — green ✓✓)`);
+        console.error(`pidge: bridge — acked ${ids.length} message(s) (exact ids of the batch — green ✓✓)${body.summary ? ` · summary: ${body.summary.length > 80 ? body.summary.slice(0, 77) + '…' : body.summary}` : ''}`);
         return true;
       }
       console.error(`pidge: bridge — WARNING: ack failed (${res.status}) — the batch re-serves after the lease; the handler will see it again`);
@@ -2911,15 +2933,42 @@ async function runBridge() {
     const batchIds = opened.map((m) => Number(m.id)).filter(Number.isInteger);
     const batch = { messages: opened, ...(firstBatch ? { history_hint: true } : {}) };
     console.error(`pidge: bridge — batch of ${opened.length} message(s) → handler${firstBatch ? ' (history_hint: first batch since this bridge started — the handler may want `pidge catchup` to situate)' : ''}`);
+    // #64: capture the handler's summary from a MARKER LINE on its stdout —
+    // `pidge-summary: <text>`. We STREAM, never buffer the whole output: stdout is
+    // teed to the bridge's own stdout (the existing log is preserved) while a
+    // bounded line-scanner keeps only the LAST marker's value (cap 1000). A handler
+    // that dumps megabytes, or closes stdout early, can neither wedge the loop nor
+    // grow memory. No marker ⇒ no summary field (we NEVER invent one).
+    let lastSummary = null;
+    let markerTail = '';
+    const MARKER_TAIL_CAP = 2048; // a marker value is ≤1000; this head is plenty to still recognize the prefix
+    const takeMarker = (line) => {
+      const m = /^pidge-summary:[ \t]?(.*)$/.exec(line.trim());
+      if (m) lastSummary = m[1].trim().slice(0, 1000);
+    };
+    const scanStdout = (text) => {
+      // Split once (O(n)); the last part is the unterminated tail carried forward.
+      const parts = (markerTail + text).split('\n');
+      markerTail = parts.pop();
+      for (const line of parts) takeMarker(line);
+      // Bound the unterminated tail — keep only the HEAD (a marker must start at
+      // the line start); a single line longer than the cap can't be a marker we'd
+      // keep, and truncating the head preserves the prefix + a full ≤1000 value.
+      if (markerTail.length > MARKER_TAIL_CAP) markerTail = markerTail.slice(0, MARKER_TAIL_CAP);
+    };
     const t0 = Date.now();
     const outcome = await new Promise((resolve) => {
       let child;
       try {
-        child = spawn(handlerCmd, { shell: true, stdio: ['pipe', 'inherit', 'inherit'] });
+        child = spawn(handlerCmd, { shell: true, stdio: ['pipe', 'pipe', 'inherit'] });
       } catch (e) { return resolve({ code: null, error: e.message }); }
       currentChild = child;
       let timedOut = false;
       let hardKill = null;
+      let settled = false;
+      let exited = null;        // {code, signal} once the process exits
+      let stdoutEnded = false;  // true once the stdout pipe reaches EOF
+      let graceT = null;
       // Cross-audit MAJOR (PR #62): a hung handler must not wedge the channel
       // forever (the lease keeps re-serving to a bridge that never finishes a
       // batch). --handler-timeout (default 30 min) → SIGTERM (SIGKILL 5 s
@@ -2941,11 +2990,37 @@ async function runBridge() {
       }, HANDLER_NARRATE_MS);
       if (narrate.unref) narrate.unref();
       const done = (o) => {
+        if (settled) return; settled = true;
         clearTimeout(killT); if (hardKill) clearTimeout(hardKill); clearInterval(narrate);
+        if (graceT) clearTimeout(graceT);
+        // A final marker line with NO trailing newline still counts.
+        if (markerTail) { takeMarker(markerTail); markerTail = ''; }
         currentChild = null; resolve(o);
       };
+      // #64: finalize only when the process has exited AND its stdout has drained,
+      // so a marker on the LAST unflushed chunk is never missed (the 'exit' event
+      // can fire before the pipe's trailing data is read). If stdout stays open past
+      // exit (a grandchild inherited the pipe), a short grace caps the wait.
+      const finishIfReady = () => { if (exited && stdoutEnded) done({ code: exited.code, signal: exited.signal, timedOut }); };
       child.on('error', (e) => done({ code: null, error: e.message }));
-      child.on('exit', (code, signal) => done({ code, signal, timedOut }));
+      child.on('exit', (code, signal) => {
+        exited = { code, signal };
+        if (stdoutEnded) return finishIfReady();
+        graceT = setTimeout(() => done({ code, signal, timedOut }), 2000);
+        if (graceT.unref) graceT.unref();
+      });
+      child.stdout.on('data', (chunk) => {
+        scanStdout(chunk.toString('utf8'));
+        // Tee to the bridge's own stdout (preserve the log) WITH backpressure — a
+        // slow sink pauses the child rather than buffering a big dump in memory.
+        if (!process.stdout.write(chunk)) {
+          child.stdout.pause();
+          process.stdout.once('drain', () => { try { child.stdout.resume(); } catch { /* child gone */ } });
+        }
+      });
+      child.stdout.on('end', () => { stdoutEnded = true; finishIfReady(); });
+      // A broken read side must never crash the daemon; treat it as drained.
+      child.stdout.on('error', () => { stdoutEnded = true; finishIfReady(); });
       // EPIPE guard: a handler may exit without reading stdin — its exit code
       // still decides the batch; the write failure itself is not a verdict.
       child.stdin.on('error', () => {});
@@ -2963,7 +3038,7 @@ async function runBridge() {
       handlerFails = 0;
       if (batchIds.length === 0) {
         console.error('pidge: bridge — WARNING: batch had no numeric ids — nothing to ack (server bug?)');
-      } else if (await ackBatch(batchIds)) {
+      } else if (await ackBatch(batchIds, lastSummary)) {
         // Only a DELIVERED + ACKED first batch retires the hint: if the ack
         // failed, the re-served batch is still effectively "first post-restart".
         firstBatch = false;
@@ -3125,8 +3200,20 @@ WantedBy=default.target
 // onto our own queue, run the listener (long-poll floor — the reachability path) for
 // the window, ack the nonce, then read the server's verdict. PASS = it round-tripped
 // in time. FAIL = the server's window verdict + a likely CAUSE the server can't see
-// (the orphan/`&`/transport bugs). Only the nonce is acked (ids:[id]) and any real
-// messages briefly served are re-served fast (lease=60), so it doesn't eat the queue.
+// (the orphan/`&`/transport bugs). Only the nonce is acked (ids:[id]).
+//
+// #65: the reachability read is scoped to `?since=<nonce id − 1>` — the POST
+// /selftest returns the nonce's id, and every message in the PRE-EXISTING backlog
+// has a LOWER id (it was already in the queue when we fired), so the backlog is
+// excluded BY CONSTRUCTION and never served/leased here (the T2 blackout bug).
+//
+// `since=` alone is NOT enough, though (PR #66 cross-audit): a real message
+// arriving DURING the window has id > nonce, so it IS served — and if the server
+// stamps it delivered with its DEFAULT lease (~10 min), that's 10× worse than the
+// original 60s bug. The `sinceId=0` fallback (a server that didn't return a numeric
+// id) has the same exposure across the whole backlog. So we KEEP `lease=60` as
+// defence in depth: `since=` removes the backlog from the read entirely, and
+// `lease=60` bounds the blackout on anything still served to ~60s, never ~10 min.
 async function doSelftest() {
   // Guard the parse: a non-numeric --window (e.g. "30s", a typo) must NOT become NaN
   // — that would make the deadline NaN, skip the poll loop entirely, and mis-report a
@@ -3145,6 +3232,11 @@ async function doSelftest() {
     die(`pidge: selftest failed (network): ${e.message}`, 2);
   }
   const id = fired.id;
+  // #65: read strictly ABOVE the nonce's predecessor — the nonce and anything
+  // newer, never the pre-existing real backlog. A non-numeric id (a broken server
+  // shape) falls back to 0 (= no floor); the selftest already fails on the id
+  // match in that case, so the fallback never masks a real bug.
+  const sinceId = Number.isFinite(Number(id)) ? Number(id) - 1 : 0;
   console.error(`pidge: self-test fired (id ${id}) — listening up to ${windowS}s to prove the round-trip (a nonce on your own queue; PASS = your listener picks it up + acks it in time)`);
 
   const deadline = Date.now() + windowS * 1000;
@@ -3153,7 +3245,11 @@ async function doSelftest() {
     const waitS = Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
     const askedAt = Date.now();
     try {
-      const qs = new URLSearchParams({ all: 'true', lease: '60' });
+      // #65: since=<nonce id − 1> keeps the pre-existing backlog out of the read;
+      // lease=60 bounds the blackout on anything still served (a mid-window arrival
+      // with id > nonce, or the whole queue under the sinceId=0 fallback) to ~60s
+      // instead of the server's ~10-min default. Both together (PR #66 cross-audit).
+      const qs = new URLSearchParams({ all: 'true', since: String(sinceId), lease: '60' });
       if (waitS > 0) qs.set('wait', String(waitS));
       const res = await fetchT(`${BASE}/api/v1/messages?${qs}`, { headers }, (waitS + 10) * 1000);
       if (res.status === 200) {
@@ -3909,15 +4005,37 @@ ${SKILL_END_MARKER}
       // durably handled them — `listen` only DELIVERS them now. --renew
       // (state=delivered) instead RENEWS the visibility-timeout lease, a
       // heartbeat for a long task so the reservation doesn't lapse and re-serve.
+      //
+      // #63: `--summary` is a global BOOLEAN (for `inbox --summary`), so the
+      // module-level parse would read `ack --summary "text"` as boolean-true and
+      // drop "text" to an ignored positional — a SILENT no-op on an attribution
+      // field. Re-parse THIS command's argv with `summary` typed as a string so
+      // the value survives; a bare `--summary` (no value) now THROWS → usage
+      // error, never a no-op. Everything else parses identically to the global.
+      let av;
+      try {
+        av = parseArgs({ options: { ...OPTIONS, summary: { type: 'string' } }, allowPositionals: true }).values;
+      } catch (e) {
+        die(`pidge: ack: ${e.message}\n  usage: pidge ack --up-to <id> | --ids a,b [--renew] [--summary "<what you did>"]`, 1);
+      }
       const ackBody = {};
-      if (v['up-to'] !== undefined && v.ids !== undefined)
+      if (av['up-to'] !== undefined && av.ids !== undefined)
         die('pidge: pass EITHER --up-to <id> OR --ids a,b, not both', 1);
       // #51: strict ids — a lazy parse here silently acks the wrong watermark
       // (and the old .filter(Number.isFinite) silently DROPPED bad ids).
-      if (v['up-to'] !== undefined) ackBody.up_to = idStrict(v['up-to'], '--up-to');
-      else if (v.ids !== undefined) ackBody.ids = v.ids.split(',').map((s) => idStrict(s, '--ids'));
-      else die('pidge: usage: pidge ack --up-to <id> | --ids a,b [--renew]', 1);
-      if (v.renew) ackBody.state = 'delivered';
+      if (av['up-to'] !== undefined) ackBody.up_to = idStrict(av['up-to'], '--up-to');
+      else if (av.ids !== undefined) ackBody.ids = av.ids.split(',').map((s) => idStrict(s, '--ids'));
+      else die('pidge: usage: pidge ack --up-to <id> | --ids a,b [--renew] [--summary "<what you did>"]', 1);
+      if (av.renew) ackBody.state = 'delivered';
+      // #63: attribution — the successor session sees WHAT this handler did
+      // (server #380: handler_summary on the history row, shown by `pidge catchup`).
+      // A present-but-EMPTY --summary is a usage error, never a silent no-op; the
+      // server caps the field, we also send at most 1000 chars.
+      if (av.summary !== undefined) {
+        const s = String(av.summary).trim();
+        if (!s) die('pidge: ack --summary needs a value (e.g. --summary "restarted the worker") — pass text or omit the flag', 1);
+        ackBody.summary = s.slice(0, 1000);
+      }
       let res, raw;
       try {
         res = await fetch(`${BASE}/api/v1/messages/ack`, { method: 'POST', headers, body: JSON.stringify(ackBody) });
@@ -3930,8 +4048,8 @@ ${SKILL_END_MARKER}
       if (!(res.status >= 200 && res.status < 300)) die(`pidge: ack failed (${res.status}): ${raw}`, 2);
       let adata = {};
       try { adata = JSON.parse(raw); } catch { /* leave {} */ }
-      if (v.renew) console.error(`pidge: lease renewed on ${adata.renewed ?? 0} message(s) (still yours; ack again when done)`);
-      else console.error(`pidge: processed ${adata.acked ?? 0} message(s) — green ✓✓ (the human sees "lida pelo agente")`);
+      if (av.renew) console.error(`pidge: lease renewed on ${adata.renewed ?? 0} message(s) (still yours; ack again when done)`);
+      else console.error(`pidge: processed ${adata.acked ?? 0} message(s)${ackBody.summary ? ' with a summary (visible in `pidge catchup`)' : ''} — green ✓✓ (the human sees "lida pelo agente")`);
       process.exit(0);
       break;
     }
@@ -4092,6 +4210,10 @@ ${SKILL_END_MARKER}
       const listenStartedAt = Date.now();
       let deadline = Date.now() + timeout * 1000;
       const queueQs = v.all ? '?all=true' : '';
+      // #65: the exit-3 hint — a message you EXPECT may be under a visibility lease
+      // from another read (a selftest, a crashed listener, a bridge), invisible to
+      // this listen until it lapses. `pidge catchup` shows the whole queue read-only.
+      const LEASE_HINT = 'if you expected a message, it may be under a visibility lease from another read (a selftest / crashed listener / bridge) — `pidge catchup` shows the whole queue read-only (delivered_at/lease), never consuming.';
       // lote-5 #5: the FIRST batch that comes back QUICKLY was already sitting in
       // the queue when this listen started — with --all that includes answers to
       // EARLIER notifications, which read as "new" if we don't say otherwise. A
@@ -4234,7 +4356,7 @@ ${SKILL_END_MARKER}
         // 'ws-unavailable' degrades to polling below (never an early timeout lie).
         if (outcome === 'deadline' && Date.now() >= deadline - 1500) {
           followEnd();
-          health.exitTimeout('no message from the human');
+          health.exitTimeout('no message from the human', LEASE_HINT);
         }
         if (outcome === 'got-messages') {
           await new Promise(() => {}); // printAndAck is in flight and exits the process
@@ -4268,7 +4390,7 @@ ${SKILL_END_MARKER}
         }
         if (Date.now() >= deadline) {
           followEnd();
-          health.exitTimeout('no message from the human');
+          health.exitTimeout('no message from the human', LEASE_HINT);
         }
         const pace = health.degraded ? DEGRADED_INTERVAL_S : listenInterval;
         if (Date.now() - askedAt < 2000) {

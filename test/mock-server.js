@@ -19,6 +19,8 @@ function createMock() {
     messages: [],          // served by GET /api/v1/messages
     messageReads: [],      // #58: every GET /api/v1/messages req.url (assert catchup's history=true&all=true)
     notifications: {},     // cid → body for GET /api/v1/notifications/:cid
+    inboxNotifications: [], // #83: rows for GET /api/v1/notifications (the list)
+    inboxSummary: null,     // #83: body for GET /api/v1/inbox/summary (null → default zeros)
     acks: [],
     ackBodies: [], // #51: the parsed ack payloads, so tests can assert up_to/ids exactly
     notifies: [],
@@ -181,13 +183,26 @@ function createMock() {
       // NEVER POSTs an ack (state.acks stays empty).
       let rows = all ? state.messages
         : state.messages.filter((m) => !m.kind || m.kind === 'message');
+      // #65: `since=<id>` scopes the read to rows with a STRICTLY GREATER id (the
+      // selftest reads since=<nonce id − 1> so the pre-existing real backlog — all
+      // lower ids — is excluded by construction and never served/leased here).
+      const since = url.searchParams.get('since');
+      if (since !== null && since !== '') {
+        const floor = Number(since);
+        if (Number.isFinite(floor)) rows = rows.filter((m) => Number(m.id) > floor);
+      }
       // #62: the lease model applies only to the CONSUME path — a history read
       // (catchup) is read-only and never opens/honors a lease.
       const history = url.searchParams.get('history') === 'true';
       if (state.leaseMs > 0 && !history) {
         const now = Date.now();
+        // PR #66 cross-audit: a `lease=<seconds>` query param OVERRIDES the default
+        // lease (the selftest passes lease=60 to cap the blackout on anything it
+        // serves; the server's stamp_delivered default is the ~10-min state.leaseMs).
+        const leaseParam = url.searchParams.get('lease');
+        const leaseMs = leaseParam && Number.isFinite(Number(leaseParam)) ? Number(leaseParam) * 1000 : state.leaseMs;
         rows = rows.filter((m) => !m._leasedUntil || m._leasedUntil <= now);
-        for (const m of rows) m._leasedUntil = now + state.leaseMs;
+        for (const m of rows) m._leasedUntil = now + leaseMs;
       }
       // strip the internal lease stamp — it must not leak into the served JSON
       return json(res, 200, {
@@ -336,6 +351,16 @@ function createMock() {
         });
       });
       return;
+    }
+    // #83 inbox: the list (GET /notifications) and the one-call summary
+    // (GET /inbox/summary). #63 uses these to prove `inbox --summary` still hits
+    // the summary path after the ack `--summary` type split.
+    if (req.method === 'GET' && url.pathname === '/api/v1/notifications') {
+      return json(res, 200, { notifications: state.inboxNotifications || [] });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/v1/inbox/summary') {
+      const scope = url.searchParams.get('all') === 'true' ? 'account' : 'channel';
+      return json(res, 200, state.inboxSummary || { total: 0, scope, pending: 0, avg_response_seconds: null });
     }
     const m = url.pathname.match(/^\/api\/v1\/notifications\/([^/]+)$/);
     if (req.method === 'GET' && m) {
