@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.20.0 — 2026-07-06
+
+- **pidge#367 F1 (E3): mídia SELADA agente→você, atrás do gate de deploy.** Num canal E2E com o
+  gate aberto (whoami `e2e_media_ready:true` — todo device deliverable roda um build iOS que ABRE
+  blob selado), `--image`/`--file` locais são selados NA MÁQUINA antes do upload
+  (`[0x01][nonce][ct][tag]`, AAD `ch<id>:<cid>:image_blob|file_blob` — o cid é mintado ANTES do
+  upload), sobem como `blob.bin` genérico, o nome REAL vira envelope `filename` no /notify e o
+  send leva `media_enc:"v1"`. Overrides locais: `PIDGE_E2E_MEDIA=on` (força, p/ teste) / `off`
+  (despina). **Pin de mídia (#313 estendido):** o primeiro send com mídia selada TRAVA o canal —
+  daí em diante mídia que iria em claro é RECUSADA (exit 2, ANTES de qualquer byte subir), mesmo
+  que o servidor diga que o gate fechou; só `PIDGE_E2E_MEDIA=off` local despina. Num send selado,
+  `--image` com URL pública e ref pré-mintado são recusados (bytes fora da nossa custódia =
+  media_enc mentiroso = foto quebrada no device).
+- **pidge#367 F1: anexo INBOUND (você→agente).** Uma mensagem do composer pode carregar
+  `attachment {filename, content_type, byte_size, url, enc?}` — `listen`/`--all` agora: anexo
+  SELADO é SEMPRE baixado + desselado para `~/.config/pidge/downloads/<msg id>/<nome real>`
+  (AAD `message_blob`/`message_filename`, ancorados no cid da MENSAGEM — campos distintos por
+  direção matam replay cross-slot) e o JSON impresso ganha `attachment.path`; anexo claro passa
+  com a `url` assinada (salve com `--download`, destino com `--download-dir DIR`). Filename é
+  SANITIZADO antes de tocar disco (separadores/`..`/dot-leading); falha de decrypt = `e2e_error`
+  preciso, ciphertext NUNCA vira arquivo. `body` pode vir `""` quando o anexo é a mensagem.
+- `KNOWN_MANIFEST_VERSION` → **62** (manifest do sealed_media + inbound files).
+
 ## 0.19.0 — 2026-07-04
 
 - **cli#47 / pidge#284 (LA v2): `pidge live` agora dirige os endpoints REAIS de Live Activity**

@@ -254,6 +254,8 @@ if (require.main !== module) {
     e2eAad, e2eKeyFingerprint, e2eLoadSecret, e2eParseSecret,
     e2eEncryptField, e2eDecryptField, e2eEncryptBlob, e2eDecryptBlob,
     E2E_NEVER_SEAL_LABEL_IDS, e2ePinKeyFor,
+    // #367: sealed media — the pure halves (gate decision + filename hygiene).
+    e2eMediaSealDecision, sanitizeAttachmentName,
   };
   return;
 }
@@ -285,6 +287,8 @@ const OPTIONS = {
   after: { type: 'string' },                   // decision queue (#157): held until this cid resolves
   'collapse-key': { type: 'string' },
   param: { type: 'string', multiple: true },   // key=value escape hatch → raw /notify field
+  download: { type: 'boolean' },               // #367: save CLEAR inbound attachments too (sealed ones always save)
+  'download-dir': { type: 'string' },          // #367: where attachments land (default <config dir>/downloads)
   timeout: { type: 'string' },
   interval: { type: 'string' },
   // perfis-S2 response axis: --wait blocks until the human answers (composes on
@@ -430,8 +434,10 @@ OPTIONS (notify / ask)
   --urgency LEVEL          normal | persistent | alarm (low-level — prefer --profile)
   --image PATH_OR_URL      image on the banner + feed: a local path is uploaded for
                            you (your machine has no public URL); an https URL is sent as-is
+                           (E2E channel + open media gate ⇒ a local path is SEALED first, #367)
   --file PATH              a real artifact (xlsx, pdf, csv…) the human previews,
-                           shares and saves on the phone; uploaded automatically (≤25 MB)
+                           shares and saves on the phone; uploaded automatically (≤25 MB;
+                           sealed bytes + filename when the media gate is open, #367)
   --url URL                deep link the app opens when the user taps (PR, dashboard, log)
   --copy TEXT              value offered as tap-to-copy on the detail (code, token)
   --actions LIST           RESPONSE axis — comma list: yes,no,approve,reject,accept,
@@ -534,6 +540,8 @@ const OPTION_DOCS = {
   summary: '--summary                counts + answer latency (one call)',
   'all-inbox': '--all                    whole-account scope (not just this channel)',
   'all-listen': '--all                    single ear: also hear notification ANSWERS, not just messages (#131)',
+  download: '--download               also save CLEAR inbound attachments to disk (sealed ones always save, #367)',
+  'download-dir': '--download-dir DIR       where inbound attachments land (default ~/.config/pidge/downloads)',
   limit: '--limit N                cap the number of rows',
   claim: '--claim CODE             the single-use setup code (the human copies it from the Pidge app)',
   'url-base': '--url BASE               the Pidge server base URL (default https://pidge.sh)',
@@ -709,9 +717,9 @@ const HELP = {
   },
   listen: {
     summary: 'block until the human MESSAGES you from the app, print, ACK after the work, exit (#48).',
-    usage: 'pidge listen [--timeout N] [--all] [--ack-on-read] [--follow]',
-    body: 'One-shot by design (loop it, don\'t daemonize). #170: a read message is DELIVERED (gray ✓✓), NOT done — ack it AFTER the work with `pidge ack --up-to <id>` (a ~10-min lease re-serves un-acked messages, so a crash never loses one).',
-    opts: ['timeout', 'all-listen', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime'],
+    usage: 'pidge listen [--timeout N] [--all] [--ack-on-read] [--follow] [--download] [--download-dir DIR]',
+    body: 'One-shot by design (loop it, don\'t daemonize). #170: a read message is DELIVERED (gray ✓✓), NOT done — ack it AFTER the work with `pidge ack --up-to <id>` (a ~10-min lease re-serves un-acked messages, so a crash never loses one). #367: a message may carry an `attachment` (a photo/file from the app\'s composer) — a SEALED one is auto-downloaded + decrypted to a local file (`attachment.path` in the JSON); a clear one keeps its fetchable `url` (--download saves it too).',
+    opts: ['timeout', 'all-listen', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
   },
   ack: {
     summary: 'mark messages PROCESSED (green ✓✓) after you handled them, or --renew the lease on a long task (#170).',
@@ -800,7 +808,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 61;
+const KNOWN_MANIFEST_VERSION = 62;
 // #280: the hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
@@ -1209,7 +1217,14 @@ async function e2eChannelInfo() {
   if (e2eChannelCache) return e2eChannelCache;
   const { res, data } = await fetchWhoami();
   if (res.status !== 200 || !data.channel) throw new Error(`whoami answered ${res.status}`);
-  e2eChannelCache = { id: data.channel.id, e2eEnabled: !!data.channel.e2e_enabled };
+  e2eChannelCache = {
+    id: data.channel.id,
+    e2eEnabled: !!data.channel.e2e_enabled,
+    // #367 media gate: sealed media is SAFE on this channel — E2E on AND every
+    // deliverable device runs a build that OPENS sealed blobs. Absent on an
+    // older server ⇒ false (never seal into the void).
+    e2eMediaReady: !!data.channel.e2e_media_ready,
+  };
   return e2eChannelCache;
 }
 
@@ -1283,10 +1298,100 @@ function e2eStampPin(kf) {
   const pins = readState().e2ePins || {};
   const cur = pins[k];
   if (cur && cur.v === 1 && cur.kf === kf) return;
-  writeState({ e2ePins: { ...pins, [k]: { v: 1, kf, at: new Date().toISOString() } } });
+  // Spread `cur`: a re-key (new kf, same token) must PRESERVE the media latch
+  // (#367) — dropping `media:true` here would re-arm the exact server-driven
+  // media-downgrade lever the pin exists to deny. e2eStampMediaPin spreads too.
+  writeState({ e2ePins: { ...pins, [k]: { ...cur, v: 1, kf, at: new Date().toISOString() } } });
   e2eNote('channel PINNED as E2E on this machine (#313) — clear sends here are now refused even if the server claims E2E is off. Genuine toggle-off ⇒ unpin locally with PIDGE_E2E=off (env var or the env file).');
 }
 const E2E_UNPIN_HINT = 'If your human GENUINELY turned E2E off in the app, unpin locally: PIDGE_E2E=off (env var, or a line in the env file next to PIDGE_TOKEN). A server response alone can never unpin.';
+
+// --- #367 (E3): sealed MEDIA — the deploy gate + its own pin latch. ---------
+// Media sealing is gated on whoami's e2e_media_ready (an iOS build that can
+// OPEN sealed blobs is on all the human's devices) because a sealed photo on
+// an old device is a broken photo. But a server-served gate is a downgrade
+// lever (#313 class), so the FIRST confirmed sealed-media send latches
+// `media:true` into the channel's pin — from then on a clear-media send is
+// REFUSED unless the human sets PIDGE_E2E_MEDIA=off locally. PIDGE_E2E_MEDIA=on
+// force-seals (testing before the iOS wave); PIDGE_E2E=off keeps voiding
+// everything E2E, media included.
+function e2eMediaOverride() {
+  const raw = String(process.env.PIDGE_E2E_MEDIA || FILE_ENV.PIDGE_E2E_MEDIA || '').toLowerCase();
+  return raw === 'on' || raw === 'off' ? raw : null;
+}
+// Pure (exported for tests): should this send seal its media?
+function e2eMediaSealDecision({ sealingActive, ready, override }) {
+  if (!sealingActive) return false;
+  if (override === 'off') return false;
+  if (override === 'on') return true;
+  return !!ready;
+}
+function e2eMediaPinned() {
+  const k = e2ePinKeyFor(TOKEN);
+  const pins = readState().e2ePins;
+  const p = k && pins && pins[k];
+  return !!(p && p.v === 1 && p.media);
+}
+function e2eStampMediaPin() {
+  const k = e2ePinKeyFor(TOKEN);
+  if (!k) return;
+  const pins = readState().e2ePins || {};
+  const cur = pins[k] || {};
+  if (cur.v === 1 && cur.media) return;
+  writeState({ e2ePins: { ...pins, [k]: { ...cur, v: 1, media: true, at: cur.at || new Date().toISOString() } } });
+  e2eNote('channel PINNED as SEALED-MEDIA on this machine (#367/#313) — a send whose media would ride CLEAR here is now refused, even if the server claims the media gate closed. Genuine downgrade (a legacy device joined, or E2E off) ⇒ PIDGE_E2E_MEDIA=off locally.');
+}
+const E2E_MEDIA_UNPIN_HINT = 'If the downgrade is GENUINE (a legacy device joined the account, or your human turned E2E off), unpin media locally: PIDGE_E2E_MEDIA=off (env var, or a line in the env file). A server response alone can never unpin.';
+
+// Attachment filenames are attacker-influenceable — sanitize before ANY disk
+// write: no separators, no dot-leading names, bounded length. null = unusable
+// (the caller falls back to attachment-<id>). Exported for tests.
+function sanitizeAttachmentName(name) {
+  if (typeof name !== 'string') return null;
+  const base = path.basename(name.replaceAll('\\', '/')).replace(/^\.+/, '').trim();
+  if (!base) return null;
+  return base.slice(0, 255);
+}
+
+// The media plan for THIS send, decided BEFORE any bytes leave the machine:
+//   null                       — clear media (the path of always), or no media;
+//   { key, channelId, cid }    — seal each local blob under these + media_enc.
+// Refusals (exit 2) happen HERE, pre-upload, so a downgrading/lying server
+// never receives clear bytes or a real filename (the #313 cross-audit rule).
+async function e2eMediaPlan(payload) {
+  const hasMedia = v.image !== undefined || v.file !== undefined;
+  if (!hasMedia) return null;
+  const mediaPinned = e2eMediaPinned() && e2eMediaOverride() !== 'off' && !e2eOverrideOff();
+  const mat = e2eKeyMaterial();
+  if (!mat) {
+    if (mediaPinned) die(`pidge: REFUSING to send CLEAR MEDIA (exit 2) — this channel is locally PINNED as sealed-media (#367/#313) but PIDGE_SECRET is missing/invalid. Fix the secret (the app's Connect screen has the terminal step). ${E2E_MEDIA_UNPIN_HINT}`, 2);
+    return null;
+  }
+  let ch;
+  try {
+    ch = await e2eChannelInfo();
+  } catch (e) {
+    if (mediaPinned) die(`pidge: REFUSING to send CLEAR MEDIA (exit 2) — this channel is locally PINNED as sealed-media (#367/#313) and the server won't confirm its media gate (${e.message}); retry when it's reachable. ${E2E_MEDIA_UNPIN_HINT}`, 2);
+    return null; // the text-seal path warns about the whoami failure already
+  }
+  const willSeal = e2eMediaSealDecision({
+    sealingActive: ch.e2eEnabled && !e2eOverrideOff(),
+    ready: ch.e2eMediaReady,
+    override: e2eMediaOverride(),
+  });
+  if (!willSeal) {
+    if (mediaPinned) die(`pidge: REFUSING to send CLEAR MEDIA (exit 2) — this machine PINNED the channel as sealed-media (#367/#313) but this send's media would ride CLEAR (the server says ${ch.e2eEnabled ? 'the media gate is closed — e2e_media_ready:false' : 'the channel is not E2E'}). ${E2E_MEDIA_UNPIN_HINT}`, 2);
+    return null;
+  }
+  // A public-URL --image can't be sealed (we don't hold its bytes' custody) and
+  // a mixed send (media_enc + a clear image_url) would make the phone try to
+  // unseal clear bytes — the broken photo the gate exists to prevent. Refuse.
+  if (v.image !== undefined && !fs.existsSync(v.image)) {
+    die('pidge: --image with a URL/ref cannot ride a SEALED-media send (#367) — the bytes must be sealed on this machine. Download the image and pass a local path (or PIDGE_E2E_MEDIA=off to send this one clear).', 2);
+  }
+  if (!payload.correlation_id) payload.correlation_id = crypto.randomUUID();
+  return { key: mat.key, channelId: ch.id, cid: payload.correlation_id };
+}
 
 // SEND-side sealing, called by doNotify on the final payload. Mutates it:
 // content fields + custom-action LABELS become envelopes (action IDs stay
@@ -1358,8 +1463,12 @@ async function e2eMaybeSeal(payload) {
   payload.enc = 'v1';
   payload.kf = mat.kf;
   e2eStampPin(mat.kf); // a CONFIRMED sealed context latches the anti-downgrade pin (#313)
-  if (payload.image !== undefined || payload.file !== undefined)
-    console.error('pidge: E2E note — media BYTES and the filename still ride CLEAR (encrypted media is phase E3); the text fields, copy and url are sealed');
+  if (payload.media_enc === 'v1') {
+    e2eStampMediaPin(); // #367: a CONFIRMED sealed-media send latches the media pin too
+    console.error('pidge: E2E — media bytes + filename sealed (#367 E3)');
+  } else if (payload.image !== undefined || payload.file !== undefined) {
+    console.error('pidge: E2E note — this send\'s media BYTES and filename ride CLEAR (the media gate is closed: whoami e2e_media_ready:false until an iOS build that opens sealed media is on all devices; PIDGE_E2E_MEDIA=on forces it). The text fields, copy and url are sealed.');
+  }
   console.error(`pidge: E2E — content sealed (kf ${mat.kf}); the server stores and relays ciphertext only`);
 }
 
@@ -1389,11 +1498,16 @@ function e2eOpenEcho(info, payload) {
 // On success the plaintext replaces the ciphertext and enc/kf are swapped for
 // e2e:"decrypted" (an agent re-gating on `enc` must never mistake plaintext for
 // an envelope); on failure the sealed fields are BLANKED and e2e_error says why.
-function e2eOpenMessageRow(m) {
+async function e2eOpenMessageRow(m) {
   const refEnc = m.ref && m.ref.enc;
-  if (!m.enc && !refEnc) return m; // a clear line renders as always (pre-E2E history)
   const out = { ...m };
   const fail = (reason) => { if (!out.e2e_error) out.e2e_error = reason; e2eNote(reason); };
+  if (!m.enc && !refEnc) {
+    // a clear line renders as always (pre-E2E history) — but a clear ATTACHMENT
+    // may still want the opt-in --download save (#367).
+    if (m.attachment) await e2eProcessAttachment(m, out, fail);
+    return m.attachment ? out : m;
+  }
   if (m.enc) {
     out.body = e2eOpenValue({
       enc: m.enc, kf: m.kf, channelId: m.channel_id, cid: m.correlation_id,
@@ -1424,12 +1538,85 @@ function e2eOpenMessageRow(m) {
       out.body = null;
     }
   }
+  if (m.attachment) await e2eProcessAttachment(m, out, fail); // #367 inbound media
   if (!out.e2e_error) {
     delete out.enc; delete out.kf;
     if (out.ref) { delete out.ref.enc; delete out.ref.kf; }
     out.e2e = 'decrypted';
   }
   return out;
+}
+
+// #367 you→agent: one message's attachment. A SEALED one ({enc:"v1"} on the
+// block) is ALWAYS downloaded + unsealed to a local file — its signed URL
+// serves ciphertext, useless to an agent otherwise; the plaintext lands at
+// <config dir>/downloads/<message id>/<sanitized real filename> and rides the
+// printed JSON as `attachment.path`. A CLEAR one passes through (its url is
+// directly fetchable) unless --download asks for the same save. Failures are
+// precise e2e_error/stderr — and ciphertext is NEVER written where a file is
+// expected.
+async function e2eProcessAttachment(m, out, fail) {
+  const att = m.attachment;
+  if (!att || typeof att !== 'object') return;
+  out.attachment = { ...att };
+  const absUrl = (u) => (typeof u === 'string' && u.startsWith('/') ? `${BASE}${u}` : u);
+  const download = async () => {
+    const res = await fetchT(absUrl(att.url));
+    if (!(res.status >= 200 && res.status < 300)) throw new Error(`download answered ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+  };
+  const destFor = (filename) => {
+    const dir = v['download-dir'] || path.join(pidgeConfigDir(), 'downloads');
+    // m.id comes off the wire — a hostile server (the #367/#313 threat model)
+    // could ship "../.." to steer the decrypted plaintext OUTSIDE the downloads
+    // dir. Sanitize the id segment AND the fallback name exactly like any other
+    // attacker-influenceable wire string, so both path parts are contained.
+    const idSeg = sanitizeAttachmentName(String(m.id)) || 'msg';
+    const name = sanitizeAttachmentName(filename) || `attachment-${idSeg}`;
+    return path.join(dir, idSeg, name);
+  };
+  if (att.enc) {
+    if (att.enc !== 'v1') {
+      return fail(`attachment sealed with an unknown envelope version ${JSON.stringify(att.enc)} — this CLI speaks v1 (update pidge-cli)`);
+    }
+    const reason = e2eSealedError('v1', m.kf)
+      || (!m.correlation_id && 'attachment is sealed but the row carries NO correlation_id (the AAD anchor) — it can never be decrypted')
+      || null;
+    if (reason) return fail(reason);
+    const mat = e2eKeyMaterial();
+    // The real filename is a "message_filename" envelope on a sealed attachment.
+    let name = att.filename;
+    if (isEnvelope(name)) {
+      try {
+        name = e2eDecryptField(mat.key, e2eAad(m.channel_id, m.correlation_id, 'message_filename'), name);
+        out.attachment.filename = name;
+      } catch (e) {
+        out.attachment.filename = null;
+        return fail(`attachment filename failed to open: ${e.message}`);
+      }
+    }
+    try {
+      const plain = e2eDecryptBlob(mat.key, e2eAad(m.channel_id, m.correlation_id, 'message_blob'), await download());
+      const dest = destFor(name);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, plain);
+      out.attachment.path = dest;
+      delete out.attachment.enc;
+      e2eNote(`attachment decrypted → ${dest}`);
+    } catch (e) {
+      fail(`attachment failed to open: ${e.message}`);
+    }
+  } else if (v.download || v['download-dir']) {
+    try {
+      const bytes = await download();
+      const dest = destFor(att.filename);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, bytes);
+      out.attachment.path = dest;
+    } catch (e) {
+      console.error(`pidge: WARNING — attachment download failed (${e.message}); the url in the JSON is still fetchable`);
+    }
+  }
 }
 
 // RECEIVE: the poll's chosen_action (wait/ask/approve/hello). The notification-
@@ -1565,9 +1752,14 @@ const guessMime = (p) => MIME[path.extname(p).toLowerCase()] || 'application/oct
 // reaches the phone: the agent's machine has no public URL and the push payload
 // is far too small to carry a file.
 async function uploadFile(filePath) {
+  return uploadBlob(fs.readFileSync(filePath), path.basename(filePath), guessMime(filePath));
+}
+
+// #367 (E3): a SEALED upload carries a generic name + octet-stream — the real
+// filename rides the /notify as an envelope, never the multipart.
+async function uploadBlob(bytes, filename, type) {
   const fd = new FormData();
-  fd.append('file', new Blob([fs.readFileSync(filePath)], { type: guessMime(filePath) }),
-            path.basename(filePath));
+  fd.append('file', new Blob([bytes], { type }), filename);
   let res, raw;
   try {
     res = await fetch(`${BASE}/api/v1/uploads`, {
@@ -1587,15 +1779,39 @@ async function uploadFile(filePath) {
 // --image / --file: an existing local path is uploaded and swapped for its ref;
 // anything else (an https URL on --image, or an already-minted ref) passes through
 // untouched — the server 422s self-describingly on an invalid value.
-async function resolveMedia(body) {
+// #367 (E3): with a mediaPlan, each local blob is SEALED before upload
+// ([0x01][nonce][ct][tag], AAD "ch<id>:<cid>:image_blob|file_blob"), uploads as
+// a generic blob.bin, the file's real name becomes a `filename` envelope (AAD
+// field "filename") and the send is flagged media_enc:"v1".
+async function resolveMedia(body, mediaPlan = null) {
   for (const key of ['image', 'file']) {
     if (v[key] === undefined) continue;
     if (fs.existsSync(v[key])) {
-      body[key] = await uploadFile(v[key]);
+      if (mediaPlan) {
+        const sealed = e2eEncryptBlob(
+          mediaPlan.key,
+          e2eAad(mediaPlan.channelId, mediaPlan.cid, `${key}_blob`),
+          fs.readFileSync(v[key])
+        );
+        body[key] = await uploadBlob(sealed, 'blob.bin', 'application/octet-stream');
+        if (key === 'file') {
+          body.filename = e2eEncryptField(
+            mediaPlan.key, e2eAad(mediaPlan.channelId, mediaPlan.cid, 'filename'),
+            path.basename(v[key])
+          );
+        }
+        body.media_enc = 'v1';
+      } else {
+        body[key] = await uploadFile(v[key]);
+      }
     } else if (key === 'file' && (/^[./~]/.test(v[key]) || v[key].includes('/'))) {
       // --file is PATH-only (no URL form) — fail fast on a typo'd path; the remote
       // 422 ("ref invalid — re-upload") would misdirect the agent's self-heal.
       die(`pidge: --file: no such file: ${v[key]}`, 1);
+    } else if (mediaPlan) {
+      // A pre-minted ref holds bytes this machine never sealed — riding it on a
+      // media_enc send would serve clear bytes the phone tries to unseal.
+      die(`pidge: --${key} with a pre-minted ref cannot ride a SEALED-media send (#367) — pass the local path so the bytes seal here (or PIDGE_E2E_MEDIA=off to send this one clear).`, 2);
     } else {
       body[key] = v[key];
     }
@@ -1611,7 +1827,11 @@ async function doNotify(extra = {}) {
   // uploads any bytes — otherwise a lying server captures the file/filename
   // (which ride clear until E3) even though the /notify is then refused.
   await e2ePreflightRefusal();
-  await resolveMedia(payload);
+  // #367 (E3): decide the media fate BEFORE any bytes leave the machine — the
+  // plan seals local blobs in resolveMedia; a media-pinned channel that would
+  // downgrade to clear media refuses HERE, pre-upload.
+  const mediaPlan = await e2eMediaPlan(payload);
+  await resolveMedia(payload, mediaPlan);
   // E2E (E2-CLI): seal the content AFTER everything else composed the payload —
   // typed sends, approval/approve/hello custom actions, --param, media refs all
   // pass through here, so every send path is covered by this one call.
@@ -3167,7 +3387,9 @@ ${SKILL_END_MARKER}
         // E2E: open sealed rows BEFORE anything prints (stdout JSON and the
         // stderr narration below both read the decrypted values — a row we
         // can't open is blanked with a precise e2e_error, never base64).
-        const msgs = msgsRaw.map(e2eOpenMessageRow);
+        // #367: async now — a sealed attachment is downloaded + unsealed to a
+        // local path here (attachment.path in the printed JSON).
+        const msgs = await Promise.all(msgsRaw.map(e2eOpenMessageRow));
         console.log(JSON.stringify(msgs, null, 2));
         // lote-5 #5: heads-up on ORPHANED backlog served on the first quick read
         // (--all only). It's within-channel — NOT the cross-channel leak (#289).
