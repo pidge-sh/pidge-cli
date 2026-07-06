@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.23.0 — 2026-07-06
+
+Bateria multi-runtime (2026-07-06, 0.22.0 vs server v63) — três achados de atribuição/leitura:
+
+- **cli#63: `pidge ack --summary "<o que você fez>"` — resolvida a colisão de tipo (era no-op silencioso).**
+  `--summary` é registrada globalmente como BOOLEAN (pro `inbox --summary` = contagens+latência),
+  então o parse global engolia `ack --summary "texto"` como boolean-true e jogava o "texto" num
+  positional ignorado — um **no-op silencioso num campo de ATRIBUIÇÃO**, o pior modo de falha. O
+  case `ack` agora **re-parseia o próprio argv** com `summary` tipado como string: o valor
+  sobrevive, entra no `ackBody` (cap 1000, o servidor #380 grava `handler_summary`) e o `pidge
+  catchup` mostra "handled by X: <summary>" pra sessão sucessora. Um `--summary` **sem valor** (ou
+  vazio) vira **usage-error alto (exit 1)**, nunca um no-op. `inbox --summary` segue funcionando
+  intacto (é a metade boolean).
+- **cli#65: `selftest` não sequestra mais mensagens reais (era um blackout de ~60s — achado T2).**
+  O listener do selftest lia a fila real com `?all=true&lease=60`: qualquer mensagem real servida
+  de passagem ficava **sob lease por 60s, invisível a qualquer `listen`** nesse intervalo (o
+  sintoma: `listen` roda a janela inteira e diz "no message", exit 3, e um segundo `listen`
+  imediato acha a mesma mensagem na hora). Agora lê com **`?since=<id do nonce − 1>`** (o POST
+  `/selftest` devolve o id): o backlog real (ids menores) some **por construção**, então nenhum
+  bystander é servido — e o `lease=60` como mitigação **saiu**. O **exit 3 do `listen`** ganhou a
+  dica: "se você esperava uma mensagem, ela pode estar sob lease de outra leitura — `pidge
+  catchup` mostra a fila inteira read-only".
+- **cli#64: o `bridge` captura o summary do handler via MARKER LINE (o "o quê" do server #380).**
+  O `ackBatch` do bridge mandava só `{ids}` — o caso central do #380 (sessão sucessora vendo QUEM
+  tratou O QUÊ) ficava manco no cenário pra que foi feito (bridge 24/7 → sessão interativa). Agora
+  o stdout do handler vira `pipe` **com tee pro log** (comportamento preservado) e o bridge varre
+  (em **stream, nunca buffer total** — um handler que despeja MB ou fecha stdout cedo não trava nem
+  estoura memória) a **ÚLTIMA** linha `pidge-summary: <texto>` (cap 1000). Achou → `ackBatch({ids,
+  summary})`; não achou → acka sem summary (**nunca inventa**). Só uma linha que COMEÇA com o
+  marcador conta — output incidental jamais vira atribuição. Um handler LLM é instruível no próprio
+  prompt: "termine imprimindo `pidge-summary: <1 frase do que você fez>`". Documentado no HELP do
+  bridge + README.
+
 ## 0.22.0 — 2026-07-06
 
 - **cli#59: `pidge bridge --exec '<handler>'` — o supervisor de 1ª classe, model-agnostic.**
