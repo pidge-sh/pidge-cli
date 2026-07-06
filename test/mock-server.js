@@ -39,6 +39,15 @@ function createMock() {
     liveWrites: [],          // every {method, path, body} the CLI sent
     liveCards: {},           // cid → true (existence drives started|updated + PATCH 404)
     liveDegrade: false,      // a test forces the dedicated-budget degrade echo
+    // #59 bridge: a test forces a non-200 on GET /messages (401 = rotated key).
+    messagesStatus: 200,
+    // #62 cross-audit: >0 models the server VISIBILITY LEASE — a delivered row
+    // is NOT re-served within the window (ack removes it regardless). Default 0
+    // keeps the legacy always-re-serve behavior the older tests rely on.
+    leaseMs: 0,
+    // #61: server v63 serves stale_from_prior_claim (top-level) on the
+    // channel-key GET /messages and on whoami — a test flips it true.
+    staleFromPriorClaim: false,
   };
   let server = null;
   let wss = null;
@@ -100,6 +109,7 @@ function createMock() {
         claim: state.claim,                                  // #181
         devices: state.devices ?? 1,
         device_reach: state.deviceReach,                     // #182 (null unless a test sets it)
+        stale_from_prior_claim: state.staleFromPriorClaim,   // #61 (server v63)
         manifest_version: 16,
       });
     }
@@ -159,15 +169,31 @@ function createMock() {
     if (req.method === 'GET' && url.pathname === '/api/v1/messages') {
       // #58: record every read so a test can assert catchup's query (history/all).
       state.messageReads.push(req.url);
+      // #59: a test forces a 401 (rotated key) / 5xx — the bridge must narrate,
+      // alert locally and back off LONG, never a blind hot loop.
+      if (state.messagesStatus && state.messagesStatus !== 200)
+        return json(res, state.messagesStatus, { error: 'unauthorized' });
       // #131: notification_reply rows are served only on the unified queue.
       const all = url.searchParams.get('all') === 'true';
       // #58: history=true is the READ-ONLY thread read (server never consumes/stamps
       // delivered/opens a lease — it just returns the conversation). The mock never
       // deletes on GET anyway, so the observable contract under test is that catchup
       // NEVER POSTs an ack (state.acks stays empty).
-      const rows = all ? state.messages
+      let rows = all ? state.messages
         : state.messages.filter((m) => !m.kind || m.kind === 'message');
-      return json(res, 200, { messages: rows });
+      // #62: the lease model applies only to the CONSUME path — a history read
+      // (catchup) is read-only and never opens/honors a lease.
+      const history = url.searchParams.get('history') === 'true';
+      if (state.leaseMs > 0 && !history) {
+        const now = Date.now();
+        rows = rows.filter((m) => !m._leasedUntil || m._leasedUntil <= now);
+        for (const m of rows) m._leasedUntil = now + state.leaseMs;
+      }
+      // strip the internal lease stamp — it must not leak into the served JSON
+      return json(res, 200, {
+        messages: rows.map(({ _leasedUntil, ...rest }) => rest),
+        stale_from_prior_claim: state.staleFromPriorClaim,
+      });
     }
     if (req.method === 'POST' && url.pathname === '/api/v1/messages/ack') {
       let body = '';
