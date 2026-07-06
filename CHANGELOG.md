@@ -7,19 +7,25 @@
   long-poll `GET /messages?all=true` (o piso robusto do #119; o socket realtime, quando
   disponível, é presença "ouvindo agora" + acorda-cedo, NUNCA o caminho dos dados) → o handler
   roda **UMA vez por lote** com o batch JSON no stdin (`{"messages":[…]}` + `history_hint:true`
-  no primeiro lote pós-restart — sinergia com o `catchup` do #58) → exit 0 ⇒ `ack --up-to
-  <última id>` · exit ≠0 ⇒ **NÃO acka** (o lease de ~10 min do servidor re-serve; at-least-once
-  é o contrato — o handler deve ser idempotente). Model-agnostic por construção:
+  no primeiro lote pós-restart — sinergia com o `catchup` do #58) → exit 0 ⇒ **ack dos ids
+  EXATOS do lote** (nunca um watermark `up_to`: no servidor ele flipa TODA unprocessed ≤ id,
+  inclusive rows sob lease de um lote anterior que o handler FALHOU — blocker do cross-audit
+  do PR #62) · exit ≠0 ⇒ **NÃO acka** (o lease de ~10 min do servidor re-serve; at-least-once
+  é o contrato — o handler deve ser idempotente). Uma invocação é limitada por
+  `--handler-timeout` (default 30 min: SIGTERM, SIGKILL 5 s depois, conta como lote FALHADO —
+  um handler pendurado não trava o canal), com heartbeat no stderr a cada 5 min enquanto roda. Model-agnostic por construção:
   `--exec 'claude -p …' | 'codex exec …' | 'gemini …'` | qualquer script. O bridge é burro de
   propósito: sem fila local, sem ledger próprio — a durabilidade é do servidor (ack/lease).
 - **Lock de instância única por canal (#59 §3).** Lockfile por `hash(token)` em
   `~/.config/pidge/bridge-<hash>.lock` (o dir BASE, ignorando `PIDGE_AGENT` de propósito: dois
   agents com a MESMA chave são um canal só e DEVEM colidir), criado com `O_EXCL` + PID dentro.
-  Segundo `bridge` no mesmo canal recusa (exit 2, mensagem clara apontando pro `catchup`);
-  **lockfile órfão pós-crash é recuperado** (PID morto ⇒ take-over narrado — um bridge que
-  crashou nunca trava o canal); re-read paranóico fecha a janela de corrida do take-over
-  concorrente. **`listen` também recusa** sob um lock VIVO de bridge (o double-consume local
-  morre por construção).
+  Segundo `bridge` no mesmo canal recusa (exit 2, mensagem clara apontando pro `catchup` +
+  a instrução de `rm` do lockfile pra quem tem CERTEZA de que não há bridge);
+  **lockfile órfão pós-crash é recuperado por RENAME atômico** (cross-audit PR #62: só um
+  racer consegue renomear o arquivo stale; o perdedor ganha ENOENT ⇒ recusa exit 2 — fecha o
+  interleaving A-e-B-leem-o-mesmo-stale), com re-read paranóico como cinto extra. EPERM no
+  PID-check é tratado como suspeito ⇒ vivo (recusar > double-consume). **`listen` também
+  recusa** sob um lock VIVO de bridge (o double-consume local morre por construção).
 - **Modos de falha narrados, nunca re-loop cego (#59 §4).** 401 → narra + **alerta LOCAL**
   (stderr é o registro; notificação de desktop best-effort — `osascript`/`notify-send`;
   `PIDGE_BRIDGE_ALERT=0` desliga) + backoff LONGO com jitter, re-tenta pra sempre (chave
@@ -36,7 +42,10 @@
   `Restart=on-failure`) apontando pro comando, e **declara `listen_mode=external_daemon`** no
   operating contract (advisory, honesto). O template **NUNCA embute a chave** (higiene #57 —
   ela fica no `~/.config/pidge/env`); só env não-secreto (`PIDGE_URL`/`PIDGE_AGENT`/
-  `XDG_CONFIG_HOME`) viaja. Warn se a chave só existe no env do shell (o daemon não herdaria).
+  `XDG_CONFIG_HOME` + o **PATH corrente** — sem ele um handler homebrew/nvm dá exit 127 sob
+  launchd/systemd) viaja. `systemdQuote` escapa `$→$$` e `%→%%` (expansões de unit-file);
+  `Wants=network-online.target` junto do `After`. Warn se a chave só existe no env do shell
+  (o daemon não herdaria) e se o CLI roda do cache do npx (template quebraria no prune).
 - **cli#61 (carona): surfacing do `stale_from_prior_claim`** (server v63 — Bool top-level no
   `GET /messages` de channel-key e no whoami). Aviso de 1 linha, UMA vez por processo, tom
   advisory ("provavelmente de um dono anterior", nunca certeza — falso ± conhecidos,

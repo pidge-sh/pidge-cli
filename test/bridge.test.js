@@ -61,7 +61,7 @@ async function waitFor(fn, ms = 8000, step = 50) {
 // A handler that copies its stdin (the batch JSON) to $OUT and exits 0.
 const CAPTURE_HANDLER = `${process.execPath} -e "require('fs').writeFileSync(process.env.OUT, require('fs').readFileSync(0))"`;
 
-test('bridge: ONE handler invocation per batch — batch JSON on stdin, exit 0 acks --up-to the last id, history_hint only on the first batch', async () => {
+test('bridge: ONE handler invocation per batch — batch JSON on stdin, exit 0 acks the EXACT ids, history_hint only on the first batch', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [
@@ -80,14 +80,14 @@ test('bridge: ONE handler invocation per batch — batch JSON on stdin, exit 0 a
   assert.equal(batch.messages.length, 2, 'the WHOLE tick in one invocation');
   assert.equal(batch.messages[1].body, 'segunda');
   assert.equal(batch.history_hint, true, 'first batch post-restart carries history_hint (#58 synergy)');
-  assert.deepEqual(mock.state.ackBodies[0], { up_to: 9 }, 'ack --up-to the LAST id of the batch');
+  assert.deepEqual(mock.state.ackBodies[0], { ids: [7, 9] }, 'ack the batch\'s EXACT ids — never an up_to watermark (#62 cross-audit)');
 
   // A second batch is ordinary: no history_hint, its own ack.
   mock.state.messages = [{ id: 12, kind: 'message', body: 'terceira', created_at: 'x' }];
   assert.ok(await waitFor(() => mock.state.ackBodies.length >= 2), `expected a second ack; stderr:\n${out.stderr}`);
   const batch2 = JSON.parse(fs.readFileSync(outFile, 'utf8'));
   assert.equal(batch2.history_hint, undefined, 'history_hint is FIRST-batch-only');
-  assert.deepEqual(mock.state.ackBodies[1], { up_to: 12 });
+  assert.deepEqual(mock.state.ackBodies[1], { ids: [12] });
 
   child.kill('SIGTERM');
   const r = await result;
@@ -208,6 +208,89 @@ test('bridge: 401 — narrated LOCAL ALERT + LONG jittered backoff; never a hot 
   await mock.stop();
 });
 
+test('cross-audit BLOCKER: a leased row from a FAILED batch is never stamped by a later batch\'s success (ack by exact ids)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.leaseMs = 60000; // model the server visibility lease
+  mock.state.messages = [{ id: 3, kind: 'message', body: 'condenada', created_at: 'x' }];
+  // The handler FAILS on any batch containing id 3, succeeds otherwise.
+  const handler = `${process.execPath} -e "const b=JSON.parse(require('fs').readFileSync(0,'utf8')); process.exit(b.messages.some(m=>m.id===3)?1:0)"`;
+
+  const { child, result, out } = runCli(
+    ['bridge', '--exec', handler, '--no-realtime', '--interval', '1'],
+    port,
+  );
+  // Batch [3] served (now under lease), handler exits 1 → not acked.
+  assert.ok(await waitFor(() => /handler exit 1/.test(out.stderr)), `stderr:\n${out.stderr}`);
+  // A new message arrives; the leased 3 is NOT re-served — the next batch is [5] alone.
+  mock.state.messages.push({ id: 5, kind: 'message', body: 'nova', created_at: 'x' });
+  assert.ok(await waitFor(() => mock.state.ackBodies.length >= 1), `stderr:\n${out.stderr}`);
+  assert.deepEqual(mock.state.ackBodies[0], { ids: [5] }, 'the success acks ONLY what that handler saw');
+  assert.ok(mock.state.messages.some((m) => m.id === 3),
+    'id 3 (failed, under lease) must STILL be pending — an up_to:5 watermark would have stamped it processed');
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
+});
+
+test('cross-audit: two starters racing for the SAME stale lock — exactly ONE wins (atomic rename), the loser exits 2', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = tmpDir('pidge-race-');
+  const corpse = spawn(process.execPath, ['-e', '']);
+  const deadPid = corpse.pid;
+  await new Promise((r) => corpse.on('exit', r));
+  fs.mkdirSync(path.join(xdg, 'pidge'), { recursive: true });
+  fs.writeFileSync(lockPathFor(xdg), JSON.stringify({ pid: deadPid, started_at: 'x', label: 'crashed' }) + '\n');
+
+  // Both A and B start against the same stale lock. Whichever interleaving the
+  // scheduler picks (both read the stale pid, or the slower one already sees
+  // the winner's fresh lock), the INVARIANT is: exactly one holds the channel,
+  // the other exits 2 — the rename is what makes the both-read-stale case safe.
+  const a = runCli(['bridge', '--exec', 'true', '--no-realtime', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg });
+  const b = runCli(['bridge', '--exec', 'true', '--no-realtime', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg });
+
+  const loser = await Promise.race([a.result, b.result]);
+  assert.equal(loser.code, 2, `the loser must refuse; stderr:\n${loser.stderr}`);
+  assert.match(loser.stderr, /REFUSED|lost the/, 'refusal must be narrated');
+  const winner = loser === a.out ? b : a;
+  await sleep(300); // give a hypothetical double-win a chance to show up
+  assert.equal(winner.out.code, null, `the winner must still be running; stderr:\n${winner.out.stderr}`);
+  const lock = JSON.parse(fs.readFileSync(lockPathFor(xdg), 'utf8'));
+  assert.equal(lock.pid, winner.child.pid, 'the lock must name the winner');
+
+  winner.child.kill('SIGTERM');
+  const rw = await winner.result;
+  await mock.stop();
+  assert.equal(rw.code, 0);
+  assert.ok(!fs.existsSync(lockPathFor(xdg)), 'the winner releases on the way out');
+});
+
+test('cross-audit: --handler-timeout — a hung handler is SIGTERMed, treated as a FAILED batch (no ack), with periodic narration', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 4, kind: 'message', body: 'trava', created_at: 'x' }];
+  const handler = `${process.execPath} -e "setTimeout(() => {}, 30000)"`;
+
+  const { child, result, out } = runCli(
+    ['bridge', '--exec', handler, '--no-realtime', '--interval', '1', '--handler-timeout', '2'],
+    port, { PIDGE_BRIDGE_NARRATE: '400' }, // heartbeat every 400ms so the test sees it pre-timeout
+  );
+  assert.ok(await waitFor(() => /handler running for/.test(out.stderr)), `no heartbeat; stderr:\n${out.stderr}`);
+  assert.ok(await waitFor(() => /exceeded --handler-timeout/.test(out.stderr)), `no timeout kill; stderr:\n${out.stderr}`);
+  assert.ok(await waitFor(() => /NOT acked/.test(out.stderr)), `stderr:\n${out.stderr}`);
+  assert.match(out.stderr, /timed out \(--handler-timeout 2s\)/);
+  await sleep(300);
+  assert.equal(mock.state.ackBodies.length, 0, 'a timed-out handler must NEVER ack');
+  assert.equal(out.code, null, 'the bridge itself stays alive (the failure is the handler\'s)');
+
+  child.kill('SIGTERM');
+  const r = await result;
+  await mock.stop();
+  assert.equal(r.code, 0);
+});
+
 test('#59: `listen` REFUSES when a LIVE bridge holds the channel lock (points at catchup)', async () => {
   const mock = createMock();
   const port = await mock.start();
@@ -240,6 +323,7 @@ test('bridge install: launchd template — handler embedded (xml-escaped), Resta
   const plist = fs.readFileSync(info.file, 'utf8');
   assert.match(plist, /claude -p &quot;handle batch&quot;/, 'the handler must be xml-escaped');
   assert.match(plist, /SuccessfulExit/, 'KeepAlive.SuccessfulExit=false = Restart=on-failure');
+  assert.match(plist, /<key>PATH<\/key>/, 'the daemon needs the current PATH — launchd\'s minimal one 127s a homebrew/nvm handler (#62)');
   assert.ok(!plist.includes('hld_test'), 'the template must NEVER embed the key');
   assert.equal(mock.state.operatingContract.listen_mode.value, 'external_daemon', 'install declares the contract');
   assert.equal(info.listen_mode_declared, true);
@@ -261,6 +345,8 @@ test('bridge install: systemd template — Restart=on-failure, quoted ExecStart,
   assert.ok(info.file.startsWith(path.join(run.xdg, 'systemd', 'user')), info.file);
   const unit = fs.readFileSync(info.file, 'utf8');
   assert.match(unit, /Restart=on-failure/);
+  assert.match(unit, /Wants=network-online\.target/, 'After alone only orders — Wants pulls the target in (#62)');
+  assert.match(unit, /Environment="PATH=/, 'the daemon needs the current PATH (#62)');
   assert.match(unit, /bridge --exec "codex exec \\"handle batch\\""/, 'ExecStart must quote+escape the handler');
   assert.ok(!unit.includes('hld_test'), 'the template must NEVER embed the key');
 });
