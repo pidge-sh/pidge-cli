@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.22.0 — 2026-07-06
+
+- **cli#59: `pidge bridge --exec '<handler>'` — o supervisor de 1ª classe, model-agnostic.**
+  A produtização do "colo um prompt e o agent fica online": loop supervisionado embutido —
+  long-poll `GET /messages?all=true` (o piso robusto do #119; o socket realtime, quando
+  disponível, é presença "ouvindo agora" + acorda-cedo, NUNCA o caminho dos dados) → o handler
+  roda **UMA vez por lote** com o batch JSON no stdin (`{"messages":[…]}` + `history_hint:true`
+  no primeiro lote pós-restart — sinergia com o `catchup` do #58) → exit 0 ⇒ `ack --up-to
+  <última id>` · exit ≠0 ⇒ **NÃO acka** (o lease de ~10 min do servidor re-serve; at-least-once
+  é o contrato — o handler deve ser idempotente). Model-agnostic por construção:
+  `--exec 'claude -p …' | 'codex exec …' | 'gemini …'` | qualquer script. O bridge é burro de
+  propósito: sem fila local, sem ledger próprio — a durabilidade é do servidor (ack/lease).
+- **Lock de instância única por canal (#59 §3).** Lockfile por `hash(token)` em
+  `~/.config/pidge/bridge-<hash>.lock` (o dir BASE, ignorando `PIDGE_AGENT` de propósito: dois
+  agents com a MESMA chave são um canal só e DEVEM colidir), criado com `O_EXCL` + PID dentro.
+  Segundo `bridge` no mesmo canal recusa (exit 2, mensagem clara apontando pro `catchup`);
+  **lockfile órfão pós-crash é recuperado** (PID morto ⇒ take-over narrado — um bridge que
+  crashou nunca trava o canal); re-read paranóico fecha a janela de corrida do take-over
+  concorrente. **`listen` também recusa** sob um lock VIVO de bridge (o double-consume local
+  morre por construção).
+- **Modos de falha narrados, nunca re-loop cego (#59 §4).** 401 → narra + **alerta LOCAL**
+  (stderr é o registro; notificação de desktop best-effort — `osascript`/`notify-send`;
+  `PIDGE_BRIDGE_ALERT=0` desliga) + backoff LONGO com jitter, re-tenta pra sempre (chave
+  rotacionada só um humano conserta — o daemon não morre em silêncio nem flapa no launchd).
+  Canal quebrado (a classe do exit 4: N falhas consecutivas sem round-trip saudável) → mesmo
+  tratamento. TODO sleep de retry tem jitter (N bridges pós-deploy não estoram em lockstep).
+  Handler quebrado escala backoff próprio (um handler morto não queima 1 chamada de LLM por
+  mensagem). **SIGTERM/SIGINT limpos:** repassa o sinal ao handler em voo, **não acka o lote em
+  voo** (o lease re-serve — a flag `shuttingDown` também fecha a corrida handler-exit→ack),
+  solta o lock, exit 0.
+- **`pidge bridge install --exec '<handler>'` (#59 §5):** gera o template launchd (Mac,
+  `~/Library/LaunchAgents/sh.pidge.bridge[.<agent>].plist`, `KeepAlive.SuccessfulExit=false`)
+  ou systemd user (Linux, `~/.config/systemd/user/pidge-bridge[.<agent>].service`,
+  `Restart=on-failure`) apontando pro comando, e **declara `listen_mode=external_daemon`** no
+  operating contract (advisory, honesto). O template **NUNCA embute a chave** (higiene #57 —
+  ela fica no `~/.config/pidge/env`); só env não-secreto (`PIDGE_URL`/`PIDGE_AGENT`/
+  `XDG_CONFIG_HOME`) viaja. Warn se a chave só existe no env do shell (o daemon não herdaria).
+- **cli#61 (carona): surfacing do `stale_from_prior_claim`** (server v63 — Bool top-level no
+  `GET /messages` de channel-key e no whoami). Aviso de 1 linha, UMA vez por processo, tom
+  advisory ("provavelmente de um dono anterior", nunca certeza — falso ± conhecidos,
+  pidge#294): no header da sessão do `listen`, no `doctor` (warning, nunca exit 2), no
+  `catchup` e no boot do `bridge`.
+- Não-objetivos honrados (#59): sem enforcement no servidor (advisory-only), sem fila local.
+
 ## 0.21.0 — 2026-07-06
 
 - **cli#58: `pidge catchup` — o verbo READ-ONLY sobre `GET /messages?history=true&all=true`.**

@@ -318,6 +318,7 @@ const OPTIONS = {
   renew: { type: 'boolean' },                  // ack: heartbeat the visibility-timeout lease (state=delivered)
   'ack-on-read': { type: 'boolean' },          // listen: restore the pre-0.9 immediate-consume
   window: { type: 'string' },                  // selftest: reachability window in seconds (default 30)
+  exec: { type: 'string' },                    // #59 bridge: the handler command (ONE invocation per batch)
   // #34 approve: the two gated-action labels (default Allow / Deny)
   'allow-label': { type: 'string' },
   'deny-label': { type: 'string' },
@@ -390,6 +391,14 @@ USAGE
                                           you learn what's already handled WITHOUT stealing a message.
                                           Exit 0 (printed, even if empty) · 2 error. NEVER run \`listen\`
                                           on a channel another runtime consumes (double-consume).
+  pidge bridge --exec '<handler>'         24/7 SUPERVISOR (#59): loop listen --all → your handler runs
+                                          ONCE per batch (batch JSON on stdin) → exit 0 ⇒ ack --up-to
+                                          <last id> · non-zero ⇒ NOT acked (the server lease re-serves).
+                                          ONE instance per channel (pid-checked lockfile by hash(token));
+                                          model-agnostic: --exec 'claude -p …' | 'codex exec …' | any script
+  pidge bridge install --exec '<handler>' write a launchd (Mac) / systemd (Linux) template running the
+                                          bridge with Restart=on-failure + declare
+                                          listen_mode=external_daemon (advisory). Never embeds the key.
   pidge listen [--timeout N] [--all] [--ack-on-read] [--follow]
                                           block until the human MESSAGES you from the app, print, exit (#48)
                                           #170: a read message is DELIVERED (gray ✓✓), NOT done — ACK it
@@ -568,6 +577,7 @@ const OPTION_DOCS = {
   ids: '--ids a,b                process this comma-list of ids',
   renew: '--renew                  heartbeat the visibility-timeout lease instead of processing',
   window: '--window N               reachability window in seconds (default 30)',
+  exec: "--exec CMD               the handler: run ONCE per batch with the batch JSON on stdin; exit 0 = batch acked (--up-to the last id), non-zero = NOT acked (the server lease re-serves — make it idempotent)",
   'quiet-nag': '--quiet-nag              silence the "server has new capabilities" nag for this run',
   'allow-label': '--allow-label TEXT       approve: label on the Face-ID allow button (default "Allow")',
   'deny-label': '--deny-label TEXT        approve: label on the deny button (default "Deny")',
@@ -734,6 +744,20 @@ const HELP = {
     usage: 'pidge listen [--timeout N] [--all] [--ack-on-read] [--follow] [--download] [--download-dir DIR]',
     body: 'One-shot by design (loop it, don\'t daemonize). #170: a read message is DELIVERED (gray ✓✓), NOT done — ack it AFTER the work with `pidge ack --up-to <id>` (a ~10-min lease re-serves un-acked messages, so a crash never loses one). #367: a message may carry an `attachment` (a photo/file from the app\'s composer) — a SEALED one is auto-downloaded + decrypted to a local file (`attachment.path` in the JSON); a clear one keeps its fetchable `url` (--download saves it too).',
     opts: ['timeout', 'all-listen', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
+  },
+  bridge: {
+    summary: '24/7 supervisor (#59): long-poll the channel, run YOUR handler once per batch, ack only on exit 0. Model-agnostic.',
+    usage: "pidge bridge --exec '<handler>'  ·  pidge bridge install --exec '<handler>'",
+    body: [
+      'The productized "paste a prompt and the agent stays online". The bridge is deliberately DUMB — no local queue, no own retry ledger: durability is the SERVER\'s ack/lease.',
+      '',
+      'LOOP: long-poll GET /messages?all=true (the robust #119 floor; a realtime socket, when available, adds presence — "ouvindo agora" — and early wake-ups, never the data path) → your --exec command runs ONCE per batch with the batch JSON on stdin ({"messages":[…]} + "history_hint":true on the first batch since boot — the handler may want `pidge catchup` to situate) → handler exit 0 ⇒ `ack --up-to <last id>` · non-zero ⇒ NOT acked: the ~10-min server lease re-serves the batch. At-least-once is the contract — make the handler IDEMPOTENT.',
+      'Model-agnostic by construction: --exec \'claude -p "…"\' | \'codex exec "…"\' | \'gemini "…"\' | any script. This is the multi-LLM answer: no dependence on a harness that wakes on background-task exit.',
+      'ONE INSTANCE PER CHANNEL: a lockfile keyed by hash(token) (~/.config/pidge/bridge-<hash>.lock, PID-checked so a crashed bridge never wedges the channel) — a second bridge, or a `listen`, on the same channel is REFUSED (exit 2). Read with `pidge catchup` instead.',
+      'FAILURES: 401 → narrated + LOCAL alert + LONG jittered backoff (a rotated key only a human can fix — the bridge never dies silent, never re-loops blind); a channel with no healthy round-trip (the exit-4 class) → same alert + long backoff; every retry sleep is jittered. SIGTERM/SIGINT → clean shutdown: the in-flight batch is NOT acked (the lease re-serves it), the lock is released, exit 0.',
+      '`pidge bridge install` writes a launchd (Mac) / systemd (Linux) TEMPLATE that runs this command with Restart=on-failure semantics and declares listen_mode=external_daemon in the operating contract (advisory, honest). The template NEVER embeds the key — it stays in ~/.config/pidge/env.',
+    ].join('\n'),
+    opts: ['exec', 'interval', 'realtime', 'no-realtime'],
   },
   ack: {
     summary: 'mark messages PROCESSED (green ✓✓) after you handled them, or --renew the lease on a long task (#170).',
@@ -2548,6 +2572,490 @@ function installOrphanWatchdog() {
   if (t.unref) t.unref(); // never keep the process alive just for the watchdog
 }
 
+// ---------------------------------------------------------------------------
+// #61: stale_from_prior_claim — server v63 serves it (Bool, top-level) on the
+// channel-key GET /messages and on /whoami: the channel holds un-acked messages
+// whose arrival PREDATES this install's ownership claim — probably a previous
+// owner's leftover work, not fresh asks for you. ADVISORY in tone by design:
+// the anchor has known false negatives (claim-code exchange doesn't set
+// claimed_at) and false positives (a same-fingerprint re-doctor refreshes the
+// anchor — benign, self-clears on drain), documented in pidge#294. Surfaces:
+// listen (session header), doctor, catchup, and the bridge boot (#59).
+// Warned ONCE per process (a long-lived bridge doesn't re-shout every poll).
+let stalePriorClaimWarned = false;
+const STALE_PRIOR_CLAIM_HINT = 'Run `pidge catchup` (read-only) to see what they are before acting on them.';
+function warnStalePriorClaim(data, hint = STALE_PRIOR_CLAIM_HINT) {
+  if (!data || data.stale_from_prior_claim !== true || stalePriorClaimWarned) return;
+  stalePriorClaimWarned = true;
+  console.error(`pidge: ⚠️ this channel holds unprocessed messages from a PRIOR claim — probably a previous owner's leftover work, not fresh asks for you (advisory, #61). ${hint}`);
+}
+
+// ---------------------------------------------------------------------------
+// #59: `pidge bridge --exec '<handler>'` — the 1st-class, model-agnostic
+// supervisor. The bridge is deliberately DUMB: no local queue, no retry ledger
+// of its own — durability lives in the server's ack/lease (a non-goal of the
+// issue is exactly "reimplementar fila local").
+//   loop: long-poll GET /messages?all=true (the #119 robust floor; a realtime
+//   socket, when available, is presence + early wake, never the data path)
+//   → ONE handler invocation per batch (the whole tick as JSON on stdin — one
+//   LLM invocation per batch, not per message) → handler exit 0 ⇒ ack --up-to
+//   <last id> · non-zero ⇒ NOT acked (the ~10-min server lease re-serves).
+// ---------------------------------------------------------------------------
+
+// --- the single-consumer lock (#59 §3). PER-CHANNEL on purpose: keyed by
+// hash(token) and living in the BASE ~/.config/pidge — PIDGE_AGENT is IGNORED
+// here, because two agents wearing the SAME key are still one channel and MUST
+// collide (a per-agent dir would hide exactly the double-consume this kills).
+function bridgeLockBaseDir() {
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'pidge');
+}
+function bridgeLockPath() {
+  const h = crypto.createHash('sha256').update(String(TOKEN)).digest('hex').slice(0, 16);
+  return path.join(bridgeLockBaseDir(), `bridge-${h}.lock`);
+}
+function readBridgeLock(file) {
+  try {
+    const d = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return d && Number.isInteger(d.pid) ? d : null;
+  } catch { return null; } // missing or garbage — the caller treats it as stale
+}
+// Is that pid a live process? Signal 0 probes without touching it; EPERM means
+// "alive but not ours" — still a live holder.
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+// Whoever holds the channel lock RIGHT NOW (a live pid), or null. `listen`
+// checks this to refuse double-consuming a channel a running bridge owns.
+function bridgeLockHolder() {
+  const cur = readBridgeLock(bridgeLockPath());
+  return cur && pidAlive(cur.pid) ? cur : null;
+}
+function acquireBridgeLock() {
+  const file = bridgeLockPath();
+  fs.mkdirSync(bridgeLockBaseDir(), { recursive: true, mode: 0o700 });
+  const payload = JSON.stringify({ pid: process.pid, started_at: new Date().toISOString(), label: agentLabel() }) + '\n';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(file, 'wx', 0o600); // atomic create-exclusive — the file IS the lock
+      fs.writeSync(fd, payload);
+      fs.closeSync(fd);
+    } catch (e) {
+      if (e.code !== 'EEXIST') die(`pidge: bridge — can't create the lock at ${file}: ${e.message}`, 2);
+      const cur = readBridgeLock(file);
+      if (cur && pidAlive(cur.pid))
+        die(`pidge: bridge — REFUSED: another consumer already holds this channel (pid ${cur.pid}${cur.label ? `, "${cur.label}"` : ''}, since ${cur.started_at || '?'}). One consumer per channel — a second bridge/listen double-consumes (#59). Stop it first, or read with \`pidge catchup\` (read-only). Lock: ${file}`, 2);
+      // Stale lock: the pid is gone (a crashed bridge never releases — that's
+      // WHY the lock stores a pid) or the file is garbage. Remove and retry the
+      // exclusive create ONCE — if another starter wins that race we EEXIST
+      // again and refuse above.
+      console.error(`pidge: bridge — recovered a STALE lock (pid ${cur ? cur.pid : '?'} is gone; crashed bridge / power loss). Taking over.`);
+      try { fs.unlinkSync(file); } catch { /* already gone */ }
+      continue;
+    }
+    // Paranoia re-read: in the stale-takeover window a concurrent starter can
+    // unlink OUR fresh lock and create its own (our write went to the unlinked
+    // inode). Whoever the file names now is the holder; if it isn't us, back off.
+    const now = readBridgeLock(file);
+    if (!now || now.pid !== process.pid)
+      die(`pidge: bridge — lost the lock race to pid ${now ? now.pid : '?'} — refusing to double-consume.`, 2);
+    return file;
+  }
+  die('pidge: bridge — couldn\'t acquire the lock (raced twice); try again.', 2);
+}
+function releaseBridgeLock(file) {
+  // Remove only OUR lock: after a crash + takeover the file may name another pid.
+  const cur = readBridgeLock(file);
+  if (cur && cur.pid !== process.pid) return;
+  try { fs.unlinkSync(file); } catch { /* best-effort */ }
+}
+
+// #59 §4: a LOCAL alert for the two "only a human can fix this" failures (401 —
+// rotated key? — and a channel with no healthy round-trip). We can't pidge —
+// that's exactly what's broken — so local is all there is: the stderr line is
+// the alert of record (launchd/systemd capture it in the log), and a desktop
+// notification is attempted best-effort. PIDGE_BRIDGE_ALERT=0 disables the
+// desktop part (test/ops hook — tests must not pop notifications).
+function localAlert(title, msg) {
+  console.error(`pidge: bridge — 🔔 LOCAL ALERT: ${title} — ${msg}`);
+  if (process.env.PIDGE_BRIDGE_ALERT === '0') return;
+  try {
+    const { spawn } = require('node:child_process');
+    const [cmd, args] = process.platform === 'darwin'
+      ? ['osascript', ['-e', `display notification ${JSON.stringify(msg)} with title ${JSON.stringify(`pidge bridge: ${title}`)}`]]
+      : ['notify-send', [`pidge bridge: ${title}`, msg]];
+    spawn(cmd, args, { stdio: 'ignore', detached: true }).unref();
+  } catch { /* the stderr line above is the alert of record */ }
+}
+
+async function runBridge() {
+  const handlerCmd = v.exec;
+  if (!handlerCmd)
+    die('pidge: bridge needs --exec \'<handler command>\' — invoked ONCE per batch with the batch JSON on stdin; exit 0 acks the batch, non-zero leaves it for the server lease to re-serve. E.g.: pidge bridge --exec \'claude -p "handle this pidge batch"\'', 1);
+  const { spawn } = require('node:child_process');
+
+  // NO orphan watchdog here, deliberately (§3c is for `listen`): the bridge is
+  // MEANT to outlive its launcher (nohup, a closed terminal, launchd) — its
+  // lifecycle belongs to the supervisor and the lock, not to the parent pid.
+  const lockFile = acquireBridgeLock();
+  let lockReleased = false;
+  const releaseOnce = () => { if (!lockReleased) { lockReleased = true; releaseBridgeLock(lockFile); } };
+  process.on('exit', releaseOnce);
+
+  // Pacing knobs. The env overrides are test/ops hooks, not documented knobs.
+  const intervalS = numStrict(v.interval, '--interval', 5);
+  const BACKOFF_BASE_MS = parseInt(process.env.PIDGE_BRIDGE_BACKOFF_BASE || '', 10) || 2000;
+  const BACKOFF_MAX_MS = parseInt(process.env.PIDGE_BRIDGE_BACKOFF_MAX || '', 10) || 120000;
+  const BACKOFF_LONG_MS = parseInt(process.env.PIDGE_BRIDGE_BACKOFF_LONG || '', 10) || 300000;
+  const BROKEN_AFTER = 5;
+  // Jitter EVERY retry sleep (issue #59 §4): N bridges restarting after the
+  // same server deploy must not stampede back in lockstep.
+  const jitter = (ms) => Math.round(ms * (0.75 + Math.random() * 0.5));
+
+  let shuttingDown = false;
+  let currentChild = null;
+  let wake = null; // resolves the current sleep early (realtime frame / shutdown)
+  const sleepInterruptible = (ms) => new Promise((resolve) => {
+    const t = setTimeout(() => { wake = null; resolve(); }, ms);
+    wake = () => { clearTimeout(t); wake = null; resolve(); };
+  });
+
+  // Hard case: SIGTERM/SIGINT must be CLEAN — forward the signal to an
+  // in-flight handler, NEVER ack the in-flight batch (the lease re-serves it;
+  // at-least-once is the contract, the handler must tolerate a replay), release
+  // the lock, exit 0. The `shuttingDown` flag also closes the handler-exit→ack
+  // race: an ack decision reached after the signal is refused even when the
+  // handler finished 0 — acking during teardown could stamp "processed" on work
+  // whose own side effects (the handler's sends) were cut short.
+  const shutdown = (sig) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error(`pidge: bridge — ${sig}: shutting down cleanly. An in-flight batch is NOT acked (the server lease re-serves it).`);
+    const finish = () => { releaseOnce(); process.exit(0); };
+    if (currentChild && currentChild.exitCode === null && currentChild.signalCode === null) {
+      try { currentChild.kill('SIGTERM'); } catch { /* already gone */ }
+      const hardKill = setTimeout(() => { try { currentChild.kill('SIGKILL'); } catch { /* gone */ } finish(); }, 5000);
+      if (hardKill.unref) hardKill.unref();
+      currentChild.once('exit', () => { clearTimeout(hardKill); finish(); });
+    } else {
+      if (wake) wake(); // not strictly needed (finish exits) — but never leave a sleep dangling
+      finish();
+    }
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
+  console.error(`pidge: bridge — up (pid ${process.pid}, lock ${path.basename(lockFile)}) · handler: ${handlerCmd}`);
+  console.error('pidge: bridge — ONE handler invocation per batch, batch JSON on stdin; exit 0 = acked, non-zero = re-served by the server lease (make the handler idempotent).');
+
+  // Boot: narrate reach + declare listen_mode=external_daemon when it isn't
+  // already (the honest advisory — a bridge IS an external daemon, #59 §5).
+  // Best-effort by design: a 401 at boot does NOT kill the process (a daemon
+  // that dies on 401 just flap-restarts under launchd/systemd — the loop below
+  // owns the narrate + long-backoff treatment).
+  try {
+    const who = await fetchWhoami();
+    if (who.res.status === 200 && who.data.channel) {
+      console.error(`pidge: bridge — canal "${who.data.channel.name}" · ${who.data.devices ?? '?'} device(s)`);
+      warnStalePriorClaim(who.data); // #61: the boot warning
+      const oc = who.data.operating_contract || {};
+      if (!(oc.listen_mode && oc.listen_mode.value === 'external_daemon')) {
+        v['listen-mode'] = 'external_daemon';
+        await declareOperatingContract(BASE, TOKEN, who.data.channel.id);
+      }
+    }
+  } catch (e) {
+    console.error(`pidge: bridge — boot whoami failed (network: ${e.message}) — the loop keeps trying`);
+  }
+  if (shuttingDown) return;
+
+  // Realtime (#118) as PRESENCE + EARLY WAKE only: a frame cuts the current
+  // idle/backoff sleep short and the human sees "ouvindo agora"; every batch
+  // still comes from the durable long-poll GET (a dropped socket costs latency,
+  // never data — the existing WS→long-poll degrade, with long-poll as floor).
+  if (wantRealtime()) {
+    let announced = false;
+    const connectWs = (channel) => {
+      if (shuttingDown) return;
+      const sub = cableSubscribe({
+        channel,
+        onUp: () => {
+          if (!announced) { announced = true; console.error('pidge: bridge — realtime socket up (the human sees "ouvindo agora"); the long-poll stays the data path'); }
+          if (wake) wake();
+        },
+        onFrame: () => { if (wake) wake(); },
+        onDown: () => {
+          const t = setTimeout(() => connectWs(channel), jitter(15000));
+          if (t.unref) t.unref();
+        },
+      });
+      if (!sub && !announced) {
+        announced = true;
+        console.error('pidge: bridge — no realtime socket — the long-poll floor carries the loop (same contract, less instant)');
+      }
+    };
+    connectWs('ConversationChannel');
+    connectWs('InboxChannel'); // --all semantics: notification answers too (#131)
+  }
+
+  let firstBatch = true;      // #59 §6: history_hint rides the first batch post-restart
+  let transportFails = 0;     // consecutive network/5xx failures
+  let handlerFails = 0;       // consecutive non-zero handler exits
+  let alerted401 = false;     // ONE local alert per outage, not one per retry
+  let alertedBroken = false;
+
+  const ackUpTo = async (upTo, count) => {
+    try {
+      const res = await fetchT(`${BASE}/api/v1/messages/ack`, {
+        method: 'POST', headers, body: JSON.stringify({ up_to: upTo }),
+      });
+      if (res.status >= 200 && res.status < 300) {
+        console.error(`pidge: bridge — acked ${count} message(s) up to id ${upTo} (green ✓✓)`);
+        return true;
+      }
+      console.error(`pidge: bridge — WARNING: ack failed (${res.status}) — the batch re-serves after the lease; the handler will see it again`);
+    } catch (e) {
+      console.error(`pidge: bridge — WARNING: ack failed (network: ${e.message}) — the batch re-serves after the lease`);
+    }
+    return false;
+  };
+
+  for (;;) {
+    if (shuttingDown) return;
+    let res = null, data = null, failWhat = null;
+    const waitS = 25;
+    const askedAt = Date.now();
+    try {
+      const qs = new URLSearchParams({ all: 'true', wait: String(waitS) });
+      res = await fetchT(`${BASE}/api/v1/messages?${qs}`, { headers }, (waitS + 10) * 1000);
+      await checkManifestNews(res);
+    } catch (e) {
+      failWhat = `network: ${e.message}`;
+    }
+    if (shuttingDown) return;
+
+    if (res && res.status === 200) {
+      data = await res.json().catch(() => null);
+      if (data === null) failWhat = 'unparseable 200 body';
+    } else if (res && res.status === 401) {
+      // #59 §4: a 401 must not die silent NOR re-loop blind — narrate, alert
+      // locally ONCE per outage, retry with LONG jittered backoff. The key may
+      // have been rotated; only the human can fix that.
+      if (!alerted401) {
+        alerted401 = true;
+        localAlert('key rejected (401)', `the server rejected the channel key — probably ROTATED. The bridge is deaf until a human re-onboards (\`pidge setup --claim <code>\`). Retrying every ~${Math.round(BACKOFF_LONG_MS / 1000)}s.`);
+      } else {
+        console.error(`pidge: bridge — still 401 (rotated key?) — next retry in ~${Math.round(BACKOFF_LONG_MS / 1000)}s`);
+      }
+      await sleepInterruptible(jitter(BACKOFF_LONG_MS));
+      continue;
+    } else if (res) {
+      failWhat = `listen error ${res.status}`;
+    }
+
+    if (failWhat) {
+      transportFails++;
+      // The exit-4 class (a channel with NO healthy round-trip) becomes, in a
+      // daemon, "local alert + LONG backoff" — never a blind hot re-loop and
+      // never a silent death (#59 §4).
+      if (transportFails >= BROKEN_AFTER) {
+        if (!alertedBroken) {
+          alertedBroken = true;
+          localAlert('channel looks broken', `${transportFails} consecutive failures reaching ${BASE} (latest: ${failWhat}) — server or network, not the human. The bridge keeps retrying with long backoff.`);
+        }
+        await sleepInterruptible(jitter(BACKOFF_MAX_MS));
+      } else {
+        console.error(`pidge: bridge — ${failWhat} (${transportFails} consecutive) — backing off`);
+        await sleepInterruptible(jitter(Math.min(BACKOFF_BASE_MS * 2 ** (transportFails - 1), BACKOFF_MAX_MS)));
+      }
+      continue;
+    }
+
+    // A healthy round-trip: narrate recovery once, reset the failure ledgers.
+    if (transportFails > 0 || alerted401 || alertedBroken) {
+      console.error(`pidge: bridge — channel recovered${transportFails ? ` after ${transportFails} consecutive failure(s)` : ''}`);
+      transportFails = 0; alerted401 = false; alertedBroken = false;
+    }
+    warnStalePriorClaim(data); // #61: server v63 serves the flag on this GET too
+
+    const msgs = Array.isArray(data.messages) ? data.messages : [];
+    if (msgs.length === 0) {
+      // The long-poll hold IS the pacing; only a fast empty return sleeps (a
+      // server that doesn't hold ?wait= must not become a hot loop).
+      if (Date.now() - askedAt < 2000) await sleepInterruptible(jitter(intervalS * 1000));
+      continue;
+    }
+
+    // ONE handler invocation per batch — the whole tick as JSON on stdin.
+    // Sealed rows are opened BEFORE the handler sees them (same path as listen).
+    const opened = await Promise.all(msgs.map(e2eOpenMessageRow));
+    const ids = opened.map((m) => Number(m.id)).filter(Number.isInteger);
+    const upTo = ids.length ? Math.max(...ids) : null;
+    const batch = { messages: opened, ...(firstBatch ? { history_hint: true } : {}) };
+    console.error(`pidge: bridge — batch of ${opened.length} message(s) → handler${firstBatch ? ' (history_hint: first batch since this bridge started — the handler may want `pidge catchup` to situate)' : ''}`);
+    const t0 = Date.now();
+    const outcome = await new Promise((resolve) => {
+      let child;
+      try {
+        child = spawn(handlerCmd, { shell: true, stdio: ['pipe', 'inherit', 'inherit'] });
+      } catch (e) { return resolve({ code: null, error: e.message }); }
+      currentChild = child;
+      child.on('error', (e) => { currentChild = null; resolve({ code: null, error: e.message }); });
+      child.on('exit', (code, signal) => { currentChild = null; resolve({ code, signal }); });
+      // EPIPE guard: a handler may exit without reading stdin — its exit code
+      // still decides the batch; the write failure itself is not a verdict.
+      child.stdin.on('error', () => {});
+      child.stdin.end(JSON.stringify(batch) + '\n');
+    });
+    // Hard case: the handler-exit → ack race. A signal that landed while the
+    // handler ran (or right as it exited) means shutdown() is tearing us down —
+    // do NOT ack: the batch stays leased and re-serves. A duplicate delivery
+    // beats a batch stamped "processed" during a teardown.
+    if (shuttingDown) return;
+    const secs = Math.round((Date.now() - t0) / 1000);
+    if (outcome.code === 0) {
+      handlerFails = 0;
+      if (upTo === null) {
+        console.error('pidge: bridge — WARNING: batch had no numeric ids — nothing to ack (server bug?)');
+      } else if (await ackUpTo(upTo, opened.length)) {
+        // Only a DELIVERED + ACKED first batch retires the hint: if the ack
+        // failed, the re-served batch is still effectively "first post-restart".
+        firstBatch = false;
+      }
+    } else {
+      handlerFails++;
+      const why = outcome.error ? `couldn't run (${outcome.error})`
+        : outcome.signal ? `killed by ${outcome.signal}` : `exit ${outcome.code}`;
+      console.error(`pidge: bridge — handler ${why} after ${secs}s — batch NOT acked (the server lease re-serves it in ~10 min; ${handlerFails} consecutive handler failure(s))`);
+      // Backoff BEFORE the next poll: fresh arrivals would re-invoke a handler
+      // that's evidently broken — escalate so a dead handler doesn't burn one
+      // LLM call per message. Jittered like every other sleep.
+      await sleepInterruptible(jitter(Math.min(BACKOFF_BASE_MS * 2 ** (handlerFails - 1), BACKOFF_MAX_MS)));
+    }
+  }
+}
+
+// #59 §5: `pidge bridge install` — write the launchd (Mac) / systemd (Linux)
+// TEMPLATE that runs the bridge under the OS supervisor with Restart=on-failure
+// semantics, and declare listen_mode=external_daemon (advisory). The template
+// NEVER embeds the key — it stays in ~/.config/pidge/env (#57 hygiene); only
+// the non-secret env (PIDGE_URL/PIDGE_AGENT/XDG_CONFIG_HOME) rides along.
+function xmlEscape(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+// systemd unit-file quoting: double quotes with backslash escapes.
+function systemdQuote(s) { return '"' + String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'; }
+
+async function runBridgeInstall() {
+  const handlerCmd = v.exec;
+  if (!handlerCmd) die('pidge: bridge install needs --exec \'<handler>\' — the exact command the daemon will run once per batch', 1);
+  // PIDGE_BRIDGE_PLATFORM: test hook so BOTH templates are exercised on any OS.
+  const platform = process.env.PIDGE_BRIDGE_PLATFORM || process.platform;
+  const nodeBin = process.execPath;
+  const cli = __filename;
+  const nameSuffix = AGENT_ID ? `.${AGENT_ID}` : '';
+  const envPairs = {};
+  if (process.env.PIDGE_URL) envPairs.PIDGE_URL = process.env.PIDGE_URL;
+  if (process.env.PIDGE_AGENT) envPairs.PIDGE_AGENT = process.env.PIDGE_AGENT;
+  if (process.env.XDG_CONFIG_HOME) envPairs.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
+
+  if (!FILE_ENV.PIDGE_TOKEN && (process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN))
+    console.error(`pidge: bridge install — WARNING: your key lives ONLY in this shell's env; the daemon won't inherit it (the template NEVER embeds secrets). Put it in the config file first — re-run \`pidge setup --claim <code>\`, or write PIDGE_TOKEN=… to ${CONFIG_FILE} yourself (chmod 600).`);
+  // An npx-cache CLI path is EPHEMERAL (npx prunes its cache) — a template
+  // pointing into it dies on the next prune. Warn; the human should install
+  // globally (npm i -g pidge-cli) and re-run so the template survives.
+  if (/[\\/]_npx[\\/]/.test(cli))
+    console.error('pidge: bridge install — WARNING: this CLI is running from the npx CACHE — the generated template points into it and BREAKS when npx prunes. Install it durably first (npm i -g pidge-cli) and re-run `pidge bridge install`.');
+
+  let file, enable;
+  if (platform === 'darwin') {
+    const label = `sh.pidge.bridge${nameSuffix}`;
+    const envBlock = Object.keys(envPairs).length
+      ? `  <key>EnvironmentVariables</key>\n  <dict>\n${Object.entries(envPairs).map(([k, val]) => `    <key>${xmlEscape(k)}</key><string>${xmlEscape(val)}</string>`).join('\n')}\n  </dict>\n`
+      : '';
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- generated by \`pidge bridge install\` (#59). A TEMPLATE: review, then
+     launchctl load -w <this file>
+     The channel key stays in ~/.config/pidge/env — NEVER embedded here. -->
+<dict>
+  <key>Label</key><string>${xmlEscape(label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${xmlEscape(nodeBin)}</string>
+    <string>${xmlEscape(cli)}</string>
+    <string>bridge</string>
+    <string>--exec</string>
+    <string>${xmlEscape(handlerCmd)}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <!-- Restart=on-failure: a clean exit 0 (SIGTERM shutdown / launchctl unload) stays down -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+${envBlock}  <key>StandardOutPath</key><string>${xmlEscape(path.join(CONFIG_DIR, 'bridge.log'))}</string>
+  <key>StandardErrorPath</key><string>${xmlEscape(path.join(CONFIG_DIR, 'bridge.err.log'))}</string>
+</dict>
+</plist>
+`;
+    const dir = path.join(os.homedir(), 'Library', 'LaunchAgents');
+    fs.mkdirSync(dir, { recursive: true });
+    file = path.join(dir, `${label}.plist`);
+    fs.writeFileSync(file, plist);
+    enable = `launchctl load -w "${file}"`;
+  } else {
+    const name = `pidge-bridge${nameSuffix}.service`;
+    const envLines = Object.entries(envPairs).map(([k, val]) => `Environment=${systemdQuote(`${k}=${val}`)}`).join('\n');
+    const unit = `# generated by \`pidge bridge install\` (#59). A TEMPLATE: review, then
+#   systemctl --user daemon-reload && systemctl --user enable --now ${name}
+# The channel key stays in ~/.config/pidge/env — NEVER embedded here.
+[Unit]
+Description=pidge bridge — supervised Pidge consumer (one handler invocation per batch)
+After=network-online.target
+
+[Service]
+ExecStart=${systemdQuote(nodeBin)} ${systemdQuote(cli)} bridge --exec ${systemdQuote(handlerCmd)}
+Restart=on-failure
+RestartSec=10
+${envLines ? envLines + '\n' : ''}StandardOutput=append:${path.join(CONFIG_DIR, 'bridge.log')}
+StandardError=append:${path.join(CONFIG_DIR, 'bridge.err.log')}
+
+[Install]
+WantedBy=default.target
+`;
+    const dir = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'systemd', 'user');
+    fs.mkdirSync(dir, { recursive: true });
+    file = path.join(dir, name);
+    fs.writeFileSync(file, unit);
+    enable = `systemctl --user daemon-reload && systemctl --user enable --now ${name}`;
+  }
+  console.error(`pidge: bridge install — template written to ${file} (Restart=on-failure semantics; logs → ${path.join(CONFIG_DIR, 'bridge.log')})`);
+  console.error(`pidge: enable it with:  ${enable}`);
+
+  // Declare listen_mode=external_daemon (ADVISORY, honest — the "same instance
+  // forever" gotcha the human should see). Best-effort like setup's declaration.
+  let declared = null;
+  try {
+    const who = await fetchWhoami();
+    if (who.res.status === 200 && who.data.channel) {
+      v['listen-mode'] = 'external_daemon';
+      declared = await declareOperatingContract(BASE, TOKEN, who.data.channel.id);
+    } else {
+      console.error(`pidge: bridge install — couldn't declare listen_mode=external_daemon (whoami ${who.res.status}); do it later: pidge contract set listen_mode=external_daemon`);
+    }
+  } catch (e) {
+    console.error(`pidge: bridge install — couldn't declare listen_mode=external_daemon (network: ${e.message}); do it later: pidge contract set listen_mode=external_daemon`);
+  }
+  console.log(JSON.stringify({
+    ok: true, file, platform: platform === 'darwin' ? 'launchd' : 'systemd',
+    listen_mode_declared: declared === 'external_daemon',
+  }, null, 2));
+  process.exit(0);
+}
+
 // selftest (#205): prove the listener works by ROUND-TRIP, not prose. Fire a nonce
 // onto our own queue, run the listener (long-poll floor — the reachability path) for
 // the window, ack the nonce, then read the server's verdict. PASS = it round-tripped
@@ -2674,6 +3182,10 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   // #182 device-reach honesty (gotcha #9) + #181 ownership — shared with whoami.
   const unreachable = reportDeviceReach(data);
   reportClaimMismatch(data);
+  // #61: SHOUT on a stale prior-claim backlog (advisory tone — the anchor has
+  // known false ±, pidge#294). Warning only, never exit 2: the messages are
+  // real and drainable; the human/agent decides what they're worth.
+  warnStalePriorClaim(data, 'Run `pidge catchup` (read-only) to see them before any listen/ack.');
   // E2E (E2-CLI): validate PIDGE_SECRET when present (32 bytes after base64url;
   // kf = base64url(SHA-256(key)[0..3])) and cross-check it against the channel:
   //   e2e_enabled + no secret   → sends go CLEAR-and-marked; point at the app's Connect-screen terminal step
@@ -3362,6 +3874,17 @@ ${SKILL_END_MARKER}
       await runContract();
       break;
     }
+    case 'bridge': {
+      // #59: the 1st-class supervisor. `bridge install` writes the launchd/
+      // systemd template; bare `bridge --exec` runs the loop (forever — its
+      // lifecycle belongs to the OS supervisor / the human, not a timeout).
+      const sub = parsed.positionals[1];
+      if (sub === 'install') { await runBridgeInstall(); break; }
+      if (sub !== undefined)
+        die("pidge: usage: pidge bridge --exec '<handler>'  |  pidge bridge install --exec '<handler>'", 1);
+      await runBridge();
+      break;
+    }
     case 'selftest': {
       // #205: prove reachability by round-trip. Fire a nonce, run the listener,
       // confirm it picks it up + acks in time. PASS exit 0 / FAIL exit 2.
@@ -3446,6 +3969,9 @@ ${SKILL_END_MARKER}
       await checkManifestNews(res);
       if (!(res.status >= 200 && res.status < 300))
         die(`pidge: catchup failed (${res.status}): ${JSON.stringify(data)}`, 2);
+      // #61: note the flag when the history carries it — the reader is looking
+      // at the very rows the warning is about.
+      warnStalePriorClaim(data, 'They are included in the thread below — note which predate you before acting on them.');
       // Open sealed rows locally (E2E history is ciphertext on the wire) — same path
       // listen uses; on a channel with no secret / clear rows this is a passthrough.
       const rows = Array.isArray(data.messages) ? data.messages : [];
@@ -3487,6 +4013,13 @@ ${SKILL_END_MARKER}
       // ANSWERS (kind notification_reply, with a self-contained ref), so a
       // fire-and-forget notify can't lose its reply. Without --all the original
       // composer-only contract stands (no double-consumption for ask/wait users).
+      // #59: refuse to double-consume a channel a RUNNING bridge owns (the lock
+      // is pid-checked — a stale lock from a crashed bridge never blocks a
+      // listen). Local-machine advisory by construction, which is exactly the
+      // incident it exists for; `catchup` stays the read path.
+      const bridgeHolder = bridgeLockHolder();
+      if (bridgeHolder)
+        die(`pidge: listen REFUSED — a running \`pidge bridge\` (pid ${bridgeHolder.pid}${bridgeHolder.label ? `, "${bridgeHolder.label}"` : ''}) is this channel's consumer; a second consumer double-consumes (#59). Read with \`pidge catchup\` (read-only), or stop the bridge first.`, 2);
       installOrphanWatchdog(); // §3c: a killed-parent orphan exits instead of eating the queue
       // #39: strict — same class as wait/ask/approve: a NaN deadline never ends
       const timeout = numStrict(v.timeout, '--timeout', 600);
@@ -3594,7 +4127,9 @@ ${SKILL_END_MARKER}
             await checkManifestNews(res);
             if (res.status === 200) {
               health.ok();
-              const msgs = (await res.json().catch(() => ({}))).messages || [];
+              const data = await res.json().catch(() => ({}));
+              warnStalePriorClaim(data); // #61: session-header warning, once
+              const msgs = data.messages || [];
               if (msgs.length) {
                 if (!v.follow) finish('got-messages');
                 await printAndAck(msgs);
@@ -3654,6 +4189,7 @@ ${SKILL_END_MARKER}
           if (res.status === 200) {
             health.ok();
             const data = await res.json().catch(() => ({}));
+            warnStalePriorClaim(data); // #61: session-header warning, once
             const msgs = data.messages || [];
             if (msgs.length) await printAndAck(msgs);
           } else if (res.status >= 500) {

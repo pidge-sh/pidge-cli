@@ -39,6 +39,11 @@ function createMock() {
     liveWrites: [],          // every {method, path, body} the CLI sent
     liveCards: {},           // cid → true (existence drives started|updated + PATCH 404)
     liveDegrade: false,      // a test forces the dedicated-budget degrade echo
+    // #59 bridge: a test forces a non-200 on GET /messages (401 = rotated key).
+    messagesStatus: 200,
+    // #61: server v63 serves stale_from_prior_claim (top-level) on the
+    // channel-key GET /messages and on whoami — a test flips it true.
+    staleFromPriorClaim: false,
   };
   let server = null;
   let wss = null;
@@ -100,6 +105,7 @@ function createMock() {
         claim: state.claim,                                  // #181
         devices: state.devices ?? 1,
         device_reach: state.deviceReach,                     // #182 (null unless a test sets it)
+        stale_from_prior_claim: state.staleFromPriorClaim,   // #61 (server v63)
         manifest_version: 16,
       });
     }
@@ -159,6 +165,10 @@ function createMock() {
     if (req.method === 'GET' && url.pathname === '/api/v1/messages') {
       // #58: record every read so a test can assert catchup's query (history/all).
       state.messageReads.push(req.url);
+      // #59: a test forces a 401 (rotated key) / 5xx — the bridge must narrate,
+      // alert locally and back off LONG, never a blind hot loop.
+      if (state.messagesStatus && state.messagesStatus !== 200)
+        return json(res, state.messagesStatus, { error: 'unauthorized' });
       // #131: notification_reply rows are served only on the unified queue.
       const all = url.searchParams.get('all') === 'true';
       // #58: history=true is the READ-ONLY thread read (server never consumes/stamps
@@ -167,7 +177,7 @@ function createMock() {
       // NEVER POSTs an ack (state.acks stays empty).
       const rows = all ? state.messages
         : state.messages.filter((m) => !m.kind || m.kind === 'message');
-      return json(res, 200, { messages: rows });
+      return json(res, 200, { messages: rows, stale_from_prior_claim: state.staleFromPriorClaim });
     }
     if (req.method === 'POST' && url.pathname === '/api/v1/messages/ack') {
       let body = '';
