@@ -22,6 +22,7 @@ function createMock() {
     ackBodies: [], // #51: the parsed ack payloads, so tests can assert up_to/ids exactly
     notifies: [],
     uploads: [],
+    blobs: {},             // #367: name → Buffer, served at GET /blobs/<name>
     claimCode: 'claim-ok',   // #110: POST /api/v1/claim exchanges this once
     devices: 1,
     // #181 ownership + #182 contract/device_reach surfaces (v27).
@@ -90,7 +91,9 @@ function createMock() {
       return json(res, 200, {
         // E2E (E2-CLI): e2e_enabled mirrors prod whoami — the ONLY signal that
         // turns the CLI's send-side sealing on (a test flips state.e2eEnabled).
-        channel: { id: 1, name: 'mock', icon: 'bot', color: 'violet', e2e_enabled: !!state.e2eEnabled },
+        channel: { id: 1, name: 'mock', icon: 'bot', color: 'violet', e2e_enabled: !!state.e2eEnabled,
+                   // #367 media gate: a test flips state.e2eMediaReady.
+                   e2e_media_ready: !!state.e2eMediaReady },
         operating_contract: state.operatingContract,         // #182
         user: { name: 'Thiago', timezone: 'America/Sao_Paulo' },
         claim: state.claim,                                  // #181
@@ -179,16 +182,33 @@ function createMock() {
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/v1/uploads') {
-      // Just record THAT an upload arrived (the CLI's #313 pin must refuse
-      // BEFORE any bytes reach here — cross-audit HIGH). Body is multipart; we
-      // only need the count, not the parse.
-      let n = 0;
-      req.on('data', (c) => { n += c.length; });
+      // Record THE upload (the CLI's #313 pin must refuse BEFORE any bytes
+      // reach here — cross-audit HIGH). #367 also captures the multipart's
+      // filename + the file part's raw bytes, so sealed-media tests prove WHAT
+      // left the machine (sealed framing + generic blob.bin, never plaintext +
+      // the real name). Naive single-part extraction — the CLI sends one part.
+      const chunks = [];
+      req.on('data', (c) => { chunks.push(c); });
       req.on('end', () => {
-        state.uploads.push({ bytes: n });
+        const raw = Buffer.concat(chunks);
+        const fnMatch = /filename="([^"]*)"/.exec(raw.toString('latin1'));
+        let fileBytes = null;
+        const sep = raw.indexOf('\r\n\r\n');
+        const tail = raw.lastIndexOf('\r\n--');
+        if (sep !== -1 && tail > sep) fileBytes = raw.subarray(sep + 4, tail);
+        state.uploads.push({ bytes: raw.length, filename: fnMatch ? fnMatch[1] : null, fileBytes });
         json(res, 201, { ref: 'upload-ref-mock' });
       });
       return;
+    }
+    // #367: attachment blob download (the signed-URL stand-in). A test parks
+    // bytes in state.blobs['a1'] and points a message's attachment.url at
+    // '/blobs/a1' (relative — the CLI prefixes its BASE).
+    if (req.method === 'GET' && url.pathname.startsWith('/blobs/')) {
+      const blob = state.blobs[url.pathname.slice('/blobs/'.length)];
+      if (!blob) { res.writeHead(404, { 'content-type': 'application/json' }); return res.end('{}'); }
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      return res.end(blob);
     }
     // cli#47 / pidge#284: the three Live Activity endpoints (LA v2 shapes).
     const laEnd = url.pathname.match(/^\/api\/v1\/live_activities\/([^/]+)\/end$/);

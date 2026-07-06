@@ -1,0 +1,343 @@
+'use strict';
+// #367 F1 (pidge) — sealed media, both directions, against the mock server.
+// Contract: pidge docs/media-e2e-spec.md + manifest v62.
+//   send: gate CLOSED ⇒ clear media of always; gate OPEN ⇒ blob sealed BEFORE
+//         upload (generic blob.bin), filename an envelope, media_enc:"v1";
+//         media pin refuses a downgrade PRE-upload; URL --image refused sealed.
+//   receive: a sealed attachment is downloaded + unsealed to a local path with
+//         a SANITIZED name; failures are precise and never write ciphertext.
+// The pure AAD-separation gate (cross-slot/cross-direction replay must fail
+// the tag) is here too — it's the spec's §2 property.
+const { test } = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+const { createMock } = require('./mock-server');
+
+const CLI = path.join(__dirname, '..', 'bin', 'pidge.js');
+const e2e = require(CLI);
+
+const FIXTURE = JSON.parse(fs.readFileSync(path.join(__dirname, 'e2e_vectors.json'), 'utf8'));
+const KEY = Buffer.from(FIXTURE.key_b64url, 'base64url');
+const SECRET = FIXTURE.key_b64url;
+
+const CHANNEL_ID = 1;
+const aad = (cid, field) => e2e.e2eAad(CHANNEL_ID, cid, field);
+
+function runCli(args, port, env = {}, xdg = null) {
+  const child = spawn(process.execPath, [CLI, ...args], {
+    env: {
+      ...process.env,
+      PIDGE_URL: `http://127.0.0.1:${port}`,
+      PIDGE_TOKEN: 'hld_test',
+      PIDGE_SECRET: '',
+      XDG_CONFIG_HOME: xdg || fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-test-')),
+      ...env,
+    },
+  });
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+function tmpFile(name, bytes) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-media-'));
+  const p = path.join(dir, name);
+  fs.writeFileSync(p, bytes);
+  return p;
+}
+
+// --- pure: the AAD registry (spec §2) — direction+slot separation ------------
+
+test('blob AAD: a sealed blob opens ONLY in the exact slot it was sealed for', () => {
+  const plain = Buffer.from('the-photo-bytes');
+  const sealed = e2e.e2eEncryptBlob(KEY, aad('cid-1', 'image_blob'), plain);
+  // the right slot opens…
+  assert.deepEqual(e2e.e2eDecryptBlob(KEY, aad('cid-1', 'image_blob'), sealed), plain);
+  // …every replay class fails the tag:
+  for (const [why, badAad] of [
+    ['image↔file swap', aad('cid-1', 'file_blob')],
+    ['cross-direction (late-reply reuses the cid — the #367 attack)', aad('cid-1', 'message_blob')],
+    ['cross-notification', aad('cid-2', 'image_blob')],
+    ['cross-channel', e2e.e2eAad(2, 'cid-1', 'image_blob')],
+  ]) {
+    assert.throws(() => e2e.e2eDecryptBlob(KEY, badAad, sealed), /failed to authenticate/, why);
+  }
+});
+
+test('filename AAD: notification "filename" and message "message_filename" never swap', () => {
+  const env1 = e2e.e2eEncryptField(KEY, aad('cid-9', 'filename'), 'relatorio.xlsx');
+  assert.equal(e2e.e2eDecryptField(KEY, aad('cid-9', 'filename'), env1), 'relatorio.xlsx');
+  assert.throws(() => e2e.e2eDecryptField(KEY, aad('cid-9', 'message_filename'), env1), /failed to authenticate/);
+});
+
+// --- pure: the gate decision + filename hygiene -------------------------------
+
+test('e2eMediaSealDecision: ready drives it, overrides win, no context = never', () => {
+  const d = e2e.e2eMediaSealDecision;
+  assert.equal(d({ sealingActive: true, ready: true, override: null }), true);
+  assert.equal(d({ sealingActive: true, ready: false, override: null }), false, 'gate closed = clear');
+  assert.equal(d({ sealingActive: true, ready: false, override: 'on' }), true, 'PIDGE_E2E_MEDIA=on forces');
+  assert.equal(d({ sealingActive: true, ready: true, override: 'off' }), false, 'PIDGE_E2E_MEDIA=off wins');
+  assert.equal(d({ sealingActive: false, ready: true, override: null }), false, 'no sealing context = never');
+  assert.equal(d({ sealingActive: false, ready: true, override: 'on' }), false, 'force-on still needs the secret+E2E');
+});
+
+test('sanitizeAttachmentName: traversal, separators, dot-leading, garbage', () => {
+  const s = e2e.sanitizeAttachmentName;
+  assert.equal(s('foto.png'), 'foto.png');
+  assert.equal(s('../../etc/passwd'), 'passwd');
+  assert.equal(s('a/b/c.txt'), 'c.txt');
+  assert.equal(s('C:\\evil\\x.exe'), 'x.exe');
+  assert.equal(s('.hidden'), 'hidden');
+  assert.equal(s('..'), null);
+  assert.equal(s(''), null);
+  assert.equal(s(null), null);
+  assert.equal(s('a'.repeat(300)).length, 255);
+});
+
+// --- SEND: the deploy gate ----------------------------------------------------
+
+test('gate CLOSED (e2e on, media not ready): media rides CLEAR with the real filename; no media_enc', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.e2eMediaReady = false;
+
+  const file = tmpFile('relatorio.xlsx', Buffer.from('plain-file-bytes'));
+  const { code, stderr } = await runCli(['message', '--title', 'doc', '--file', file], port, { PIDGE_SECRET: SECRET });
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const up = mock.state.uploads[0];
+  assert.equal(up.filename, 'relatorio.xlsx', 'clear media keeps the real multipart name');
+  assert.deepEqual(up.fileBytes, Buffer.from('plain-file-bytes'), 'clear media uploads plaintext (the path of always)');
+  const sent = mock.state.notifies[0];
+  assert.equal(sent.media_enc, undefined, 'no media_enc while the gate is closed');
+  assert.equal(sent.filename, undefined);
+  assert.match(stderr, /media BYTES and filename ride CLEAR/, 'the closed gate is narrated');
+});
+
+test('gate OPEN: blob sealed BEFORE upload (generic blob.bin), filename an envelope, media_enc:"v1" — full round-trip', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.e2eMediaReady = true;
+
+  const plain = Buffer.from('the-secret-spreadsheet-bytes');
+  const file = tmpFile('relatorio.xlsx', plain);
+  const { code, stderr } = await runCli(['message', '--title', 'doc', '--file', file], port, { PIDGE_SECRET: SECRET });
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const up = mock.state.uploads[0];
+  assert.equal(up.filename, 'blob.bin', 'a sealed upload NEVER carries the real name');
+  assert.equal(up.fileBytes[0], 0x01, 'the uploaded bytes wear the sealed framing');
+  assert.ok(!up.fileBytes.includes(plain), 'plaintext must not leave the machine');
+
+  const sent = mock.state.notifies[0];
+  assert.equal(sent.media_enc, 'v1');
+  assert.equal(sent.enc, 'v1');
+  assert.ok(sent.correlation_id, 'cid minted client-side BEFORE sealing');
+  // the uploaded blob opens with the file_blob AAD anchored on the SENT cid…
+  assert.deepEqual(e2e.e2eDecryptBlob(KEY, aad(sent.correlation_id, 'file_blob'), up.fileBytes), plain);
+  // …and the real filename rides as a "filename" envelope on the notify.
+  assert.equal(e2e.e2eDecryptField(KEY, aad(sent.correlation_id, 'filename'), sent.filename), 'relatorio.xlsx');
+  assert.match(stderr, /media bytes \+ filename sealed/);
+});
+
+test('gate OPEN + --image local: sealed with the image_blob AAD (slot-distinct from file_blob)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.e2eMediaReady = true;
+
+  const plain = Buffer.from('png-bytes-here');
+  const img = tmpFile('chart.png', plain);
+  const { code, stderr } = await runCli(['message', '--title', 'img', '--image', img], port, { PIDGE_SECRET: SECRET });
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const sent = mock.state.notifies[0];
+  assert.equal(sent.media_enc, 'v1');
+  assert.equal(sent.filename, undefined, 'an image has no filename to seal');
+  assert.deepEqual(e2e.e2eDecryptBlob(KEY, aad(sent.correlation_id, 'image_blob'), mock.state.uploads[0].fileBytes), plain);
+});
+
+test('gate OPEN + a URL --image: REFUSED exit 2 BEFORE any upload (a mixed media_enc send would break the phone)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.e2eMediaReady = true;
+
+  const { code, stderr } = await runCli(
+    ['message', '--title', 'img', '--image', 'https://example.com/chart.png'],
+    port, { PIDGE_SECRET: SECRET });
+  await mock.stop();
+
+  assert.equal(code, 2, `stderr: ${stderr}`);
+  assert.match(stderr, /cannot ride a SEALED-media send/);
+  assert.equal(mock.state.uploads.length, 0);
+  assert.equal(mock.state.notifies.length, 0);
+});
+
+test('PIDGE_E2E_MEDIA=on forces sealing even with the gate closed (pre-iOS testing)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.e2eMediaReady = false;
+
+  const file = tmpFile('x.bin', Buffer.from('forced'));
+  const { code, stderr } = await runCli(['message', '--title', 'f', '--file', file], port,
+    { PIDGE_SECRET: SECRET, PIDGE_E2E_MEDIA: 'on' });
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.equal(mock.state.notifies[0].media_enc, 'v1');
+  assert.equal(mock.state.uploads[0].filename, 'blob.bin');
+});
+
+// --- SEND: the media pin (the #313 latch, extended) ----------------------------
+
+test('media pin: a confirmed sealed-media send LATCHES; a later "gate closed" server answer is refused PRE-upload; PIDGE_E2E_MEDIA=off unpins', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.e2eMediaReady = true;
+  // ONE config dir across the three runs — the pin lives in its state.json.
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-pin-'));
+
+  // 1. sealed-media send → latches the media pin.
+  const file = tmpFile('a.bin', Buffer.from('aaa'));
+  let r = await runCli(['message', '--title', 'a', '--file', file], port, { PIDGE_SECRET: SECRET }, xdg);
+  assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+  assert.match(r.stderr, /PINNED as SEALED-MEDIA/);
+
+  // 2. the server now claims the gate closed — the pinned channel REFUSES, before upload.
+  mock.state.e2eMediaReady = false;
+  const uploadsBefore = mock.state.uploads.length;
+  r = await runCli(['message', '--title', 'b', '--file', file], port, { PIDGE_SECRET: SECRET }, xdg);
+  assert.equal(r.code, 2, `stderr: ${r.stderr}`);
+  assert.match(r.stderr, /REFUSING to send CLEAR MEDIA/);
+  assert.equal(mock.state.uploads.length, uploadsBefore, 'the refusal fires BEFORE any bytes upload');
+
+  // 3. the human's local unpin lets the clear-media send through (text still seals).
+  r = await runCli(['message', '--title', 'c', '--file', file], port,
+    { PIDGE_SECRET: SECRET, PIDGE_E2E_MEDIA: 'off' }, xdg);
+  await mock.stop();
+  assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+  const sent = mock.state.notifies.at(-1);
+  assert.equal(sent.media_enc, undefined, 'unpinned send goes clear-media');
+  assert.equal(sent.enc, 'v1', 'the TEXT sealing is untouched by the media unpin');
+});
+
+// --- RECEIVE: inbound attachments ----------------------------------------------
+
+function sealedAttachmentRow(mock, { id = 40, cid = 'cid-att-1', name = 'foto.png', bytes = Buffer.from('jpeg-bytes') } = {}) {
+  mock.state.blobs.a1 = e2e.e2eEncryptBlob(KEY, aad(cid, 'message_blob'), bytes);
+  return {
+    id, channel_id: CHANNEL_ID, kind: 'message', created_at: 'x',
+    body: '', enc: 'v1', kf: FIXTURE.kf, correlation_id: cid,
+    attachment: {
+      filename: e2e.e2eEncryptField(KEY, aad(cid, 'message_filename'), name),
+      content_type: 'application/octet-stream', byte_size: mock.state.blobs.a1.length,
+      url: '/blobs/a1', enc: 'v1',
+    },
+  };
+}
+
+test('listen: a SEALED attachment is downloaded + unsealed to a local path; filename decrypted; empty body stays ""', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-dl-'));
+  const plain = Buffer.from('jpeg-bytes-of-the-photo');
+  mock.state.messages = [sealedAttachmentRow(mock, { bytes: plain })];
+
+  const { code, stdout, stderr } = await runCli(
+    ['listen', '--no-realtime', '--timeout', '20', '--interval', '1'],
+    port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const row = JSON.parse(stdout)[0];
+  assert.equal(row.body, '', 'an attachment-only message keeps its empty body');
+  assert.equal(row.attachment.filename, 'foto.png', 'the real name, decrypted');
+  assert.ok(row.attachment.path, 'the plaintext file path rides the JSON');
+  assert.ok(row.attachment.path.includes(`${path.sep}40${path.sep}`), 'namespaced by message id');
+  assert.deepEqual(fs.readFileSync(row.attachment.path), plain, 'the file on disk is the PLAINTEXT');
+  assert.equal(row.attachment.enc, undefined, 'opened = no enc flag left');
+  assert.equal(row.e2e, 'decrypted');
+});
+
+test('listen: a traversal filename in a sealed attachment is SANITIZED before touching disk', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-trav-'));
+  mock.state.messages = [sealedAttachmentRow(mock, { name: '../../../evil.sh' })];
+
+  const { code, stdout, stderr } = await runCli(
+    ['listen', '--no-realtime', '--timeout', '20', '--interval', '1'],
+    port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const row = JSON.parse(stdout)[0];
+  assert.equal(path.basename(row.attachment.path), 'evil.sh');
+  assert.ok(row.attachment.path.startsWith(path.join(xdg, 'pidge', 'downloads')),
+    `must stay INSIDE the downloads dir, got ${row.attachment.path}`);
+});
+
+test('listen: kf mismatch on a sealed attachment ⇒ precise e2e_error, NOTHING written to disk', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-kf-'));
+  const row = sealedAttachmentRow(mock);
+  row.kf = FIXTURE.wrong_key_kf; // sealed with another key
+  mock.state.messages = [row];
+
+  const { code, stdout, stderr } = await runCli(
+    ['listen', '--no-realtime', '--timeout', '20', '--interval', '1'],
+    port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const out = JSON.parse(stdout)[0];
+  assert.match(out.e2e_error, /ANOTHER key/);
+  assert.equal(out.attachment.path, undefined);
+  assert.ok(!fs.existsSync(path.join(xdg, 'pidge', 'downloads')), 'no downloads dir, no file');
+});
+
+test('listen: a CLEAR attachment passes through with its url; --download saves it too', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-clear-'));
+  const plain = Buffer.from('clear-csv-bytes');
+  mock.state.blobs.c1 = plain;
+  const row = {
+    id: 41, channel_id: CHANNEL_ID, kind: 'message', created_at: 'x', body: 'segue o csv',
+    attachment: { filename: 'dados.csv', content_type: 'text/csv', byte_size: plain.length, url: '/blobs/c1' },
+  };
+  mock.state.messages = [row];
+
+  // without --download: url passthrough only.
+  let r = await runCli(['listen', '--no-realtime', '--timeout', '20', '--interval', '1'], port, {}, xdg);
+  assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+  let out = JSON.parse(r.stdout)[0];
+  assert.equal(out.attachment.filename, 'dados.csv');
+  assert.equal(out.attachment.path, undefined, 'clear = no auto-download');
+
+  // with --download: saved + path in the JSON.
+  mock.state.messages = [row]; // the ack cleared the queue — re-arm
+  r = await runCli(['listen', '--no-realtime', '--timeout', '20', '--interval', '1', '--download'], port, {}, xdg);
+  await mock.stop();
+  assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+  out = JSON.parse(r.stdout)[0];
+  assert.ok(out.attachment.path);
+  assert.deepEqual(fs.readFileSync(out.attachment.path), plain);
+});
