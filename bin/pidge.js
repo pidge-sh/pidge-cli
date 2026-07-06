@@ -755,7 +755,7 @@ const HELP = {
   skill: {
     summary: 'write the generated Pidge skill from the live manifest (persistent Pidge knowledge for an AI agent).',
     usage: 'pidge skill install [--target claude|agents|gemini]',
-    body: 'Content is the same for every target — only the destination changes: --target claude (default) → .claude/skills/pidge/SKILL.md (a Claude Code skill) · --target agents → AGENTS.md · --target gemini → GEMINI.md (both at the repo root). An existing file whose content differs is backed up to <dest>.bak first.',
+    body: 'Content is the same for every target — only the destination changes: --target claude (default) → .claude/skills/pidge/SKILL.md (a Claude Code skill) · --target agents → AGENTS.md · --target gemini → GEMINI.md (both at the repo root). An existing file whose content differs is backed up to <dest>.bak (or <dest>.bak.<timestamp> if that is taken) first. NOTE: only the claude target SELF-HEALS — any pidge command silently refreshes a stale .claude skill, but AGENTS.md/GEMINI.md do NOT auto-update; re-run `pidge skill install --target agents|gemini` yourself to refresh them.',
     opts: ['target'],
   },
   catchup: {
@@ -835,7 +835,9 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
-const KNOWN_MANIFEST_VERSION = 62;
+// v63 (server #380/#294 P0.2′): ack attribution — acked_by_label/handler_summary on
+// history rows (catchup narrates them) + stale_from_prior_claim. See `pidge catchup`.
+const KNOWN_MANIFEST_VERSION = 63;
 // #280: the hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
@@ -852,7 +854,9 @@ const KNOWN_MANIFEST_VERSION = 62;
 // Bumped to 7 in 0.21.0 (#58): the spine now teaches `pidge catchup` (the read-only
 // situational read) + the one-consumer-per-channel rule (situate with catchup, NEVER
 // listen on a channel another runtime consumes).
-const SKILL_REVISION = 7;
+// Bumped to 8 in 0.21.0 (PR #60 cross-audit): the multi-runtime section is now the
+// VERBATIM prose from issue #58 (EN title, the listen_mode heuristic, "Only then speak").
+const SKILL_REVISION = 8;
 // #38: the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -2943,7 +2947,7 @@ Every send is **a TYPE + a markdown body + an OPTIONAL response**. The TYPE (one
 | A thing with a known TIME | \`pidge event --event-at <ISO8601>\` |
 | A live status you'll keep updating | Live Activity endpoints (see **Live progress** below) |
 | WAKE them now — rare, real, <1/day | \`pidge urgent\` |
-| Coming up on a channel ANOTHER runtime consumes — situate first | \`pidge catchup\` (read-only; NEVER \`listen\`) |
+| Waking up where a bridge/daemon may already consume the channel | \`pidge catchup\` first (read-only; NEVER \`listen\`) |
 
 ⭐ \`important\` is the default. On the fence between informing and asking, pick \`important\`. \`message\` is only for a true no-action FYI. (\`fyi\`/\`report\`/\`ask\`/\`alert\` still work as silent aliases → message/important/important/urgent.) Run \`pidge <type> --help\` for each one's flags.
 
@@ -3081,32 +3085,22 @@ ${notes.map((n) => `- ${n}`).join('\n')}
   on stderr at send time) or \`pidge listen --all\` (replies + messages). Park the cid, never re-send.
 - ${exits}
 
-## Subindo numa sessão interativa (situate yourself FIRST)
+## Waking up in an interactive session (multi-runtime channels)
 
-**One consumer per channel.** A Pidge channel's inbound queue is served ONCE: whoever
-reads a message with \`listen\` (or \`ack\`) CONSUMES it — a delivered stamp, a visibility
-lease, and eventually a green ✓✓. If a **24/7 bridge/daemon is the channel's consumer**
-(it runs \`listen\` in a loop), then a second runtime that also runs \`listen\` **steals
-messages out from under it** (double-consume) — the classic incident: an interactive
-session woke on a bridged channel, ran \`listen\`, and offered to redo work the bridge had
-already handled, because it had no way to see the thread without consuming it.
+Your channel may already have a LIVE consumer — an always-on bridge or daemon (\`listen_mode: persistent\` or \`external_daemon\` in the channel contract). To the human, you and that consumer are ONE assistant. So before you offer any work in a fresh interactive session:
 
-So, when you come up on a channel that ANOTHER runtime consumes:
-1. **\`pidge catchup\`** — a READ-ONLY peek at the whole conversation (\`GET ?history=true\`):
-   the thread newest-first, answers included, **NEVER consumed, NEVER acked, no lease.**
-   Run it to learn what's already been said and handled before you offer anything.
-   \`\`\`bash
-   pidge catchup                 # the whole thread, newest first (safe to repeat)
-   pidge catchup --limit 20      # just the latest 20
-   pidge catchup --before 480    # page further back (older than message id 480)
-   \`\`\`
-   Exit \`0\` = printed (even the empty \`{"messages":[]}\`) · \`2\` = error. No wait, no exit 3/4.
-2. **NEVER run \`listen\` on a channel whose consumer is another runtime** — that
-   double-consumes. \`catchup\` reads without stealing; \`listen\`/\`ack\` are for the SINGLE
-   consumer only. If you're not sure whether you're the consumer, \`catchup\` is always safe.
+1. **Run \`pidge catchup\` first.** It prints the channel's full thread read-only — the human's messages, their answers to notifications, and what was already handled. It never consumes and never steals from the live consumer, so it is always safe.
+2. **Never run \`pidge listen\` when another runtime is the consumer.** One channel has exactly ONE consumer. A second listener double-consumes: you steal messages the bridge was supposed to handle, and the human sees work done twice or not at all.
+3. **Only then speak.** The human may have already asked the bridge for the thing you are about to offer — the catchup is how you know.
 
-If YOU are the sole consumer of the channel (the common single-agent case), \`listen\`/\`ack\`
-as usual — \`catchup\` is still handy to re-read context you already consumed.
+**The rule: one channel = one consumer. Reads are free (\`catchup\`, \`pidge wait <cid>\`); the consume loop (\`listen\`/\`ack\`) belongs to exactly one process.**
+
+\`\`\`bash
+pidge catchup                 # the whole thread, newest first (safe to repeat)
+pidge catchup --limit 20      # just the newest 20 (enforced client-side)
+pidge catchup --before 480    # page further back (older than message id 480)
+\`\`\`
+When the server carries ack attribution (v63+), a processed row also narrates \`handled by <who>: <what>\` on stderr — so you SEE what the other consumer already did, not just that a message exists.
 
 ## Stay "always-on" while you're turn-based
 
@@ -3126,12 +3120,22 @@ ${SKILL_END_MARKER}
   // #38: never clobber silently — the installed skill may have been customized.
   // When the file being replaced differs from what we're writing, keep the old
   // content as <dest>.bak and say so in one stderr line.
-  const bak = `${file}.bak`;
   let previous = null;
   try { previous = fs.readFileSync(file, 'utf8'); } catch { /* no existing file */ }
   if (previous !== null && previous !== skill) {
+    // #58 cross-audit (PR #60): NEVER clobber an existing .bak. The FIRST install
+    // to a shared target (agents/gemini) parks the user's ORIGINAL file (e.g. their
+    // hand-written AGENTS.md) at <dest>.bak; a later re-install whose generated
+    // content changed would otherwise overwrite that .bak with our now-stale skill,
+    // destroying the only copy of their work. If .bak is taken, use a timestamped
+    // sibling so every prior version survives. (Date is fine here — the CLI process,
+    // not a workflow script.)
+    let bak = `${file}.bak`;
+    if (fs.existsSync(bak)) bak = `${file}.bak.${Date.now()}`;
     fs.writeFileSync(bak, previous);
-    console.error(`pidge: the previous SKILL.md differed from the regenerated one — saved to ${bak}`);
+    // #58 cross-audit: name the ACTUAL destination file, not a hardcoded "SKILL.md"
+    // (a --target agents/gemini install writes AGENTS.md/GEMINI.md).
+    console.error(`pidge: the previous ${path.basename(file)} differed from the regenerated one — saved to ${bak}`);
   }
   // #38: ATOMIC replace — write a per-process tmp, then rename. A killed process or
   // a full disk leaves the OLD skill intact instead of a torn file whose surviving
@@ -3419,7 +3423,18 @@ ${SKILL_END_MARKER}
       // --all is default-ON for catchup (the situational read WANTS the answers to
       // earlier notifications, not just composer messages) — always request them.
       qs.set('all', 'true');
-      if (v.limit !== undefined) qs.set('limit', v.limit);
+      // #58 cross-audit (PR #60): the server IGNORES `limit` on the ?history=true
+      // path (it always returns the whole thread), so --limit must be enforced
+      // LOCALLY — a slice of the newest N after the sort below. --before IS honored
+      // server-side (older-than paging); we still forward both (harmless if a future
+      // server learns limit), but the local slice is the guarantee, not the query.
+      let catchupLimit = null;
+      if (v.limit !== undefined) {
+        catchupLimit = parseInt(v.limit, 10);
+        if (!Number.isInteger(catchupLimit) || catchupLimit < 1)
+          die(`pidge: --limit must be a positive integer (got ${JSON.stringify(v.limit)})`, 1);
+        qs.set('limit', String(catchupLimit));
+      }
       if (v.before !== undefined) qs.set('before', v.before);
       let res, data;
       try {
@@ -3438,12 +3453,26 @@ ${SKILL_END_MARKER}
       // Newest first (the situational read wants the latest context up top); the
       // server orders history this way already, but sort defensively by id desc.
       opened.sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0));
-      console.log(JSON.stringify({ messages: opened }, null, 2));
-      // TODO(#58 item 4 / server thiagoc77/pidge#380): when the server ships
-      // acked_by/handler_summary on history rows, print "handled by X: <summary>"
-      // per processed line here so the reader sees what the other consumer did.
-      const replies = opened.filter((m) => m.kind === 'notification_reply').length;
-      console.error(`pidge: catchup — ${opened.length} message(s) in the thread${replies ? ` (${replies} answer(s) to earlier notifications)` : ''}, read-only: NOT consumed, NOT acked. This is a peek; it never steals a message from another consumer.`);
+      // #58 cross-audit: enforce --limit locally (server ignores it here) — the
+      // newest N after the sort.
+      const printed = catchupLimit != null ? opened.slice(0, catchupLimit) : opened;
+      console.log(JSON.stringify({ messages: printed }, null, 2));
+      // #58 item 4 (server v63 / #380, now in production): a PROCESSED row carries
+      // acked_by_label + handler_summary — narrate WHO already handled it and WHAT
+      // they did, so the reader sees the other consumer's work instead of re-offering
+      // it (the whole point of catchup). Present-only: rows without the fields (never
+      // acked, or a server older than v63) simply produce no line.
+      for (const m of printed) {
+        if (m.acked_by_label || m.handler_summary) {
+          const who = m.acked_by_label || 'another consumer';
+          const what = m.handler_summary ? `: ${String(m.handler_summary)}` : '';
+          console.error(`pidge: message ${m.id} handled by ${who}${what}`);
+        }
+      }
+      const replies = printed.filter((m) => m.kind === 'notification_reply').length;
+      const clipped = catchupLimit != null && opened.length > printed.length
+        ? ` (newest ${printed.length} of ${opened.length} — --limit; drop it or raise --before to see more)` : '';
+      console.error(`pidge: catchup — ${printed.length} message(s) in the thread${clipped}${replies ? ` · ${replies} answer(s) to earlier notifications` : ''}, read-only: NOT consumed, NOT acked. This is a peek; it never steals a message from another consumer.`);
       process.exit(0);
       break;
     }
