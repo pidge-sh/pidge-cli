@@ -1244,7 +1244,7 @@ test('selftest — a non-numeric --window falls back to the default, never a fal
 // bystander it served went dark for ~60s from every OTHER listen. The fix scopes
 // the read to since=<nonce id − 1> so the pre-existing backlog is excluded by
 // construction, and drops the lease=60 mitigation entirely.
-test('#65: selftest does NOT lease a real pending message (since=nonce-1, no lease=60)', async () => {
+test('#65: selftest excludes the pre-existing backlog from the read (since=nonce-1) — never served, never leased', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.leaseMs = 60000; // model the server visibility lease — a served row goes dark for 60s
@@ -1259,10 +1259,36 @@ test('#65: selftest does NOT lease a real pending message (since=nonce-1, no lea
   const real = mock.state.messages.find((m) => m.id === 42);
   assert.ok(real, 'the real message is still in the queue (never consumed by the selftest)');
   assert.equal(real._leasedUntil, undefined,
-    'the selftest must NEVER open a lease on a real message (the T2 60s blackout)');
+    'the pre-existing backlog (id < nonce) is excluded by since= — never served, never leased');
   const reads = mock.state.messageReads;
   assert.ok(reads.some((u) => /[?&]since=/.test(u)), `the reachability read must carry since=; reads:\n${reads.join('\n')}`);
-  assert.ok(!reads.some((u) => /lease=60/.test(u)), 'the lease=60 mitigation must be gone');
+  await mock.stop();
+});
+
+// PR #66 cross-audit: since= only excludes the PRE-EXISTING backlog. A message with
+// id > nonce (a real arrival during the selftest window) IS served — so lease=60
+// must ride along to cap its blackout at ~60s, never the server's ~10-min default.
+test('#65: a served message with id > nonce gets a ~60s lease (lease=60), never the ~10-min default', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.leaseMs = 600000; // the server's DEFAULT stamp_delivered lease = 10 min
+  // id 200 > the nonce the selftest will mint (selftestSeq starts at 100): since=
+  // does NOT exclude it, so the selftest serves it — and must bound its lease.
+  mock.state.messages = [{ id: 200, kind: 'message', body: 'chegou durante a janela', created_at: 'x' }];
+
+  const t0 = Date.now();
+  const { result } = runCli(['selftest', '--window', '10', '--no-realtime'], port);
+  const { code, stderr } = await result;
+  assert.equal(code, 0, `the selftest itself must still PASS; stderr: ${stderr}`);
+
+  const served = mock.state.messages.find((m) => m.id === 200);
+  assert.ok(served, 'the higher-id message is still in the queue (the selftest acks only the nonce)');
+  assert.ok(served._leasedUntil, 'it WAS served (since= includes id > nonce), so it carries a lease');
+  const leaseFromStart = served._leasedUntil - t0;
+  assert.ok(leaseFromStart < 120000,
+    `lease=60 must cap the blackout (~60s), never the ~10-min default; got ${Math.round(leaseFromStart / 1000)}s`);
+  assert.ok(leaseFromStart >= 55000,
+    `the ~60s lease must actually be applied; got ${Math.round(leaseFromStart / 1000)}s`);
   await mock.stop();
 });
 

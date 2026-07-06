@@ -196,8 +196,13 @@ function createMock() {
       const history = url.searchParams.get('history') === 'true';
       if (state.leaseMs > 0 && !history) {
         const now = Date.now();
+        // PR #66 cross-audit: a `lease=<seconds>` query param OVERRIDES the default
+        // lease (the selftest passes lease=60 to cap the blackout on anything it
+        // serves; the server's stamp_delivered default is the ~10-min state.leaseMs).
+        const leaseParam = url.searchParams.get('lease');
+        const leaseMs = leaseParam && Number.isFinite(Number(leaseParam)) ? Number(leaseParam) * 1000 : state.leaseMs;
         rows = rows.filter((m) => !m._leasedUntil || m._leasedUntil <= now);
-        for (const m of rows) m._leasedUntil = now + state.leaseMs;
+        for (const m of rows) m._leasedUntil = now + leaseMs;
       }
       // strip the internal lease stamp — it must not leak into the served JSON
       return json(res, 200, {

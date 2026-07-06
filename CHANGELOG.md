@@ -18,10 +18,13 @@ Bateria multi-runtime (2026-07-06, 0.22.0 vs server v63) — três achados de at
   de passagem ficava **sob lease por 60s, invisível a qualquer `listen`** nesse intervalo (o
   sintoma: `listen` roda a janela inteira e diz "no message", exit 3, e um segundo `listen`
   imediato acha a mesma mensagem na hora). Agora lê com **`?since=<id do nonce − 1>`** (o POST
-  `/selftest` devolve o id): o backlog real (ids menores) some **por construção**, então nenhum
-  bystander é servido — e o `lease=60` como mitigação **saiu**. O **exit 3 do `listen`** ganhou a
-  dica: "se você esperava uma mensagem, ela pode estar sob lease de outra leitura — `pidge
-  catchup` mostra a fila inteira read-only".
+  `/selftest` devolve o id): o backlog **pré-existente** (ids menores) some por construção. O
+  `lease=60` **fica** como defesa em profundidade (cross-audit do PR #66): uma mensagem real que
+  chega **durante** a janela tem id > nonce, é servida, e sem o `lease=60` ganharia o lease
+  **default de ~10 min** do stamp_delivered (10× pior que o bug original) — o `since=` tira o
+  backlog da leitura, o `lease=60` limita o blackout de qualquer coisa ainda servida a ~60s. O
+  **exit 3 do `listen`** ganhou a dica: "se você esperava uma mensagem, ela pode estar sob lease
+  de outra leitura — `pidge catchup` mostra a fila inteira read-only".
 - **cli#64: o `bridge` captura o summary do handler via MARKER LINE (o "o quê" do server #380).**
   O `ackBatch` do bridge mandava só `{ids}` — o caso central do #380 (sessão sucessora vendo QUEM
   tratou O QUÊ) ficava manco no cenário pra que foi feito (bridge 24/7 → sessão interativa). Agora

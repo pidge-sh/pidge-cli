@@ -3203,11 +3203,17 @@ WantedBy=default.target
 // (the orphan/`&`/transport bugs). Only the nonce is acked (ids:[id]).
 //
 // #65: the reachability read is scoped to `?since=<nonce id − 1>` — the POST
-// /selftest returns the nonce's id, and every REAL pending message has a LOWER id
-// (it was already in the queue when we fired), so it's excluded BY CONSTRUCTION and
-// never served here. That kills the old `lease=60` mitigation (which briefly leased
-// any bystander it served, blacking it out for ~60s from every other listen — T2
-// bug): we no longer touch bystanders at all, so no lease is needed or taken.
+// /selftest returns the nonce's id, and every message in the PRE-EXISTING backlog
+// has a LOWER id (it was already in the queue when we fired), so the backlog is
+// excluded BY CONSTRUCTION and never served/leased here (the T2 blackout bug).
+//
+// `since=` alone is NOT enough, though (PR #66 cross-audit): a real message
+// arriving DURING the window has id > nonce, so it IS served — and if the server
+// stamps it delivered with its DEFAULT lease (~10 min), that's 10× worse than the
+// original 60s bug. The `sinceId=0` fallback (a server that didn't return a numeric
+// id) has the same exposure across the whole backlog. So we KEEP `lease=60` as
+// defence in depth: `since=` removes the backlog from the read entirely, and
+// `lease=60` bounds the blackout on anything still served to ~60s, never ~10 min.
 async function doSelftest() {
   // Guard the parse: a non-numeric --window (e.g. "30s", a typo) must NOT become NaN
   // — that would make the deadline NaN, skip the poll loop entirely, and mis-report a
@@ -3239,9 +3245,11 @@ async function doSelftest() {
     const waitS = Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
     const askedAt = Date.now();
     try {
-      // #65: since=<nonce id − 1> scopes the read to the nonce (+ anything newer),
-      // NOT the real backlog — so no bystander is served, and no lease is taken.
-      const qs = new URLSearchParams({ all: 'true', since: String(sinceId) });
+      // #65: since=<nonce id − 1> keeps the pre-existing backlog out of the read;
+      // lease=60 bounds the blackout on anything still served (a mid-window arrival
+      // with id > nonce, or the whole queue under the sinceId=0 fallback) to ~60s
+      // instead of the server's ~10-min default. Both together (PR #66 cross-audit).
+      const qs = new URLSearchParams({ all: 'true', since: String(sinceId), lease: '60' });
       if (waitS > 0) qs.set('wait', String(waitS));
       const res = await fetchT(`${BASE}/api/v1/messages?${qs}`, { headers }, (waitS + 10) * 1000);
       if (res.status === 200) {
