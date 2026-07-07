@@ -25,6 +25,10 @@ function runCli(args, port, env = {}, cwd = undefined) {
       // Isolate per spawn: state.json (manifest nag, #313 e2e pins) must never
       // touch the REAL ~/.config/pidge — nor leak between tests.
       XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-test-')),
+      // #69: os.homedir() drives the HOME skill self-heal candidate — isolate it
+      // too, so no test ever regenerates the developer's REAL ~/.claude/skills/pidge.
+      // A test that exercises the home heal passes its own HOME via `env`.
+      HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')),
       ...env,
     },
   });
@@ -401,10 +405,10 @@ test('#33 — a 0.15.2 marker-first install self-heals into the fixed in-frontma
   // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
   assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
   assert.ok(!/<!-- pidge-skill rev=/.test(healed), 'the old HTML-comment marker is gone (the #38 end trailer is not it)');
-  assert.match(healed, /\n# pidge-skill rev=9 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=10 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
   assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
   assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 9, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 10, manifest v16\)/, 'one stderr note');
 });
 
 test('#280 — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
@@ -421,17 +425,17 @@ test('#280 — a SPINE bump (SKILL_REVISION > installed) self-heals the local sk
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
-  assert.match(healed, /\n# pidge-skill rev=9 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=10 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 9, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 10, manifest v16\)/, 'one stderr note');
 });
 
 test('#280 — a MANIFEST bump (server version > installed) self-heals the local skill', async () => {
   const mock = createMock();
   const port = await mock.start();
-  // New-format skill, spine current (rev=9) but the baked manifest is stale (15 < the mock's 16).
-  const { dir, file } = seedNewSkill(9, 15, 'STALE BY MANIFEST');
+  // New-format skill, spine current (rev=10) but the baked manifest is stale (15 < the mock's 16).
+  const { dir, file } = seedNewSkill(10, 15, 'STALE BY MANIFEST');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
   const { code, stderr } = await result;
@@ -439,7 +443,7 @@ test('#280 — a MANIFEST bump (server version > installed) self-heals the local
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=9 manifest=16\n/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=10 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
 });
@@ -449,7 +453,7 @@ test('#280 — a FRESH skill (new-format marker current) is left byte-for-byte, 
   const port = await mock.start();
   // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
   // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
-  const { dir, file } = seedNewSkill(9, 16, 'SENTINEL FRESH — keep me');
+  const { dir, file } = seedNewSkill(10, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -476,6 +480,72 @@ test('#280 — NO local skill present: a command runs normally, nothing is auto-
   assert.ok(!/refreshed your local Pidge skill/.test(stderr), 'no refresh note when there is no skill');
 });
 
+// --- #69: the self-heal covers the HOME skill too, not just the cwd project skill ---
+// A live agent (Javier) ran 3 WEEKS on ~/.claude/skills/pidge frozen at rev 6 because
+// ensureSkillFresh only resolved the cwd project path. Old installs live in HOME.
+
+function seedSkillAt(file, rev, body = 'STALE') {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=${rev} manifest=16\n---\n\n# Pidge\n\n${body}\n\n<!-- pidge-skill-end -->\n`);
+}
+
+test('#69 — a STALE home skill self-heals even when there is NO project skill', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homeheal-'));
+  const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
+  seedSkillAt(homeSkill, 6, 'STALE HOME DOCTRINE'); // rev 6 = Javier's real incident
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj-')); // NO project skill here
+
+  const { result } = runCli(['whoami'], port, { HOME: home }, cwd);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const healed = fs.readFileSync(homeSkill, 'utf8');
+  assert.match(healed, /\n# pidge-skill rev=10 manifest=16\n/, 'the home skill was regenerated to the current rev');
+  assert.ok(!/STALE HOME DOCTRINE/.test(healed), 'the stale home doctrine was replaced by a real regeneration');
+  assert.match(stderr, /refreshed your local Pidge skill/, 'the home heal narrated itself');
+});
+
+test('#69 — BOTH project and home skills stale: both heal in one pass; the note names ~/.claude', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homeheal2-'));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-projheal2-'));
+  const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
+  const projSkill = path.join(cwd, '.claude', 'skills', 'pidge', 'SKILL.md');
+  seedSkillAt(homeSkill, 6, 'STALE HOME');
+  seedSkillAt(projSkill, 6, 'STALE PROJECT');
+
+  const { result } = runCli(['whoami'], port, { HOME: home }, cwd);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=10 manifest=16/, 'home healed');
+  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=10 manifest=16/, 'project healed');
+  assert.match(stderr, /2 locations incl\. ~\/\.claude/, 'the note reports BOTH locations were refreshed');
+});
+
+test('#69 — a FRESH home skill is left byte-for-byte (no needless home regeneration)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homefresh-'));
+  const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
+  seedSkillAt(homeSkill, 10, 'SENTINEL HOME — keep me'); // current rev
+  const original = fs.readFileSync(homeSkill, 'utf8');
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj2-'));
+
+  const { result } = runCli(['whoami'], port, { HOME: home }, cwd);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.equal(fs.readFileSync(homeSkill, 'utf8'), original, 'a current home skill must NOT be regenerated');
+  assert.ok(!/refreshed your local Pidge skill/.test(stderr), 'no refresh note when the home skill is fresh');
+});
+
 // --- #38: atomic self-heal — torn writes, concurrency, read-only, prose marker, .bak ---
 
 test('#38 — a TORN write (marker intact, tail truncated) is detected and re-healed', async () => {
@@ -486,7 +556,7 @@ test('#38 — a TORN write (marker intact, tail truncated) is detected and re-he
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A partial write that died after the frontmatter: rev/manifest read as CURRENT, so
   // pre-#38 this file looked "fresh" forever and never healed (proven in the review).
-  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=9 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
+  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=10 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
   const { code, stderr } = await result;
@@ -515,7 +585,7 @@ test('#38 — "pidge-skill" in body PROSE is not the marker: a marker-less skill
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=9 manifest=16\n/, 'a real marker was written by the heal');
+  assert.match(healed, /\n# pidge-skill rev=10 manifest=16\n/, 'a real marker was written by the heal');
   assert.ok(!/rev=99/.test(healed), 'the prose decoy is gone with the regeneration');
 });
 
@@ -533,7 +603,7 @@ test('#38 — 4 concurrent heals never tear the file (atomic tmp+rename)', async
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
   assert.equal((healed.match(/# pidge-skill rev=/g) || []).length, 1, 'exactly ONE marker — no interleaved halves');
-  assert.match(healed, /\n# pidge-skill rev=9 manifest=16\n/, 'a whole, current skill won');
+  assert.match(healed, /\n# pidge-skill rev=10 manifest=16\n/, 'a whole, current skill won');
   assert.match(healed.trimEnd(), /<!-- pidge-skill-end -->$/, 'the trailer closes the file — no torn tail');
   const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
   assert.deepEqual(leftovers, [], 'no tmp litter after concurrent heals');
@@ -1537,6 +1607,30 @@ test('#68/#67 — skill teaches bridge, ack --summary, the PIDGE_AGENT block + t
   assert.match(skill, /mirror the language they use/, 'the human\'s-language guidance is in');
   // #68.5/#67.3 — the turn-based example spans more than one harness
   assert.match(skill, /Claude Code, Codex, Gemini CLI/, 'the turn-based example is no longer a single harness');
+});
+
+// #70 — the session-start ritual in the skill now recommends the O(new) digest read.
+test('#70 — skill recommends `pidge catchup --digest --since <last>` as the session-start read', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-skill70-'));
+
+  const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
+    cwd: dir,
+    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test' },
+  });
+  const out = await new Promise((resolve) => {
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    child.on('exit', (code) => resolve({ code, stdout, stderr }));
+  });
+  await mock.stop();
+
+  assert.equal(out.code, 0, out.stderr);
+  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  assert.match(skill, /pidge catchup --digest --since <last>/, 'the session-start ritual uses the incremental digest read');
+  assert.match(skill, /pidge catchup --digest --since 480/, 'a concrete --since example is shown');
 });
 
 // --- 0.13.0 — template system (#246): type subcommands + skill --------------
@@ -2606,6 +2700,98 @@ test('catchup: a server error exits 2 (not 3/4 — there is no wait)', async () 
 
   assert.equal(code, 2, `stderr: ${stderr}`);
   assert.match(stderr, /catchup failed/);
+});
+
+// #70 — catchup gains an incremental cursor (--since) + a condensed view (--digest).
+// Situate in O(new), not O(whole thread).
+test('#70: catchup --since <id> shows only NEWER rows (client-side) and forwards the query', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [
+    { id: 10, channel_id: 1, kind: 'message', body: 'velha' },
+    { id: 20, channel_id: 1, kind: 'message', body: 'no limiar' },
+    { id: 30, channel_id: 1, kind: 'message', body: 'nova' },
+    { id: 40, channel_id: 1, kind: 'message', body: 'mais nova' },
+  ];
+  const { result } = runCli(['catchup', '--since', '20'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const out = JSON.parse(stdout);
+  assert.deepEqual(out.messages.map((m) => m.id), [40, 30], 'STRICTLY greater than 20, newest first');
+  assert.match(mock.state.messageReads[0], /since=20/, 'the cursor is forwarded to the server too');
+  assert.match(stderr, /2 message\(s\) since id 20/, 'the summary names the cursor');
+});
+
+test('#70: catchup --since is STRICT numeric (a correlation-id-shaped value is exit 1, not a wrong watermark)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { result } = runCli(['catchup', '--since', 'c-9f2e'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 1, `stderr: ${stderr}`);
+  assert.match(stderr, /--since/, 'the usage error names the flag');
+});
+
+test('#70: catchup --digest prints ONE line per message — id · kind · body · handled/PENDING', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [
+    { id: 40, channel_id: 1, kind: 'message', body: 'faz o deploy',
+      acked_by_label: 'bridge-24x7', handler_summary: 'shipped PR #382' },
+    { id: 41, channel_id: 1, kind: 'message', body: 'ainda não tratada' },
+  ];
+  const { result } = runCli(['catchup', '--digest'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  // stdout is the digest (NOT JSON): one line per message, newest first.
+  assert.ok(!/^\s*\{/.test(stdout), 'digest mode does not print raw JSON');
+  const lines = stdout.trim().split('\n');
+  assert.equal(lines.length, 2, 'exactly one line per message');
+  // newest first (id desc): 41 (PENDING) then 40 (attributed).
+  assert.match(lines[0], /^41 · message · ainda não tratada · PENDING$/);
+  assert.match(lines[1], /^40 · message · faz o deploy · handled by bridge-24x7: shipped PR #382$/);
+  // the per-row "handled by" stderr narration is inline in the digest, not doubled on stderr.
+  assert.ok(!/pidge: message 40 handled by/.test(stderr), 'digest carries attribution inline, not on stderr');
+});
+
+test('#70: catchup --digest --since compose (condensed view of only what is new)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [
+    { id: 10, channel_id: 1, kind: 'message', body: 'velha' },
+    { id: 30, channel_id: 1, kind: 'message', body: 'nova' },
+  ];
+  const { result } = runCli(['catchup', '--digest', '--since', '10'], port);
+  const { code, stdout } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0);
+  const lines = stdout.trim().split('\n');
+  assert.equal(lines.length, 1, 'only the row newer than id 10');
+  assert.match(lines[0], /^30 · message · nova · PENDING$/);
+});
+
+test('#70: a SECOND catchup (same config dir) suggests the cursor from the first read', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 55, channel_id: 1, kind: 'message', body: 'oi' }];
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cursor-'));
+
+  // First run records the cursor (highest id = 55); no prior cursor ⇒ no tip.
+  const first = await runCli(['catchup'], port, { XDG_CONFIG_HOME: xdg }).result;
+  assert.equal(first.code, 0, first.stderr);
+  assert.ok(!/tip: your last catchup/.test(first.stderr), 'the first run has no prior cursor to suggest');
+
+  // A newer message arrives; the second run (same dir, no --since) suggests --since 55.
+  mock.state.messages.push({ id: 60, channel_id: 1, kind: 'message', body: 'novidade' });
+  const second = await runCli(['catchup'], port, { XDG_CONFIG_HOME: xdg }).result;
+  await mock.stop();
+  assert.equal(second.code, 0, second.stderr);
+  assert.match(second.stderr, /tip: your last catchup read up to id 55 .* --since 55/, `stderr: ${second.stderr}`);
 });
 
 // ---------------------------------------------------------------------------
