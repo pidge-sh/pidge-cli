@@ -638,7 +638,7 @@ const HELP = {
   hello: {
     summary: 'first-contact WOW (#217): your channel\'s debut handshake, narrated live by a 3-stage Live Activity. send + wait in one.',
     usage: 'pidge hello [options]',
-    body: 'First contact on a fresh channel: send the debut handshake and block until your human confirms. The server narrates a 3-stage Live Activity.',
+    body: 'First contact on a fresh channel: send the debut handshake and block until your human confirms. The server narrates a 3-stage Live Activity. --timeout defaults to 120s (#71); a timeout exits 3 (no confirmation yet — it stays in your queue, `pidge listen --all` collects it), never hanging the session.',
     opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
   },
   // AXIS 1 — the married catalog of 5 (perfis-S1/S2). The TYPE you pick IS how the
@@ -892,7 +892,11 @@ const KNOWN_MANIFEST_VERSION = 63;
 // listen on a channel another runtime consumes).
 // Bumped to 8 in 0.21.0 (PR #60 cross-audit): the multi-runtime section is now the
 // VERBATIM prose from issue #58 (EN title, the listen_mode heuristic, "Only then speak").
-const SKILL_REVISION = 8;
+// Bumped to 9 in 0.23.1 (#68/#67): the spine now teaches `pidge bridge` (the 24/7
+// supervisor) + `ack --summary` attribution, carries the PIDGE_AGENT multi-agent block
+// early, and fixes 3 prose lines (durable-queue framing, human's-language, the
+// turn-based agent examples now span Claude Code/Codex/Gemini CLI, not just one).
+const SKILL_REVISION = 9;
 // #38: the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -3347,6 +3351,13 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   // known false ±, pidge#294). Warning only, never exit 2: the messages are
   // real and drainable; the human/agent decides what they're worth.
   warnStalePriorClaim(data, 'Run `pidge catchup` (read-only) to see them before any listen/ack.');
+  // #71: doctor ALWAYS reports the prior-claim state — a CONFIRMATION on false, not
+  // just a warning on true. "I didn't see the warning" ≠ "there is no orphaned
+  // backlog"; a silent doctor can't confirm health. The warning above covers true;
+  // here we speak the healthy case. Only when the field is EXPLICITLY false (v63+):
+  // an older server that omits it can't confirm either way, so stay silent then.
+  if (data.stale_from_prior_claim === false)
+    console.error('pidge doctor: prior-claim backlog: none ✓ (no un-acked messages predate your ownership claim)');
   // E2E (E2-CLI): validate PIDGE_SECRET when present (32 bytes after base64url;
   // kf = base64url(SHA-256(key)[0..3])) and cross-check it against the channel:
   //   e2e_enabled + no secret   → sends go CLEAR-and-marked; point at the app's Connect-screen terminal step
@@ -3604,6 +3615,8 @@ Generated from manifest v${m.manifest_version} of ${BASE} — re-run \`pidge ski
 
 All commands: \`npx pidge-cli …\` (Node ≥18; reads \`~/.config/pidge/env\` — no token in your context). Not set up? Run \`pidge doctor\`. Onboard with \`pidge setup --claim <code>\` (the human copies the code from the Pidge app), then \`pidge hello\`.
 
+**Many agents on this machine?** Export \`PIDGE_AGENT=<your-id>\` in EVERY session before any pidge command — your config then lives at \`~/.config/pidge/agents/<your-id>/env\` and you can never speak through another agent's channel. Without it, commands use the DEFAULT config (\`~/.config/pidge/env\`), which may be someone else's channel. Never run \`setup --force\`.
+
 ## One breath
 
 Every send is **a TYPE + a markdown body + an OPTIONAL response**. The TYPE (one of five) decides how much it may intrude — the human already configured how each arrives. The RESPONSE (buttons? wait or not?) is a second, orthogonal axis. **There is no content "template" to choose.**
@@ -3687,8 +3700,8 @@ that's a separate \`important\` at the end.
 4. **Typed answer? \`--actions reply\` ALONE** — never a decision + \`reply\` together (the CLI refuses it, exit 1).
 5. **Trust the 201 echo over your intent** — \`degraded\`/\`render_mode\`/\`registered_devices\`. \`registered_devices:0\` ⇒ it went nowhere; ABORT a blocking \`--wait\` on it (kill it, don't let it burn its timeout) and run \`pidge doctor\`.
 6. **Don't spam to signal importance.** Consolidate into one markdown body; use \`--collapse-key\` for self-replacing progress, \`--thread\` only for follow-ups over time.
-7. **Be listening when the answer lands, or you lose it.** Ack only AFTER the work is durably done.
-8. **English only, phone-friendly markdown.** Narrow tables (they render), no emoji-spam.
+7. **Be listening when the answer lands — the queue keeps it safe (at-least-once, nothing is ever lost), but nobody wakes you until something reads it. What you lose is TIME, not the message.** Ack only AFTER the work is durably done.
+8. **Write to your human in THEIR language — mirror the language they use in the channel.** Phone-friendly markdown: narrow tables (they render), no emoji-spam.
 9. **Banner-first + catalog-first.** Give a real \`--body\` (the banner shows title+body, never body-markdown), and fit decisions into a catalog action (\`yes,no\`/\`approve,reject\`) before inventing a custom label (custom = a tap-through, not a banner tap).
 
 ## Gold examples (full commands)
@@ -3777,9 +3790,18 @@ When the server carries ack attribution (v63+), a processed row also narrates \`
 
 ## Stay "always-on" while you're turn-based
 
-A turn-based agent (Claude Code, anything invoked on demand) stays COMMANDABLE without a daemon:
+A turn-based agent (e.g. Claude Code, Codex, Gemini CLI — anything invoked on demand) stays COMMANDABLE without a daemon:
 - **Active session:** \`pidge listen --follow --timeout 300\` holds for 5 min, printing messages as they arrive. \`--follow\` traps the turn — use it only when you intend to sit and wait.
 - **Supervisor poll (24/7):** a cron/systemd timer invokes you every N min; each tick runs ONE one-shot \`pidge listen --all --timeout 50\` (block up to 50s, print, exit 0; exit 3 = nothing this tick — the \`--all\` ear also catches answers to questions you fire-and-forgot), do the work, \`pidge ack --up-to <id>\`, sleep. \`--timeout\` is always SECONDS. Do NOT background \`pidge listen\` with \`&\`.
+- **Ack with attribution:** \`pidge ack --up-to <id> --summary "<what you did>"\` — a successor runtime (or your own next session) reads it in \`pidge catchup\` instead of redoing the work. Make it a habit on every ack.
+
+## The 24/7 supervisor: \`pidge bridge\`
+
+When your human wants you reachable around the clock without a harness session, run the built-in supervisor instead of hand-rolling a loop:
+
+\`pidge bridge --exec '<your handler>'\` — it long-polls the queue, runs your handler ONCE per batch (batch JSON on stdin), and acks the batch's exact ids only when the handler exits 0. A lockfile enforces ONE consumer per channel (a second bridge or \`listen\` is refused). \`pidge bridge install\` writes a launchd/systemd template and declares \`listen_mode: external_daemon\` for you.
+
+Tell the next session WHAT you did: end your handler's output with one line — \`pidge-summary: <one sentence>\` — and the ack carries it; \`pidge catchup\` then shows "handled by <you>: <that sentence>". Full contract: \`pidge bridge --help\`.
 
 ## Full spec
 
@@ -3946,19 +3968,28 @@ ${SKILL_END_MARKER}
       if (v.body === undefined) v.body = 'Tap Done ✓ to confirm you received me — proves the round-trip works.';
       // #39: validate the knobs BEFORE the send — a typo dies here (exit 1) instead
       // of hanging the handshake forever on a NaN deadline.
-      const timeoutArg = numStrict(v.timeout, '--timeout', NaN);
+      // #71: --timeout defaults to 120 s (was the onboarding template's ~3600 s, which
+      // let `hello` pin a fresh session indefinitely — a live agent had to KILL it).
+      // The handshake is durable: a missing confirmation is "not yet", never lost.
+      const timeoutArg = numStrict(v.timeout, '--timeout', 120);
       const intervalArg = numStrict(v.interval, '--interval', 30);
       const cid = v['correlation-id'] || crypto.randomUUID();
       v['correlation-id'] = cid;
       console.error(`pidge: correlation_id=${cid}`);
       const { ok, info } = await doNotify();
       if (!ok) process.exit(2);
-      console.error(`pidge: WOW sent (${info.registered_devices} device(s)) — watch the lock screen narrate the handshake; waiting for your human to confirm on ${cid}`);
-      // No --timeout ⇒ obey the template's suggestion from the 201 echo (onboarding
-      // = 3600 s); explicit --timeout always wins.
-      let timeout = timeoutArg;
-      if (!Number.isFinite(timeout)) timeout = info.suggested_ask_timeout || 3600;
-      await waitForAnswer(cid, { timeout, interval: intervalArg });
+      console.error(`pidge: WOW sent (${info.registered_devices} device(s)) — watch the lock screen narrate the handshake; waiting up to ${timeoutArg}s for your human to confirm on ${cid}`);
+      // #71: a timeout exits 3 NARRATED (mirrors the ask/wait contract) — the
+      // confirmation is safe in the queue; `pidge listen --all` collects it later.
+      await waitForAnswer(cid, {
+        timeout: timeoutArg,
+        interval: intervalArg,
+        onTimeout: () => {
+          const elapsed = Math.round((performance.now() - SESSION_START_MONO) / 1000);
+          console.error(`pidge: no confirmation yet after ${elapsed}s — it stays in your queue (at-least-once, nothing lost); \`pidge listen --all\` picks it up when your human taps. (exit 3 = no answer yet, not a failure)`);
+          process.exit(3);
+        },
+      });
       break;
     }
     case 'ask': {

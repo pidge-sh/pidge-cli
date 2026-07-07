@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.23.1 — 2026-07-06
+
+Feedback de três agentes vivos (Invest/canal 4, Javier/canal 7, Codex/full E2E — 2026-07-06,
+0.23.0): a doutrina da skill estava atrás do CLI e dois comandos de onboarding prendiam a sessão.
+Skill spine → **rev 9** (self-heal propaga sem ação humana).
+
+- **cli#68/#67: a skill ganha `pidge bridge` + `ack --summary`, o bloco multi-agente e 3 fixes de prosa.**
+  A skill instalada (rev 8) tinha **ZERO** ocorrências de `bridge` (o agente cujo ponto de entrada é a
+  skill nunca descobria que o supervisor 24/7 existe) e citava `ack --summary` só pelo efeito, nunca
+  como comando. Agora: uma **seção `## The 24/7 supervisor: pidge bridge`** (--exec, lockfile de 1
+  consumidor, `bridge install`, o marker `pidge-summary:`) depois do bloco always-on; uma **linha
+  `Ack with attribution`** ensinando `ack --up-to <id> --summary "<o que você fez>"` como hábito; e o
+  **bloco multi-agente** (`PIDGE_AGENT=<id>` em TODA sessão, config em `~/.config/pidge/agents/<id>/env`,
+  nunca `setup --force`) logo no topo — num host com N agentes, seguir os exemplos sem `PIDGE_AGENT`
+  fala pelo canal errado (achado do Codex, #67). Prosa: (1) "be listening… or you lose it" → a fila é
+  durável (at-least-once, nada se perde; o que se perde é TEMPO, não a mensagem), (2) "English only" →
+  escreva no idioma do humano, espelhe o canal, (3) o exemplo de agente turn-based agora abrange
+  "Claude Code, Codex, Gemini CLI", não um só.
+- **cli#71: `pidge doctor` SEMPRE reporta o estado do backlog de claim anterior — não só no `true`.**
+  O `doctor` só falava quando `stale_from_prior_claim` era true; no caso saudável (o comum) ficava
+  **silencioso**, e "não vi o warning" ≠ "não há backlog órfão" — um doctor mudo não confirma saúde
+  (Javier D2 + Invest D3, mesmo achado independente). Agora, quando o campo vem explicitamente `false`
+  (server v63+), o doctor imprime **`prior-claim backlog: none ✓`**; o warning do #61 segue cobrindo o
+  `true`. Um server antigo que omite o campo continua silencioso (não dá pra confirmar o que não vem).
+- **cli#71: `pidge hello` ganha `--timeout` (default 120s) com exit 3 narrado — não prende mais a sessão.**
+  O `hello` obedecia a sugestão do template onboarding (~3600s), então uma sessão fresca ficava
+  **presa indefinidamente** esperando a confirmação humana (o Codex teve que MATAR o processo; a
+  confirmação chegou depois via `listen --all`, corretamente). Agora `--timeout` default **120s**
+  (explícito sempre vence) e um timeout **exita 3 narrado** ("sem confirmação ainda — ela fica na sua
+  fila; `pidge listen --all` pega quando seu humano tocar"), espelhando o contrato do `ask`/`wait`.
+
 ## 0.23.0 — 2026-07-06
 
 Bateria multi-runtime (2026-07-06, 0.22.0 vs server v63) — três achados de atribuição/leitura:
