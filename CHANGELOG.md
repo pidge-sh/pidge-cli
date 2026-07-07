@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.24.0 — 2026-07-06
+
+Dois achados dos agentes vivos que atacam a mesma dor — "situar-se sem redundância". Skill spine
+→ **rev 10**.
+
+- **cli#69: o self-heal da skill agora cobre o path HOME (`~/.claude/skills/pidge`), não só o do projeto.**
+  O `ensureSkillFresh` resolvia SÓ o path relativo ao cwd (`.claude/skills/pidge/SKILL.md`), então uma
+  skill instalada no HOME — que o Claude Code também carrega, e que instalações antigas usavam — nunca
+  era visitada. O Javier operou **3 SEMANAS** com a doutrina v26 (rev 6) porque a home skill dele nunca
+  se curou, sem nenhum aviso. Agora o self-heal checa **AMBOS** os paths (projeto + home) numa passada
+  e cura cada cópia obsoleta **no lugar** (nunca cross-escreve). **Escolha: curar em silêncio, não só
+  avisar.** O conteúdo gerado é agnóstico de agente E de projeto (não embute token — só a versão do
+  manifest do servidor + a doutrina fixa), então qualquer projeto regenera a MESMA skill; um usuário
+  multi-servidor no máximo vê o número do manifest oscilar (regeneração best-effort, uma vez por
+  processo, engolida em falha). Um doctor mudo não bastava — o healing silencioso fecha o buraco sem
+  ação humana, que é a promessa do #280. **Cross-audit:** o path HOME só cura arquivo COM o marcador
+  pidge — um `~/.claude/skills/pidge/SKILL.md` sem marcador é AUTORAL e fica intocado (o path de projeto
+  mantém a semântica de curar até sem marcador, já coberta por teste #38).
+- **cli#70: `pidge catchup` ganha `--since <id>` (cursor incremental) + `--digest` (1 linha/msg).**
+  Dois agentes convergiram: o catchup era JSON cru da thread inteira — pra responder "o que rolou desde
+  minha última sessão" o agente puxava O(thread) e olhava no olho. Agora **`--since <id>`** filtra pros
+  ids ESTRITAMENTE maiores (forwarded ao servidor E enforced client-side — O(novos), aceitável ≤200; id
+  STRICT como `--up-to`/`--ids`), e **`--digest`** condensa cada msg em **`id · kind · <60 chars> · handled
+  by X: <summary>` (ou `PENDING`)** — a visão "o que rolou, quem tratou o quê" antes de oferecer trabalho.
+  O catchup lembra o maior id que imprimiu (`state.json`, **keyed por hash(token) — per-CHANNEL, o mesmo
+  keying do pin #313**, pra que o cursor do canal A não vaze pro `--since` sugerido do canal B) e, num run
+  seguinte sem `--since`, **sugere o cursor**; o cursor só AVANÇA (um `--before`, com highest menor, nunca
+  regride). A seção de início de sessão da skill agora recomenda **`pidge catchup --digest --since <last>`**.
+
 ## 0.23.1 — 2026-07-06
 
 Feedback de três agentes vivos (Invest/canal 4, Javier/canal 7, Codex/full E2E — 2026-07-06,
