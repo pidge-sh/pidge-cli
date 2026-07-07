@@ -335,7 +335,8 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
 
   const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
     cwd: dir,
-    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test' },
+    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   const out = await new Promise((resolve) => {
     let stdout = '', stderr = '';
@@ -544,6 +545,29 @@ test('#69 — a FRESH home skill is left byte-for-byte (no needless home regener
   assert.equal(code, 0, `stderr: ${stderr}`);
   assert.equal(fs.readFileSync(homeSkill, 'utf8'), original, 'a current home skill must NOT be regenerated');
   assert.ok(!/refreshed your local Pidge skill/.test(stderr), 'no refresh note when the home skill is fresh');
+});
+
+// #73 cross-audit — the HOME path requires a pidge marker: an unmarked home skill is
+// AUTHORIAL (the human wrote it) and must be left alone. (The project path keeps its
+// heal-a-marker-less-file semantics — covered by the #38 "pidge-skill in body PROSE" test.)
+test('#73 — an AUTHORIAL home skill (no pidge marker) is left untouched by the self-heal', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-authorial-'));
+  const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
+  fs.mkdirSync(path.dirname(homeSkill), { recursive: true });
+  // A hand-written skill named "pidge" with NO pidge-skill marker anywhere.
+  const authored = '---\nname: pidge\ndescription: my own hand-written skill.\n---\n\n# My Pidge notes\n\nhand-written, no marker.\n';
+  fs.writeFileSync(homeSkill, authored);
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj3-'));
+
+  const { result } = runCli(['whoami'], port, { HOME: home }, cwd);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.equal(fs.readFileSync(homeSkill, 'utf8'), authored, 'an unmarked home skill is authorial — never overwritten');
+  assert.ok(!/refreshed your local Pidge skill/.test(stderr), 'no heal note for an authorial home skill');
 });
 
 // --- #38: atomic self-heal — torn writes, concurrency, read-only, prose marker, .bak ---
@@ -1550,7 +1574,8 @@ test('#244 — skill install includes the always-on recipe for turn-based agents
 
   const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
     cwd: dir,
-    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test' },
+    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   const out = await new Promise((resolve) => {
     let stdout = '', stderr = '';
@@ -1578,7 +1603,8 @@ test('#68/#67 — skill teaches bridge, ack --summary, the PIDGE_AGENT block + t
 
   const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
     cwd: dir,
-    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test' },
+    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   const out = await new Promise((resolve) => {
     let stdout = '', stderr = '';
@@ -1617,7 +1643,8 @@ test('#70 — skill recommends `pidge catchup --digest --since <last>` as the se
 
   const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
     cwd: dir,
-    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test' },
+    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   const out = await new Promise((resolve) => {
     let stdout = '', stderr = '';
@@ -1912,7 +1939,8 @@ test('#246 — skill install includes the "Choose the right type" catalog table'
 
   const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
     cwd: dir,
-    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test' },
+    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   const out = await new Promise((resolve) => {
     let stdout = '', stderr = '';
@@ -2794,6 +2822,47 @@ test('#70: a SECOND catchup (same config dir) suggests the cursor from the first
   assert.match(second.stderr, /tip: your last catchup read up to id 55 .* --since 55/, `stderr: ${second.stderr}`);
 });
 
+// #73 cross-audit — the cursor is keyed per CHANNEL (hash(token)), like the #313 pin:
+// two channels from ONE config dir must not cross-contaminate the suggested --since.
+test('#73: the catchup cursor is per-CHANNEL — channel A never suggests its cursor to channel B', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 90, channel_id: 1, kind: 'message', body: 'oi' }];
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-chan-'));
+
+  // Channel A records a cursor at id 90.
+  const a = await runCli(['catchup'], port, { XDG_CONFIG_HOME: xdg, PIDGE_TOKEN: 'hld_channelA' }).result;
+  assert.equal(a.code, 0, a.stderr);
+
+  // Channel B (SAME config dir, DIFFERENT token) sees a newer thread but must NOT be
+  // told to use channel A's cursor — its own slot is empty.
+  mock.state.messages.push({ id: 95, channel_id: 1, kind: 'message', body: 'novidade' });
+  const b = await runCli(['catchup'], port, { XDG_CONFIG_HOME: xdg, PIDGE_TOKEN: 'hld_channelB' }).result;
+  await mock.stop();
+  assert.equal(b.code, 0, b.stderr);
+  assert.ok(!/tip: your last catchup/.test(b.stderr), "channel B has no prior cursor — A's must not leak");
+});
+
+// #73 cross-audit — a --before page (older rows, lower highest id) must NEVER regress
+// the stored cursor; the cursor only ever ADVANCES to the newest id seen.
+test('#73: a later read with a LOWER highest id does NOT regress the stored cursor', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-noregress-'));
+  const statePath = path.join(xdg, 'pidge', 'state.json');
+  const storedId = () => Object.values(JSON.parse(fs.readFileSync(statePath, 'utf8')).catchupLastSeen)[0].id;
+
+  mock.state.messages = [{ id: 100, channel_id: 1, kind: 'message', body: 'nova' }];
+  await runCli(['catchup'], port, { XDG_CONFIG_HOME: xdg }).result;
+  assert.equal(storedId(), 100, 'the first read records the newest id');
+
+  // A subsequent read that only sees an OLDER row (a --before page) must not lower it.
+  mock.state.messages = [{ id: 40, channel_id: 1, kind: 'message', body: 'velha' }];
+  await runCli(['catchup', '--before', '100'], port, { XDG_CONFIG_HOME: xdg }).result;
+  await mock.stop();
+  assert.equal(storedId(), 100, 'the cursor stays at the newest id ever seen, never regressed by a back-page');
+});
+
 // ---------------------------------------------------------------------------
 // #58 — `pidge skill install --target claude|agents|gemini`: same content, the
 // destination changes (a Claude skill vs the AGENTS.md/GEMINI.md root conventions).
@@ -2801,7 +2870,8 @@ test('#70: a SECOND catchup (same config dir) suggests the cursor from the first
 function runSkillInstall(args, port, cwd) {
   const child = spawn(process.execPath, [CLI, 'skill', 'install', ...args], {
     cwd,
-    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test' },
+    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   return new Promise((resolve) => {
     let stdout = '', stderr = '';

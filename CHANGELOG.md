@@ -15,15 +15,19 @@ Dois achados dos agentes vivos que atacam a mesma dor — "situar-se sem redund�
   manifest do servidor + a doutrina fixa), então qualquer projeto regenera a MESMA skill; um usuário
   multi-servidor no máximo vê o número do manifest oscilar (regeneração best-effort, uma vez por
   processo, engolida em falha). Um doctor mudo não bastava — o healing silencioso fecha o buraco sem
-  ação humana, que é a promessa do #280.
+  ação humana, que é a promessa do #280. **Cross-audit:** o path HOME só cura arquivo COM o marcador
+  pidge — um `~/.claude/skills/pidge/SKILL.md` sem marcador é AUTORAL e fica intocado (o path de projeto
+  mantém a semântica de curar até sem marcador, já coberta por teste #38).
 - **cli#70: `pidge catchup` ganha `--since <id>` (cursor incremental) + `--digest` (1 linha/msg).**
   Dois agentes convergiram: o catchup era JSON cru da thread inteira — pra responder "o que rolou desde
   minha última sessão" o agente puxava O(thread) e olhava no olho. Agora **`--since <id>`** filtra pros
   ids ESTRITAMENTE maiores (forwarded ao servidor E enforced client-side — O(novos), aceitável ≤200; id
   STRICT como `--up-to`/`--ids`), e **`--digest`** condensa cada msg em **`id · kind · <60 chars> · handled
   by X: <summary>` (ou `PENDING`)** — a visão "o que rolou, quem tratou o quê" antes de oferecer trabalho.
-  O catchup lembra o maior id que imprimiu (`state.json`) e, num run seguinte sem `--since`, **sugere o
-  cursor**. A seção de início de sessão da skill agora recomenda **`pidge catchup --digest --since <last>`**.
+  O catchup lembra o maior id que imprimiu (`state.json`, **keyed por hash(token) — per-CHANNEL, o mesmo
+  keying do pin #313**, pra que o cursor do canal A não vaze pro `--since` sugerido do canal B) e, num run
+  seguinte sem `--since`, **sugere o cursor**; o cursor só AVANÇA (um `--before`, com highest menor, nunca
+  regride). A seção de início de sessão da skill agora recomenda **`pidge catchup --digest --since <last>`**.
 
 ## 0.23.1 — 2026-07-06
 

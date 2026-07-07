@@ -1009,13 +1009,22 @@ function skillHealCandidates() {
   const rel = path.join('.claude', 'skills', 'pidge', 'SKILL.md');
   const project = path.join(process.cwd(), rel);
   const home = path.join(os.homedir(), rel);
-  return project === home ? [project] : [project, home];
+  // #73 cross-audit: the HOME path requires a pidge MARKER before we touch it — an
+  // unmarked ~/.claude/skills/pidge/SKILL.md is an AUTHORIAL skill (the human wrote
+  // their own), NOT a pidge install gone stale, and must be left alone. The PROJECT
+  // path keeps the current semantics (it heals a marker-less file too, since a project
+  // skill only exists because pidge/onboarding put it there — covered by an existing
+  // #38 test). Deduped when cwd IS home (heal once, and require the marker then).
+  if (project === home) return [{ file: project, requireMarker: true }];
+  return [{ file: project, requireMarker: false }, { file: home, requireMarker: true }];
 }
 
 // True when the skill at `file` EXISTS and is stale (torn tail, older spine rev, or
 // older baked manifest than the server's). A missing file is never stale — the
-// self-heal only REFRESHES an existing skill, it never creates one.
-function skillIsStale(file, serverManifestVersion) {
+// self-heal only REFRESHES an existing skill, it never creates one. When
+// `requireMarker` is set, a file with NO pidge marker is treated as NOT ours (an
+// authorial skill) and left untouched.
+function skillIsStale(file, serverManifestVersion, requireMarker = false) {
   if (!fs.existsSync(file)) return false;
   // #33 fix + #38: the marker rides a `# pidge-skill rev=N manifest=M` YAML comment INSIDE
   // the frontmatter (0.15.3+); pre-0.15.3 installs put `<!-- pidge-skill … -->` as line 1.
@@ -1024,6 +1033,8 @@ function skillIsStale(file, serverManifestVersion) {
   // the marker and suppress a legitimate heal.
   const content = fs.readFileSync(file, 'utf8');
   const markerLine = findSkillMarker(content);
+  // #73: no marker + marker required (the HOME path) ⇒ an authorial skill, not ours.
+  if (requireMarker && !markerLine) return false;
   const revM = markerLine.match(/rev=(\d+)/);
   const manM = markerLine.match(/manifest=(\d+)/);
   const installedRev = revM ? parseInt(revM[1], 10) : 0;
@@ -1045,7 +1056,9 @@ async function ensureSkillFresh(serverManifestVersion) {
     // use: the generated content is agent- AND project-agnostic (it bakes no token —
     // only the server's manifest version + fixed doctrine), so any project's
     // invocation regenerates the SAME skill.
-    const stale = skillHealCandidates().filter((f) => skillIsStale(f, serverManifestVersion));
+    const stale = skillHealCandidates()
+      .filter((c) => skillIsStale(c.file, serverManifestVersion, c.requireMarker))
+      .map((c) => c.file);
     if (stale.length === 0) return;
     skillHealed = true; // latch BEFORE the network write — attempt the heal at most once per process
     let manifestVersion = null;
@@ -1404,8 +1417,16 @@ function e2eOverrideOff() {
 // still find it), and the token itself never lands in state.json. A re-claim
 // rotates the token ⇒ the new token starts unpinned and re-latches on its
 // first confirmed seal (the stale entry is inert).
-function e2ePinKeyFor(token) {
+// The channel key — hash(token), resolvable with ZERO server help and never
+// storing the token itself in state.json. The E2E pin (#313) and the catchup
+// cursor (#70) both key their state.json entries by THIS, for the same reason:
+// one machine can drive two channels from the same config dir, so a per-install
+// (unkeyed) entry would let channel A's state leak into channel B.
+function channelKeyFor(token) {
   return token ? crypto.createHash('sha256').update(String(token)).digest('base64url').slice(0, 12) : null;
+}
+function e2ePinKeyFor(token) {
+  return channelKeyFor(token);
 }
 function e2ePinned() {
   const k = e2ePinKeyFor(TOKEN);
@@ -4224,9 +4245,14 @@ ${SKILL_END_MARKER}
         catchupSince = idStrict(v.since, '--since');
         qs.set('since', String(catchupSince));
       }
-      // #70: the cursor the LAST catchup left (read BEFORE we overwrite it below) — a
-      // no-`--since` run suggests it so the agent can situate in O(new) next time.
-      const priorCursor = v.since === undefined ? (readState().catchupLastSeen || null) : null;
+      // #70: the cursor the LAST catchup left, keyed by CHANNEL (hash(token)) — the
+      // same keying the #313 pin uses, so a catchup on channel A never contaminates
+      // the --since suggested for channel B from the same config dir. Read BEFORE we
+      // overwrite it below; a no-`--since` run suggests it so the agent situates in
+      // O(new) next time.
+      const channelKey = channelKeyFor(TOKEN);
+      const priorCursor = v.since === undefined && channelKey
+        ? ((readState().catchupLastSeen || {})[channelKey] || null) : null;
       let res, data;
       try {
         res = await fetchT(`${BASE}/api/v1/messages?${qs}`, { headers });
@@ -4289,10 +4315,14 @@ ${SKILL_END_MARKER}
           }
         }
       }
-      // #70: remember the highest id seen so a later no-`--since` run can suggest the
-      // cursor. Best-effort (writeState swallows a read-only fs). Date is fine here —
-      // the CLI process, not a workflow script.
-      if (highestId > 0) writeState({ catchupLastSeen: { id: highestId, at: new Date().toISOString() } });
+      // #70: remember the highest id seen (per channel) so a later no-`--since` run
+      // can suggest the cursor. Best-effort (writeState swallows a read-only fs). Date
+      // is fine here — the CLI process, not a workflow script. Only ADVANCE the cursor:
+      // a `--before` page (older rows) has a lower highest and must NOT regress it.
+      const cursors = readState().catchupLastSeen || {};
+      const storedId = (channelKey && cursors[channelKey] && cursors[channelKey].id) || 0;
+      if (channelKey && highestId > storedId)
+        writeState({ catchupLastSeen: { ...cursors, [channelKey]: { id: highestId, at: new Date().toISOString() } } });
       const replies = printed.filter((m) => m.kind === 'notification_reply').length;
       const clipped = catchupLimit != null && fresh.length > printed.length
         ? ` (newest ${printed.length} of ${fresh.length} — --limit; drop it or raise --before to see more)` : '';
