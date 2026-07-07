@@ -35,7 +35,13 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 > **New in v0.15.x** — the local skill **self-heals**: any networked pidge command detects
 > a stale `.claude/skills/pidge/SKILL.md` (CLI spine or server manifest moved) and silently
 > regenerates it, so an onboarded agent's next session is always current (`pidge skill
-> install` still exists for the first write).
+> install` still exists for the first write). **v0.24.0 (#69)** extends the self-heal to the
+> **home** skill (`~/.claude/skills/pidge/SKILL.md`) too — but only files carrying the pidge
+> marker, so an authored skill of your own is never touched. **v0.24.1 (#76):** because of
+> that guard, a **pre-marker** home copy (an old install) won't self-heal and would silently
+> stay on old doctrine — so `pidge doctor` now **flags** an unmarked home skill and, if it's
+> an old pidge copy rather than your own, points you at `cd ~ && npx pidge-cli skill install`
+> (the current file is backed up to `.bak` first). It never writes the file itself.
 >
 > **New in v0.14.0** — the **married vocabulary** (perfis): the CLI now speaks the same
 > language as the server (manifest v42) and the app. **One list of 5 types** —

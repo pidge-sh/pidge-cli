@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.24.1 — 2026-07-07
+
+Round 2 do feedback dos agentes vivos (2026-07-07, 0.24.0) — três correções, uma delas grave
+porque mente na ferramenta anti-redo. Skill spine → **rev 11**.
+
+- **cli#76.1: `catchup --digest` mentia `PENDING` numa mensagem JÁ PROCESSADA (MEDIUM-HIGH — os DOIS
+  agentes acharam independentemente).** O estado da linha vinha SÓ de `handler_summary`/`acked_by_label`
+  (ausentes quando o ack foi sem nota), ignorando `processed_at`: uma msg com `processed_at` mas sem nota
+  imprimia `PENDING` → um sucessor re-fazia trabalho já feito (o incidente que a feature existe pra matar).
+  Agora são **TRÊS estados**: `handled by X: <nota>` (nota presente) · `✓ acked (no note)` (`processed_at`
+  ou label presente, sem nota — feito em silêncio, NÃO é pra refazer) · `PENDING` (de fato não processado).
+- **cli#76.2: o auto-tip do cursor não aparecia.** O gate antigo (só quando existia um cursor anterior E a
+  thread tinha avançado além dele) fazia um canal fresco — ou um canal quieto lido algumas vezes — não
+  imprimir tip NENHUM (o que os agentes viram: ~5 runs sem `--since`, zero tip). Não era gate por TTY (já
+  era stderr), era a condição. Agora **todo run sem `--since` que viu mensagens imprime o cursor no stderr**
+  (o stdout — JSON ou digest — fica limpo), apontando pro id mais alto atual (`--since <highest>` = só o que
+  chegar depois).
+- **cli#76.3: `pidge doctor` avisa quando `~/.claude/skills/pidge/SKILL.md` existe SEM o marcador pidge.**
+  Resíduo do cli#69: uma skill pré-marcador no home é (corretamente) NÃO tocada pelo self-heal — mas aí o
+  agente segue em doutrina velha sem saber. doctor não pode curar (pode ser autoral), mas agora **DIZ**:
+  aponta o arquivo e sugere `cd ~ && npx pidge-cli skill install` (a atual vai pra `.bak`); nunca escreve.
+
 ## 0.24.0 — 2026-07-06
 
 Dois achados dos agentes vivos que atacam a mesma dor — "situar-se sem redundância". Skill spine

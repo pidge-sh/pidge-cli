@@ -576,7 +576,7 @@ const OPTION_DOCS = {
   limit: '--limit N                cap the number of rows',
   before: '--before ID              catchup: page the thread OLDER than this message id (walk back through history)',
   since: '--since ID               catchup: incremental cursor — only messages NEWER than this id (O(new), not O(thread))',
-  digest: '--digest                 catchup: one condensed line per message (id · kind · 60 chars · handled by X / PENDING)',
+  digest: '--digest                 catchup: one condensed line per message (id · kind · 60 chars · handled by X: <note> / ✓ acked (no note) / PENDING)',
   target: '--target T               skill install: claude (default) → .claude/skills/pidge/SKILL.md · agents → AGENTS.md · gemini → GEMINI.md',
   claim: '--claim CODE             the single-use setup code (the human copies it from the Pidge app)',
   'url-base': '--url BASE               the Pidge server base URL (default https://pidge.sh)',
@@ -806,7 +806,7 @@ const HELP = {
       '',
       'Run it to SITUATE yourself at the start of an interactive session on a channel whose messages another runtime (a 24/7 bridge/daemon) is the real consumer of: you learn what has already been said and handled WITHOUT stealing a message out of that consumer\'s queue. The rule is one consumer per channel — if another runtime consumes this channel, use `catchup` to read and NEVER run `listen` (that would double-consume).',
       '',
-      '#70: `--since <id>` is an incremental cursor — only messages with an id GREATER than <id> (situate in O(new), not O(whole thread)). It is enforced client-side too, so it holds regardless of server support. catchup remembers the highest id it printed and, on a later no-`--since` run, suggests the cursor to use. `--digest` collapses each message to ONE line — `id · kind · <60 chars> · handled by X: <summary>` (or `PENDING`) — the condensed view for "what happened, who handled what" before you offer work. The two compose: `pidge catchup --digest --since <last>`.',
+      '#70: `--since <id>` is an incremental cursor — only messages with an id GREATER than <id> (situate in O(new), not O(whole thread)). It is enforced client-side too, so it holds regardless of server support. catchup remembers the highest id it printed and, on EVERY no-`--since` run, prints the cursor on stderr (stdout stays clean). `--digest` collapses each message to ONE line — `id · kind · <60 chars> · <state>`, where <state> is `handled by X: <summary>` (acked WITH a note), `✓ acked (no note)` (processed, no note — NOT pending), or `PENDING` (genuinely un-processed). The three states matter: a processed-but-noteless row is NOT work to redo. The two flags compose: `pidge catchup --digest --since <last>`.',
       '',
       'Exit 0 = printed (even the empty `{"messages":[]}`) · 2 = error. There is no wait, so no exit 3/4.',
     ].join('\n'),
@@ -905,7 +905,9 @@ const KNOWN_MANIFEST_VERSION = 63;
 // Bumped to 10 in 0.24.0 (#70): the session-start ritual is now
 // `pidge catchup --digest --since <last>` — situate in O(new), one line per message,
 // instead of raw JSON over the whole thread.
-const SKILL_REVISION = 10;
+// Bumped to 11 in 0.24.1 (#76): the digest teaches THREE states (handled/✓ acked (no
+// note)/PENDING) — a processed-but-noteless row is NOT PENDING, i.e. not work to redo.
+const SKILL_REVISION = 11;
 // #38: the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -1017,6 +1019,23 @@ function skillHealCandidates() {
   // #38 test). Deduped when cwd IS home (heal once, and require the marker then).
   if (project === home) return [{ file: project, requireMarker: true }];
   return [{ file: project, requireMarker: false }, { file: home, requireMarker: true }];
+}
+
+// #76 item 3: doctor's nudge for a home skill with NO pidge marker. Such a file is
+// left untouched by the self-heal (#73 requireMarker) — correct, since it might be
+// the human's OWN authored skill — but a PRE-MARKER pidge copy is indistinguishable
+// and would silently stay on old doctrine. So doctor SAYS so (never writes). The fix
+// it points at is `skill install` run FROM the home dir (the target is cwd-relative),
+// which backs the old file up to .bak. Best-effort: a read failure just skips it.
+function warnUnmarkedHomeSkill() {
+  try {
+    const homeSkill = path.join(os.homedir(), '.claude', 'skills', 'pidge', 'SKILL.md');
+    // Skip when cwd IS home: that file is the PROJECT skill, already self-healed.
+    if (path.join(process.cwd(), '.claude', 'skills', 'pidge', 'SKILL.md') === homeSkill) return;
+    if (!fs.existsSync(homeSkill)) return;
+    if (findSkillMarker(fs.readFileSync(homeSkill, 'utf8'))) return; // marked ⇒ self-heals; nothing to say
+    console.error(`pidge doctor: ⚠️ ${homeSkill} has NO pidge marker — the self-heal won't touch it (#69), so if it's an OLD pidge copy (not a skill you authored) it may be running STALE doctrine with no other signal. To refresh it, run \`pidge skill install\` FROM your home dir (\`cd ~ && npx pidge-cli skill install\`) — the current file is backed up to .bak first. If you AUTHORED it yourself, ignore this.`);
+  } catch { /* best-effort — never break doctor over a skill probe */ }
 }
 
 // True when the skill at `file` EXISTS and is stale (torn tail, older spine rev, or
@@ -2657,6 +2676,26 @@ function installOrphanWatchdog() {
 }
 
 // ---------------------------------------------------------------------------
+// #76 item 1: the digest's per-row state — THREE states, not two. Deriving it
+// from acked_by_label/handler_summary ALONE (the old two-state code) marked a row
+// PENDING whenever the ack carried no note — even when the server had stamped
+// `processed_at`. In the anti-redo tool, that's the worst lie: a successor reads
+// PENDING and re-does finished work. So:
+//   · handler_summary present        → `handled by X: <summary>`   (done, with a note)
+//   · processed (processed_at OR a    → `✓ acked[ by X] (no note)`  (done, silently)
+//     label) but no note
+//   · neither                         → `PENDING`                    (genuinely not done)
+function digestHandledState(m) {
+  if (m.handler_summary) {
+    const who = m.acked_by_label || 'another consumer';
+    return `handled by ${who}: ${String(m.handler_summary).replace(/\s+/g, ' ').trim()}`;
+  }
+  if (m.processed_at || m.acked_by_label) {
+    return `✓ acked${m.acked_by_label ? ` by ${m.acked_by_label}` : ''} (no note)`;
+  }
+  return 'PENDING';
+}
+
 // #61: stale_from_prior_claim — server v63 serves it (Bool, top-level) on the
 // channel-key GET /messages and on /whoami: the channel holds un-acked messages
 // whose arrival PREDATES this install's ownership claim — probably a previous
@@ -3417,6 +3456,11 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   // an older server that omits it can't confirm either way, so stay silent then.
   if (data.stale_from_prior_claim === false)
     console.error('pidge doctor: prior-claim backlog: none ✓ (no un-acked messages predate your ownership claim)');
+  // #76 item 3: an UNMARKED home skill is one the self-heal (correctly) won't touch
+  // (#69 requireMarker) — so a PRE-MARKER pidge copy silently stays on old doctrine
+  // with no signal (the Javier incident). doctor can't fix it (it might be an
+  // AUTHORED skill), but it can SAY so — a nudge, never a write.
+  warnUnmarkedHomeSkill();
   // E2E (E2-CLI): validate PIDGE_SECRET when present (32 bytes after base64url;
   // kf = base64url(SHA-256(key)[0..3])) and cross-check it against the channel:
   //   e2e_enabled + no secret   → sends go CLEAR-and-marked; point at the app's Connect-screen terminal step
@@ -3837,7 +3881,7 @@ ${notes.map((n) => `- ${n}`).join('\n')}
 
 Your channel may already have a LIVE consumer — an always-on bridge or daemon (\`listen_mode: persistent\` or \`external_daemon\` in the channel contract). To the human, you and that consumer are ONE assistant. So before you offer any work in a fresh interactive session:
 
-1. **Situate first — \`pidge catchup --digest --since <last>\`.** \`catchup\` prints the channel's thread read-only — the human's messages, their answers to notifications, and what was already handled. \`--digest\` collapses it to one line per message (\`id · kind · <60 chars> · handled by X: <summary>\` or \`PENDING\`) so you read "what happened, who handled what" at a glance instead of raw JSON; \`--since <last>\` scopes it to what's NEW since your last session (O(new), not O(whole thread)). catchup remembers the highest id it printed and, on your next run without \`--since\`, tells you the cursor to pass. It never consumes and never steals from the live consumer, so it is always safe to repeat.
+1. **Situate first — \`pidge catchup --digest --since <last>\`.** \`catchup\` prints the channel's thread read-only — the human's messages, their answers to notifications, and what was already handled. \`--digest\` collapses it to one line per message (\`id · kind · <60 chars> · <state>\`) so you read "what happened, who handled what" at a glance instead of raw JSON; \`--since <last>\` scopes it to what's NEW since your last session (O(new), not O(whole thread)). **The <state> has THREE values — read them carefully before offering work: \`handled by X: <summary>\` (done, with a note) · \`✓ acked (no note)\` (done SILENTLY — do NOT redo it) · \`PENDING\` (genuinely un-processed — this is the work).** catchup prints the cursor on stderr every no-\`--since\` run (stdout stays clean). It never consumes and never steals from the live consumer, so it is always safe to repeat.
 2. **Never run \`pidge listen\` when another runtime is the consumer.** One channel has exactly ONE consumer. A second listener double-consumes: you steal messages the bridge was supposed to handle, and the human sees work done twice or not at all.
 3. **Only then speak.** The human may have already asked the bridge for the thing you are about to offer — the catchup is how you know.
 
@@ -3849,7 +3893,7 @@ pidge catchup --digest --since 480      # only what's NEW since message id 480 (
 pidge catchup                           # the full raw JSON (newest first), when you need every field
 pidge catchup --before 480              # page further back (older than message id 480)
 \`\`\`
-In \`--digest\` each line already carries \`handled by <who>: <summary>\` (or \`PENDING\`) when the server has ack attribution (v63+) — so you SEE what the other consumer already did, not just that a message exists.
+In \`--digest\` each line already carries its state — \`handled by <who>: <summary>\`, \`✓ acked (no note)\`, or \`PENDING\` — so you SEE what the other consumer already did (or that it's done silently), not just that a message exists. Only \`PENDING\` is work to pick up.
 
 ## Stay "always-on" while you're turn-based
 
@@ -4290,15 +4334,7 @@ ${SKILL_END_MARKER}
         for (const m of printed) {
           const kind = m.kind || 'message';
           const body = String(m.body ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
-          let handled;
-          if (m.acked_by_label || m.handler_summary) {
-            const who = m.acked_by_label || 'another consumer';
-            const what = m.handler_summary ? `: ${String(m.handler_summary).replace(/\s+/g, ' ').trim()}` : '';
-            handled = `handled by ${who}${what}`;
-          } else {
-            handled = 'PENDING';
-          }
-          console.log(`${m.id} · ${kind} · ${body} · ${handled}`);
+          console.log(`${m.id} · ${kind} · ${body} · ${digestHandledState(m)}`);
         }
       } else {
         console.log(JSON.stringify({ messages: printed }, null, 2));
@@ -4328,10 +4364,22 @@ ${SKILL_END_MARKER}
         ? ` (newest ${printed.length} of ${fresh.length} — --limit; drop it or raise --before to see more)` : '';
       const sinceNote = catchupSince != null ? ` since id ${catchupSince}` : '';
       console.error(`pidge: catchup — ${printed.length} message(s)${sinceNote} in the thread${clipped}${replies ? ` · ${replies} answer(s) to earlier notifications` : ''}, read-only: NOT consumed, NOT acked. This is a peek; it never steals a message from another consumer.`);
-      // #70: the incremental-cursor nudge — only when the caller didn't pass --since,
-      // a prior cursor exists, and the thread actually moved past it.
-      if (priorCursor && priorCursor.id && highestId > priorCursor.id)
-        console.error(`pidge: tip: your last catchup read up to id ${priorCursor.id} — next time \`pidge catchup --digest --since ${priorCursor.id}\` shows only what's new (${highestId - priorCursor.id > 0 ? 'now at id ' + highestId : ''}).`);
+      // #76 item 2: the incremental-cursor nudge must ALWAYS surface on stderr — an
+      // agent ALWAYS pipes (no TTY), and a repeat situating run must still learn the
+      // --since cursor even when the thread hasn't moved. The old gate (only when a
+      // prior cursor existed AND the thread moved past it) meant a fresh channel, or a
+      // quiet one polled a few times, printed NO tip at all (the observed bug). Now:
+      // any no-`--since` run that saw messages prints the cursor on stderr; stdout stays
+      // clean (JSON or digest only). It points at the CURRENT highest id — the right
+      // cursor for "only what arrives after".
+      if (v.since === undefined && highestId > 0) {
+        let newerNote = '';
+        if (priorCursor && priorCursor.id && highestId > priorCursor.id) {
+          const n = opened.filter((m) => (Number(m.id) || 0) > priorCursor.id).length;
+          newerNote = ` (${n} new since your last read at id ${priorCursor.id})`;
+        }
+        console.error(`pidge: cursor — newest message is id ${highestId}${newerNote}. Next session: \`pidge catchup --digest --since ${highestId}\` shows only what arrives after.`);
+      }
       process.exit(0);
       break;
     }
