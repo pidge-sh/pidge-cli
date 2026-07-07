@@ -40,6 +40,8 @@ function runCli(args, port, env = {}, cwd = undefined) {
       // Isolate per spawn: state.json (manifest nag, #313 e2e pins) must never
       // touch the REAL ~/.config/pidge — nor leak between tests.
       XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-test-')),
+      // #69: isolate HOME so the skill self-heal never touches the real ~/.claude.
+      HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')),
       ...env,
     },
   });

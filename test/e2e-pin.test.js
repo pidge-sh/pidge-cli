@@ -42,6 +42,8 @@ function runCli(args, port, env = {}) {
       PIDGE_TOKEN: 'hld_test',
       PIDGE_SECRET: '',
       PIDGE_E2E: '',
+      // #69: isolate HOME so the skill self-heal never touches the real ~/.claude.
+      HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')),
       ...env,
     },
   });

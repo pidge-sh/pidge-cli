@@ -37,6 +37,9 @@ function runCli(args, port, env = {}) {
       PIDGE_BRIDGE_BACKOFF_BASE: '200',  // test-fast backoff ladder
       PIDGE_BRIDGE_BACKOFF_MAX: '500',
       PIDGE_BRIDGE_BACKOFF_LONG: '600',
+      // #69: isolate HOME so the self-heal never regenerates the developer's REAL
+      // ~/.claude/skills/pidge during a test (bridge tests run with cwd = repo).
+      HOME: tmpDir('pidge-bridge-home-'),
       ...env,
       XDG_CONFIG_HOME: xdg,
     },

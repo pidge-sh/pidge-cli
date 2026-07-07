@@ -306,6 +306,8 @@ const OPTIONS = {
   all: { type: 'boolean' },
   limit: { type: 'string' },
   before: { type: 'string' },                  // #58 catchup: page older than this message id
+  since: { type: 'string' },                   // #70 catchup: incremental cursor — only ids > this
+  digest: { type: 'boolean' },                 // #70 catchup: one condensed line per message
   // realtime (#118): WS by default when the runtime has a WebSocket (Node ≥22)
   realtime: { type: 'boolean' },               // force WS (warn+fallback if unavailable)
   'no-realtime': { type: 'boolean' },          // polling only
@@ -573,6 +575,8 @@ const OPTION_DOCS = {
   'download-dir': '--download-dir DIR       where inbound attachments land (default ~/.config/pidge/downloads)',
   limit: '--limit N                cap the number of rows',
   before: '--before ID              catchup: page the thread OLDER than this message id (walk back through history)',
+  since: '--since ID               catchup: incremental cursor — only messages NEWER than this id (O(new), not O(thread))',
+  digest: '--digest                 catchup: one condensed line per message (id · kind · 60 chars · handled by X / PENDING)',
   target: '--target T               skill install: claude (default) → .claude/skills/pidge/SKILL.md · agents → AGENTS.md · gemini → GEMINI.md',
   claim: '--claim CODE             the single-use setup code (the human copies it from the Pidge app)',
   'url-base': '--url BASE               the Pidge server base URL (default https://pidge.sh)',
@@ -796,15 +800,17 @@ const HELP = {
   },
   catchup: {
     summary: 'READ-ONLY peek at the whole conversation (GET ?history=true) — the thread newest-first, answers included. NEVER consumes.',
-    usage: 'pidge catchup [--limit N] [--before ID]',
+    usage: 'pidge catchup [--since ID] [--digest] [--limit N] [--before ID]',
     body: [
       'Prints the channel\'s conversation as JSON (newest first) over GET /messages?history=true&all=true — the WHOLE thread, notification answers included. It NEVER consumes: no ack, no delivered stamp, no visibility lease. Safe to run any number of times.',
       '',
       'Run it to SITUATE yourself at the start of an interactive session on a channel whose messages another runtime (a 24/7 bridge/daemon) is the real consumer of: you learn what has already been said and handled WITHOUT stealing a message out of that consumer\'s queue. The rule is one consumer per channel — if another runtime consumes this channel, use `catchup` to read and NEVER run `listen` (that would double-consume).',
       '',
+      '#70: `--since <id>` is an incremental cursor — only messages with an id GREATER than <id> (situate in O(new), not O(whole thread)). It is enforced client-side too, so it holds regardless of server support. catchup remembers the highest id it printed and, on a later no-`--since` run, suggests the cursor to use. `--digest` collapses each message to ONE line — `id · kind · <60 chars> · handled by X: <summary>` (or `PENDING`) — the condensed view for "what happened, who handled what" before you offer work. The two compose: `pidge catchup --digest --since <last>`.',
+      '',
       'Exit 0 = printed (even the empty `{"messages":[]}`) · 2 = error. There is no wait, so no exit 3/4.',
     ].join('\n'),
-    opts: ['limit', 'before'],
+    opts: ['since', 'digest', 'limit', 'before'],
   },
 };
 
@@ -896,7 +902,10 @@ const KNOWN_MANIFEST_VERSION = 63;
 // supervisor) + `ack --summary` attribution, carries the PIDGE_AGENT multi-agent block
 // early, and fixes 3 prose lines (durable-queue framing, human's-language, the
 // turn-based agent examples now span Claude Code/Codex/Gemini CLI, not just one).
-const SKILL_REVISION = 9;
+// Bumped to 10 in 0.24.0 (#70): the session-start ritual is now
+// `pidge catchup --digest --since <last>` — situate in O(new), one line per message,
+// instead of raw JSON over the whole thread.
+const SKILL_REVISION = 10;
 // #38: the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -990,36 +999,65 @@ function findSkillMarker(content) {
   return '';
 }
 
+// #69: the TWO locations Claude Code loads a `pidge` skill from — the PROJECT skill
+// (.claude/skills/pidge under cwd, where `skill install` writes) AND the HOME skill
+// (~/.claude/skills/pidge). Old installs (and hand-copies) live in HOME; the
+// cwd-only self-heal never visited it, so a live agent ran 3 WEEKS on a home skill
+// frozen at an old rev with NO signal. Both are candidates now; each stale copy
+// heals IN PLACE. Deduped when cwd IS home (heal once, never twice).
+function skillHealCandidates() {
+  const rel = path.join('.claude', 'skills', 'pidge', 'SKILL.md');
+  const project = path.join(process.cwd(), rel);
+  const home = path.join(os.homedir(), rel);
+  return project === home ? [project] : [project, home];
+}
+
+// True when the skill at `file` EXISTS and is stale (torn tail, older spine rev, or
+// older baked manifest than the server's). A missing file is never stale — the
+// self-heal only REFRESHES an existing skill, it never creates one.
+function skillIsStale(file, serverManifestVersion) {
+  if (!fs.existsSync(file)) return false;
+  // #33 fix + #38: the marker rides a `# pidge-skill rev=N manifest=M` YAML comment INSIDE
+  // the frontmatter (0.15.3+); pre-0.15.3 installs put `<!-- pidge-skill … -->` as line 1.
+  // #38: the scan is ANCHORED to those two positions (line 1, or inside the opening `---`
+  // block) — a prose line in the body like "see pidge-skill rev=99" must never be read as
+  // the marker and suppress a legitimate heal.
+  const content = fs.readFileSync(file, 'utf8');
+  const markerLine = findSkillMarker(content);
+  const revM = markerLine.match(/rev=(\d+)/);
+  const manM = markerLine.match(/manifest=(\d+)/);
+  const installedRev = revM ? parseInt(revM[1], 10) : 0;
+  const installedManifest = manM ? parseInt(manM[1], 10) : 0;
+  // #38 integrity: a generated skill always ends with SKILL_END_MARKER. A marker whose
+  // rev looks current but whose trailer is missing = a TORN write (the marker survived
+  // on line ~4, the tail didn't) — without this check the tear would read as "fresh"
+  // and never heal. Pre-#38 installs lack the trailer too, but their rev < 4 already
+  // marks them stale, so the two triggers compose instead of fighting.
+  const torn = installedRev > 0 && !content.trimEnd().endsWith(SKILL_END_MARKER);
+  return torn || SKILL_REVISION > installedRev || (serverManifestVersion || 0) > installedManifest;
+}
+
 async function ensureSkillFresh(serverManifestVersion) {
   if (skillHealed) return;
   try {
-    // Resolve the path the SAME way installSkill does (cwd-relative).
-    const file = path.join(process.cwd(), '.claude', 'skills', 'pidge', 'SKILL.md');
-    if (!fs.existsSync(file)) return; // don't auto-create — only refresh an existing skill
-    // #33 fix + #38: the marker rides a `# pidge-skill rev=N manifest=M` YAML comment INSIDE
-    // the frontmatter (0.15.3+); pre-0.15.3 installs put `<!-- pidge-skill … -->` as line 1.
-    // #38: the scan is ANCHORED to those two positions (line 1, or inside the opening `---`
-    // block) — a prose line in the body like "see pidge-skill rev=99" must never be read as
-    // the marker and suppress a legitimate heal.
-    const content = fs.readFileSync(file, 'utf8');
-    const markerLine = findSkillMarker(content);
-    const revM = markerLine.match(/rev=(\d+)/);
-    const manM = markerLine.match(/manifest=(\d+)/);
-    const installedRev = revM ? parseInt(revM[1], 10) : 0;
-    const installedManifest = manM ? parseInt(manM[1], 10) : 0;
-    // #38 integrity: a generated skill always ends with SKILL_END_MARKER. A marker whose
-    // rev looks current but whose trailer is missing = a TORN write (the marker survived
-    // on line ~4, the tail didn't) — without this check the tear would read as "fresh"
-    // and never heal. Pre-#38 installs lack the trailer too, but their rev < 4 already
-    // marks them stale, so the two triggers compose instead of fighting.
-    const torn = installedRev > 0 && !content.trimEnd().endsWith(SKILL_END_MARKER);
-    const stale = torn || SKILL_REVISION > installedRev || (serverManifestVersion || 0) > installedManifest;
-    if (!stale) return;
-    skillHealed = true; // latch BEFORE the network write — attempt the heal at most once
-    const r = await installSkill(BASE, TOKEN); // silent: it already writes the file
+    // #69: check BOTH project + home; heal every stale copy in ONE pass (a single
+    // process may own two stale skills). A silent home heal is safe in multi-project
+    // use: the generated content is agent- AND project-agnostic (it bakes no token —
+    // only the server's manifest version + fixed doctrine), so any project's
+    // invocation regenerates the SAME skill.
+    const stale = skillHealCandidates().filter((f) => skillIsStale(f, serverManifestVersion));
+    if (stale.length === 0) return;
+    skillHealed = true; // latch BEFORE the network write — attempt the heal at most once per process
+    let manifestVersion = null;
+    for (const file of stale) {
+      const r = await installSkill(BASE, TOKEN, 'claude', file); // silent: writes the file in place
+      manifestVersion = r.manifest_version;
+    }
     // Respect QUIET_NAG/PIDGE_QUIET_NAG for the note only — we STILL regenerated.
-    if (!QUIET_NAG)
-      console.error(`pidge: refreshed your local Pidge skill (rev ${SKILL_REVISION}, manifest v${r.manifest_version}) — your next session will use it.`);
+    if (!QUIET_NAG) {
+      const many = stale.length > 1;
+      console.error(`pidge: refreshed your local Pidge skill${many ? 's' : ''} (rev ${SKILL_REVISION}, manifest v${manifestVersion}${many ? `; ${stale.length} locations incl. ~/.claude` : ''}) — your next session will use ${many ? 'them' : 'it'}.`);
+    }
   } catch { /* best-effort — a skill refresh must never break the user's command */ }
 }
 
@@ -3580,8 +3618,11 @@ const SKILL_TARGETS = {
   gemini: () => path.join(process.cwd(), 'GEMINI.md'),
 };
 
-async function installSkill(base = BASE, token = TOKEN, target = 'claude') {
-  const destFor = SKILL_TARGETS[target];
+// #69: destFileOverride lets the self-heal write to a SPECIFIC file (e.g. the
+// HOME skill ~/.claude/skills/pidge/SKILL.md) rather than the cwd-relative claude
+// target — so a stale skill is healed IN PLACE wherever it lives, never cross-written.
+async function installSkill(base = BASE, token = TOKEN, target = 'claude', destFileOverride = null) {
+  const destFor = destFileOverride ? () => destFileOverride : SKILL_TARGETS[target];
   if (!destFor) throw new Error(`unknown skill target ${JSON.stringify(target)} — use claude, agents or gemini`);
   const hdrs = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
   let res, m;
@@ -3775,18 +3816,19 @@ ${notes.map((n) => `- ${n}`).join('\n')}
 
 Your channel may already have a LIVE consumer — an always-on bridge or daemon (\`listen_mode: persistent\` or \`external_daemon\` in the channel contract). To the human, you and that consumer are ONE assistant. So before you offer any work in a fresh interactive session:
 
-1. **Run \`pidge catchup\` first.** It prints the channel's full thread read-only — the human's messages, their answers to notifications, and what was already handled. It never consumes and never steals from the live consumer, so it is always safe.
+1. **Situate first — \`pidge catchup --digest --since <last>\`.** \`catchup\` prints the channel's thread read-only — the human's messages, their answers to notifications, and what was already handled. \`--digest\` collapses it to one line per message (\`id · kind · <60 chars> · handled by X: <summary>\` or \`PENDING\`) so you read "what happened, who handled what" at a glance instead of raw JSON; \`--since <last>\` scopes it to what's NEW since your last session (O(new), not O(whole thread)). catchup remembers the highest id it printed and, on your next run without \`--since\`, tells you the cursor to pass. It never consumes and never steals from the live consumer, so it is always safe to repeat.
 2. **Never run \`pidge listen\` when another runtime is the consumer.** One channel has exactly ONE consumer. A second listener double-consumes: you steal messages the bridge was supposed to handle, and the human sees work done twice or not at all.
 3. **Only then speak.** The human may have already asked the bridge for the thing you are about to offer — the catchup is how you know.
 
 **The rule: one channel = one consumer. Reads are free (\`catchup\`, \`pidge wait <cid>\`); the consume loop (\`listen\`/\`ack\`) belongs to exactly one process.**
 
 \`\`\`bash
-pidge catchup                 # the whole thread, newest first (safe to repeat)
-pidge catchup --limit 20      # just the newest 20 (enforced client-side)
-pidge catchup --before 480    # page further back (older than message id 480)
+pidge catchup --digest                  # the whole thread, one line per message (the session-start read)
+pidge catchup --digest --since 480      # only what's NEW since message id 480 (O(new))
+pidge catchup                           # the full raw JSON (newest first), when you need every field
+pidge catchup --before 480              # page further back (older than message id 480)
 \`\`\`
-When the server carries ack attribution (v63+), a processed row also narrates \`handled by <who>: <what>\` on stderr — so you SEE what the other consumer already did, not just that a message exists.
+In \`--digest\` each line already carries \`handled by <who>: <summary>\` (or \`PENDING\`) when the server has ack attribution (v63+) — so you SEE what the other consumer already did, not just that a message exists.
 
 ## Stay "always-on" while you're turn-based
 
@@ -4173,6 +4215,18 @@ ${SKILL_END_MARKER}
         qs.set('limit', String(catchupLimit));
       }
       if (v.before !== undefined) qs.set('before', v.before);
+      // #70: --since <id> — the incremental cursor. STRICT numeric (same class as
+      // --up-to/--ids: a lazy parse would silently read the wrong watermark). Forwarded
+      // to the server AND enforced locally below, so "since my last session" is
+      // O(new) regardless of whether this server paginates history by id.
+      let catchupSince = null;
+      if (v.since !== undefined) {
+        catchupSince = idStrict(v.since, '--since');
+        qs.set('since', String(catchupSince));
+      }
+      // #70: the cursor the LAST catchup left (read BEFORE we overwrite it below) — a
+      // no-`--since` run suggests it so the agent can situate in O(new) next time.
+      const priorCursor = v.since === undefined ? (readState().catchupLastSeen || null) : null;
       let res, data;
       try {
         res = await fetchT(`${BASE}/api/v1/messages?${qs}`, { headers });
@@ -4193,26 +4247,61 @@ ${SKILL_END_MARKER}
       // Newest first (the situational read wants the latest context up top); the
       // server orders history this way already, but sort defensively by id desc.
       opened.sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0));
+      // #70: the highest id in the WHOLE thread (before any --since/--limit slice) —
+      // the cursor to persist so the NEXT no-`--since` catchup can suggest it.
+      const highestId = opened.reduce((mx, m) => Math.max(mx, Number(m.id) || 0), 0);
+      // #70: --since <id> filters to STRICTLY newer rows, client-side (belt-and-braces
+      // over the server query) — acceptable at the catchup scale (≤200). Applied before
+      // --limit, so --limit still means "the newest N of what's new".
+      const fresh = catchupSince != null ? opened.filter((m) => (Number(m.id) || 0) > catchupSince) : opened;
       // #58 cross-audit: enforce --limit locally (server ignores it here) — the
-      // newest N after the sort.
-      const printed = catchupLimit != null ? opened.slice(0, catchupLimit) : opened;
-      console.log(JSON.stringify({ messages: printed }, null, 2));
-      // #58 item 4 (server v63 / #380, now in production): a PROCESSED row carries
-      // acked_by_label + handler_summary — narrate WHO already handled it and WHAT
-      // they did, so the reader sees the other consumer's work instead of re-offering
-      // it (the whole point of catchup). Present-only: rows without the fields (never
-      // acked, or a server older than v63) simply produce no line.
-      for (const m of printed) {
-        if (m.acked_by_label || m.handler_summary) {
-          const who = m.acked_by_label || 'another consumer';
-          const what = m.handler_summary ? `: ${String(m.handler_summary)}` : '';
-          console.error(`pidge: message ${m.id} handled by ${who}${what}`);
+      // newest N after the sort/since-filter.
+      const printed = catchupLimit != null ? fresh.slice(0, catchupLimit) : fresh;
+      if (v.digest) {
+        // #70: --digest — one condensed line per message. The condensed view for
+        // "what happened, who handled what" before offering work; the raw JSON works
+        // against that purpose on a long thread.
+        for (const m of printed) {
+          const kind = m.kind || 'message';
+          const body = String(m.body ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
+          let handled;
+          if (m.acked_by_label || m.handler_summary) {
+            const who = m.acked_by_label || 'another consumer';
+            const what = m.handler_summary ? `: ${String(m.handler_summary).replace(/\s+/g, ' ').trim()}` : '';
+            handled = `handled by ${who}${what}`;
+          } else {
+            handled = 'PENDING';
+          }
+          console.log(`${m.id} · ${kind} · ${body} · ${handled}`);
+        }
+      } else {
+        console.log(JSON.stringify({ messages: printed }, null, 2));
+        // #58 item 4 (server v63 / #380, now in production): a PROCESSED row carries
+        // acked_by_label + handler_summary — narrate WHO already handled it and WHAT
+        // they did, so the reader sees the other consumer's work instead of re-offering
+        // it (the whole point of catchup). In --digest mode this rides inline instead.
+        // Present-only: rows without the fields (never acked, or a pre-v63 server) skip.
+        for (const m of printed) {
+          if (m.acked_by_label || m.handler_summary) {
+            const who = m.acked_by_label || 'another consumer';
+            const what = m.handler_summary ? `: ${String(m.handler_summary)}` : '';
+            console.error(`pidge: message ${m.id} handled by ${who}${what}`);
+          }
         }
       }
+      // #70: remember the highest id seen so a later no-`--since` run can suggest the
+      // cursor. Best-effort (writeState swallows a read-only fs). Date is fine here —
+      // the CLI process, not a workflow script.
+      if (highestId > 0) writeState({ catchupLastSeen: { id: highestId, at: new Date().toISOString() } });
       const replies = printed.filter((m) => m.kind === 'notification_reply').length;
-      const clipped = catchupLimit != null && opened.length > printed.length
-        ? ` (newest ${printed.length} of ${opened.length} — --limit; drop it or raise --before to see more)` : '';
-      console.error(`pidge: catchup — ${printed.length} message(s) in the thread${clipped}${replies ? ` · ${replies} answer(s) to earlier notifications` : ''}, read-only: NOT consumed, NOT acked. This is a peek; it never steals a message from another consumer.`);
+      const clipped = catchupLimit != null && fresh.length > printed.length
+        ? ` (newest ${printed.length} of ${fresh.length} — --limit; drop it or raise --before to see more)` : '';
+      const sinceNote = catchupSince != null ? ` since id ${catchupSince}` : '';
+      console.error(`pidge: catchup — ${printed.length} message(s)${sinceNote} in the thread${clipped}${replies ? ` · ${replies} answer(s) to earlier notifications` : ''}, read-only: NOT consumed, NOT acked. This is a peek; it never steals a message from another consumer.`);
+      // #70: the incremental-cursor nudge — only when the caller didn't pass --since,
+      // a prior cursor exists, and the thread actually moved past it.
+      if (priorCursor && priorCursor.id && highestId > priorCursor.id)
+        console.error(`pidge: tip: your last catchup read up to id ${priorCursor.id} — next time \`pidge catchup --digest --since ${priorCursor.id}\` shows only what's new (${highestId - priorCursor.id > 0 ? 'now at id ' + highestId : ''}).`);
       process.exit(0);
       break;
     }
