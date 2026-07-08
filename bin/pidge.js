@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 'use strict';
 //
-// pidge — CLI so an agent (Hermes, or a running Claude Code) can send a rich
+// pidge — CLI so an agent (a running Claude Code, or any agent with a shell) can send a rich
 // iPhone notification AND block until the human answers (polling — the primary
 // read path for terminal/CLI use, where there's no webhook to receive a reply).
 //
 //   export PIDGE_URL=https://pidge.sh              # default http://localhost:3000
 //   export PIDGE_TOKEN=hld_xxx                     # the channel's bearer key
-//   (HERALD_URL / HERALD_TOKEN are honored as a fallback; with no env vars set,
-//    ~/.config/pidge/env — KEY=VALUE — is read instead, so the key can live
-//    OUTSIDE the agent's chat/context entirely, #57)
+//   (HERALD_URL / HERALD_TOKEN are legacy env names, still honored as a
+//    fallback; with no env vars set, ~/.config/pidge/env — KEY=VALUE — is read
+//    instead, so the key can live OUTSIDE the agent's chat/context entirely)
 //
-//   TWO AXES (perfis, manifest v40+): (1) the TYPE — one married list of 5 the
+//   TWO AXES: (1) the TYPE — one married list of 5 the
 //   human configured how to receive: message · important · urgent · event · live;
 //   (2) the RESPONSE — buttons (--actions/--custom-action) + send-and-go vs wait
 //   (--wait blocks until the human answers). Response composes onto ANY type.
@@ -34,7 +34,7 @@
 //   # block on an already-sent notification (by correlation_id)
 //   pidge wait order-7 --timeout 300
 //
-//   # cancel a still-scheduled notification before it fires (#56)
+//   # cancel a still-scheduled notification before it fires
 //   pidge cancel med-ozempic-qui
 //
 // stdout is ALWAYS machine-readable: `notify` prints the raw 201 JSON; `ask`/`wait`
@@ -60,12 +60,12 @@ if (process.argv.includes('--version') || process.argv.includes('-v')) {
   process.exit(0);
 }
 
-// Per-agent isolation (incident 2026-06-13): ~/.config/pidge/env is one slot
-// per machine-user, so N agents sharing a HOME share an identity — one agent's
-// setup hijacked another's cron. The fix is a NON-secret namespacing var the
+// Per-agent isolation (a real incident: a shared config file made one agent's
+// setup hijack another's cron): ~/.config/pidge/env is one slot per
+// machine-user, so N agents sharing a HOME share an identity. The fix is a NON-secret namespacing var the
 // human sets ONCE at each agent's launch: PIDGE_AGENT=<id> → the config lives
 // at ~/.config/pidge/agents/<id>/env, isolated by construction. The CLI still
-// WRITES the key (the agent never sees it — #57 hygiene intact), it's just
+// WRITES the key (the agent never sees it — token hygiene intact), it's just
 // per-agent now. No PIDGE_AGENT ⇒ the legacy shared file (single-agent only).
 // (An explicit PIDGE_TOKEN env var still wins over any file — the purest
 // per-agent path.)
@@ -75,7 +75,7 @@ function pidgeConfigDir() {
   return AGENT_ID ? path.join(base, 'agents', AGENT_ID) : base;
 }
 
-// #57 token hygiene: when the env vars are unset, fall back to the config file
+// token hygiene: when the env vars are unset, fall back to the config file
 // (KEY=VALUE the CLI writes during setup, or the HUMAN writes once) so the raw
 // hld_… key never rides the agent's chat/context. Explicit env vars always win;
 // `export ` prefixes, quotes and #comments are tolerated.
@@ -104,15 +104,16 @@ function die(msg, code = 1) { console.error(msg); process.exit(code); }
 // first-time `npx pidge-cli --help` must work without any setup.
 
 // ---------------------------------------------------------------------------
-// E2E crypto (E0 — #180; the contract is e2e-spec-v1.md, ratified 2026-07-02).
+// E2E crypto — wire format v1 (shared with the server and the iOS app; test
+// vectors in test/e2e_vectors.json).
 // AES-256-GCM · 32-byte per-channel key · ONE independent envelope per field:
 //   field envelope  "v1:" + base64url( nonce(12) || ciphertext || tag(16) )
 //   blob framing    [0x01][nonce 12B][ciphertext][tag 16B]  (binary, no base64)
 //   AAD             "ch<channel_id>:<correlation_id>:<field_name>"    (ASCII)
 //   kf              base64url(SHA-256(key)[0..3])    (4-byte key fingerprint)
-// E0 ships the PURE functions + the shared fixture (test/e2e_vectors.json)
-// ONLY — no command encrypts yet (server passthrough is E1; send/receive
-// integration is E2/E3). The nonce parameter exists ONLY for the deterministic
+// This section is the PURE functions + the shared fixture (test/e2e_vectors.json)
+// ONLY — the send/receive integration lives further down in the wire layer.
+// The nonce parameter exists ONLY for the deterministic
 // fixture; production callers omit it (crypto.randomBytes(12) per envelope).
 // ---------------------------------------------------------------------------
 const E2E_FIELD_PREFIX = 'v1:';
@@ -226,16 +227,15 @@ function e2eParseSecret(raw) {
   return key;
 }
 
-// Action ids whose LABELS must NEVER be sealed (#313): the server's 12
-// built-ins + the system ids "dismiss"/"acknowledge"/"seen" (#313/F7 — "seen"
-// is the app's opened-signal: the server intercepts it before act!, so a custom
-// "seen" button never reaches the agent; server 422s it since manifest v59).
-// Mirrors the server's
-// Notification::RESERVED_ACTION_IDS and the iOS builtin set (E2EContent),
-// which SKIPS label decrypt for these ids — a sealed label on one would
+// Action ids whose LABELS must NEVER be sealed: the server's 12
+// built-ins + the system ids "dismiss"/"acknowledge"/"seen" ("seen"
+// is the app's opened-signal: the server intercepts it, so a custom
+// "seen" button never reaches the agent; newer servers 422 it).
+// Mirrors the server's reserved action-id list and the iOS app's builtin set,
+// both of which SKIP label decrypt for these ids — a sealed label on one would
 // render raw "v1:…" on the button. Built-in ids ride CLEAR everywhere (the
-// action contract runs on ids); E3 seals only CUSTOM labels. The server 422s
-// a custom action with one of these ids anyway (manifest v52) — this is the
+// action contract runs on ids); only CUSTOM labels are sealed. Newer servers
+// 422 a custom action with one of these ids anyway — this is the
 // fail-safe for older servers.
 const E2E_NEVER_SEAL_LABEL_IDS = new Set([
   'snooze', 'done', 'reschedule', 'mute', 'reply',
@@ -244,7 +244,7 @@ const E2E_NEVER_SEAL_LABEL_IDS = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// Test seam (E0): require()ing this file exports the pure e2e helpers and
+// Test seam: require()ing this file exports the pure e2e helpers and
 // stops HERE — none of the CLI machinery below (parseArgs, the TOKEN check,
 // command dispatch) may run under a test runner's argv. Executed as a binary
 // (require.main === module) it skips the export and runs the CLI unchanged.
@@ -254,7 +254,7 @@ if (require.main !== module) {
     e2eAad, e2eKeyFingerprint, e2eLoadSecret, e2eParseSecret,
     e2eEncryptField, e2eDecryptField, e2eEncryptBlob, e2eDecryptBlob,
     E2E_NEVER_SEAL_LABEL_IDS, e2ePinKeyFor,
-    // #367: sealed media — the pure halves (gate decision + filename hygiene).
+    // sealed media — the pure halves (gate decision + filename hygiene).
     e2eMediaSealDecision, sanitizeAttachmentName,
   };
   return;
@@ -265,38 +265,38 @@ const OPTIONS = {
   title: { type: 'string' },
   body: { type: 'string' },
   'body-markdown': { type: 'string', short: 'm' },
-  'body-markdown-file': { type: 'string' },   // a path, or "-" to read stdin (#274)
+  'body-markdown-file': { type: 'string' },   // a path, or "-" to read stdin
   subtitle: { type: 'string' },
   template: { type: 'string' },                // content/action pattern (manifest `templates`)
   profile: { type: 'string' },                 // delivery profile id (manifest `profiles`)
   'event-at': { type: 'string' },              // WHEN the thing happens (profile event)
   'lead-minutes': { type: 'string' },          // notify/countdown lead before event_at
   urgency: { type: 'string' },                 // normal | persistent | alarm (low-level — prefer --profile)
-  escalate: { type: 'boolean' },               // #246: alert type — force an AlarmKit alarm (escalate:true)
-  gated: { type: 'boolean' },                  // #274: one Face-ID confirm action (replaces content_template:sensitive)
+  escalate: { type: 'boolean' },               // alert type — force an AlarmKit alarm (escalate:true)
+  gated: { type: 'boolean' },                  // one Face-ID confirm action (replaces content_template:sensitive)
   image: { type: 'string' },                   // banner+feed image: local path → uploaded; URL → as-is
   file: { type: 'string' },                    // real artifact (xlsx/pdf/csv…): local path → uploaded
-  url: { type: 'string' },                     // deep link the app opens on tap (#45)
-  copy: { type: 'string' },                    // tap-to-copy value on the detail (#45)
+  url: { type: 'string' },                     // deep link the app opens on tap
+  copy: { type: 'string' },                    // tap-to-copy value on the detail
   actions: { type: 'string' },                 // comma list from the catalog
   'custom-action': { type: 'string', multiple: true }, // id:label[:destructive][:confirm][:biometric][:terminal]
   'deliver-at': { type: 'string' },
   'reply-to': { type: 'string' },
   'correlation-id': { type: 'string' },
-  thread: { type: 'string' },                  // conversation handle (#49) — same id ⇒ one strand on the phone
-  after: { type: 'string' },                   // decision queue (#157): held until this cid resolves
+  thread: { type: 'string' },                  // conversation handle — same id ⇒ one strand on the phone
+  after: { type: 'string' },                   // decision queue: held until this cid resolves
   'collapse-key': { type: 'string' },
   param: { type: 'string', multiple: true },   // key=value escape hatch → raw /notify field
-  download: { type: 'boolean' },               // #367: save CLEAR inbound attachments too (sealed ones always save)
-  'download-dir': { type: 'string' },          // #367: where attachments land (default <config dir>/downloads)
+  download: { type: 'boolean' },               // save CLEAR inbound attachments too (sealed ones always save)
+  'download-dir': { type: 'string' },          // where attachments land (default <config dir>/downloads)
   timeout: { type: 'string' },
   interval: { type: 'string' },
-  // perfis-S2 response axis: --wait blocks until the human answers (composes on
+  // The response axis: --wait blocks until the human answers (composes on
   // ANY type — send-and-go vs wait). ask/approval imply it.
   wait: { type: 'boolean' },
-  // inbox flags (#83)
+  // inbox flags
   pending: { type: 'boolean' },
-  // #83 inbox uses `--summary` as a valueless BOOLEAN (counts+latency). #63: the
+  // inbox uses `--summary` as a valueless BOOLEAN (counts+latency). The
   // `ack` command needs `--summary "<what you did>"` as a STRING. One global
   // OPTIONS map can't be both, so this stays boolean (for inbox) and the `ack`
   // case RE-PARSES its own argv with `summary` typed as a string — otherwise the
@@ -305,36 +305,36 @@ const OPTIONS = {
   summary: { type: 'boolean' },
   all: { type: 'boolean' },
   limit: { type: 'string' },
-  before: { type: 'string' },                  // #58 catchup: page older than this message id
-  since: { type: 'string' },                   // #70 catchup: incremental cursor — only ids > this
-  digest: { type: 'boolean' },                 // #70 catchup: one condensed line per message
-  // realtime (#118): WS by default when the runtime has a WebSocket (Node ≥22)
+  before: { type: 'string' },                  // catchup: page older than this message id
+  since: { type: 'string' },                   // catchup: incremental cursor — only ids > this
+  digest: { type: 'boolean' },                 // catchup: one condensed line per message
+  // realtime: WS by default when the runtime has a WebSocket (Node ≥22)
   realtime: { type: 'boolean' },               // force WS (warn+fallback if unavailable)
   'no-realtime': { type: 'boolean' },          // polling only
-  'quiet-nag': { type: 'boolean' },            // #241: silence the manifest-version nag for this run
-  // onboarding v2 (#110)
+  'quiet-nag': { type: 'boolean' },            // silence the manifest-version nag for this run
+  // onboarding v2
   claim: { type: 'string' },                   // setup --claim <single-use code>
-  // #157 P2: listen keeps going after a batch (supervisor loop, one process)
+  // listen keeps going after a batch (supervisor loop, one process)
   follow: { type: 'boolean' },
   force: { type: 'boolean' },                  // setup: overwrite a config owned by ANOTHER channel
   print: { type: 'boolean' },                  // setup: print export lines instead of writing a file (per-agent, human runs it)
   'listen-mode': { type: 'string' },           // setup: declare operating_contract listen mode (turn_based|always_on; default turn_based)
-  target: { type: 'string' },                  // #58 skill install: claude (default) | agents | gemini — same content, different destination file
-  // Fix 2 (#170): read-receipt split — `ack` after the work; listen no longer consumes on read.
+  target: { type: 'string' },                  // skill install: claude (default) | agents | gemini — same content, different destination file
+  // Read-receipt split — `ack` after the work; listen no longer consumes on read.
   'up-to': { type: 'string' },                 // ack: process messages up to this id
   ids: { type: 'string' },                     // ack: process this comma-list of ids
   renew: { type: 'boolean' },                  // ack: heartbeat the visibility-timeout lease (state=delivered)
   'ack-on-read': { type: 'boolean' },          // listen: restore the pre-0.9 immediate-consume
   window: { type: 'string' },                  // selftest: reachability window in seconds (default 30)
-  exec: { type: 'string' },                    // #59 bridge: the handler command (ONE invocation per batch)
-  'handler-timeout': { type: 'string' },       // #62 bridge: max seconds ONE handler run may take (default 1800)
-  // #34 approve: the two gated-action labels (default Allow / Deny)
+  exec: { type: 'string' },                    // bridge: the handler command (ONE invocation per batch)
+  'handler-timeout': { type: 'string' },       // bridge: max seconds ONE handler run may take (default 1800)
+  // approve: the two gated-action labels (default Allow / Deny)
   'allow-label': { type: 'string' },
   'deny-label': { type: 'string' },
-  // lote-5 #4: collapse `setup` onboarding to a single status line (the full
+  // Collapse `setup` onboarding to a single status line (the full
   // doctor stays the default; --quiet is opt-in, never the default).
   quiet: { type: 'boolean' },
-  // cli#47 / pidge#284 (LA v2): the `pidge live` verb drives the REAL Live
+  // The `pidge live` verb drives the REAL Live
   // Activity endpoints (status center) — no more silent degrade to /notify.
   status: { type: 'string' },                  // live: short status line on the card
   symbol: { type: 'string' },                  // live: SF Symbol name
@@ -354,7 +354,7 @@ const OPTIONS = {
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
 
 USAGE
-  pidge setup --claim CODE [--url BASE]   one-shot onboarding (#110): exchange the single-use
+  pidge setup --claim CODE [--url BASE]   one-shot onboarding: exchange the single-use
                                           code for the channel key, store it, run doctor.
                                           MULTI-AGENT: set PIDGE_AGENT=<id> at each agent's launch
                                           → isolated config ~/.config/pidge/agents/<id>/env.
@@ -363,11 +363,11 @@ USAGE
                                                    agent's launcher — never run --print as an agent)
                                           --force  overwrite a shared file owned by another channel
                                           --listen-mode turn_based|persistent|external_daemon
-                                                   declare how you operate (#182; default turn_based)
+                                                   declare how you operate (default turn_based)
   pidge doctor                            validate the setup WITHOUT exposing secrets:
                                           env source, server, key, "canal X · N devices"
   pidge whoami                            which channel does this key speak for (JSON)
-  pidge hello  [options]                  FIRST-CONTACT WOW (#217): your channel's debut handshake,
+  pidge hello  [options]                  FIRST-CONTACT WOW: your channel's debut handshake,
                                           narrated LIVE on the lock screen by a 3-stage Live Activity
                                           (Conectando → toque para confirmar → Concluído ✓). send + wait
                                           in one — run it as your FIRST contact on a fresh channel.
@@ -376,7 +376,7 @@ USAGE
   pidge important [options]  ⭐DEFAULT     a pendency the human should resolve ("waiting-for-you" card)
   pidge urgent    [options]               breaks through silent/Focus; --escalate forces an AlarmKit alarm
   pidge event     [options]               a scheduled thing — needs --event-at (countdown Live Activity)
-  pidge live [CID] [options]              a REAL lock-screen card (Live Activity, #284): entry of the
+  pidge live [CID] [options]              a REAL lock-screen card (Live Activity): entry of the
                                           user's consolidated status center. --title starts/upserts;
                                           CID without --title updates; --end concludes (✓ + outcome)
   AXIS 2 — RESPONSE (composes on ANY type above): --actions/--custom-action add
@@ -390,8 +390,8 @@ USAGE
   pidge fyi→message · report→important · alert→urgent  (event/live unchanged)
   pidge notify [options]                  DEPRECATED — send without a type; prefer a TYPE above
   pidge wait   <correlation_id> [options] block on an already-sent notification
-  pidge cancel <correlation_id>           cancel a still-scheduled notification (#56)
-  pidge inbox  [--pending|--summary|--all|--limit N]   what you sent: list, pending slice, or counts+latency (#83)
+  pidge cancel <correlation_id>           cancel a still-scheduled notification
+  pidge inbox  [--pending|--summary|--all|--limit N]   what you sent: list, pending slice, or counts+latency
   pidge catchup [--limit N] [--before ID]  READ-ONLY peek at the whole conversation (GET ?history=true):
                                           the thread newest-first, answers included — NEVER consumes,
                                           NEVER acks, NEVER opens a lease. Run it to SITUATE yourself at
@@ -400,7 +400,7 @@ USAGE
                                           you learn what's already handled WITHOUT stealing a message.
                                           Exit 0 (printed, even if empty) · 2 error. NEVER run \`listen\`
                                           on a channel another runtime consumes (double-consume).
-  pidge bridge --exec '<handler>'         24/7 SUPERVISOR (#59): loop listen --all → your handler runs
+  pidge bridge --exec '<handler>'         24/7 SUPERVISOR: loop listen --all → your handler runs
                                           ONCE per batch (batch JSON on stdin) → exit 0 ⇒ ack of the
                                           batch's EXACT ids · non-zero ⇒ NOT acked (the server lease
                                           re-serves). ONE instance per channel (pid-checked lockfile by
@@ -410,22 +410,22 @@ USAGE
                                           bridge with Restart=on-failure + declare
                                           listen_mode=external_daemon (advisory). Never embeds the key.
   pidge listen [--timeout N] [--all] [--ack-on-read] [--follow]
-                                          block until the human MESSAGES you from the app, print, exit (#48)
-                                          #170: a read message is DELIVERED (gray ✓✓), NOT done — ACK it
+                                          block until the human MESSAGES you from the app, print, exit
+                                          a read message is DELIVERED (gray ✓✓), NOT done — ACK it
                                           AFTER the work: pidge ack --up-to <id> (a ~10-min lease re-serves
                                           un-acked messages, so a crash never loses one)
                                           --ack-on-read = the old immediate-consume (ack on print)
                                           --follow      = KEEP listening until --timeout (supervisor-only)
-                                          --all (#131)  = the SINGLE EAR: also hear notification ANSWERS
+                                          --all  = the SINGLE EAR: also hear notification ANSWERS
   pidge ack --up-to <id> | --ids a,b [--renew]
-                                          mark messages PROCESSED (green ✓✓) after you handled them (#170);
+                                          mark messages PROCESSED (green ✓✓) after you handled them;
                                           --renew heartbeats the lease on a long task (state=delivered)
   pidge contract set <key>=<value> | contract show
-                                          DECLARE how you operate (#182): keep_connection_alive,
+                                          DECLARE how you operate: keep_connection_alive,
                                           mirror_in_origin_session,
                                           listen_mode=turn_based|persistent|external_daemon,
                                           quiet_when_idle. ADVISORY, never policy (the human SEES if you honor it).
-  pidge selftest [--window N]             prove your listener works by ROUND-TRIP (#205): fire a nonce,
+  pidge selftest [--window N]             prove your listener works by ROUND-TRIP: fire a nonce,
                                           run the listener, confirm it picks it up + acks in time.
                                           PASS exit 0 / FAIL exit 2 (with the likely cause). Run it as the
                                           last onboarding step + whenever sends seem to go unheard.
@@ -436,7 +436,7 @@ USAGE
   pidge --version                         print the CLI version
   pidge --help
 
-REALTIME (#118)
+REALTIME
   listen/ask/wait hold a WebSocket to the server (ActionCable at /cable) when the
   runtime has one (Node ≥22): answers/messages land in <1 s, an idle hours-long
   listen survives server deploys by RECONNECTING, and while you listen the human
@@ -445,7 +445,7 @@ REALTIME (#118)
   --realtime      force WS (warns + falls back to polling if unavailable)
   --no-realtime   polling only (the ?wait= long-poll, capped 25 s server-side)
   Degrade ladder, narrated on stderr: WS → ?wait= long-poll → plain GETs every
-  ~45 s after 3 consecutive failures on held polls (#119). Degrade is STICKY for
+  ~45 s after 3 consecutive failures on held polls. Degrade is STICKY for
   the session (we can't probe held-poll health without re-paying the failure) —
   re-invoke the command to retry the fast path.
 
@@ -465,10 +465,10 @@ OPTIONS (notify / ask)
   --urgency LEVEL          normal | persistent | alarm (low-level — prefer --profile)
   --image PATH_OR_URL      image on the banner + feed: a local path is uploaded for
                            you (your machine has no public URL); an https URL is sent as-is
-                           (E2E channel + open media gate ⇒ a local path is SEALED first, #367)
+                           (E2E channel + open media gate ⇒ a local path is SEALED first)
   --file PATH              a real artifact (xlsx, pdf, csv…) the human previews,
                            shares and saves on the phone; uploaded automatically (≤25 MB;
-                           sealed bytes + filename when the media gate is open, #367)
+                           sealed bytes + filename when the media gate is open)
   --url URL                deep link the app opens when the user taps (PR, dashboard, log)
   --copy TEXT              value offered as tap-to-copy on the detail (code, token)
   --actions LIST           RESPONSE axis — comma list: yes,no,approve,reject,accept,
@@ -481,9 +481,9 @@ OPTIONS (notify / ask)
   --deliver-at ISO8601     schedule for later
   --reply-to URL           also POST the answer to your webhook (HMAC-signed)
   --correlation-id ID      idempotency + routing key (auto-generated if omitted)
-  --thread ID              conversation handle (#49): sends sharing it group as ONE
+  --thread ID              conversation handle: sends sharing it group as ONE
                            strand on the phone — use it for follow-ups
-  --after CID              decision queue (#157): HELD until that notification is
+  --after CID              decision queue: HELD until that notification is
                            answered — chain N decisions so the human sees one at a
                            time ("Decisão 2/3" --after <cid-da-1>); snooze doesn't advance
   --collapse-key KEY       replace/update a prior notification
@@ -519,7 +519,7 @@ OUTPUT
   Exit: 0 answered · 3 timed out (no answer yet, not a failure) · 4 timed out
   WITHOUT ONE healthy round-trip all session (the CHANNEL looks broken —
   server/network — not the human ignoring you: surface it instead of retrying
-  blindly, #119) · 2 error · 1 usage.
+  blindly) · 2 error · 1 usage.
 
 Responses are one-and-done EXCEPT snooze/reschedule (they re-fire); a --wait send
 keeps polling through a snooze and prints snooze_until. Follow-up = a NEW
@@ -530,7 +530,7 @@ it never produces an answer, so --wait/ask refuse it.
 Full spec (the contract — always current): GET $PIDGE_URL/api/v1/manifest`;
 
 // ---------------------------------------------------------------------------
-// #240: per-subcommand help. `pidge <cmd> --help` (and `pidge help <cmd>`) must
+// per-subcommand help. `pidge <cmd> --help` (and `pidge help <cmd>`) must
 // show the focused help for THAT command — its synopsis, what it does, and only
 // the flags that apply — instead of dumping the global USAGE (the bug an agent
 // hit: `pidge ask --help` listed the global flags, burying ask's own
@@ -559,8 +559,8 @@ const OPTION_DOCS = {
   'deliver-at': '--deliver-at ISO8601     schedule the send for later',
   'reply-to': '--reply-to URL           also POST the answer to your webhook (HMAC-signed)',
   'correlation-id': '--correlation-id ID      idempotency + routing key (auto-generated if omitted)',
-  thread: '--thread ID              conversation handle (#49): same id ⇒ one strand on the phone',
-  after: '--after CID              decision queue (#157): held until that notification is answered',
+  thread: '--thread ID              conversation handle: same id ⇒ one strand on the phone',
+  after: '--after CID              decision queue: held until that notification is answered',
   'collapse-key': '--collapse-key KEY       replace/update a prior notification',
   param: '--param KEY=VALUE        pass ANY raw /notify field (repeatable) — the manifest is the contract',
   timeout: '--timeout SECONDS        how long --wait blocks (ask/approval: template suggestion ~3600 · wait: 300 · listen: 600)',
@@ -570,8 +570,8 @@ const OPTION_DOCS = {
   pending: '--pending                only delivered + still-unanswered notifications',
   summary: '--summary                counts + answer latency (one call)',
   'all-inbox': '--all                    whole-account scope (not just this channel)',
-  'all-listen': '--all                    single ear: also hear notification ANSWERS, not just messages (#131)',
-  download: '--download               also save CLEAR inbound attachments to disk (sealed ones always save, #367)',
+  'all-listen': '--all                    single ear: also hear notification ANSWERS, not just messages',
+  download: '--download               also save CLEAR inbound attachments to disk (sealed ones always save)',
   'download-dir': '--download-dir DIR       where inbound attachments land (default ~/.config/pidge/downloads)',
   limit: '--limit N                cap the number of rows',
   before: '--before ID              catchup: page the thread OLDER than this message id (walk back through history)',
@@ -611,7 +611,7 @@ const OPTION_DOCS = {
   linger: '--linger N               end: seconds the final snapshot stays visible (default 30)',
 };
 // Content flags shared by every send.
-// lote-5 #3: `template` is intentionally OFF the menu (#274 — content_template is
+// `template` is intentionally OFF the menu (content_template is
 // undocumented back-compat). It stays a parseable OPTION but is NOT listed here,
 // so `pidge <type> --help` no longer prints a bare, description-less `template` line.
 const CONTENT_OPTS = ['title', 'body', 'body-markdown', 'body-markdown-file', 'subtitle', 'profile',
@@ -624,7 +624,7 @@ const SEND_OPTS = [...CONTENT_OPTS, 'gated', 'wait', 'timeout', 'interval', 'rea
 
 const HELP = {
   setup: {
-    summary: 'one-shot onboarding (#110): exchange a single-use claim code for the channel key, store it, run doctor.',
+    summary: 'one-shot onboarding: exchange a single-use claim code for the channel key, store it, run doctor.',
     usage: 'pidge setup --claim CODE [--url BASE] [--print] [--force] [--listen-mode MODE]',
     body: 'The CLI writes the key itself (chmod 600) — it never appears on screen or in the agent\'s chat. MULTI-AGENT: set PIDGE_AGENT=<id> at each agent\'s launch for an isolated config. --quiet collapses the onboarding to one status line.',
     opts: ['claim', 'url-base', 'print', 'force', 'listen-mode', 'quiet'],
@@ -640,12 +640,12 @@ const HELP = {
     opts: [],
   },
   hello: {
-    summary: 'first-contact WOW (#217): your channel\'s debut handshake, narrated live by a 3-stage Live Activity. send + wait in one.',
+    summary: 'first-contact WOW: your channel\'s debut handshake, narrated live by a 3-stage Live Activity. send + wait in one.',
     usage: 'pidge hello [options]',
-    body: 'First contact on a fresh channel: send the debut handshake and block until your human confirms. The server narrates a 3-stage Live Activity. --timeout defaults to 120s (#71); a timeout exits 3 (no confirmation yet — it stays in your queue, `pidge listen --all` collects it), never hanging the session.',
+    body: 'First contact on a fresh channel: send the debut handshake and block until your human confirms. The server narrates a 3-stage Live Activity. --timeout defaults to 120s; a timeout exits 3 (no confirmation yet — it stays in your queue, `pidge listen --all` collects it), never hanging the session.',
     opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
   },
-  // AXIS 1 — the married catalog of 5 (perfis-S1/S2). The TYPE you pick IS how the
+  // AXIS 1 — the married catalog of 5. The TYPE you pick IS how the
   // human configured it to arrive. RESPONSE (--actions/--wait) composes on any of them.
   message: {
     summary: 'just inform — passive info the human reads when they want; no action (clears when they OPEN it).',
@@ -674,7 +674,7 @@ const HELP = {
   live: {
     summary: 'track an in-flight task (deploy/build/trip) on a REAL lock-screen Live Activity. Status-only — never answers.',
     usage: 'pidge live [CID] --title TEXT [--status "…"] [--step 3/5 | --progress 0.6 | --ends-at ISO] · pidge live CID --end [--outcome "…"] [--linger N]',
-    body: 'Drives the /live_activities endpoints (LA v2 #284) — by default an ENTRY of the user\'s ONE consolidated status-center card (cards never stack; --dedicated opts into an own card, budget 2). FIELDS DRIVE THE RENDER: --step/--progress → bar + fraction · --ends-at → native countdown (the server concludes it at zero) · --end → ✓ + --outcome, lingers --linger seconds, then leaves. The handle is the CID (positional or --correlation-id; auto-generated on first POST — reuse it to update/end). Updates are cheap: identical re-writes echo operation:"noop"; a stale entry is retired by the server. ALWAYS --end what you started anyway — outcome beats timeout.',
+    body: 'Drives the /live_activities endpoints — by default an ENTRY of the user\'s ONE consolidated status-center card (cards never stack; --dedicated opts into an own card, budget 2). FIELDS DRIVE THE RENDER: --step/--progress → bar + fraction · --ends-at → native countdown (the server concludes it at zero) · --end → ✓ + --outcome, lingers --linger seconds, then leaves. The handle is the CID (positional or --correlation-id; auto-generated on first POST — reuse it to update/end). Updates are cheap: identical re-writes echo operation:"noop"; a stale entry is retired by the server. ALWAYS --end what you started anyway — outcome beats timeout.',
     opts: ['title', 'status', 'step', 'progress', 'ends-at', 'starts-at', 'paused', 'resume', 'detail', 'symbol', 'dedicated', 'end', 'outcome', 'linger', 'correlation-id'],
   },
   // AXIS 2 — the two response shortcuts (bundle a type + buttons + --wait).
@@ -687,10 +687,10 @@ const HELP = {
   approval: {
     summary: 'a go/no-go RECIPE — = important + Approve/Reject + Face ID on Approve + --wait.',
     usage: 'pidge approval --title TEXT [--body-markdown MD] [options]',
-    body: 'The easy shortcut for an explicit approval: injects an Approve (Face-ID gated) / Reject pair and blocks on the answer. Pass your own --actions/--custom-action to override the default pair. A gated action is detail-screen only (the banner shows no quick buttons by design — gotcha #19).',
+    body: 'The easy shortcut for an explicit approval: injects an Approve (Face-ID gated) / Reject pair and blocks on the answer. Pass your own --actions/--custom-action to override the default pair. A gated action is detail-screen only (the banner shows no quick buttons by design).',
     opts: [...CONTENT_OPTS, 'timeout', 'interval', 'realtime', 'no-realtime'],
   },
-  // #34 — the HOOK-shaped gate. DENY-DEFAULT: exit 0 ONLY on an explicit allow;
+  // — the HOOK-shaped gate. DENY-DEFAULT: exit 0 ONLY on an explicit allow;
   // deny, timeout, a dead channel or any ambiguity is non-zero, so a permission
   // hook fails CLOSED. Built for PreToolUse (see the runnable example below).
   approve: {
@@ -744,29 +744,29 @@ const HELP = {
     opts: ['timeout', 'interval', 'realtime', 'no-realtime'],
   },
   cancel: {
-    summary: 'cancel a still-scheduled notification before it fires (#56; idempotent; 409 once it reached the phone).',
+    summary: 'cancel a still-scheduled notification before it fires (idempotent; 409 once it reached the phone).',
     usage: 'pidge cancel <correlation_id>',
     opts: [],
   },
   inbox: {
-    summary: 'what you sent: the list (default), the pending slice, or counts + answer latency (#83).',
+    summary: 'what you sent: the list (default), the pending slice, or counts + answer latency.',
     usage: 'pidge inbox [--pending | --summary] [--all] [--limit N]',
     opts: ['pending', 'summary', 'all-inbox', 'limit'],
   },
   listen: {
-    summary: 'block until the human MESSAGES you from the app, print, ACK after the work, exit (#48).',
+    summary: 'block until the human MESSAGES you from the app, print, ACK after the work, exit.',
     usage: 'pidge listen [--timeout N] [--all] [--ack-on-read] [--follow] [--download] [--download-dir DIR]',
-    body: 'One-shot by design (loop it, don\'t daemonize). #170: a read message is DELIVERED (gray ✓✓), NOT done — ack it AFTER the work with `pidge ack --up-to <id>` (a ~10-min lease re-serves un-acked messages, so a crash never loses one). #367: a message may carry an `attachment` (a photo/file from the app\'s composer) — a SEALED one is auto-downloaded + decrypted to a local file (`attachment.path` in the JSON); a clear one keeps its fetchable `url` (--download saves it too).',
+    body: 'One-shot by design (loop it, don\'t daemonize). a read message is DELIVERED (gray ✓✓), NOT done — ack it AFTER the work with `pidge ack --up-to <id>` (a ~10-min lease re-serves un-acked messages, so a crash never loses one). a message may carry an `attachment` (a photo/file from the app\'s composer) — a SEALED one is auto-downloaded + decrypted to a local file (`attachment.path` in the JSON); a clear one keeps its fetchable `url` (--download saves it too).',
     opts: ['timeout', 'all-listen', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
   },
   bridge: {
-    summary: '24/7 supervisor (#59): long-poll the channel, run YOUR handler once per batch, ack only on exit 0. Model-agnostic.',
+    summary: '24/7 supervisor: long-poll the channel, run YOUR handler once per batch, ack only on exit 0. Model-agnostic.',
     usage: "pidge bridge --exec '<handler>'  ·  pidge bridge install --exec '<handler>'",
     body: [
       'The productized "paste a prompt and the agent stays online". The bridge is deliberately DUMB — no local queue, no own retry ledger: durability is the SERVER\'s ack/lease.',
       '',
-      'LOOP: long-poll GET /messages?all=true (the robust #119 floor; a realtime socket, when available, adds presence — "ouvindo agora" — and early wake-ups, never the data path) → your --exec command runs ONCE per batch with the batch JSON on stdin ({"messages":[…]} + "history_hint":true on the first batch since boot — the handler may want `pidge catchup` to situate) → handler exit 0 ⇒ ack of the batch\'s EXACT ids (never a --up-to watermark: that would stamp rows under lease from an EARLIER batch the handler FAILED on) · non-zero ⇒ NOT acked: the ~10-min server lease re-serves the batch. At-least-once is the contract — make the handler IDEMPOTENT. One run is capped by --handler-timeout (default 30 min): over it the handler is SIGTERMed (SIGKILL 5s later) and the batch counts as FAILED; while it runs, a heartbeat line lands on stderr every 5 min.',
-      'SUMMARY (#64): the handler tells the NEXT session WHAT it did by printing a marker line to stdout — `pidge-summary: <one sentence>`. The bridge tees the handler\'s stdout to its own log AND scans it (streamed, never buffered) for the LAST such line; found ⇒ the ack carries that summary (capped ~1000 chars) so `pidge catchup` shows "handled by X: <summary>"; not found ⇒ acked without one (never invented). An LLM handler is instructable in its own prompt: end with `echo "pidge-summary: <what you did>"` (or have the model print it). Only a line that STARTS with the marker counts — incidental output never becomes attribution.',
+      'LOOP: long-poll GET /messages?all=true (the robust floor; a realtime socket, when available, adds presence — "ouvindo agora" — and early wake-ups, never the data path) → your --exec command runs ONCE per batch with the batch JSON on stdin ({"messages":[…]} + "history_hint":true on the first batch since boot — the handler may want `pidge catchup` to situate) → handler exit 0 ⇒ ack of the batch\'s EXACT ids (never a --up-to watermark: that would stamp rows under lease from an EARLIER batch the handler FAILED on) · non-zero ⇒ NOT acked: the ~10-min server lease re-serves the batch. At-least-once is the contract — make the handler IDEMPOTENT. One run is capped by --handler-timeout (default 30 min): over it the handler is SIGTERMed (SIGKILL 5s later) and the batch counts as FAILED; while it runs, a heartbeat line lands on stderr every 5 min.',
+      'SUMMARY: the handler tells the NEXT session WHAT it did by printing a marker line to stdout — `pidge-summary: <one sentence>`. The bridge tees the handler\'s stdout to its own log AND scans it (streamed, never buffered) for the LAST such line; found ⇒ the ack carries that summary (capped ~1000 chars) so `pidge catchup` shows "handled by X: <summary>"; not found ⇒ acked without one (never invented). An LLM handler is instructable in its own prompt: end with `echo "pidge-summary: <what you did>"` (or have the model print it). Only a line that STARTS with the marker counts — incidental output never becomes attribution.',
       'Model-agnostic by construction: --exec \'claude -p "…"\' | \'codex exec "…"\' | \'gemini "…"\' | any script. This is the multi-LLM answer: no dependence on a harness that wakes on background-task exit.',
       'ONE INSTANCE PER CHANNEL: a lockfile keyed by hash(token) (~/.config/pidge/bridge-<hash>.lock, PID-checked so a crashed bridge never wedges the channel) — a second bridge, or a `listen`, on the same channel is REFUSED (exit 2). Read with `pidge catchup` instead.',
       'FAILURES: 401 → narrated + LOCAL alert + LONG jittered backoff (a rotated key only a human can fix — the bridge never dies silent, never re-loops blind); a channel with no healthy round-trip (the exit-4 class) → same alert + long backoff; every retry sleep is jittered. SIGTERM/SIGINT → clean shutdown: the in-flight batch is NOT acked (the lease re-serves it), the lock is released, exit 0.',
@@ -775,19 +775,19 @@ const HELP = {
     opts: ['exec', 'handler-timeout', 'interval', 'realtime', 'no-realtime'],
   },
   ack: {
-    summary: 'mark messages PROCESSED (green ✓✓) after you handled them, or --renew the lease on a long task (#170).',
+    summary: 'mark messages PROCESSED (green ✓✓) after you handled them, or --renew the lease on a long task.',
     usage: 'pidge ack --up-to <id> | --ids a,b [--renew] [--summary "<what you did>"]',
-    body: '--summary attaches a one-line note (WHAT you did) to the acked messages — a successor session sees it as "handled by X: <summary>" in `pidge catchup` (#63/server #380). A bare --summary with no value is a usage error, never a silent no-op.',
+    body: '--summary attaches a one-line note (WHAT you did) to the acked messages — a successor session sees it as "handled by X: <summary>" in `pidge catchup`. A bare --summary with no value is a usage error, never a silent no-op.',
     opts: ['up-to', 'ids', 'renew', 'ack-summary'],
   },
   contract: {
-    summary: 'DECLARE how you operate (#182) — ADVISORY, never policy (the human SEES if you honor it).',
+    summary: 'DECLARE how you operate — ADVISORY, never policy (the human SEES if you honor it).',
     usage: 'pidge contract set <key>=<value> | pidge contract show',
     body: 'Keys: keep_connection_alive, mirror_in_origin_session, listen_mode=turn_based|persistent|external_daemon, quiet_when_idle. An unknown key / bad value is rejected locally (exit 1).',
     opts: [],
   },
   selftest: {
-    summary: 'prove your listener works by ROUND-TRIP (#205): fire a nonce, run the listener, confirm it acks in time.',
+    summary: 'prove your listener works by ROUND-TRIP: fire a nonce, run the listener, confirm it acks in time.',
     usage: 'pidge selftest [--window N]',
     body: 'PASS exit 0 / FAIL exit 2 (with the likely cause). Run it as the last onboarding step + whenever sends seem to go unheard.',
     opts: ['window'],
@@ -806,7 +806,7 @@ const HELP = {
       '',
       'Run it to SITUATE yourself at the start of an interactive session on a channel whose messages another runtime (a 24/7 bridge/daemon) is the real consumer of: you learn what has already been said and handled WITHOUT stealing a message out of that consumer\'s queue. The rule is one consumer per channel — if another runtime consumes this channel, use `catchup` to read and NEVER run `listen` (that would double-consume).',
       '',
-      '#70: `--since <id>` is an incremental cursor — only messages with an id GREATER than <id> (situate in O(new), not O(whole thread)). It is enforced client-side too, so it holds regardless of server support. catchup remembers the highest id it printed and, on EVERY no-`--since` run, prints the cursor on stderr (stdout stays clean). `--digest` collapses each message to ONE line — `id · kind · <60 chars> · <state>`, where <state> is `handled by X: <summary>` (acked WITH a note), `✓ acked (no note)` (processed, no note — NOT pending), or `PENDING` (genuinely un-processed). The three states matter: a processed-but-noteless row is NOT work to redo. The two flags compose: `pidge catchup --digest --since <last>`.',
+      '`--since <id>` is an incremental cursor — only messages with an id GREATER than <id> (situate in O(new), not O(whole thread)). It is enforced client-side too, so it holds regardless of server support. catchup remembers the highest id it printed and, on EVERY no-`--since` run, prints the cursor on stderr (stdout stays clean). `--digest` collapses each message to ONE line — `id · kind · <60 chars> · <state>`, where <state> is `handled by X: <summary>` (acked WITH a note), `✓ acked (no note)` (processed, no note — NOT pending), or `PENDING` (genuinely un-processed). The three states matter: a processed-but-noteless row is NOT work to redo. The two flags compose: `pidge catchup --digest --since <last>`.',
       '',
       'Exit 0 = printed (even the empty `{"messages":[]}`) · 2 = error. There is no wait, so no exit 3/4.',
     ].join('\n'),
@@ -837,16 +837,16 @@ try {
 }
 const v = parsed.values;
 const command = parsed.positionals[0];
-// #241: silence the manifest-version nag entirely (per run via --quiet-nag, or
+// silence the manifest-version nag entirely (per run via --quiet-nag, or
 // per environment via PIDGE_QUIET_NAG=1) — for scripts and CI where the nudge is noise.
 const QUIET_NAG = !!v['quiet-nag'] || process.env.PIDGE_QUIET_NAG === '1';
-// lote-5 #4: `--quiet` collapses setup/doctor NARRATION to a single status line.
+// `--quiet` collapses setup/doctor NARRATION to a single status line.
 // `note()` prints an informational line only when NOT quiet; WARNINGS and ERRORS
 // keep using console.error directly, so --quiet never hides a broken setup.
 const QUIET = !!v.quiet;
 const note = (msg) => { if (!QUIET) console.error(msg); };
 
-// Help on stdout, exit 0. #240: `pidge <cmd> --help` / `pidge help <cmd>` show the
+// Help on stdout, exit 0. `pidge <cmd> --help` / `pidge help <cmd>` show the
 // FOCUSED help for that command (its synopsis + own flags); `pidge --help` / `help`
 // with no command show the global USAGE. No command at all → USAGE on stderr, exit 1.
 if (v.help || command === 'help') {
@@ -862,7 +862,7 @@ if (!TOKEN && command !== 'setup')
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
 
-// fetch with a hard timeout (#119 review): a wedged edge proxy can stall even a
+// fetch with a hard timeout: a wedged edge proxy can stall even a
 // short POST forever, and a hung ack on the realtime listen path would pin the
 // process past its deadline — worse than going deaf. NOTHING in this CLI should
 // await a fetch that can't time out. A held long-poll passes its own (larger)
@@ -877,49 +877,27 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // The server advertises its manifest version on every response. When it's newer
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
-// v63 (server #380/#294 P0.2′): ack attribution — acked_by_label/handler_summary on
-// history rows (catchup narrates them) + stale_from_prior_claim. See `pidge catchup`.
+// The newest server manifest additions this CLI narrates natively: ack
+// attribution — acked_by_label/handler_summary on history rows (catchup
+// narrates them) + stale_from_prior_claim. See `pidge catchup`.
 const KNOWN_MANIFEST_VERSION = 63;
-// #280: the hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
+// The hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
-// onboarded agent always runs the latest skill without any human action. Start at 1.
-// Bumped to 2 in 0.15.3 so every 0.15.2 install (which baked the marker ABOVE the `---`,
-// corrupting the skill's description) is detected as stale and self-heals into the fixed
-// in-frontmatter format on the next command. Bump this whenever the hand-authored spine moves.
-// Bumped to 3 in 0.16.0: the spine now teaches `pidge approve` (the hook-shaped gate)
-// and notes the CLI now REFUSES a decision + reply in one send (lote-5 #2).
-// Bumped to 4 in 0.16.1 (#38): the generated skill now ends with SKILL_END_MARKER (the
-// cheap integrity check) — the bump heals every pre-marker install into the new format.
-// Bumped to 6 in 0.19.0 (cli#47 / pidge#284): the spine now teaches the WIRED `pidge live`
-// (status center, --step sugar, --end/--outcome) and drops the "silently degrades" warning.
-// Bumped to 7 in 0.21.0 (#58): the spine now teaches `pidge catchup` (the read-only
-// situational read) + the one-consumer-per-channel rule (situate with catchup, NEVER
-// listen on a channel another runtime consumes).
-// Bumped to 8 in 0.21.0 (PR #60 cross-audit): the multi-runtime section is now the
-// VERBATIM prose from issue #58 (EN title, the listen_mode heuristic, "Only then speak").
-// Bumped to 9 in 0.23.1 (#68/#67): the spine now teaches `pidge bridge` (the 24/7
-// supervisor) + `ack --summary` attribution, carries the PIDGE_AGENT multi-agent block
-// early, and fixes 3 prose lines (durable-queue framing, human's-language, the
-// turn-based agent examples now span Claude Code/Codex/Gemini CLI, not just one).
-// Bumped to 10 in 0.24.0 (#70): the session-start ritual is now
-// `pidge catchup --digest --since <last>` — situate in O(new), one line per message,
-// instead of raw JSON over the whole thread.
-// Bumped to 11 in 0.24.1 (#76): the digest teaches THREE states (handled/✓ acked (no
-// note)/PENDING) — a processed-but-noteless row is NOT PENDING, i.e. not work to redo.
-const SKILL_REVISION = 11;
-// #38: the LAST line of every generated skill. A file that carries the frontmatter
+// onboarded agent always runs the latest skill without any human action.
+const SKILL_REVISION = 12;
+// the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
 const SKILL_END_MARKER = '<!-- pidge-skill-end -->';
-const NAG_TTL_MS = 24 * 60 * 60 * 1000; // #241: at most one nag per 24 h
+const NAG_TTL_MS = 24 * 60 * 60 * 1000; // at most one nag per 24 h
 let newsWarned = false;
-// #280: the self-heal runs at most ONCE per process (one regeneration, even when
+// the self-heal runs at most ONCE per process (one regeneration, even when
 // many commands/poll-ticks call checkManifestNews). Non-stale checks stay cheap +
 // repeatable; this only latches once an actual heal is attempted.
 let skillHealed = false;
 
-// #241: a tiny per-install state cache (~/.config/pidge/state.json, per-agent
+// a tiny per-install state cache (~/.config/pidge/state.json, per-agent
 // when PIDGE_AGENT is set — same dir as the env file). Best-effort: a read-only
 // fs just means the throttle falls back to once-per-process. Date is fine here
 // (this is the CLI process, not a workflow script).
@@ -934,7 +912,7 @@ function writeState(patch) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     // Atomic: write a temp then rename, so a crash/ENOSPC mid-write can't leave
     // a TRUNCATED state.json (which readState would silently treat as {} and
-    // drop the #313 pin — fail-open). rename over the live file is atomic on
+    // drop the E2E pin — fail-open). rename over the live file is atomic on
     // the same fs. (Shallow-merge race across parallel agents on a SHARED dir
     // stays possible; the multi-agent guidance is PIDGE_AGENT, which isolates
     // the dir — a lost pin re-latches on the next confirmed seal anyway.)
@@ -946,7 +924,7 @@ function writeState(patch) {
 
 async function checkManifestNews(res) {
   const ver = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10);
-  // #280: the self-heal runs on EVERY command (its own once-guard + cheap
+  // the self-heal runs on EVERY command (its own once-guard + cheap
   // first-line read), BEFORE the nag throttle below — it must fire even when the
   // server isn't ahead of KNOWN_MANIFEST_VERSION (a pure spine bump) and even
   // under QUIET_NAG (which only silences the stderr note, never the regenerate).
@@ -954,7 +932,7 @@ async function checkManifestNews(res) {
   if (QUIET_NAG || newsWarned) return;
   // (c) only when the server is ahead of what THIS CLI knows.
   if (!(ver > KNOWN_MANIFEST_VERSION)) return;
-  // #241 throttle: nag at most once per 24 h, and after that window only when the
+  // throttle: nag at most once per 24 h, and after that window only when the
   // server version actually CHANGED — so 5 calls in a row (or a steady server)
   // don't re-spam. A recent OR unchanged record suppresses; the record's seenAt is
   // stamped only on a real nag (suppressed runs don't roll the 24 h clock forward).
@@ -966,16 +944,16 @@ async function checkManifestNews(res) {
   }
   newsWarned = true;
   writeState({ manifestVersion: { value: ver, seenAt: new Date().toISOString() } });
-  // #26: pidge is a THIN PIPE — a server manifest bump almost never needs a CLI
+  // pidge is a THIN PIPE — a server manifest bump almost never needs a CLI
   // release, because --param carries any new /notify field NOW. So the nudge is
   // "new capabilities + how to use them today", NOT "your CLI is stale, update it".
-  // #249-A: the manifest is PUBLIC — the curl reads the catalog without a key
+  // The manifest is PUBLIC — the curl reads the catalog without a key
   // (a key only adds your channel's own config). Updating the CLI is the LAST,
   // optional step (only to gain native flags), never the headline.
   console.error(`pidge: the server has NEW capabilities (manifest v${ver}; this CLI knows v${KNOWN_MANIFEST_VERSION}) — pidge is a thin pipe, so you can use any new /notify field RIGHT NOW via --param KEY=VALUE. Read the catalog (whats_new) in the public manifest:  curl $PIDGE_URL/api/v1/manifest  (public; add -H "Authorization: Bearer $PIDGE_TOKEN" to also see your channel's config). Updating the CLI only matters to gain native flags:  npx pidge-cli@latest  (a pinned ref never self-updates). Silence this with --quiet-nag or PIDGE_QUIET_NAG=1.`);
 }
 
-// #280: STRUCTURAL self-heal — keep the LOCAL skill current with zero human action.
+// STRUCTURAL self-heal — keep the LOCAL skill current with zero human action.
 // The installed .claude/skills/pidge/SKILL.md is written once at onboarding and then
 // goes stale silently (a CLI/skill improvement gives an onboarded agent no signal, so
 // it keeps running the old skill). This silently regenerates it when EITHER trigger
@@ -986,7 +964,7 @@ async function checkManifestNews(res) {
 // onboarding's job, never a side effect of an unrelated command), runs at most once per
 // process, and is wholly best-effort: any failure is swallowed — a skill refresh must
 // NEVER break the user's actual command.
-// #38: locate the self-heal marker ONLY where a generated skill ever put it —
+// locate the self-heal marker ONLY where a generated skill ever put it —
 // line 1 (the pre-0.15.3 `<!-- pidge-skill … -->` HTML comment, above the `---`)
 // or a line inside the OPENING frontmatter block (the 0.15.3+ `# pidge-skill …`
 // YAML comment). Body prose mentioning "pidge-skill" is invisible to this scan.
@@ -1001,7 +979,7 @@ function findSkillMarker(content) {
   return '';
 }
 
-// #69: the TWO locations Claude Code loads a `pidge` skill from — the PROJECT skill
+// the TWO locations Claude Code loads a `pidge` skill from — the PROJECT skill
 // (.claude/skills/pidge under cwd, where `skill install` writes) AND the HOME skill
 // (~/.claude/skills/pidge). Old installs (and hand-copies) live in HOME; the
 // cwd-only self-heal never visited it, so a live agent ran 3 WEEKS on a home skill
@@ -1011,18 +989,18 @@ function skillHealCandidates() {
   const rel = path.join('.claude', 'skills', 'pidge', 'SKILL.md');
   const project = path.join(process.cwd(), rel);
   const home = path.join(os.homedir(), rel);
-  // #73 cross-audit: the HOME path requires a pidge MARKER before we touch it — an
+  // The HOME path requires a pidge MARKER before we touch it — an
   // unmarked ~/.claude/skills/pidge/SKILL.md is an AUTHORIAL skill (the human wrote
   // their own), NOT a pidge install gone stale, and must be left alone. The PROJECT
   // path keeps the current semantics (it heals a marker-less file too, since a project
   // skill only exists because pidge/onboarding put it there — covered by an existing
-  // #38 test). Deduped when cwd IS home (heal once, and require the marker then).
+  // test). Deduped when cwd IS home (heal once, and require the marker then).
   if (project === home) return [{ file: project, requireMarker: true }];
   return [{ file: project, requireMarker: false }, { file: home, requireMarker: true }];
 }
 
-// #76 item 3: doctor's nudge for a home skill with NO pidge marker. Such a file is
-// left untouched by the self-heal (#73 requireMarker) — correct, since it might be
+// Doctor's nudge for a home skill with NO pidge marker. Such a file is
+// left untouched by the self-heal (requireMarker) — correct, since it might be
 // the human's OWN authored skill — but a PRE-MARKER pidge copy is indistinguishable
 // and would silently stay on old doctrine. So doctor SAYS so (never writes). The fix
 // it points at is `skill install` run FROM the home dir (the target is cwd-relative),
@@ -1034,7 +1012,7 @@ function warnUnmarkedHomeSkill() {
     if (path.join(process.cwd(), '.claude', 'skills', 'pidge', 'SKILL.md') === homeSkill) return;
     if (!fs.existsSync(homeSkill)) return;
     if (findSkillMarker(fs.readFileSync(homeSkill, 'utf8'))) return; // marked ⇒ self-heals; nothing to say
-    console.error(`pidge doctor: ⚠️ ${homeSkill} has NO pidge marker — the self-heal won't touch it (#69), so if it's an OLD pidge copy (not a skill you authored) it may be running STALE doctrine with no other signal. To refresh it, run \`pidge skill install\` FROM your home dir (\`cd ~ && npx pidge-cli skill install\`) — the current file is backed up to .bak first. If you AUTHORED it yourself, ignore this.`);
+    console.error(`pidge doctor: ⚠️ ${homeSkill} has NO pidge marker — the self-heal won't touch it, so if it's an OLD pidge copy (not a skill you authored) it may be running STALE doctrine with no other signal. To refresh it, run \`pidge skill install\` FROM your home dir (\`cd ~ && npx pidge-cli skill install\`) — the current file is backed up to .bak first. If you AUTHORED it yourself, ignore this.`);
   } catch { /* best-effort — never break doctor over a skill probe */ }
 }
 
@@ -1045,23 +1023,23 @@ function warnUnmarkedHomeSkill() {
 // authorial skill) and left untouched.
 function skillIsStale(file, serverManifestVersion, requireMarker = false) {
   if (!fs.existsSync(file)) return false;
-  // #33 fix + #38: the marker rides a `# pidge-skill rev=N manifest=M` YAML comment INSIDE
+  // The marker rides a `# pidge-skill rev=N manifest=M` YAML comment INSIDE
   // the frontmatter (0.15.3+); pre-0.15.3 installs put `<!-- pidge-skill … -->` as line 1.
-  // #38: the scan is ANCHORED to those two positions (line 1, or inside the opening `---`
+  // the scan is ANCHORED to those two positions (line 1, or inside the opening `---`
   // block) — a prose line in the body like "see pidge-skill rev=99" must never be read as
   // the marker and suppress a legitimate heal.
   const content = fs.readFileSync(file, 'utf8');
   const markerLine = findSkillMarker(content);
-  // #73: no marker + marker required (the HOME path) ⇒ an authorial skill, not ours.
+  // no marker + marker required (the HOME path) ⇒ an authorial skill, not ours.
   if (requireMarker && !markerLine) return false;
   const revM = markerLine.match(/rev=(\d+)/);
   const manM = markerLine.match(/manifest=(\d+)/);
   const installedRev = revM ? parseInt(revM[1], 10) : 0;
   const installedManifest = manM ? parseInt(manM[1], 10) : 0;
-  // #38 integrity: a generated skill always ends with SKILL_END_MARKER. A marker whose
+  // integrity: a generated skill always ends with SKILL_END_MARKER. A marker whose
   // rev looks current but whose trailer is missing = a TORN write (the marker survived
   // on line ~4, the tail didn't) — without this check the tear would read as "fresh"
-  // and never heal. Pre-#38 installs lack the trailer too, but their rev < 4 already
+  // and never heal. Pre-trailer installs lack the trailer too, but their rev < 4 already
   // marks them stale, so the two triggers compose instead of fighting.
   const torn = installedRev > 0 && !content.trimEnd().endsWith(SKILL_END_MARKER);
   return torn || SKILL_REVISION > installedRev || (serverManifestVersion || 0) > installedManifest;
@@ -1070,7 +1048,7 @@ function skillIsStale(file, serverManifestVersion, requireMarker = false) {
 async function ensureSkillFresh(serverManifestVersion) {
   if (skillHealed) return;
   try {
-    // #69: check BOTH project + home; heal every stale copy in ONE pass (a single
+    // check BOTH project + home; heal every stale copy in ONE pass (a single
     // process may own two stale skills). A silent home heal is safe in multi-project
     // use: the generated content is agent- AND project-agnostic (it bakes no token —
     // only the server's manifest version + fixed doctrine), so any project's
@@ -1094,7 +1072,7 @@ async function ensureSkillFresh(serverManifestVersion) {
 }
 
 // ---------------------------------------------------------------------------
-// #119: the health ledger of one blocking session (wait/ask/listen). Drives
+// the health ledger of one blocking session (wait/ask/listen). Drives
 //   (a) automatic DEGRADE from held ?wait= polls to plain GETs after
 //       DEGRADE_AFTER consecutive failures (an edge that kills held responses
 //       leaves short requests fine — the channel stays alive, less instant),
@@ -1106,10 +1084,10 @@ const DEGRADE_AFTER = 3;
 // env override = a test/ops hook, not a documented knob
 const DEGRADED_INTERVAL_S = parseInt(process.env.PIDGE_DEGRADED_INTERVAL || '45', 10);
 // When the blocking session began — so a timeout reports the REAL elapsed
-// wall-clock, never the configured deadline. The dogfooding bug (2026-06-14): a
+// wall-clock, never the configured deadline. A real bug once shipped: a
 // WS close 1006 made the CLI exit "timed out after 28800s" when only seconds had
 // passed — the number lied. exitTimeout now reports elapsed since this baseline.
-// MONOTONIC on purpose (§2.5): performance.now() can't be skewed by a wall-clock
+// MONOTONIC on purpose: performance.now() can't be skewed by a wall-clock
 // change (NTP step / DST) mid-session — a Date.now() delta could, re-opening the
 // "wrong number" failure mode the fix exists to kill.
 const SESSION_START_MONO = performance.now();
@@ -1132,11 +1110,11 @@ const health = {
     }
   },
   exitTimeout(message, hint) {
-    // REAL elapsed wall-clock — never the configured deadline (the 2026-06-14
+    // REAL elapsed wall-clock — never the configured deadline (the
     // "timed out after 28800s" lie). If only seconds passed, the number says so.
     const elapsed = Math.round((performance.now() - SESSION_START_MONO) / 1000);
     if (this.okEver) {
-      // #65: a healthy channel that heard nothing on exit 3 might not be empty —
+      // a healthy channel that heard nothing on exit 3 might not be empty —
       // a message can be UNDER A VISIBILITY LEASE from another read (a selftest,
       // a crashed listener, a bridge), invisible until the lease lapses. Point at
       // the read-only diagnostic that sees the whole queue regardless. Only on
@@ -1151,7 +1129,7 @@ const health = {
 };
 
 // ---------------------------------------------------------------------------
-// Realtime (#118): a minimal ActionCable client over the runtime's native
+// Realtime: a minimal ActionCable client over the runtime's native
 // WebSocket (Node ≥22). The token rides an extra Sec-WebSocket-Protocol entry
 // (the browser-style API can't set headers). The WS is a WAKE-UP + payload
 // channel only — every durable read (message backlog, chosen_action) still
@@ -1197,7 +1175,7 @@ function cableSubscribe({ channel, onUp, onFrame, onDown, base = BASE, token = T
     if (f.identifier === identifier && f.message) onFrame(f.message);
   };
   ws.onerror = () => { /* onclose follows with the code */ };
-  // #25: the reconnect log prefixes "realtime socket …", so the reason must NOT
+  // the reconnect log prefixes "realtime socket …", so the reason must NOT
   // start with "socket" again (was "socket socket closed (1006)").
   ws.onclose = (e) => die(`closed (${e.code})`);
   return { close: () => { closed = true; clearInterval(beatCheck); try { ws.close(); } catch { /* noop */ } } };
@@ -1205,7 +1183,7 @@ function cableSubscribe({ channel, onUp, onFrame, onDown, base = BASE, token = T
 
 // Run one WS subscription session until the deadline / an unrecoverable WS
 // problem, reconnecting with backoff in between (a deploy = seconds of gap; the
-// criterion: hours-long listens must SURVIVE it, #119). onUp/onFrame get a
+// criterion: hours-long listens must SURVIVE it). onUp/onFrame get a
 // `finish(reason)` to end the session (e.g. when the answer landed over HTTP).
 // Resolves 'deadline' | 'ws-unavailable'.
 async function cableSession({ channel, deadline, onUp, onFrame }) {
@@ -1239,7 +1217,7 @@ async function cableSession({ channel, deadline, onUp, onFrame }) {
     // env override = a test/ops hook (keeps the forced-1006 degrade test fast)
     const base = parseInt(process.env.PIDGE_WS_BACKOFF_MS || '2000', 10) || 2000;
     const backoff = Math.min(base * wsFails, base * 5);
-    // #25: show the MONOTONIC reconnect count, not the consecutive-fail counter —
+    // show the MONOTONIC reconnect count, not the consecutive-fail counter —
     // a connect→drop FLAP resets wsFails (onUp forgives a healthy connect), so the
     // old "attempt 1/4" repeated forever and looked like a stuck loop. The cumulative
     // "#N" visibly advances; the polling fallback is spelled out so the ceiling is clear.
@@ -1249,8 +1227,8 @@ async function cableSession({ channel, deadline, onUp, onFrame }) {
   return 'deadline';
 }
 
-// #171: doctor's realtime probe — the failure class an HTTP-only doctor can't
-// see (#119: an edge killing held responses, a proxy refusing the upgrade). A
+// doctor's realtime probe — the failure class an HTTP-only doctor can't
+// see (an edge killing held responses, a proxy refusing the upgrade). A
 // green HTTP doctor can coexist with a `listen` that's deaf over the socket.
 // Open ONE ConversationChannel subscription on /cable (reusing cableSubscribe —
 // the same client `listen` holds), wait for confirm_subscription, close — all
@@ -1284,14 +1262,14 @@ function probeRealtime(base, token) {
   });
 }
 
-// #242: a custom action id is lowercase letters, digits and underscore (≤40) —
+// a custom action id is lowercase letters, digits and underscore (≤40) —
 // the same rule the server enforces, validated LOCALLY so a typo fails fast.
 const CUSTOM_ACTION_ID = /^[a-z0-9_]{1,40}$/;
 
 // --custom-action "id:label[:destructive][:confirm][:biometric][:terminal]"
 function customActionFromSpec(spec) {
   const [id, label, ...flags] = spec.split(':');
-  // #157 P2: fail fast locally — the rule is stable and the server 422 costs a
+  // Fail fast locally — the rule is stable and the server 422 costs a
   // round-trip an agent then has to interpret.
   if (!CUSTOM_ACTION_ID.test(id || '')) {
     die(`pidge: --custom-action id ${JSON.stringify(id)} is invalid — lowercase letters, digits and underscore only (^[a-z0-9_]{1,40}$)`, 1);
@@ -1304,7 +1282,7 @@ function customActionFromSpec(spec) {
   return ca;
 }
 
-// #242: one item of a JSON --actions array → a custom_actions spec. Validates
+// one item of a JSON --actions array → a custom_actions spec. Validates
 // {id,label} and passes the optional gating fields the server understands.
 function customActionFromJson(item, i) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) {
@@ -1327,7 +1305,8 @@ function customActionFromJson(item, i) {
 }
 
 // ---------------------------------------------------------------------------
-// E2E wire layer (E2-CLI, #43 — contract: e2e-spec-v1.md + manifest v49/v51).
+// E2E wire layer — send/receive integration of wire format v1 (shared with the
+// server and the iOS app).
 // SEND: with a valid PIDGE_SECRET AND an E2E channel (whoami says — never a
 // guess), the content fields leave this machine as envelopes with enc:"v1"+kf;
 // otherwise the send is the clear send of always (the server accepts-and-marks
@@ -1335,12 +1314,12 @@ function customActionFromJson(item, i) {
 // RECEIVE: every read path gates on the EXPLICIT `enc` flag (never on sniffing
 // the "v1:" prefix). Inside a sealed context, an envelope MUST open — a kf that
 // isn't ours / a failed tag / a missing AAD anchor is a PRECISE error and the
-// field is BLANKED (base64 never reaches the terminal — follow-up A1); a value
+// field is BLANKED (base64 never reaches the terminal); a value
 // that is NOT an envelope is readable text and passes through untouched (a
 // built-in action label, or a clear reply typed on a pre-E2E app — the same
 // accept-and-mark honesty the iOS app shows).
 // ---------------------------------------------------------------------------
-// v59/#351: `copy` (tap-to-copy — the field MADE for tokens/codes) and `url`
+// `copy` (tap-to-copy — the field MADE for tokens/codes) and `url`
 // (deep link) joined the seal. AAD field names are the payload names verbatim
 // ("copy"/"url") — the iOS tap paths decrypt with the same names.
 const E2E_CONTENT_FIELDS = ['title', 'subtitle', 'body', 'body_markdown', 'copy', 'url'];
@@ -1373,7 +1352,7 @@ async function e2eChannelInfo() {
   e2eChannelCache = {
     id: data.channel.id,
     e2eEnabled: !!data.channel.e2e_enabled,
-    // #367 media gate: sealed media is SAFE on this channel — E2E on AND every
+    // media gate: sealed media is SAFE on this channel — E2E on AND every
     // deliverable device runs a build that OPENS sealed blobs. Absent on an
     // older server ⇒ false (never seal into the void).
     e2eMediaReady: !!data.channel.e2e_media_ready,
@@ -1406,7 +1385,7 @@ function e2eSealedError(enc, theirKf) {
 function e2eOpenValue({ enc, kf, channelId, cid, field, value, onError }) {
   if (!isEnvelope(value)) return value;
   const reason = e2eSealedError(enc, kf)
-    || (!cid && 'sealed but the row carries NO correlation_id (the AAD anchor) — the server predates E1.5, or a bug: it can never be decrypted')
+    || (!cid && 'sealed but the row carries NO correlation_id (the AAD anchor) — an old server, or a bug: it can never be decrypted')
     || (channelId == null && 'sealed but the channel id is unknown (whoami failed) — the AAD needs it; retry when the server is reachable')
     || null;
   if (reason) { onError(reason); return null; }
@@ -1418,7 +1397,7 @@ function e2eOpenValue({ enc, kf, channelId, cid, field, value, onError }) {
   }
 }
 
-// #313 local pin — the anti-downgrade latch. The seal decision used to trust
+// local pin — the anti-downgrade latch. The seal decision used to trust
 // server-served flags in BOTH directions: a lying/compromised server answering
 // e2e_enabled=false (or just failing whoami) made this CLI send PLAINTEXT
 // despite holding the key — breaking the feature's own threat model ("protects
@@ -1437,8 +1416,8 @@ function e2eOverrideOff() {
 // rotates the token ⇒ the new token starts unpinned and re-latches on its
 // first confirmed seal (the stale entry is inert).
 // The channel key — hash(token), resolvable with ZERO server help and never
-// storing the token itself in state.json. The E2E pin (#313) and the catchup
-// cursor (#70) both key their state.json entries by THIS, for the same reason:
+// storing the token itself in state.json. The E2E pin and the catchup
+// cursor both key their state.json entries by THIS, for the same reason:
 // one machine can drive two channels from the same config dir, so a per-install
 // (unkeyed) entry would let channel A's state leak into channel B.
 function channelKeyFor(token) {
@@ -1460,18 +1439,18 @@ function e2eStampPin(kf) {
   const cur = pins[k];
   if (cur && cur.v === 1 && cur.kf === kf) return;
   // Spread `cur`: a re-key (new kf, same token) must PRESERVE the media latch
-  // (#367) — dropping `media:true` here would re-arm the exact server-driven
+  // — dropping `media:true` here would re-arm the exact server-driven
   // media-downgrade lever the pin exists to deny. e2eStampMediaPin spreads too.
   writeState({ e2ePins: { ...pins, [k]: { ...cur, v: 1, kf, at: new Date().toISOString() } } });
-  e2eNote('channel PINNED as E2E on this machine (#313) — clear sends here are now refused even if the server claims E2E is off. Genuine toggle-off ⇒ unpin locally with PIDGE_E2E=off (env var or the env file).');
+  e2eNote('channel PINNED as E2E on this machine — clear sends here are now refused even if the server claims E2E is off. Genuine toggle-off ⇒ unpin locally with PIDGE_E2E=off (env var or the env file).');
 }
 const E2E_UNPIN_HINT = 'If your human GENUINELY turned E2E off in the app, unpin locally: PIDGE_E2E=off (env var, or a line in the env file next to PIDGE_TOKEN). A server response alone can never unpin.';
 
-// --- #367 (E3): sealed MEDIA — the deploy gate + its own pin latch. ---------
+// --- Sealed MEDIA — the deploy gate + its own pin latch. --------------------
 // Media sealing is gated on whoami's e2e_media_ready (an iOS build that can
 // OPEN sealed blobs is on all the human's devices) because a sealed photo on
 // an old device is a broken photo. But a server-served gate is a downgrade
-// lever (#313 class), so the FIRST confirmed sealed-media send latches
+// lever (the same class the E2E pin refuses), so the FIRST confirmed sealed-media send latches
 // `media:true` into the channel's pin — from then on a clear-media send is
 // REFUSED unless the human sets PIDGE_E2E_MEDIA=off locally. PIDGE_E2E_MEDIA=on
 // force-seals (testing before the iOS wave); PIDGE_E2E=off keeps voiding
@@ -1500,7 +1479,7 @@ function e2eStampMediaPin() {
   const cur = pins[k] || {};
   if (cur.v === 1 && cur.media) return;
   writeState({ e2ePins: { ...pins, [k]: { ...cur, v: 1, media: true, at: cur.at || new Date().toISOString() } } });
-  e2eNote('channel PINNED as SEALED-MEDIA on this machine (#367/#313) — a send whose media would ride CLEAR here is now refused, even if the server claims the media gate closed. Genuine downgrade (a legacy device joined, or E2E off) ⇒ PIDGE_E2E_MEDIA=off locally.');
+  e2eNote('channel PINNED as SEALED-MEDIA on this machine — a send whose media would ride CLEAR here is now refused, even if the server claims the media gate closed. Genuine downgrade (a legacy device joined, or E2E off) ⇒ PIDGE_E2E_MEDIA=off locally.');
 }
 const E2E_MEDIA_UNPIN_HINT = 'If the downgrade is GENUINE (a legacy device joined the account, or your human turned E2E off), unpin media locally: PIDGE_E2E_MEDIA=off (env var, or a line in the env file). A server response alone can never unpin.';
 
@@ -1518,21 +1497,21 @@ function sanitizeAttachmentName(name) {
 //   null                       — clear media (the path of always), or no media;
 //   { key, channelId, cid }    — seal each local blob under these + media_enc.
 // Refusals (exit 2) happen HERE, pre-upload, so a downgrading/lying server
-// never receives clear bytes or a real filename (the #313 cross-audit rule).
+// never receives clear bytes or a real filename (the pin-refuses-before-upload rule).
 async function e2eMediaPlan(payload) {
   const hasMedia = v.image !== undefined || v.file !== undefined;
   if (!hasMedia) return null;
   const mediaPinned = e2eMediaPinned() && e2eMediaOverride() !== 'off' && !e2eOverrideOff();
   const mat = e2eKeyMaterial();
   if (!mat) {
-    if (mediaPinned) die(`pidge: REFUSING to send CLEAR MEDIA (exit 2) — this channel is locally PINNED as sealed-media (#367/#313) but PIDGE_SECRET is missing/invalid. Fix the secret (the app's Connect screen has the terminal step). ${E2E_MEDIA_UNPIN_HINT}`, 2);
+    if (mediaPinned) die(`pidge: REFUSING to send CLEAR MEDIA (exit 2) — this channel is locally PINNED as sealed-media but PIDGE_SECRET is missing/invalid. Fix the secret (the app's Connect screen has the terminal step). ${E2E_MEDIA_UNPIN_HINT}`, 2);
     return null;
   }
   let ch;
   try {
     ch = await e2eChannelInfo();
   } catch (e) {
-    if (mediaPinned) die(`pidge: REFUSING to send CLEAR MEDIA (exit 2) — this channel is locally PINNED as sealed-media (#367/#313) and the server won't confirm its media gate (${e.message}); retry when it's reachable. ${E2E_MEDIA_UNPIN_HINT}`, 2);
+    if (mediaPinned) die(`pidge: REFUSING to send CLEAR MEDIA (exit 2) — this channel is locally PINNED as sealed-media and the server won't confirm its media gate (${e.message}); retry when it's reachable. ${E2E_MEDIA_UNPIN_HINT}`, 2);
     return null; // the text-seal path warns about the whoami failure already
   }
   const willSeal = e2eMediaSealDecision({
@@ -1541,14 +1520,14 @@ async function e2eMediaPlan(payload) {
     override: e2eMediaOverride(),
   });
   if (!willSeal) {
-    if (mediaPinned) die(`pidge: REFUSING to send CLEAR MEDIA (exit 2) — this machine PINNED the channel as sealed-media (#367/#313) but this send's media would ride CLEAR (the server says ${ch.e2eEnabled ? 'the media gate is closed — e2e_media_ready:false' : 'the channel is not E2E'}). ${E2E_MEDIA_UNPIN_HINT}`, 2);
+    if (mediaPinned) die(`pidge: REFUSING to send CLEAR MEDIA (exit 2) — this machine PINNED the channel as sealed-media but this send's media would ride CLEAR (the server says ${ch.e2eEnabled ? 'the media gate is closed — e2e_media_ready:false' : 'the channel is not E2E'}). ${E2E_MEDIA_UNPIN_HINT}`, 2);
     return null;
   }
   // A public-URL --image can't be sealed (we don't hold its bytes' custody) and
   // a mixed send (media_enc + a clear image_url) would make the phone try to
   // unseal clear bytes — the broken photo the gate exists to prevent. Refuse.
   if (v.image !== undefined && !fs.existsSync(v.image)) {
-    die('pidge: --image with a URL/ref cannot ride a SEALED-media send (#367) — the bytes must be sealed on this machine. Download the image and pass a local path (or PIDGE_E2E_MEDIA=off to send this one clear).', 2);
+    die('pidge: --image with a URL/ref cannot ride a SEALED-media send — the bytes must be sealed on this machine. Download the image and pass a local path (or PIDGE_E2E_MEDIA=off to send this one clear).', 2);
   }
   if (!payload.correlation_id) payload.correlation_id = crypto.randomUUID();
   return { key: mat.key, channelId: ch.id, cid: payload.correlation_id };
@@ -1559,7 +1538,7 @@ async function e2eMediaPlan(payload) {
 // clear — the action contract runs on ids), enc:"v1" + kf ride alongside, and
 // the correlation_id is ALWAYS minted client-side (the AAD needs it BEFORE the
 // server ever sees the payload).
-// Server-side length caps on the columns these fields land in (notification.rb)
+// Server-side length caps on the columns these fields land in
 // — the AES-GCM+base64url envelope inflates ~4/3 + a prefix, so a value that
 // fits in CLEAR can 422 once sealed. We check locally with a message that names
 // the CAUSE (the server's bare "too long" wouldn't tell the agent it was E2E).
@@ -1569,26 +1548,26 @@ const E2E_SEALED_FIELD_CAPS = { copy: 512, url: 1024 };
 // when the send may proceed (sealed, or legitimately clear on an unpinned
 // channel). Shared by the pre-upload preflight AND e2eMaybeSeal so the two can
 // never diverge — and so the pin can REFUSE before any bytes leave the machine
-// (cross-audit HIGH: media upload used to precede the gate). whoami is cached,
+// (a real bug once: media upload used to precede the gate). whoami is cached,
 // so calling this twice per send is cheap; when NOT pinned it returns early and
 // pays no whoami, keeping the common clear path fast.
 async function e2eRefusalIfPinned() {
   if (!(e2ePinned() && !e2eOverrideOff())) return null;
   if (!e2eKeyMaterial())
-    return `pidge: REFUSING to send CLEAR (exit 2) — this channel is locally PINNED as E2E (#313) but PIDGE_SECRET is missing/invalid. Fix the secret (the app's Connect screen has the terminal step that writes it). ${E2E_UNPIN_HINT}`;
+    return `pidge: REFUSING to send CLEAR (exit 2) — this channel is locally PINNED as E2E but PIDGE_SECRET is missing/invalid. Fix the secret (the app's Connect screen has the terminal step that writes it). ${E2E_UNPIN_HINT}`;
   try {
     const ch = await e2eChannelInfo();
     if (!ch.e2eEnabled)
-      return `pidge: REFUSING to send CLEAR (exit 2) — the server says this channel is NOT E2E, but this machine PINNED it as E2E (#313: a lying/compromised server could be downgrading you to plaintext). ${E2E_UNPIN_HINT}`;
+      return `pidge: REFUSING to send CLEAR (exit 2) — the server says this channel is NOT E2E, but this machine PINNED it as E2E (a lying/compromised server could be downgrading you to plaintext). ${E2E_UNPIN_HINT}`;
   } catch (e) {
-    return `pidge: REFUSING to send CLEAR (exit 2) — this channel is locally PINNED as E2E (#313) and the server won't confirm its E2E state (${e.message}). A server that can't answer whoami must not be able to downgrade you to plaintext; retry when it's reachable. ${E2E_UNPIN_HINT}`;
+    return `pidge: REFUSING to send CLEAR (exit 2) — this channel is locally PINNED as E2E and the server won't confirm its E2E state (${e.message}). A server that can't answer whoami must not be able to downgrade you to plaintext; retry when it's reachable. ${E2E_UNPIN_HINT}`;
   }
   return null;
 }
 
 // Called by doNotify BEFORE resolveMedia: on a pinned channel that would
 // downgrade to clear, die HERE — so a compromised server never receives the
-// upload bytes/filename (which ride clear until E3) in the first place.
+// upload bytes/filename (which ride clear when media sealing is off) in the first place.
 async function e2ePreflightRefusal() {
   const reason = await e2eRefusalIfPinned();
   if (reason) die(reason, 2);
@@ -1614,7 +1593,7 @@ async function e2eMaybeSeal(payload) {
     if (payload[f] !== undefined && payload[f] !== null && payload[f] !== '') payload[f] = seal(f, payload[f]);
   }
   for (const ca of payload.custom_actions || []) {
-    if (E2E_NEVER_SEAL_LABEL_IDS.has(ca.id)) continue; // builtin/system id — the label rides CLEAR (#313)
+    if (E2E_NEVER_SEAL_LABEL_IDS.has(ca.id)) continue; // builtin/system id — the label rides CLEAR
     if (typeof ca.label === 'string' && ca.label !== '') ca.label = seal(`action_label_${ca.id}`, ca.label);
   }
   for (const [f, cap] of Object.entries(E2E_SEALED_FIELD_CAPS)) {
@@ -1623,10 +1602,10 @@ async function e2eMaybeSeal(payload) {
   }
   payload.enc = 'v1';
   payload.kf = mat.kf;
-  e2eStampPin(mat.kf); // a CONFIRMED sealed context latches the anti-downgrade pin (#313)
+  e2eStampPin(mat.kf); // a CONFIRMED sealed context latches the anti-downgrade pin
   if (payload.media_enc === 'v1') {
-    e2eStampMediaPin(); // #367: a CONFIRMED sealed-media send latches the media pin too
-    console.error('pidge: E2E — media bytes + filename sealed (#367 E3)');
+    e2eStampMediaPin(); // a CONFIRMED sealed-media send latches the media pin too
+    console.error('pidge: E2E — media bytes + filename sealed');
   } else if (payload.image !== undefined || payload.file !== undefined) {
     console.error('pidge: E2E note — this send\'s media BYTES and filename ride CLEAR (the media gate is closed: whoami e2e_media_ready:false until an iOS build that opens sealed media is on all devices; PIDGE_E2E_MEDIA=on forces it). The text fields, copy and url are sealed.');
   }
@@ -1650,10 +1629,10 @@ function e2eOpenEcho(info, payload) {
 }
 
 // RECEIVE: one row of GET /api/v1/messages. Two sealed shapes exist —
-//   kind:"message" (E1.5): the row's own enc/kf/correlation_id; body opens with
+//   kind:"message": the row's own enc/kf/correlation_id; body opens with
 //     field ALWAYS "message" (composer AND late-reply — the late reply reuses
 //     the answered notification's cid as its correlation_id);
-//   kind:"notification_reply": the envelope rides ref/ref_payload (E2) — ref.enc
+//   kind:"notification_reply": the envelope rides ref/ref_payload — ref.enc
 //     gates; text opens with field "reply", ref.title with "title", and a body
 //     that is a custom-action LABEL with "action_label_<action_id>".
 // On success the plaintext replaces the ciphertext and enc/kf are swapped for
@@ -1665,7 +1644,7 @@ async function e2eOpenMessageRow(m) {
   const fail = (reason) => { if (!out.e2e_error) out.e2e_error = reason; e2eNote(reason); };
   if (!m.enc && !refEnc) {
     // a clear line renders as always (pre-E2E history) — but a clear ATTACHMENT
-    // may still want the opt-in --download save (#367).
+    // may still want the opt-in --download save.
     if (m.attachment) await e2eProcessAttachment(m, out, fail);
     return m.attachment ? out : m;
   }
@@ -1699,7 +1678,7 @@ async function e2eOpenMessageRow(m) {
       out.body = null;
     }
   }
-  if (m.attachment) await e2eProcessAttachment(m, out, fail); // #367 inbound media
+  if (m.attachment) await e2eProcessAttachment(m, out, fail); // inbound media
   if (!out.e2e_error) {
     delete out.enc; delete out.kf;
     if (out.ref) { delete out.ref.enc; delete out.ref.kf; }
@@ -1708,7 +1687,7 @@ async function e2eOpenMessageRow(m) {
   return out;
 }
 
-// #367 you→agent: one message's attachment. A SEALED one ({enc:"v1"} on the
+// you→agent: one message's attachment. A SEALED one ({enc:"v1"} on the
 // block) is ALWAYS downloaded + unsealed to a local file — its signed URL
 // serves ciphertext, useless to an agent otherwise; the plaintext lands at
 // <config dir>/downloads/<message id>/<sanitized real filename> and rides the
@@ -1728,7 +1707,7 @@ async function e2eProcessAttachment(m, out, fail) {
   };
   const destFor = (filename) => {
     const dir = v['download-dir'] || path.join(pidgeConfigDir(), 'downloads');
-    // m.id comes off the wire — a hostile server (the #367/#313 threat model)
+    // m.id comes off the wire — a hostile server (the E2E threat model)
     // could ship "../.." to steer the decrypted plaintext OUTSIDE the downloads
     // dir. Sanitize the id segment AND the fallback name exactly like any other
     // attacker-influenceable wire string, so both path parts are contained.
@@ -1809,7 +1788,7 @@ async function e2eOpenChosen(data) {
 }
 
 // Map CLI flags → the /notify JSON body, including only what was provided. `extra`
-// carries subcommand-supplied raw fields (#246: the typed sends' template_kind and
+// carries subcommand-supplied raw fields (the typed sends' template_kind and
 // alert's escalate) — merged below, before the --param escape hatch.
 function buildBody(extra = {}) {
   if (!v.title) die('pidge: --title is required', 1);
@@ -1838,7 +1817,7 @@ function buildBody(extra = {}) {
   if (v['collapse-key'] !== undefined) body.collapse_key = v['collapse-key'];
 
   // --actions: the short comma form (built-in catalog ids → body.actions) OR a
-  // JSON array of custom {id,label,…} specs (#242 → body.custom_actions). A
+  // JSON array of custom {id,label,…} specs (→ body.custom_actions). A
   // leading '[' selects JSON; bad JSON is a friendly LOCAL error (exit 1), never
   // a silent fall-through that drops the labels and sends a plain notification.
   // --custom-action specs APPEND to whatever the JSON form produced, so both can coexist.
@@ -1858,8 +1837,8 @@ function buildBody(extra = {}) {
   for (const spec of v['custom-action'] || []) customActions.push(customActionFromSpec(spec));
   if (customActions.length) body.custom_actions = customActions;
 
-  // lote-5 #2: REFUSE a decision button + `reply` in the same send (the skill's
-  // anti-slop rule #4). The human taps the easy Yes/No and you get a useless
+  // REFUSE a decision button + `reply` in the same send (the skill's
+  // anti-slop rule). The human taps the easy Yes/No and you get a useless
   // "Yes" instead of the typed text you wanted. One question per send — enforce
   // it locally (exit 1, no round-trip), don't warn-and-send. (`reply` alongside a
   // non-decision like done/snooze is fine — DONE_REPLY is a real category.)
@@ -1870,7 +1849,7 @@ function buildBody(extra = {}) {
       die(`pidge: --actions can't combine a decision button (${decisions.join(',')}) with \`reply\` — the human taps the easy button and you get a useless "${decisions[0]}" instead of the text you wanted. Use \`--actions reply\` ALONE for a typed answer, or drop \`reply\` for a button decision. One question per send.`, 1);
   }
 
-  // #274: --gated synthesizes ONE Face-ID confirm on the consequential action
+  // --gated synthesizes ONE Face-ID confirm on the consequential action
   // (money/deletion) — the replacement for the retired content_template:sensitive.
   // Skip if the agent already supplied a biometric action (don't double-gate).
   if (v.gated && !(body.custom_actions || []).some((c) => c.biometric)) {
@@ -1879,7 +1858,7 @@ function buildBody(extra = {}) {
     ]);
   }
 
-  // #246: subcommand-supplied raw fields (template_kind, alert's escalate). Applied
+  // subcommand-supplied raw fields (template_kind, alert's escalate). Applied
   // before the --param loop so a raw --param can still override in a pinch.
   Object.assign(body, extra);
 
@@ -1916,7 +1895,7 @@ async function uploadFile(filePath) {
   return uploadBlob(fs.readFileSync(filePath), path.basename(filePath), guessMime(filePath));
 }
 
-// #367 (E3): a SEALED upload carries a generic name + octet-stream — the real
+// A SEALED upload carries a generic name + octet-stream — the real
 // filename rides the /notify as an envelope, never the multipart.
 async function uploadBlob(bytes, filename, type) {
   const fd = new FormData();
@@ -1940,7 +1919,7 @@ async function uploadBlob(bytes, filename, type) {
 // --image / --file: an existing local path is uploaded and swapped for its ref;
 // anything else (an https URL on --image, or an already-minted ref) passes through
 // untouched — the server 422s self-describingly on an invalid value.
-// #367 (E3): with a mediaPlan, each local blob is SEALED before upload
+// With a mediaPlan, each local blob is SEALED before upload
 // ([0x01][nonce][ct][tag], AAD "ch<id>:<cid>:image_blob|file_blob"), uploads as
 // a generic blob.bin, the file's real name becomes a `filename` envelope (AAD
 // field "filename") and the send is flagged media_enc:"v1".
@@ -1972,7 +1951,7 @@ async function resolveMedia(body, mediaPlan = null) {
     } else if (mediaPlan) {
       // A pre-minted ref holds bytes this machine never sealed — riding it on a
       // media_enc send would serve clear bytes the phone tries to unseal.
-      die(`pidge: --${key} with a pre-minted ref cannot ride a SEALED-media send (#367) — pass the local path so the bytes seal here (or PIDGE_E2E_MEDIA=off to send this one clear).`, 2);
+      die(`pidge: --${key} with a pre-minted ref cannot ride a SEALED-media send — pass the local path so the bytes seal here (or PIDGE_E2E_MEDIA=off to send this one clear).`, 2);
     } else {
       body[key] = v[key];
     }
@@ -1984,16 +1963,16 @@ async function resolveMedia(body, mediaPlan = null) {
 // degrade), so stdout stays free for machine output.
 async function doNotify(extra = {}) {
   const payload = buildBody(extra);
-  // #313 (cross-audit HIGH): a PINNED channel must refuse BEFORE resolveMedia
+  // A PINNED channel must refuse BEFORE resolveMedia
   // uploads any bytes — otherwise a lying server captures the file/filename
-  // (which ride clear until E3) even though the /notify is then refused.
+  // (which ride clear when media sealing is off) even though the /notify is then refused.
   await e2ePreflightRefusal();
-  // #367 (E3): decide the media fate BEFORE any bytes leave the machine — the
+  // Decide the media fate BEFORE any bytes leave the machine — the
   // plan seals local blobs in resolveMedia; a media-pinned channel that would
   // downgrade to clear media refuses HERE, pre-upload.
   const mediaPlan = await e2eMediaPlan(payload);
   await resolveMedia(payload, mediaPlan);
-  // E2E (E2-CLI): seal the content AFTER everything else composed the payload —
+  // E2E: seal the content AFTER everything else composed the payload —
   // typed sends, approval/approve/hello custom actions, --param, media refs all
   // pass through here, so every send path is covered by this one call.
   await e2eMaybeSeal(payload);
@@ -2017,7 +1996,7 @@ async function doNotify(extra = {}) {
     if (display) raw = display;
   }
   if (ok) {
-    // #56: the same correlation_id while still scheduled EDITS in place.
+    // the same correlation_id while still scheduled EDITS in place.
     if (info.updated)
       console.error('pidge: updated scheduled notification (same correlation_id, nothing fires twice)');
     if (info.registered_devices === 0)
@@ -2031,7 +2010,7 @@ async function doNotify(extra = {}) {
     }
     if (info.degraded)
       console.error(`pidge: DEGRADED by channel policy — ${info.degrade_reason} (delivered anyway, quieter; the human's setting, don't retry harder)`);
-    // #49: threads — remind the agent how to keep the conversation grouped.
+    // threads — remind the agent how to keep the conversation grouped.
     if (info.thread_id)
       console.error(`pidge: thread=${info.thread_id} — send follow-ups with the same --thread to group them on the phone`);
   } else {
@@ -2040,25 +2019,25 @@ async function doNotify(extra = {}) {
   return { ok, info, raw };
 }
 
-// The RESPONSE axis (perfis-S2): true when the send carries SOME way for the human
+// The RESPONSE axis: true when the send carries SOME way for the human
 // to answer with a tap — built-in actions, custom actions, or a content --template
 // that supplies them. Free-text reply is ALWAYS available, so this is only about
 // buttons. `ask` requires it; `approval` injects a default pair when it's absent.
 const hasAnswerAffordance = () =>
   v.actions !== undefined || (v['custom-action'] || []).length > 0 || v.template !== undefined;
 
-// The `approval` recipe's default button pair (perfis-S2 follow-up). Sent as
+// The `approval` recipe's default button pair. Sent as
 // CUSTOM actions, NOT built-ins: only custom_actions can carry `biometric` (Face
 // ID), and a custom id may NOT reuse a built-in id like approve/reject (the server
 // 422s "collides with a built-in") — so the ids are grant/deny. Face ID gates the
 // consequential "Approve"; "Reject" is the safe (destructive-styled) out. A gated
-// action is detail-screen only (no banner buttons — gotcha #19), by design.
+// action is detail-screen only (no banner buttons), by design.
 const APPROVAL_ACTIONS = [
   { id: 'grant', label: 'Approve', biometric: true, terminal: true },
   { id: 'deny', label: 'Reject', style: 'destructive', terminal: true },
 ];
 
-// The married catalog of 5 (perfis-S1): one send, stamped with the canonical
+// The married catalog of 5: one send, stamped with the canonical
 // `template_kind` (message/important/urgent/event/live). The RESPONSE axis is
 // orthogonal: with `wait:false` it's fire-and-forget (print the raw 201, exit);
 // with `wait:true` it mints a cid, sends, and BLOCKS until a terminal answer
@@ -2081,7 +2060,7 @@ async function doTypedSend(kind, { wait = false, extra = {}, requireAnswerable =
     process.exit(ok ? 0 : 2);
   }
 
-  // #39: validate the wait knobs BEFORE the send — a typo must die here (exit 1),
+  // validate the wait knobs BEFORE the send — a typo must die here (exit 1),
   // not hang the poll loop forever nor leave a ghost notification behind a post-send die.
   const timeoutArg = numStrict(v.timeout, '--timeout', NaN);
   const intervalArg = numStrict(v.interval, '--interval', 30);
@@ -2094,7 +2073,7 @@ async function doTypedSend(kind, { wait = false, extra = {}, requireAnswerable =
   const { ok, info } = await doNotify({ template_kind: kind, ...extra });
   if (!ok) process.exit(2);
   console.error(`pidge: sent (${info.registered_devices} device(s)) — waiting on ${cid}`);
-  // #132: no --timeout ⇒ obey the template's suggestion from the 201 echo (human
+  // no --timeout ⇒ obey the template's suggestion from the 201 echo (human
   // decisions take 30-40 min; a 600 s default misreads them as silence). Explicit wins.
   let timeout = timeoutArg;
   if (!Number.isFinite(timeout)) {
@@ -2102,7 +2081,7 @@ async function doTypedSend(kind, { wait = false, extra = {}, requireAnswerable =
       timeout = info.suggested_ask_timeout;
       console.error(`pidge: timeout ${Math.round(timeout / 60)} min — suggested by template ${info.template || v.template} (override with --timeout)`);
     } else if (info.requires_action) {
-      timeout = 3600;   // #274/#132: a human decision (buttons present) takes 30-40 min, not 600 s of "silence"
+      timeout = 3600;   // a human decision (buttons present) takes 30-40 min, not 600 s of "silence"
       console.error(`pidge: no template suggestion — defaulting --wait to 60 min for a decision (override with --timeout)`);
     } else {
       timeout = 600;
@@ -2111,12 +2090,12 @@ async function doTypedSend(kind, { wait = false, extra = {}, requireAnswerable =
   await waitForAnswer(cid, { timeout, interval: intervalArg });
 }
 
-// `pidge live` (cli#47 / pidge#284, LA v2) — the wrapper over the three
+// `pidge live` — the wrapper over the three
 // /live_activities endpoints. By default the write lands as an ENTRY of the
 // user's consolidated status-center card; the response's `operation` echo
 // (started|updated|noop|rotated|ended) is the truth of what happened. The old
 // behavior (template_kind:live → a silently-degraded message-profile /notify)
-// is dead — [[cli-truth]]: nunca mais.
+// is dead.
 async function doLive() {
   if (v.wait)
     die("pidge: `live` can't --wait — a status card never produces an answer (drop --wait, or ask with a real type)", 1);
@@ -2124,7 +2103,7 @@ async function doLive() {
   const cid = parsed.positionals[1] || v['correlation-id'];
 
   // --step N/M is SUGAR: there is no steps field on the wire — it becomes
-  // progress + the fraction label the bar renders (decision B, #284).
+  // progress + the fraction label the bar renders.
   let progress; let progressLabel;
   if (v.step !== undefined) {
     if (v.progress !== undefined) die('pidge: pass --step OR --progress, not both', 1);
@@ -2203,7 +2182,7 @@ async function doLive() {
   process.exit(0);
 }
 
-// `pidge approve` (#34) — a hook-shaped, DENY-DEFAULT permission gate. Sends a
+// `pidge approve` — a hook-shaped, DENY-DEFAULT permission gate. Sends a
 // Face-ID approval and BLOCKS, then maps the human's tap to an exit code: ONLY an
 // explicit allow is exit 0; deny, timeout, a dead channel or any ambiguity is
 // non-zero (exit 1) so a PreToolUse hook fails CLOSED. A thin wrapper over the
@@ -2213,11 +2192,11 @@ async function doApprove() {
   const question = parsed.positionals[1] || v.title;
   if (!question)
     die('pidge: usage: pidge approve "<question>" [--body TEXT] [--timeout N] [--allow-label L] [--deny-label L]', 1);
-  // #39: a typo in the knobs must die HERE (exit 1, fail-closed), before the
+  // a typo in the knobs must die HERE (exit 1, fail-closed), before the
   // approval is even sent — a NaN deadline would hang this gate open forever.
   const timeout = numStrict(v.timeout, '--timeout', 300);
   const interval = numStrict(v.interval, '--interval', 30);
-  // #39: an interrupt mid-wait is NOT an approval — exit 1 loudly (deny-default),
+  // an interrupt mid-wait is NOT an approval — exit 1 loudly (deny-default),
   // like every other unanswered path out of this gate.
   process.on('SIGINT', () => {
     console.error('pidge: interrupted before an answer — DENIED (deny-default; nothing was approved). exit 1');
@@ -2227,8 +2206,8 @@ async function doApprove() {
   const allowLabel = v['allow-label'] || 'Allow';
   const denyLabel = v['deny-label'] || 'Deny';
   // allow = Face-ID confirm (both confirm+biometric) · deny = destructive out.
-  // Both terminal, both gated ⇒ the banner is detail-only (resolve_push_category →
-  // HERALD_OPEN): approving is a deliberate in-app Face-ID tap, never a one-tap banner.
+  // Both terminal, both gated ⇒ the server resolves the push to a detail-only
+  // category: approving is a deliberate in-app Face-ID tap, never a one-tap banner.
   const customActions = [
     { id: 'allow', label: allowLabel, confirm: true, biometric: true, terminal: true },
     { id: 'deny', label: denyLabel, style: 'destructive', terminal: true },
@@ -2264,7 +2243,7 @@ async function doApprove() {
   });
 }
 
-// A compat alias (perfis-S1): the OLD type name still works, mapped to the new
+// A compat alias: the OLD type name still works, mapped to the new
 // canonical one — a one-line note points at the rename so muscle-memory migrates.
 function warnRenamed(oldName, newName) {
   console.error(`pidge: \`pidge ${oldName}\` was renamed → use \`pidge ${newName}\` (the married catalog of 5; the alias keeps working).`);
@@ -2279,17 +2258,17 @@ function warnDeprecatedSend(name) {
 // Poll GET /notifications/:cid until a TERMINAL answer, print chosen_action JSON to
 // stdout, exit 0. A snooze (snooze / reschedule-to-a-time) is non-terminal — it
 // re-fires — so keep waiting through it. Exits 3 on timeout.
-// Long-poll (#45): each GET carries ?wait=N (≤55 s) and the SERVER holds it until
+// Long-poll: each GET carries ?wait=N (≤55 s) and the SERVER holds it until
 // the user acts — answer latency ~instant, ~1 request/min. --interval is only the
 // fallback pace against an old server that ignores `wait` (returns immediately).
-// #34: onAnswer(chosen)/onTimeout() let a caller (approve) MAP the outcome to an
+// onAnswer(chosen)/onTimeout() let a caller (approve) MAP the outcome to an
 // exit code instead of the default print-chosen+exit-0 / exitTimeout. Both
 // callbacks MUST exit the process; when omitted the wait/ask behavior stands.
 async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
   const deadline = Date.now() + timeout * 1000;
   let firedNotice = false;
   for (;;) {
-    // Degraded (#119): a held poll keeps dying behind some edge — switch to
+    // Degraded: a held poll keeps dying behind some edge — switch to
     // PLAIN GETs (the requests that kept working in the wild) on a slow pace.
     const waitS = health.degraded ? 0 : Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
     const url = `${BASE}/api/v1/notifications/${encodeURIComponent(cid)}${waitS > 0 ? `?wait=${waitS}` : ''}`;
@@ -2313,7 +2292,7 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
           }
         } else if (!firedNotice && data.escalation && data.escalation.state === 'fired') {
           firedNotice = true;
-          // #70: stopping the ring on-device now reports `seen` (seen_at flips);
+          // stopping the ring on-device now reports `seen` (seen_at flips);
           // snoozing it is a real snoozed event this loop narrates.
           console.error('pidge: the escalation alarm FIRED and there is still no answer — seen_at tells you if the human at least silenced it; keep waiting or back off');
         }
@@ -2344,7 +2323,7 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
   }
 }
 
-// Realtime wait (#118): hold an InboxChannel subscription and treat every frame
+// Realtime wait: hold an InboxChannel subscription and treat every frame
 // for OUR cid as a wake-up; the durable answer is always re-read over HTTP
 // (doWait prints + exits). A safety re-check every 60 s covers a frame lost in
 // a reconnect gap. Returns only when WS can't carry us — caller falls back.
@@ -2385,7 +2364,7 @@ async function realtimeWait(cid, { timeout, interval, onAnswer, onTimeout } = {}
   }
   // Only exit-as-timeout if the REAL deadline genuinely passed. An EARLY
   // 'deadline' (a spurious guard, a WS oddity) must degrade to polling for the
-  // remaining budget, NOT exit lying that the full timeout elapsed (#119).
+  // remaining budget, NOT exit lying that the full timeout elapsed.
   if (outcome === 'deadline' && Date.now() >= deadline - 1500) {
     if (onTimeout) return onTimeout();
     health.exitTimeout(`no answer on ${cid}`);
@@ -2394,8 +2373,8 @@ async function realtimeWait(cid, { timeout, interval, onAnswer, onTimeout } = {}
   return Math.max(1, Math.ceil((deadline - Date.now()) / 1000)); // remaining budget
 }
 
-// wait/ask entry: WS when we can, polling as the universal fallback (#118/#119).
-// #34: onAnswer/onTimeout thread through to both paths so `approve` can map the
+// wait/ask entry: WS when we can, polling as the universal fallback.
+// onAnswer/onTimeout thread through to both paths so `approve` can map the
 // outcome to an exit code; omit them for the default print-and-exit-0 behavior.
 async function waitForAnswer(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
   let budget = timeout;
@@ -2405,7 +2384,7 @@ async function waitForAnswer(cid, { timeout, interval, onAnswer, onTimeout } = {
 
 const num = (val, fallback) => (val !== undefined ? parseInt(val, 10) : fallback);
 
-// #39: STRICT variant for the blocking knobs (--timeout/--interval). parseInt('abc')
+// STRICT variant for the blocking knobs (--timeout/--interval). parseInt('abc')
 // → NaN would make doWait's deadline NaN — never reached — so wait/ask/approve/hello
 // would poll FOREVER; on `pidge approve` that turns the deny-default gate into an
 // agent hung open. An unparseable value dies IMMEDIATELY (exit 1), before any send.
@@ -2417,10 +2396,10 @@ const numStrict = (val, flag, fallback) => {
   return n;
 };
 
-// #51: message-queue ids are STRICT integers. parseInt alone is lazy —
+// message-queue ids are STRICT integers. parseInt alone is lazy —
 // parseInt("9f2e7c31-…") === 9 — so an agent that pastes a correlation_id where
 // the numeric listen id belongs would silently ack messages 1..9 it never
-// handled (at-least-once loss, the exact class #39 killed for --timeout).
+// handled (at-least-once loss, the exact class the strict --timeout parse killed).
 // Full-string digits or die loud, BEFORE any HTTP.
 const idStrict = (val, flag) => {
   const s = String(val).trim();
@@ -2430,7 +2409,7 @@ const idStrict = (val, flag) => {
 };
 
 // ---------------------------------------------------------------------------
-// Onboarding v2 (#110): setup --claim / doctor / whoami / skill install.
+// Onboarding v2: setup --claim / doctor / whoami / skill install.
 // ---------------------------------------------------------------------------
 
 const CONFIG_DIR = pidgeConfigDir();
@@ -2456,7 +2435,7 @@ async function fetchWhoami(base = BASE, token = TOKEN) {
   return { res, data };
 }
 
-// #181 identity ownership: a STABLE, privacy-safe per-install fingerprint (a
+// identity ownership: a STABLE, privacy-safe per-install fingerprint (a
 // HASH, never raw hostname/PII) so the server can tell THIS install apart from a
 // different agent that grabbed the same key. The label is the human-readable
 // self-name (PIDGE_LABEL, else PIDGE_AGENT, else the hostname).
@@ -2468,7 +2447,7 @@ function agentLabel() {
   return (process.env.PIDGE_LABEL || AGENT_ID || os.hostname() || 'pidge-cli').slice(0, 80);
 }
 
-// #170 first-run notice: show the ack-after-work BREAKING-flip contract ONCE PER
+// first-run notice: show the ack-after-work BREAKING-flip contract ONCE PER
 // INSTALL (a stamp under the config dir), not every invocation — a turn-based
 // agent runs a FRESH process per turn, so an in-process flag would shout every
 // time. Best-effort: if the stamp can't be persisted (env-var-only install /
@@ -2484,7 +2463,7 @@ function markAckNoticeSeen() {
   } catch { /* best-effort — per-process guard covers it */ }
 }
 
-// Shared by `doctor` AND `whoami` (#182/gotcha #9): narrate HONEST device reach —
+// Shared by `doctor` AND `whoami`: narrate HONEST device reach —
 // `deliverable` (push-enabled AND on the live APNs environment) can be lower than
 // the headline pushable count. Returns true when reach is BROKEN: devices exist
 // but NONE are deliverable (a send reaches nobody). doctor exits 2 on that.
@@ -2497,7 +2476,7 @@ function reportDeviceReach(data) {
   return reach.total > 0 && reach.deliverable === 0;
 }
 
-// Shared by `doctor` AND `whoami` (#181): SHOUT when a DIFFERENT install claimed
+// Shared by `doctor` AND `whoami`: SHOUT when a DIFFERENT install claimed
 // this channel since we set up. Returns 'hard' (different fingerprint AND higher
 // generation), 'soft' (we never claimed locally — informational), or null.
 function reportClaimMismatch(data) {
@@ -2517,7 +2496,7 @@ function reportClaimMismatch(data) {
   return null;
 }
 
-// POST /claim/ownership — stamp WHICH install wears this channel's key (#181), so
+// POST /claim/ownership — stamp WHICH install wears this channel's key, so
 // a multi-agent machine can DETECT a silent key swap. Best-effort: a server that
 // predates it 404s (skip silently); a network blip never breaks setup. Returns
 // the server's claim block or null.
@@ -2534,7 +2513,7 @@ async function claimOwnership(base, token) {
   } catch { return null; }
 }
 
-// #182 step 5: after onboarding, DECLARE how this agent operates so the human
+// step 5: after onboarding, DECLARE how this agent operates so the human
 // knows what to expect from this channel. ADVISORY — Pidge enforces nothing; it's
 // metadata the human reads. The default is the common case (a turn-based agent:
 // one-shot listen, no keep-alive); `--listen-mode always_on` flips it for a
@@ -2545,7 +2524,7 @@ async function declareOperatingContract(base, token, channelId) {
   const mode = v['listen-mode'];
   let contract;
   // turn_based holds no connection; persistent/external_daemon/always_on all keep one
-  // alive (a supervisor or daemon holding the listen). §3c.
+  // alive (a supervisor or daemon holding the listen).
   if (!mode || mode === 'turn_based') contract = { listen_mode: 'turn_based', keep_connection_alive: false };
   else if (['persistent', 'external_daemon', 'always_on'].includes(mode)) contract = { listen_mode: mode, keep_connection_alive: true };
   else { console.error(`pidge: --listen-mode must be turn_based | persistent | external_daemon (got "${mode}") — skipping the contract declaration`); return null; }
@@ -2567,13 +2546,13 @@ async function declareOperatingContract(base, token, channelId) {
   return null;
 }
 
-// #182 the CLOSED allowlist (mirrors the server's OPERATING_CONTRACT_KEYS) — so
+// the CLOSED allowlist (mirrors the server's closed allowlist of contract keys) — so
 // `contract set` and `setup` reject an unknown key / bad value type LOCALLY (exit
 // 1) before the round-trip, instead of leaning on the server's 422.
 const OPERATING_CONTRACT_SPEC = {
   keep_connection_alive: 'boolean',
   mirror_in_origin_session: 'boolean',
-  // §3c: match your RUNTIME. turn_based (no event loop — block-and-exit) · persistent
+  // Match your RUNTIME. turn_based (no event loop — block-and-exit) · persistent
   // (a supervisor holding the socket, --follow) · external_daemon (a daemon outside the
   // session). always_on stays as a tolerated deprecated alias of persistent.
   listen_mode: ['turn_based', 'persistent', 'external_daemon', 'always_on'],
@@ -2594,7 +2573,7 @@ function coerceContractValue(key, raw) {
   return value;
 }
 
-// #182 operating_contract: DECLARE how you operate. ADVISORY, never policy —
+// operating_contract: DECLARE how you operate. ADVISORY, never policy —
 // nothing derives urgency/ceiling from it and Pidge enforces nothing; you declare,
 // the human registers their own expectation and SEES if you honor it.
 //   pidge contract show           → print the channel's operating_contract
@@ -2658,7 +2637,7 @@ async function runContract() {
   process.exit(0);
 }
 
-// Orphan-zombie guard (§3c pitfall #1): when `npx pidge-cli listen` is launched as a
+// Orphan-zombie guard: when `npx pidge-cli listen` is launched as a
 // background task and the harness later kills the npx wrapper, the node LEAF can
 // orphan and keep consuming the channel forever without ever waking the agent. A
 // long-running listen polls its parent: if it had a real parent at startup and that
@@ -2676,7 +2655,7 @@ function installOrphanWatchdog() {
 }
 
 // ---------------------------------------------------------------------------
-// #76 item 1: the digest's per-row state — THREE states, not two. Deriving it
+// The digest's per-row state — THREE states, not two. Deriving it
 // from acked_by_label/handler_summary ALONE (the old two-state code) marked a row
 // PENDING whenever the ack carried no note — even when the server had stamped
 // `processed_at`. In the anti-redo tool, that's the worst lie: a successor reads
@@ -2696,36 +2675,36 @@ function digestHandledState(m) {
   return 'PENDING';
 }
 
-// #61: stale_from_prior_claim — server v63 serves it (Bool, top-level) on the
+// stale_from_prior_claim — newer servers serve it (Bool, top-level) on the
 // channel-key GET /messages and on /whoami: the channel holds un-acked messages
 // whose arrival PREDATES this install's ownership claim — probably a previous
 // owner's leftover work, not fresh asks for you. ADVISORY in tone by design:
 // the anchor has known false negatives (claim-code exchange doesn't set
 // claimed_at) and false positives (a same-fingerprint re-doctor refreshes the
-// anchor — benign, self-clears on drain), documented in pidge#294. Surfaces:
-// listen (session header), doctor, catchup, and the bridge boot (#59).
+// anchor — benign, self-clears on drain). Surfaces:
+// listen (session header), doctor, catchup, and the bridge boot.
 // Warned ONCE per process (a long-lived bridge doesn't re-shout every poll).
 let stalePriorClaimWarned = false;
 const STALE_PRIOR_CLAIM_HINT = 'Run `pidge catchup` (read-only) to see what they are before acting on them.';
 function warnStalePriorClaim(data, hint = STALE_PRIOR_CLAIM_HINT) {
   if (!data || data.stale_from_prior_claim !== true || stalePriorClaimWarned) return;
   stalePriorClaimWarned = true;
-  console.error(`pidge: ⚠️ this channel holds unprocessed messages from a PRIOR claim — probably a previous owner's leftover work, not fresh asks for you (advisory, #61). ${hint}`);
+  console.error(`pidge: ⚠️ this channel holds unprocessed messages from a PRIOR claim — probably a previous owner's leftover work, not fresh asks for you (advisory). ${hint}`);
 }
 
 // ---------------------------------------------------------------------------
-// #59: `pidge bridge --exec '<handler>'` — the 1st-class, model-agnostic
+// `pidge bridge --exec '<handler>'` — the 1st-class, model-agnostic
 // supervisor. The bridge is deliberately DUMB: no local queue, no retry ledger
-// of its own — durability lives in the server's ack/lease (a non-goal of the
-// issue is exactly "reimplementar fila local").
-//   loop: long-poll GET /messages?all=true (the #119 robust floor; a realtime
+// of its own — durability lives in the server's ack/lease (reimplementing a
+// local queue is an explicit non-goal).
+//   loop: long-poll GET /messages?all=true (the robust long-poll floor; a realtime
 //   socket, when available, is presence + early wake, never the data path)
 //   → ONE handler invocation per batch (the whole tick as JSON on stdin — one
 //   LLM invocation per batch, not per message) → handler exit 0 ⇒ ack --up-to
 //   <last id> · non-zero ⇒ NOT acked (the ~10-min server lease re-serves).
 // ---------------------------------------------------------------------------
 
-// --- the single-consumer lock (#59 §3). PER-CHANNEL on purpose: keyed by
+// --- the single-consumer lock. PER-CHANNEL on purpose: keyed by
 // hash(token) and living in the BASE ~/.config/pidge — PIDGE_AGENT is IGNORED
 // here, because two agents wearing the SAME key are still one channel and MUST
 // collide (a per-agent dir would hide exactly the double-consume this kills).
@@ -2744,7 +2723,7 @@ function readBridgeLock(file) {
 }
 // Is that pid a live process? Signal 0 probes without touching it. EPERM =
 // "exists, but not ours to signal" — SUSPICIOUS, so treated as ALIVE: when we
-// can't prove the holder is dead, refusing beats double-consuming (#62 audit).
+// can't prove the holder is dead, refusing beats double-consuming.
 function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
@@ -2767,9 +2746,9 @@ function acquireBridgeLock() {
       if (e.code !== 'EEXIST') die(`pidge: bridge — can't create the lock at ${file}: ${e.message}`, 2);
       const cur = readBridgeLock(file);
       if (cur && pidAlive(cur.pid))
-        die(`pidge: bridge — REFUSED: another consumer already holds this channel (pid ${cur.pid}${cur.label ? `, "${cur.label}"` : ''}, since ${cur.started_at || '?'}). One consumer per channel — a second bridge/listen double-consumes (#59). Stop it first, or read with \`pidge catchup\` (read-only). If you are CERTAIN no bridge is running (e.g. the pid belongs to an unrelated process), delete the lockfile yourself: rm "${file}"`, 2);
+        die(`pidge: bridge — REFUSED: another consumer already holds this channel (pid ${cur.pid}${cur.label ? `, "${cur.label}"` : ''}, since ${cur.started_at || '?'}). One consumer per channel — a second bridge/listen double-consumes. Stop it first, or read with \`pidge catchup\` (read-only). If you are CERTAIN no bridge is running (e.g. the pid belongs to an unrelated process), delete the lockfile yourself: rm "${file}"`, 2);
       // Stale lock: the pid is gone (a crashed bridge never releases — that's
-      // WHY the lock stores a pid) or the file is garbage. #62 cross-audit:
+      // WHY the lock stores a pid) or the file is garbage. So:
       // CLAIM the corpse by atomic RENAME — on the same fs exactly ONE racer's
       // rename succeeds; the loser gets ENOENT and refuses. This closes the
       // unlink-race window where two starters both saw the same stale pid and
@@ -2800,7 +2779,7 @@ function releaseBridgeLock(file) {
   try { fs.unlinkSync(file); } catch { /* best-effort */ }
 }
 
-// #59 §4: a LOCAL alert for the two "only a human can fix this" failures (401 —
+// A LOCAL alert for the two "only a human can fix this" failures (401 —
 // rotated key? — and a channel with no healthy round-trip). We can't pidge —
 // that's exactly what's broken — so local is all there is: the stderr line is
 // the alert of record (launchd/systemd capture it in the log), and a desktop
@@ -2824,7 +2803,7 @@ async function runBridge() {
     die('pidge: bridge needs --exec \'<handler command>\' — invoked ONCE per batch with the batch JSON on stdin; exit 0 acks the batch, non-zero leaves it for the server lease to re-serve. E.g.: pidge bridge --exec \'claude -p "handle this pidge batch"\'', 1);
   const { spawn } = require('node:child_process');
 
-  // NO orphan watchdog here, deliberately (§3c is for `listen`): the bridge is
+  // NO orphan watchdog here, deliberately (that guard is for `listen`): the bridge is
   // MEANT to outlive its launcher (nohup, a closed terminal, launchd) — its
   // lifecycle belongs to the supervisor and the lock, not to the parent pid.
   const lockFile = acquireBridgeLock();
@@ -2834,7 +2813,7 @@ async function runBridge() {
 
   // Pacing knobs. The env overrides are test/ops hooks, not documented knobs.
   const intervalS = numStrict(v.interval, '--interval', 5);
-  // #62 cross-audit: how long ONE handler invocation may run before SIGTERM
+  // How long ONE handler invocation may run before SIGTERM
   // (default 30 min — an LLM handler can legitimately think for many minutes).
   const handlerTimeoutS = numStrict(v['handler-timeout'], '--handler-timeout', 1800);
   const HANDLER_NARRATE_MS = parseInt(process.env.PIDGE_BRIDGE_NARRATE || '', 10) || 300000; // 5 min
@@ -2842,7 +2821,7 @@ async function runBridge() {
   const BACKOFF_MAX_MS = parseInt(process.env.PIDGE_BRIDGE_BACKOFF_MAX || '', 10) || 120000;
   const BACKOFF_LONG_MS = parseInt(process.env.PIDGE_BRIDGE_BACKOFF_LONG || '', 10) || 300000;
   const BROKEN_AFTER = 5;
-  // Jitter EVERY retry sleep (issue #59 §4): N bridges restarting after the
+  // Jitter EVERY retry sleep: N bridges restarting after the
   // same server deploy must not stampede back in lockstep.
   const jitter = (ms) => Math.round(ms * (0.75 + Math.random() * 0.5));
 
@@ -2883,7 +2862,7 @@ async function runBridge() {
   console.error('pidge: bridge — ONE handler invocation per batch, batch JSON on stdin; exit 0 = acked, non-zero = re-served by the server lease (make the handler idempotent).');
 
   // Boot: narrate reach + declare listen_mode=external_daemon when it isn't
-  // already (the honest advisory — a bridge IS an external daemon, #59 §5).
+  // already (the honest advisory — a bridge IS an external daemon).
   // Best-effort by design: a 401 at boot does NOT kill the process (a daemon
   // that dies on 401 just flap-restarts under launchd/systemd — the loop below
   // owns the narrate + long-backoff treatment).
@@ -2891,7 +2870,7 @@ async function runBridge() {
     const who = await fetchWhoami();
     if (who.res.status === 200 && who.data.channel) {
       console.error(`pidge: bridge — canal "${who.data.channel.name}" · ${who.data.devices ?? '?'} device(s)`);
-      warnStalePriorClaim(who.data); // #61: the boot warning
+      warnStalePriorClaim(who.data); // the boot warning
       const oc = who.data.operating_contract || {};
       if (!(oc.listen_mode && oc.listen_mode.value === 'external_daemon')) {
         v['listen-mode'] = 'external_daemon';
@@ -2903,7 +2882,7 @@ async function runBridge() {
   }
   if (shuttingDown) return;
 
-  // Realtime (#118) as PRESENCE + EARLY WAKE only: a frame cuts the current
+  // Realtime as PRESENCE + EARLY WAKE only: a frame cuts the current
   // idle/backoff sleep short and the human sees "ouvindo agora"; every batch
   // still comes from the durable long-poll GET (a dropped socket costs latency,
   // never data — the existing WS→long-poll degrade, with long-poll as floor).
@@ -2929,23 +2908,23 @@ async function runBridge() {
       }
     };
     connectWs('ConversationChannel');
-    connectWs('InboxChannel'); // --all semantics: notification answers too (#131)
+    connectWs('InboxChannel'); // --all semantics: notification answers too
   }
 
-  let firstBatch = true;      // #59 §6: history_hint rides the first batch post-restart
+  let firstBatch = true;      // history_hint rides the first batch post-restart
   let transportFails = 0;     // consecutive network/5xx failures
   let handlerFails = 0;       // consecutive non-zero handler exits
   let alerted401 = false;     // ONE local alert per outage, not one per retry
   let alertedBroken = false;
 
-  // Cross-audit BLOCKER (PR #62): ack the batch's EXACT ids, never `up_to`.
+  // Ack the batch's EXACT ids, never `up_to`.
   // The server's up_to flips EVERY unprocessed row ≤ id — including rows under
   // lease from an EARLIER batch the handler FAILED on (or never saw): a later
   // success would stamp "processed" on work that never happened. ids:[…] can
   // only stamp what this handler demonstrably just handled.
   const ackBatch = async (ids, summary) => {
     const body = { ids };
-    // #64: attribution — WHAT the handler did, captured from its stdout marker
+    // attribution — WHAT the handler did, captured from its stdout marker
     // line (below). Absent ⇒ no field (never invent one). Server slices; we cap.
     if (summary) body.summary = String(summary).slice(0, 1000);
     try {
@@ -2981,7 +2960,7 @@ async function runBridge() {
       data = await res.json().catch(() => null);
       if (data === null) failWhat = 'unparseable 200 body';
     } else if (res && res.status === 401) {
-      // #59 §4: a 401 must not die silent NOR re-loop blind — narrate, alert
+      // A 401 must not die silent NOR re-loop blind — narrate, alert
       // locally ONCE per outage, retry with LONG jittered backoff. The key may
       // have been rotated; only the human can fix that.
       if (!alerted401) {
@@ -3000,7 +2979,7 @@ async function runBridge() {
       transportFails++;
       // The exit-4 class (a channel with NO healthy round-trip) becomes, in a
       // daemon, "local alert + LONG backoff" — never a blind hot re-loop and
-      // never a silent death (#59 §4).
+      // never a silent death.
       if (transportFails >= BROKEN_AFTER) {
         if (!alertedBroken) {
           alertedBroken = true;
@@ -3019,7 +2998,7 @@ async function runBridge() {
       console.error(`pidge: bridge — channel recovered${transportFails ? ` after ${transportFails} consecutive failure(s)` : ''}`);
       transportFails = 0; alerted401 = false; alertedBroken = false;
     }
-    warnStalePriorClaim(data); // #61: server v63 serves the flag on this GET too
+    warnStalePriorClaim(data); // newer servers serve the flag on this GET too
 
     const msgs = Array.isArray(data.messages) ? data.messages : [];
     if (msgs.length === 0) {
@@ -3035,7 +3014,7 @@ async function runBridge() {
     const batchIds = opened.map((m) => Number(m.id)).filter(Number.isInteger);
     const batch = { messages: opened, ...(firstBatch ? { history_hint: true } : {}) };
     console.error(`pidge: bridge — batch of ${opened.length} message(s) → handler${firstBatch ? ' (history_hint: first batch since this bridge started — the handler may want `pidge catchup` to situate)' : ''}`);
-    // #64: capture the handler's summary from a MARKER LINE on its stdout —
+    // capture the handler's summary from a MARKER LINE on its stdout —
     // `pidge-summary: <text>`. We STREAM, never buffer the whole output: stdout is
     // teed to the bridge's own stdout (the existing log is preserved) while a
     // bounded line-scanner keeps only the LAST marker's value (cap 1000). A handler
@@ -3071,7 +3050,7 @@ async function runBridge() {
       let exited = null;        // {code, signal} once the process exits
       let stdoutEnded = false;  // true once the stdout pipe reaches EOF
       let graceT = null;
-      // Cross-audit MAJOR (PR #62): a hung handler must not wedge the channel
+      // A hung handler must not wedge the channel
       // forever (the lease keeps re-serving to a bridge that never finishes a
       // batch). --handler-timeout (default 30 min) → SIGTERM (SIGKILL 5 s
       // later), treated EXACTLY like a failed handler: no ack, backoff ladder.
@@ -3099,7 +3078,7 @@ async function runBridge() {
         if (markerTail) { takeMarker(markerTail); markerTail = ''; }
         currentChild = null; resolve(o);
       };
-      // #64: finalize only when the process has exited AND its stdout has drained,
+      // finalize only when the process has exited AND its stdout has drained,
       // so a marker on the LAST unflushed chunk is never missed (the 'exit' event
       // can fire before the pipe's trailing data is read). If stdout stays open past
       // exit (a grandchild inherited the pipe), a short grace caps the wait.
@@ -3159,17 +3138,17 @@ async function runBridge() {
   }
 }
 
-// #59 §5: `pidge bridge install` — write the launchd (Mac) / systemd (Linux)
+// `pidge bridge install` — write the launchd (Mac) / systemd (Linux)
 // TEMPLATE that runs the bridge under the OS supervisor with Restart=on-failure
 // semantics, and declare listen_mode=external_daemon (advisory). The template
-// NEVER embeds the key — it stays in ~/.config/pidge/env (#57 hygiene); only
+// NEVER embeds the key — it stays in ~/.config/pidge/env (token hygiene); only
 // the non-secret env (PIDGE_URL/PIDGE_AGENT/XDG_CONFIG_HOME) rides along.
 function xmlEscape(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 // systemd unit-file quoting: double quotes with backslash escapes, PLUS the
-// unit-file expansions (#62 audit): '$' would be variable-expanded in command
+// unit-file expansions: '$' would be variable-expanded in command
 // lines ($$ = literal $) and '%' is a specifier everywhere (%% = literal %) —
 // a handler like `claude -p "$x is 100%"` must arrive verbatim.
 function systemdQuote(s) {
@@ -3192,7 +3171,7 @@ async function runBridgeInstall() {
   if (process.env.PIDGE_URL) envPairs.PIDGE_URL = process.env.PIDGE_URL;
   if (process.env.PIDGE_AGENT) envPairs.PIDGE_AGENT = process.env.PIDGE_AGENT;
   if (process.env.XDG_CONFIG_HOME) envPairs.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
-  // #62 audit: launchd/systemd give services a MINIMAL PATH — a handler like
+  // launchd/systemd give services a MINIMAL PATH — a handler like
   // `claude`/`codex` installed via homebrew/nvm would exit 127 under the
   // daemon while working fine in the shell. Embed the CURRENT PATH (non-secret)
   // so the daemon resolves the same binaries the human just tested with.
@@ -3215,7 +3194,7 @@ async function runBridgeInstall() {
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<!-- generated by \`pidge bridge install\` (#59). A TEMPLATE: review, then
+<!-- generated by \`pidge bridge install\`. A TEMPLATE: review, then
      launchctl load -w <this file>
      The channel key stays in ~/.config/pidge/env — NEVER embedded here. -->
 <dict>
@@ -3248,12 +3227,12 @@ ${envBlock}  <key>StandardOutPath</key><string>${xmlEscape(path.join(CONFIG_DIR,
   } else {
     const name = `pidge-bridge${nameSuffix}.service`;
     const envLines = Object.entries(envPairs).map(([k, val]) => `Environment=${systemdQuote(`${k}=${val}`)}`).join('\n');
-    const unit = `# generated by \`pidge bridge install\` (#59). A TEMPLATE: review, then
+    const unit = `# generated by \`pidge bridge install\`. A TEMPLATE: review, then
 #   systemctl --user daemon-reload && systemctl --user enable --now ${name}
 # The channel key stays in ~/.config/pidge/env — NEVER embedded here.
 [Unit]
 Description=pidge bridge — supervised Pidge consumer (one handler invocation per batch)
-# Wants + After (#62 audit): After alone only ORDERS against the target if
+# Wants + After: After alone only ORDERS against the target if
 # something else pulls it in — Wants actually pulls it into the transaction.
 Wants=network-online.target
 After=network-online.target
@@ -3298,18 +3277,19 @@ WantedBy=default.target
   process.exit(0);
 }
 
-// selftest (#205): prove the listener works by ROUND-TRIP, not prose. Fire a nonce
+// selftest: prove the listener works by ROUND-TRIP, not prose. Fire a nonce
 // onto our own queue, run the listener (long-poll floor — the reachability path) for
 // the window, ack the nonce, then read the server's verdict. PASS = it round-tripped
 // in time. FAIL = the server's window verdict + a likely CAUSE the server can't see
 // (the orphan/`&`/transport bugs). Only the nonce is acked (ids:[id]).
 //
-// #65: the reachability read is scoped to `?since=<nonce id − 1>` — the POST
+// the reachability read is scoped to `?since=<nonce id − 1>` — the POST
 // /selftest returns the nonce's id, and every message in the PRE-EXISTING backlog
 // has a LOWER id (it was already in the queue when we fired), so the backlog is
-// excluded BY CONSTRUCTION and never served/leased here (the T2 blackout bug).
+// excluded BY CONSTRUCTION and never served/leased here (a real bug once: the
+// selftest read leased the whole backlog, blacking it out for the real reader).
 //
-// `since=` alone is NOT enough, though (PR #66 cross-audit): a real message
+// `since=` alone is NOT enough, though: a real message
 // arriving DURING the window has id > nonce, so it IS served — and if the server
 // stamps it delivered with its DEFAULT lease (~10 min), that's 10× worse than the
 // original 60s bug. The `sinceId=0` fallback (a server that didn't return a numeric
@@ -3334,7 +3314,7 @@ async function doSelftest() {
     die(`pidge: selftest failed (network): ${e.message}`, 2);
   }
   const id = fired.id;
-  // #65: read strictly ABOVE the nonce's predecessor — the nonce and anything
+  // read strictly ABOVE the nonce's predecessor — the nonce and anything
   // newer, never the pre-existing real backlog. A non-numeric id (a broken server
   // shape) falls back to 0 (= no floor); the selftest already fails on the id
   // match in that case, so the fallback never masks a real bug.
@@ -3347,10 +3327,10 @@ async function doSelftest() {
     const waitS = Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
     const askedAt = Date.now();
     try {
-      // #65: since=<nonce id − 1> keeps the pre-existing backlog out of the read;
+      // since=<nonce id − 1> keeps the pre-existing backlog out of the read;
       // lease=60 bounds the blackout on anything still served (a mid-window arrival
       // with id > nonce, or the whole queue under the sinceId=0 fallback) to ~60s
-      // instead of the server's ~10-min default. Both together (PR #66 cross-audit).
+      // instead of the server's ~10-min default. Both together, always.
       const qs = new URLSearchParams({ all: 'true', since: String(sinceId), lease: '60' });
       if (waitS > 0) qs.set('wait', String(waitS));
       const res = await fetchT(`${BASE}/api/v1/messages?${qs}`, { headers }, (waitS + 10) * 1000);
@@ -3415,7 +3395,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     process.exit(2);
   }
   if (res.status === 404) {
-    // pre-#110 server: no /whoami yet — the key may still be fine; prove it on the manifest.
+    // Older server: no /whoami yet — the key may still be fine; prove it on the manifest.
     const m = await fetchT(`${base}/api/v1/manifest`, { headers: { authorization: `Bearer ${token}` } }).catch(() => null);
     if (m && m.status === 200) {
       console.error('pidge doctor: key VALID (server predates /whoami — channel/device detail unavailable; update the server to see it)');
@@ -3429,7 +3409,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     console.error(`pidge doctor: unexpected ${res.status} from /whoami — ${JSON.stringify(data)}`);
     process.exit(2);
   }
-  // #52: since server v57 /whoami is either-track — a SESSION token (ses_) gets
+  // On newer servers /whoami is either-track — a SESSION token (ses_) gets
   // a 200 with NO channel block. Pre-v57 that misconfig 401ed loudly; without
   // this branch the doctor would print key valid — canal "undefined" and exit 0,
   // hiding the error until the first send 401s.
@@ -3442,37 +3422,38 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   note(`pidge doctor: key valid — canal "${data.channel && data.channel.name}" · ${devices} device(s)`);
   if (devices === 0)
     console.error('pidge doctor: WARNING — 0 devices: sends will reach NOBODY until the human installs/opens the Pidge app on their iPhone');
-  // #182 device-reach honesty (gotcha #9) + #181 ownership — shared with whoami.
+  // device-reach honesty + install ownership — shared with whoami.
   const unreachable = reportDeviceReach(data);
   reportClaimMismatch(data);
-  // #61: SHOUT on a stale prior-claim backlog (advisory tone — the anchor has
-  // known false ±, pidge#294). Warning only, never exit 2: the messages are
+  // SHOUT on a stale prior-claim backlog (advisory tone — the anchor has
+  // known false ±). Warning only, never exit 2: the messages are
   // real and drainable; the human/agent decides what they're worth.
   warnStalePriorClaim(data, 'Run `pidge catchup` (read-only) to see them before any listen/ack.');
-  // #71: doctor ALWAYS reports the prior-claim state — a CONFIRMATION on false, not
+  // doctor ALWAYS reports the prior-claim state — a CONFIRMATION on false, not
   // just a warning on true. "I didn't see the warning" ≠ "there is no orphaned
   // backlog"; a silent doctor can't confirm health. The warning above covers true;
-  // here we speak the healthy case. Only when the field is EXPLICITLY false (v63+):
+  // here we speak the healthy case. Only when the field is EXPLICITLY false:
   // an older server that omits it can't confirm either way, so stay silent then.
   if (data.stale_from_prior_claim === false)
     console.error('pidge doctor: prior-claim backlog: none ✓ (no un-acked messages predate your ownership claim)');
-  // #76 item 3: an UNMARKED home skill is one the self-heal (correctly) won't touch
-  // (#69 requireMarker) — so a PRE-MARKER pidge copy silently stays on old doctrine
-  // with no signal (the Javier incident). doctor can't fix it (it might be an
+  // An UNMARKED home skill is one the self-heal (correctly) won't touch
+  // (requireMarker) — so a PRE-MARKER pidge copy silently stays on old doctrine
+  // with no signal (a real incident: an install ran months-stale doctrine
+  // unnoticed). doctor can't fix it (it might be an
   // AUTHORED skill), but it can SAY so — a nudge, never a write.
   warnUnmarkedHomeSkill();
-  // E2E (E2-CLI): validate PIDGE_SECRET when present (32 bytes after base64url;
+  // E2E: validate PIDGE_SECRET when present (32 bytes after base64url;
   // kf = base64url(SHA-256(key)[0..3])) and cross-check it against the channel:
   //   e2e_enabled + no secret   → sends go CLEAR-and-marked; point at the app's Connect-screen terminal step
   //   secret + non-E2E channel  → an ORPHAN secret (never used); warn
   //   e2e_enabled + bad/mismatched secret → BROKEN (exit 2): the seal promise can't hold
   const e2e = reportE2eHealth(data);
   if (ON_SHARED_FILE)
-    console.error(`pidge doctor: WARNING — reading the SHARED file ${CONFIG_FILE}. If another agent runs on this machine, it reads the SAME key and you'll send as each other (the 2026-06-13 incident). Isolate: set PIDGE_AGENT=<id> at this agent's launch (config → ~/.config/pidge/agents/<id>/env) or give it its own PIDGE_TOKEN.`);
-  // #182: devices exist but 0 are deliverable ⇒ a send reaches NOBODY — BROKEN
+    console.error(`pidge doctor: WARNING — reading the SHARED file ${CONFIG_FILE}. If another agent runs on this machine, it reads the SAME key and you'll send as each other (a real incident, not a hypothetical). Isolate: set PIDGE_AGENT=<id> at this agent's launch (config → ~/.config/pidge/agents/<id>/env) or give it its own PIDGE_TOKEN.`);
+  // devices exist but 0 are deliverable ⇒ a send reaches NOBODY — BROKEN
   // (exit 2). (0 devices total stays a warning above: a fresh setup before the
   // app is installed isn't "broken".) The claim mismatch SHOUTS but stays exit 0
-  // — the warning is the contract (§4.6: the severity split is a judgment call).
+  // — the warning is the contract (the severity split is a judgment call).
   if (unreachable) {
     console.error('pidge doctor: BROKEN (exit 2) — devices exist but 0 are reachable (all disabled or on the wrong APNs environment): a send reaches nobody.');
     process.exit(2);
@@ -3481,7 +3462,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     console.error('pidge doctor: BROKEN (exit 2) — this channel is E2E but the PIDGE_SECRET cannot seal/open anything on it. The app\'s Connect screen shows a separate TERMINAL step that writes PIDGE_SECRET to ~/.config/pidge/env — ask your human to run THAT (never paste the secret in chat), then re-run `pidge doctor`.');
     process.exit(2);
   }
-  // #171: probe the realtime path (the #119 failure class an HTTP-only doctor
+  // probe the realtime path (the held-poll failure class an HTTP-only doctor
   // misses). Exit stays 0 either way — an unavailable WS degrades to polling.
   const rt = await probeRealtime(base, token);
   let realtime;
@@ -3495,10 +3476,10 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     realtime = 'unavailable';
     note(`pidge doctor: realtime: INDISPONÍVEL — ${rt.reason}. O \`listen\` degrada pra polling (funciona, menos instantâneo); use --no-realtime pra fixar o piso.`);
   }
-  // #229: lead with `pidge hello` — the first-contact WOW (send + wait in one),
-  // the same debut the /agent-setup guide leads with. (#274: no --template hint —
+  // lead with `pidge hello` — the first-contact WOW (send + wait in one),
+  // the same debut the /agent-setup guide leads with. (no --template hint —
   // `pidge hello` IS the entry point; the content_template surface is off the menu.)
-  // lote-5 #4: --quiet collapses ALL of the above to this single status line.
+  // --quiet collapses ALL of the above to this single status line.
   if (QUIET)
     console.error(`pidge: ✓ setup ok — canal "${data.channel && data.channel.name}" · ${devices} device(s) · realtime ${realtime} (run \`pidge doctor\` for the full check)`);
   else
@@ -3541,9 +3522,9 @@ function reportE2eHealth(data) {
     console.error(`pidge doctor: BROKEN — your PIDGE_SECRET (kf ${out.kf}) is NOT this channel's key (kf ${serverKf}): the token and the secret belong to different channels. Ask your human to run THIS channel's terminal step from the app's Connect screen (never paste the secret in chat).`);
   } else if (channelOn) {
     note('pidge doctor: e2e ON — sends are sealed end-to-end (the server relays ciphertext only)');
-    e2eStampPin(out.kf); // doctor CONFIRMED the sealed context — latch the pin (#313)
+    e2eStampPin(out.kf); // doctor CONFIRMED the sealed context — latch the pin
   } else if (e2ePinned() && !e2eOverrideOff()) {
-    console.error(`pidge doctor: WARNING — the server says this channel is NOT E2E, but this machine PINNED it as E2E (#313): every send here is REFUSED (exit 2) instead of going clear — a lying server must not downgrade you to plaintext. ${E2E_UNPIN_HINT}`);
+    console.error(`pidge doctor: WARNING — the server says this channel is NOT E2E, but this machine PINNED it as E2E: every send here is REFUSED (exit 2) instead of going clear — a lying server must not downgrade you to plaintext. ${E2E_UNPIN_HINT}`);
   } else {
     console.error('pidge doctor: WARNING — PIDGE_SECRET present but this channel is NOT E2E (secret órfão): sends stay CLEAR and the secret is never used. Either the human turns on E2E for this channel in the app, or drop the secret.');
   }
@@ -3559,7 +3540,8 @@ async function runSetup() {
   if (!code) die('pidge: usage: pidge setup --claim <code> [--url <base>]   (the human copies the code from the Pidge app)', 1);
   const base = (v.url || process.env.PIDGE_URL || FILE_ENV.PIDGE_URL || 'https://pidge.sh').replace(/\/+$/, '');
 
-  // THE SHARED-CONFIG GUARD (real incident, 2026-06-13). Only the FILE path can
+  // THE SHARED-CONFIG GUARD (a real incident: a shared config file let one
+  // agent's setup hijack another's cron). Only the FILE path can
   // collide; --print writes nothing, so skip it there. CONFIG_FILE is now
   // per-agent when PIDGE_AGENT is set (no collision by construction), but on the
   // legacy shared file two agents still share it — refuse to clobber a file that
@@ -3599,7 +3581,7 @@ async function runSetup() {
   const channelName = data.channel && data.channel.name;
   const channelId = data.channel && data.channel.id;
 
-  // #182 step 5: DECLARE how this agent operates (operating_contract) right after
+  // step 5: DECLARE how this agent operates (operating_contract) right after
   // the claim succeeds — ADVISORY metadata, the same for --print and the file
   // path. Done here (before the branch) so both onboarding modes declare it.
   await declareOperatingContract(finalBase, data.key, channelId);
@@ -3614,7 +3596,7 @@ async function runSetup() {
     console.log(`export PIDGE_TOKEN=${data.key}`);
     // E2E: the {TOKEN, SECRET} pair travels together from ONE source — when this
     // environment already carries PIDGE_SECRET (the human exported it before
-    // running setup), emit it alongside. (#315: the secret comes from the app's
+    // running setup), emit it alongside. (the secret comes from the app's
     // Connect-screen terminal step, never from the chat prompt.)
     if (process.env.PIDGE_SECRET) console.log(`export PIDGE_SECRET=${process.env.PIDGE_SECRET}`);
     console.error(`pidge: canal "${channelName}" — modo POR-AGENTE (nada gravado em disco). Cole as duas linhas no ambiente de lançamento DESTE agente (systemd/launcher/cron/profile). Cada agente tem a SUA chave; perdeu, é só pegar outro código no app e re-rodar (a chave do canal é a MESMA). NÃO rode --print de dentro de um agente — a chave apareceria no contexto dele.`);
@@ -3624,9 +3606,9 @@ async function runSetup() {
   }
 
   // File path (default): the CLI writes the key — the agent never sees it
-  // (#57). Per-agent when PIDGE_AGENT is set; otherwise the legacy shared file.
+  // (token hygiene). Per-agent when PIDGE_AGENT is set; otherwise the legacy shared file.
   // E2E: the {TOKEN, SECRET} pair travels together from ONE source — persist
-  // PIDGE_SECRET next to the token when this env already carries it (#315: it
+  // PIDGE_SECRET next to the token when this env already carries it (it
   // gets there via the app's Connect-screen terminal step, never the chat
   // prompt), and never silently DROP a secret the file already held: the human
   // may be re-claiming the same E2E channel with a fresh code.
@@ -3638,9 +3620,9 @@ async function runSetup() {
   try { fs.chmodSync(CONFIG_FILE, 0o600); } catch { /* mode set on create */ }
   note(`pidge: canal "${channelName}" configurado — chave em ${CONFIG_FILE} (chmod 600, nunca exibida)`);
   if (e2eSecret) note('pidge: PIDGE_SECRET stored next to the token (the {TOKEN, SECRET} pair travels together) — E2E sends seal automatically when the channel is E2E');
-  // #181: claim ownership of the channel for THIS install and record the
+  // claim ownership of the channel for THIS install and record the
   // generation locally, so a later `pidge doctor` can DETECT a silent key swap
-  // by a different agent (the v25 incident, now caught in code). Best-effort.
+  // by a different agent (a real incident, now caught in code). Best-effort.
   const claim = await claimOwnership(finalBase, data.key);
   if (claim) {
     fs.appendFileSync(CONFIG_FILE, `PIDGE_CLAIM_GENERATION=${claim.claim_generation}\nPIDGE_FINGERPRINT=${agentFingerprint()}\n`, { mode: 0o600 });
@@ -3652,7 +3634,7 @@ async function runSetup() {
   await runDoctor(finalBase, data.key, CONFIG_FILE);
 }
 
-// #274 F4: setup → skill → hello. Best-effort, run right BEFORE the post-setup
+// The setup fuse: setup → skill → hello. Best-effort, run right BEFORE the post-setup
 // doctor (runDoctor process.exit()s, so this can't trail it). A skill-install
 // failure is ONE stderr line — NEVER a `--help`/USAGE dump (the graceful-degrade
 // invariant). `pidge hello` stays a printed NEXT step: we don't auto-fire a push
@@ -3668,13 +3650,13 @@ async function fuseSkillAndHello(base, token) {
   note('pidge: next → `pidge hello` to send your first handshake and watch it confirm on the lock screen.');
 }
 
-// skill install (#110e; rewritten #274 F3): persistent Pidge knowledge for AI
+// skill install: persistent Pidge knowledge for AI
 // agents — the live manifest's APPENDIX (profiles / notes / exits) wrapped around
 // a HAND-AUTHORED, failure-mode-first spine. The dead content_template
 // `decision_table` is NEVER pulled again, so even an old manifest can't reinject
 // the v46 collision. Non-exiting: RETURNS {file, manifest_version} and THROWS on
 // failure, so callers (`skill install` AND the setup fuse) choose die-vs-degrade.
-// #58: `--target` picks the DESTINATION only — the generated content is identical
+// `--target` picks the DESTINATION only — the generated content is identical
 // (it's already agent-agnostic). claude = a Claude Code skill; agents/gemini = the
 // emerging root-file conventions (AGENTS.md for Codex et al., GEMINI.md for Gemini).
 const SKILL_TARGETS = {
@@ -3683,7 +3665,7 @@ const SKILL_TARGETS = {
   gemini: () => path.join(process.cwd(), 'GEMINI.md'),
 };
 
-// #69: destFileOverride lets the self-heal write to a SPECIFIC file (e.g. the
+// destFileOverride lets the self-heal write to a SPECIFIC file (e.g. the
 // HOME skill ~/.claude/skills/pidge/SKILL.md) rather than the cwd-relative claude
 // target — so a stale skill is healed IN PLACE wherever it lives, never cross-written.
 async function installSkill(base = BASE, token = TOKEN, target = 'claude', destFileOverride = null) {
@@ -3702,7 +3684,7 @@ async function installSkill(base = BASE, token = TOKEN, target = 'claude', destF
   const profileTable = (m.profiles && m.profiles.decision_table) || [];
   const notes = m.notes || [];
   const exits = (m.cli && m.cli.output) || '';
-  // #33 fix (0.15.3): the self-heal marker rides a `# pidge-skill …` YAML COMMENT INSIDE
+  // The self-heal marker rides a `# pidge-skill …` YAML COMMENT INSIDE
   // the frontmatter — it MUST NOT precede the opening `---`. A SKILL.md whose first line
   // isn't `---` fails the YAML frontmatter parse, so Claude Code loads the skill with a
   // GARBAGE description (the HTML comment leaked in as the description, the real one lost)
@@ -3777,7 +3759,7 @@ Need a TYPED reply (a time/value/name)? \`--actions reply\` ALONE — never a de
 ## Live progress (a status card you update in place)
 
 For a long job whose progress the human wants to GLANCE at, you have two honest paths:
-- **\`pidge live\` — the real lock-screen card (LA v2, #284).** By default your card is an ENTRY
+- **\`pidge live\` — the real lock-screen card.** By default your card is an ENTRY
   of the user's ONE consolidated status-center Live Activity (all agents share it — cards never
   stack). Fields drive the render: \`--step 3/5\` (sugar → progress + fraction) or \`--progress\`
   → bar; \`--ends-at\` → native countdown the SERVER concludes at zero; \`--end\` → ✓ + outcome,
@@ -3919,13 +3901,13 @@ ${SKILL_END_MARKER}
   const file = destFor();
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
-  // #38: never clobber silently — the installed skill may have been customized.
+  // never clobber silently — the installed skill may have been customized.
   // When the file being replaced differs from what we're writing, keep the old
   // content as <dest>.bak and say so in one stderr line.
   let previous = null;
   try { previous = fs.readFileSync(file, 'utf8'); } catch { /* no existing file */ }
   if (previous !== null && previous !== skill) {
-    // #58 cross-audit (PR #60): NEVER clobber an existing .bak. The FIRST install
+    // NEVER clobber an existing .bak. The FIRST install
     // to a shared target (agents/gemini) parks the user's ORIGINAL file (e.g. their
     // hand-written AGENTS.md) at <dest>.bak; a later re-install whose generated
     // content changed would otherwise overwrite that .bak with our now-stale skill,
@@ -3935,11 +3917,11 @@ ${SKILL_END_MARKER}
     let bak = `${file}.bak`;
     if (fs.existsSync(bak)) bak = `${file}.bak.${Date.now()}`;
     fs.writeFileSync(bak, previous);
-    // #58 cross-audit: name the ACTUAL destination file, not a hardcoded "SKILL.md"
+    // Name the ACTUAL destination file, not a hardcoded "SKILL.md"
     // (a --target agents/gemini install writes AGENTS.md/GEMINI.md).
     console.error(`pidge: the previous ${path.basename(file)} differed from the regenerated one — saved to ${bak}`);
   }
-  // #38: ATOMIC replace — write a per-process tmp, then rename. A killed process or
+  // ATOMIC replace — write a per-process tmp, then rename. A killed process or
   // a full disk leaves the OLD skill intact instead of a torn file whose surviving
   // marker reads as "fresh" (the 0.15.2→0.15.3 corruption class, one version on);
   // concurrent heals each rename a WHOLE file (last one wins), never interleaved bytes.
@@ -3970,7 +3952,7 @@ ${SKILL_END_MARKER}
       if (res.status !== 200) die(`pidge: whoami failed (${res.status}): ${JSON.stringify(data)}`, 2);
       console.log(JSON.stringify(data, null, 2));
       console.error(`pidge: you are canal "${data.channel && data.channel.name}" · ${data.devices ?? '?'} device(s)`);
-      // §5.2/§4.6: whoami MUST also report HONEST reach + SHOUT on a claim swap,
+      // whoami MUST also report HONEST reach + SHOUT on a claim swap,
       // not just doctor — the same shared helpers (deliverable, ANOTHER AGENT…).
       reportDeviceReach(data);
       reportClaimMismatch(data);
@@ -3979,7 +3961,7 @@ ${SKILL_END_MARKER}
     }
     case 'skill': {
       if (parsed.positionals[1] !== 'install') die('pidge: usage: pidge skill install [--target claude|agents|gemini]', 1);
-      // #58: --target picks the DESTINATION (claude → .claude skill · agents →
+      // --target picks the DESTINATION (claude → .claude skill · agents →
       // AGENTS.md · gemini → GEMINI.md); the generated content is identical.
       const target = (v.target || 'claude').trim().toLowerCase();
       if (!SKILL_TARGETS[target])
@@ -3990,7 +3972,7 @@ ${SKILL_END_MARKER}
       console.log(JSON.stringify({ ok: true, file: r.file, target, manifest_version: r.manifest_version }));
       process.exit(0);
     }
-    // === AXIS 1 — the married catalog of 5 (perfis-S1/S2). Each stamps the
+    // === AXIS 1 — the married catalog of 5. Each stamps the
     // canonical template_kind. AXIS 2 (response) is orthogonal: --actions/
     // --custom-action add buttons, --wait blocks on the answer (else fire-and-
     // forget). notify/send = the deprecated typeless path; ask/approval = the
@@ -4017,12 +3999,12 @@ ${SKILL_END_MARKER}
       break;
     }
     case 'live':
-      // cli#47: the verb drives the REAL /live_activities endpoints now — the
+      // the verb drives the REAL /live_activities endpoints now — the
       // old silent degrade (template_kind:live → a message-profile /notify 201
       // with no card) is dead. --wait is refused inside (status never answers).
       await doLive();
       break;
-    // --- compat aliases (perfis-S1): old type names → the new canonical 5. They
+    // --- compat aliases: old type names → the new canonical 5. They
     // map to the new template_kind and still honor --wait/--actions, so scripts
     // and muscle-memory keep working; a one-line note points at the new name.
     case 'fyi':
@@ -4037,7 +4019,7 @@ ${SKILL_END_MARKER}
       warnRenamed('alert', 'urgent');
       await doTypedSend('urgent', { wait: !!v.wait, extra: v.escalate ? { escalate: true } : {}, label: 'alert' });
       break;
-    // `approval` = the RECIPE (perfis-S2 follow-up): important + Approve/Reject
+    // `approval` = the RECIPE: important + Approve/Reject
     // (Face ID on Approve) + --wait. A shortcut for an explicit go/no-go; the human
     // can override the pair with their own --actions/--custom-action.
     case 'approval': {
@@ -4045,7 +4027,7 @@ ${SKILL_END_MARKER}
       await doTypedSend('important', { wait: true, extra, label: 'approval' });
       break;
     }
-    // #34 — the hook-shaped, deny-default permission gate (allow→0, everything
+    // — the hook-shaped, deny-default permission gate (allow→0, everything
     // else→non-zero). See doApprove + `pidge approve --help` (PreToolUse example).
     case 'approve': {
       await doApprove();
@@ -4062,7 +4044,7 @@ ${SKILL_END_MARKER}
       break;
     }
     case 'hello': {
-      // #217 — the first-contact WOW: fire the onboarding handshake and block on
+      // — the first-contact WOW: fire the onboarding handshake and block on
       // your human's confirmation. The SERVER narrates a 3-stage Live Activity on
       // the lock screen (Conectando → toque para confirmar → Concluído ✓) so your
       // human SEES the agent→human→agent loop close. One command: send + wait.
@@ -4073,9 +4055,9 @@ ${SKILL_END_MARKER}
       v.template = 'onboarding';
       if (v.title === undefined) v.title = 'Your agent is ready 🐦';
       if (v.body === undefined) v.body = 'Tap Done ✓ to confirm you received me — proves the round-trip works.';
-      // #39: validate the knobs BEFORE the send — a typo dies here (exit 1) instead
+      // validate the knobs BEFORE the send — a typo dies here (exit 1) instead
       // of hanging the handshake forever on a NaN deadline.
-      // #71: --timeout defaults to 120 s (was the onboarding template's ~3600 s, which
+      // --timeout defaults to 120 s (was the onboarding template's ~3600 s, which
       // let `hello` pin a fresh session indefinitely — a live agent had to KILL it).
       // The handshake is durable: a missing confirmation is "not yet", never lost.
       const timeoutArg = numStrict(v.timeout, '--timeout', 120);
@@ -4086,7 +4068,7 @@ ${SKILL_END_MARKER}
       const { ok, info } = await doNotify();
       if (!ok) process.exit(2);
       console.error(`pidge: WOW sent (${info.registered_devices} device(s)) — watch the lock screen narrate the handshake; waiting up to ${timeoutArg}s for your human to confirm on ${cid}`);
-      // #71: a timeout exits 3 NARRATED (mirrors the ask/wait contract) — the
+      // a timeout exits 3 NARRATED (mirrors the ask/wait contract) — the
       // confirmation is safe in the queue; `pidge listen --all` collects it later.
       await waitForAnswer(cid, {
         timeout: timeoutArg,
@@ -4101,7 +4083,7 @@ ${SKILL_END_MARKER}
     }
     case 'ask': {
       // `ask` = the preserved shortcut: important + --wait + REQUIRES a way to
-      // answer. There is no `ask` TYPE in the married catalog (manifest v40+) —
+      // answer. There is no `ask` TYPE in the married catalog —
       // asking is "a type + buttons + wait". The legacy alias keeps working because
       // it always ships with buttons. `live`/tracking is refused (it never answers).
       await doTypedSend('important', { wait: true, requireAnswerable: true, label: 'ask' });
@@ -4110,12 +4092,12 @@ ${SKILL_END_MARKER}
     case 'wait': {
       const cid = parsed.positionals[1];
       if (!cid) die('pidge: usage: pidge wait <correlation_id> [--timeout N] [--interval N]', 1);
-      // #39: strict — a NaN deadline would make this wait eternal (fail-closed instead)
+      // strict — a NaN deadline would make this wait eternal (fail-closed instead)
       await waitForAnswer(cid, { timeout: numStrict(v.timeout, '--timeout', 300), interval: numStrict(v.interval, '--interval', 30) });
       break;
     }
     case 'cancel': {
-      // #56: withdraw a still-scheduled notification (also kills a snooze re-fire).
+      // withdraw a still-scheduled notification (also kills a snooze re-fire).
       // Exit 0 cancelled (idempotent) · 2 otherwise (404 unknown, 409 too late).
       const cid = parsed.positionals[1];
       if (!cid) die('pidge: usage: pidge cancel <correlation_id>', 1);
@@ -4139,12 +4121,12 @@ ${SKILL_END_MARKER}
       break;
     }
     case 'ack': {
-      // #170 read-receipt split: mark messages PROCESSED (green ✓✓) AFTER you've
+      // read-receipt split: mark messages PROCESSED (green ✓✓) AFTER you've
       // durably handled them — `listen` only DELIVERS them now. --renew
       // (state=delivered) instead RENEWS the visibility-timeout lease, a
       // heartbeat for a long task so the reservation doesn't lapse and re-serve.
       //
-      // #63: `--summary` is a global BOOLEAN (for `inbox --summary`), so the
+      // `--summary` is a global BOOLEAN (for `inbox --summary`), so the
       // module-level parse would read `ack --summary "text"` as boolean-true and
       // drop "text" to an ignored positional — a SILENT no-op on an attribution
       // field. Re-parse THIS command's argv with `summary` typed as a string so
@@ -4159,14 +4141,14 @@ ${SKILL_END_MARKER}
       const ackBody = {};
       if (av['up-to'] !== undefined && av.ids !== undefined)
         die('pidge: pass EITHER --up-to <id> OR --ids a,b, not both', 1);
-      // #51: strict ids — a lazy parse here silently acks the wrong watermark
+      // strict ids — a lazy parse here silently acks the wrong watermark
       // (and the old .filter(Number.isFinite) silently DROPPED bad ids).
       if (av['up-to'] !== undefined) ackBody.up_to = idStrict(av['up-to'], '--up-to');
       else if (av.ids !== undefined) ackBody.ids = av.ids.split(',').map((s) => idStrict(s, '--ids'));
       else die('pidge: usage: pidge ack --up-to <id> | --ids a,b [--renew] [--summary "<what you did>"]', 1);
       if (av.renew) ackBody.state = 'delivered';
-      // #63: attribution — the successor session sees WHAT this handler did
-      // (server #380: handler_summary on the history row, shown by `pidge catchup`).
+      // attribution — the successor session sees WHAT this handler did
+      // (server handler_summary on the history row, shown by `pidge catchup`).
       // A present-but-EMPTY --summary is a usage error, never a silent no-op; the
       // server caps the field, we also send at most 1000 chars.
       if (av.summary !== undefined) {
@@ -4196,7 +4178,7 @@ ${SKILL_END_MARKER}
       break;
     }
     case 'bridge': {
-      // #59: the 1st-class supervisor. `bridge install` writes the launchd/
+      // the 1st-class supervisor. `bridge install` writes the launchd/
       // systemd template; bare `bridge --exec` runs the loop (forever — its
       // lifecycle belongs to the OS supervisor / the human, not a timeout).
       const sub = parsed.positionals[1];
@@ -4207,13 +4189,13 @@ ${SKILL_END_MARKER}
       break;
     }
     case 'selftest': {
-      // #205: prove reachability by round-trip. Fire a nonce, run the listener,
+      // prove reachability by round-trip. Fire a nonce, run the listener,
       // confirm it picks it up + acks in time. PASS exit 0 / FAIL exit 2.
       await doSelftest();
       break;
     }
     case 'inbox': {
-      // #83: what this channel sent — the list (default), the pending slice
+      // what this channel sent — the list (default), the pending slice
       // (--pending = delivered + still unanswered) or the one-call summary
       // (--summary = counts + answer latency). stdout = raw server JSON.
       const qs = new URLSearchParams();
@@ -4254,9 +4236,9 @@ ${SKILL_END_MARKER}
       break;
     }
     case 'catchup': {
-      // #58: READ-ONLY situational read. GET /messages?history=true&all=true — the
+      // READ-ONLY situational read. GET /messages?history=true&all=true — the
       // WHOLE thread (server never consumes/stamps delivered/opens a lease on the
-      // history read, since #186), answers (notification_reply) included. This verb
+      // history read), answers (notification_reply) included. This verb
       // NEVER acks and NEVER holds a lease: it's the safe way to SITUATE yourself at
       // the start of an interactive session on a channel whose real consumer is
       // ANOTHER runtime (a 24/7 bridge/daemon) — you read what's already handled
@@ -4267,7 +4249,7 @@ ${SKILL_END_MARKER}
       // --all is default-ON for catchup (the situational read WANTS the answers to
       // earlier notifications, not just composer messages) — always request them.
       qs.set('all', 'true');
-      // #58 cross-audit (PR #60): the server IGNORES `limit` on the ?history=true
+      // The server IGNORES `limit` on the ?history=true
       // path (it always returns the whole thread), so --limit must be enforced
       // LOCALLY — a slice of the newest N after the sort below. --before IS honored
       // server-side (older-than paging); we still forward both (harmless if a future
@@ -4280,7 +4262,7 @@ ${SKILL_END_MARKER}
         qs.set('limit', String(catchupLimit));
       }
       if (v.before !== undefined) qs.set('before', v.before);
-      // #70: --since <id> — the incremental cursor. STRICT numeric (same class as
+      // --since <id> — the incremental cursor. STRICT numeric (same class as
       // --up-to/--ids: a lazy parse would silently read the wrong watermark). Forwarded
       // to the server AND enforced locally below, so "since my last session" is
       // O(new) regardless of whether this server paginates history by id.
@@ -4289,8 +4271,8 @@ ${SKILL_END_MARKER}
         catchupSince = idStrict(v.since, '--since');
         qs.set('since', String(catchupSince));
       }
-      // #70: the cursor the LAST catchup left, keyed by CHANNEL (hash(token)) — the
-      // same keying the #313 pin uses, so a catchup on channel A never contaminates
+      // the cursor the LAST catchup left, keyed by CHANNEL (hash(token)) — the
+      // same keying the E2E pin uses, so a catchup on channel A never contaminates
       // the --since suggested for channel B from the same config dir. Read BEFORE we
       // overwrite it below; a no-`--since` run suggests it so the agent situates in
       // O(new) next time.
@@ -4307,7 +4289,7 @@ ${SKILL_END_MARKER}
       await checkManifestNews(res);
       if (!(res.status >= 200 && res.status < 300))
         die(`pidge: catchup failed (${res.status}): ${JSON.stringify(data)}`, 2);
-      // #61: note the flag when the history carries it — the reader is looking
+      // note the flag when the history carries it — the reader is looking
       // at the very rows the warning is about.
       warnStalePriorClaim(data, 'They are included in the thread below — note which predate you before acting on them.');
       // Open sealed rows locally (E2E history is ciphertext on the wire) — same path
@@ -4317,18 +4299,18 @@ ${SKILL_END_MARKER}
       // Newest first (the situational read wants the latest context up top); the
       // server orders history this way already, but sort defensively by id desc.
       opened.sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0));
-      // #70: the highest id in the WHOLE thread (before any --since/--limit slice) —
+      // the highest id in the WHOLE thread (before any --since/--limit slice) —
       // the cursor to persist so the NEXT no-`--since` catchup can suggest it.
       const highestId = opened.reduce((mx, m) => Math.max(mx, Number(m.id) || 0), 0);
-      // #70: --since <id> filters to STRICTLY newer rows, client-side (belt-and-braces
+      // --since <id> filters to STRICTLY newer rows, client-side (belt-and-braces
       // over the server query) — acceptable at the catchup scale (≤200). Applied before
       // --limit, so --limit still means "the newest N of what's new".
       const fresh = catchupSince != null ? opened.filter((m) => (Number(m.id) || 0) > catchupSince) : opened;
-      // #58 cross-audit: enforce --limit locally (server ignores it here) — the
+      // Enforce --limit locally (server ignores it here) — the
       // newest N after the sort/since-filter.
       const printed = catchupLimit != null ? fresh.slice(0, catchupLimit) : fresh;
       if (v.digest) {
-        // #70: --digest — one condensed line per message. The condensed view for
+        // --digest — one condensed line per message. The condensed view for
         // "what happened, who handled what" before offering work; the raw JSON works
         // against that purpose on a long thread.
         for (const m of printed) {
@@ -4338,11 +4320,11 @@ ${SKILL_END_MARKER}
         }
       } else {
         console.log(JSON.stringify({ messages: printed }, null, 2));
-        // #58 item 4 (server v63 / #380, now in production): a PROCESSED row carries
+        // Newer servers: a PROCESSED row carries
         // acked_by_label + handler_summary — narrate WHO already handled it and WHAT
         // they did, so the reader sees the other consumer's work instead of re-offering
         // it (the whole point of catchup). In --digest mode this rides inline instead.
-        // Present-only: rows without the fields (never acked, or a pre-v63 server) skip.
+        // Present-only: rows without the fields (never acked, or an older server) skip.
         for (const m of printed) {
           if (m.acked_by_label || m.handler_summary) {
             const who = m.acked_by_label || 'another consumer';
@@ -4351,7 +4333,7 @@ ${SKILL_END_MARKER}
           }
         }
       }
-      // #70: remember the highest id seen (per channel) so a later no-`--since` run
+      // remember the highest id seen (per channel) so a later no-`--since` run
       // can suggest the cursor. Best-effort (writeState swallows a read-only fs). Date
       // is fine here — the CLI process, not a workflow script. Only ADVANCE the cursor:
       // a `--before` page (older rows) has a lower highest and must NOT regress it.
@@ -4364,7 +4346,7 @@ ${SKILL_END_MARKER}
         ? ` (newest ${printed.length} of ${fresh.length} — --limit; drop it or raise --before to see more)` : '';
       const sinceNote = catchupSince != null ? ` since id ${catchupSince}` : '';
       console.error(`pidge: catchup — ${printed.length} message(s)${sinceNote} in the thread${clipped}${replies ? ` · ${replies} answer(s) to earlier notifications` : ''}, read-only: NOT consumed, NOT acked. This is a peek; it never steals a message from another consumer.`);
-      // #76 item 2: the incremental-cursor nudge must ALWAYS surface on stderr — an
+      // The incremental-cursor nudge must ALWAYS surface on stderr — an
       // agent ALWAYS pipes (no TTY), and a repeat situating run must still learn the
       // --since cursor even when the thread hasn't moved. The old gate (only when a
       // prior cursor existed AND the thread moved past it) meant a fresh channel, or a
@@ -4384,41 +4366,41 @@ ${SKILL_END_MARKER}
       break;
     }
     case 'listen': {
-      // #48: block until the human messages this channel (the app's composer),
+      // block until the human messages this channel (the app's composer),
       // print the messages as JSON, ACK them, exit 0. One-shot by design (loop
       // it, don't daemonize) — same contract as `wait`. Exit 3 on timeout, 4 if
-      // the whole session never had a healthy round-trip (#119).
+      // the whole session never had a healthy round-trip.
       // At-least-once: the ack happens AFTER the print — a crash re-serves them;
       // dedupe by id if you've seen one before.
-      // --all (#131): the SINGLE EAR — the queue also serves notification
+      // --all: the SINGLE EAR — the queue also serves notification
       // ANSWERS (kind notification_reply, with a self-contained ref), so a
       // fire-and-forget notify can't lose its reply. Without --all the original
       // composer-only contract stands (no double-consumption for ask/wait users).
-      // #59: refuse to double-consume a channel a RUNNING bridge owns (the lock
+      // refuse to double-consume a channel a RUNNING bridge owns (the lock
       // is pid-checked — a stale lock from a crashed bridge never blocks a
       // listen). Local-machine advisory by construction, which is exactly the
-      // incident it exists for; `catchup` stays the read path.
+      // failure mode it exists for; `catchup` stays the read path.
       const bridgeHolder = bridgeLockHolder();
       if (bridgeHolder)
-        die(`pidge: listen REFUSED — a running \`pidge bridge\` (pid ${bridgeHolder.pid}${bridgeHolder.label ? `, "${bridgeHolder.label}"` : ''}) is this channel's consumer; a second consumer double-consumes (#59). Read with \`pidge catchup\` (read-only), or stop the bridge first.`, 2);
-      installOrphanWatchdog(); // §3c: a killed-parent orphan exits instead of eating the queue
-      // #39: strict — same class as wait/ask/approve: a NaN deadline never ends
+        die(`pidge: listen REFUSED — a running \`pidge bridge\` (pid ${bridgeHolder.pid}${bridgeHolder.label ? `, "${bridgeHolder.label}"` : ''}) is this channel's consumer; a second consumer double-consumes. Read with \`pidge catchup\` (read-only), or stop the bridge first.`, 2);
+      installOrphanWatchdog(); // a killed-parent orphan exits instead of eating the queue
+      // strict — same class as wait/ask/approve: a NaN deadline never ends
       const timeout = numStrict(v.timeout, '--timeout', 600);
       const listenInterval = numStrict(v.interval, '--interval', 5);
       const listenStartedAt = Date.now();
       let deadline = Date.now() + timeout * 1000;
       const queueQs = v.all ? '?all=true' : '';
-      // #65: the exit-3 hint — a message you EXPECT may be under a visibility lease
+      // the exit-3 hint — a message you EXPECT may be under a visibility lease
       // from another read (a selftest, a crashed listener, a bridge), invisible to
       // this listen until it lapses. `pidge catchup` shows the whole queue read-only.
       const LEASE_HINT = 'if you expected a message, it may be under a visibility lease from another read (a selftest / crashed listener / bridge) — `pidge catchup` shows the whole queue read-only (delivered_at/lease), never consuming.';
-      // lote-5 #5: the FIRST batch that comes back QUICKLY was already sitting in
+      // The FIRST batch that comes back QUICKLY was already sitting in
       // the queue when this listen started — with --all that includes answers to
       // EARLIER notifications, which read as "new" if we don't say otherwise. A
       // batch that arrives after a real hold (a long-poll that waited) is fresh.
       const BACKLOG_WINDOW_MS = 5000;
       let firstBatch = true;
-      // §2.6: --follow is SUPERVISOR-ONLY — warn LOUDLY at startup. A turn-based
+      // --follow is SUPERVISOR-ONLY — warn LOUDLY at startup. A turn-based
       // agent that uses it traps its turn (the process keeps listening); the
       // default one-shot, looped from the supervisor, is what almost everyone wants.
       if (v.follow) {
@@ -4426,7 +4408,7 @@ ${SKILL_END_MARKER}
         console.error('pidge: a TURN-BASED agent must NOT use --follow — it traps the turn. Use the');
         console.error('pidge: default one-shot (loop the command from your supervisor) instead.');
       }
-      // #157 P2 --follow: print+ack a batch and KEEP listening until the
+      // --follow: print+ack a batch and KEEP listening until the
       // timeout — the supervisor loop without re-spawning a process per batch.
       let gotAny = false;
       const followEnd = () => {
@@ -4437,7 +4419,7 @@ ${SKILL_END_MARKER}
         return false;
       };
 
-      // #170 read-receipt split: by DEFAULT a read message is DELIVERED (gray
+      // read-receipt split: by DEFAULT a read message is DELIVERED (gray
       // ✓✓), NOT consumed — the agent ACKS after the work (`pidge ack`), and a
       // ~10-min server lease re-serves un-acked messages so a crash never loses
       // one. --ack-on-read restores the pre-0.9 immediate-consume.
@@ -4450,19 +4432,19 @@ ${SKILL_END_MARKER}
         // E2E: open sealed rows BEFORE anything prints (stdout JSON and the
         // stderr narration below both read the decrypted values — a row we
         // can't open is blanked with a precise e2e_error, never base64).
-        // #367: async now — a sealed attachment is downloaded + unsealed to a
+        // async now — a sealed attachment is downloaded + unsealed to a
         // local path here (attachment.path in the printed JSON).
         const msgs = await Promise.all(msgsRaw.map(e2eOpenMessageRow));
         console.log(JSON.stringify(msgs, null, 2));
-        // lote-5 #5: heads-up on ORPHANED backlog served on the first quick read
-        // (--all only). It's within-channel — NOT the cross-channel leak (#289).
+        // Heads-up on ORPHANED backlog served on the first quick read
+        // (--all only). It's within-channel — NOT the cross-channel leak.
         if (v.all && firstBatch && (Date.now() - listenStartedAt) < BACKLOG_WINDOW_MS) {
           const replies = msgs.filter((m) => m.kind === 'notification_reply').length;
           const detail = replies ? ` (${replies} of them are answers to EARLIER notifications)` : '';
-          console.error(`pidge: --all — ${msgs.length} message(s) were ALREADY queued when this listen started${detail}: OLD backlog (sent while you weren't listening), NOT fresh arrivals. This is your OWN channel's backlog, not a cross-channel leak (#289).`);
+          console.error(`pidge: --all — ${msgs.length} message(s) were ALREADY queued when this listen started${detail}: OLD backlog (sent while you weren't listening), NOT fresh arrivals. This is your OWN channel's backlog, not a cross-channel leak.`);
         }
         firstBatch = false;
-        // #131: narrate answers so the agent knows WHICH notification spoke back.
+        // narrate answers so the agent knows WHICH notification spoke back.
         for (const m of msgs) {
           if (m.kind === 'notification_reply' && m.ref) {
             const said = m.text ? `: ${String(m.text).slice(0, 120)}` : '';
@@ -4499,7 +4481,7 @@ ${SKILL_END_MARKER}
         console.error('pidge: --follow — still listening');
       };
 
-      // Realtime path (#118): hold ConversationChannel — the human sees "ouvindo
+      // Realtime path: hold ConversationChannel — the human sees "ouvindo
       // agora" — and treat frames as wake-ups: the BACKLOG is always re-read over
       // a plain GET (at-least-once; also catches messages sent while offline).
       if (wantRealtime()) {
@@ -4513,7 +4495,7 @@ ${SKILL_END_MARKER}
             if (res.status === 200) {
               health.ok();
               const data = await res.json().catch(() => ({}));
-              warnStalePriorClaim(data); // #61: session-header warning, once
+              warnStalePriorClaim(data); // session-header warning, once
               const msgs = data.messages || [];
               if (msgs.length) {
                 if (!v.follow) finish('got-messages');
@@ -4533,12 +4515,12 @@ ${SKILL_END_MARKER}
           channel: 'ConversationChannel',
           deadline,
           onUp: (finish) => {
-            if (!announced) { announced = true; console.error(`pidge: listening over the realtime socket${v.all ? ' — single ear: composer + notification answers (#131)' : ''} (the human sees "ouvindo agora")`); }
+            if (!announced) { announced = true; console.error(`pidge: listening over the realtime socket${v.all ? ' — single ear: composer + notification answers' : ''} (the human sees "ouvindo agora")`); }
             drain(finish);
           },
           onFrame: (m, finish) => { if (m.type === 'message') drain(finish); },
         })];
-        // --all (#131): answers broadcast on InboxChannel, not Conversation — a
+        // --all: answers broadcast on InboxChannel, not Conversation — a
         // second subscription wakes the same HTTP drain (the queue is the ledger;
         // the loser session leaks until exit, harmless in a one-shot process).
         if (v.all) {
@@ -4574,11 +4556,11 @@ ${SKILL_END_MARKER}
           if (res.status === 200) {
             health.ok();
             const data = await res.json().catch(() => ({}));
-            warnStalePriorClaim(data); // #61: session-header warning, once
+            warnStalePriorClaim(data); // session-header warning, once
             const msgs = data.messages || [];
             if (msgs.length) await printAndAck(msgs);
           } else if (res.status >= 500) {
-            health.fail(`listen error ${res.status}`); // aggregated (#119) — no line per attempt
+            health.fail(`listen error ${res.status}`); // aggregated — no line per attempt
           } else {
             health.ok();
             console.error(`pidge: listen error ${res.status}`);

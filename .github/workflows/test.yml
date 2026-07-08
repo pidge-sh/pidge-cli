@@ -1,7 +1,7 @@
 name: test
 
-# cli#40: the repo's first CI. No secrets needed — the suite runs against the
-# local mock server (test/mock-server.js); `ws` is a devDependency npm ci brings.
+# No secrets needed — the suite runs against the local mock server
+# (test/mock-server.js); `ws` is a devDependency npm ci brings.
 on:
   push:
     branches: [main]
@@ -20,5 +20,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+          cache: npm
       - run: npm ci
-      - run: node --test
+      - run: npm test

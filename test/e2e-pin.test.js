@@ -1,5 +1,5 @@
 'use strict';
-// #313 — the local anti-downgrade pin. The seal decision used to trust
+// The local anti-downgrade pin. The seal decision used to trust
 // server-served flags in BOTH directions: e2eEnabled=false (or a failing
 // whoami) made the CLI send PLAINTEXT despite holding the key. Contract now:
 //   • the first CONFIRMED sealed context stamps state.json (e2ePinned)
@@ -42,7 +42,7 @@ function runCli(args, port, env = {}) {
       PIDGE_TOKEN: 'hld_test',
       PIDGE_SECRET: '',
       PIDGE_E2E: '',
-      // #69: isolate HOME so the skill self-heal never touches the real ~/.claude.
+      // Isolate HOME so the skill self-heal never touches the real ~/.claude.
       HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')),
       ...env,
     },
@@ -78,7 +78,7 @@ test('pinned + server says NOT e2e ⇒ exit 2 and NOTHING leaves the machine', a
   writePin(xdg, FIXTURE.kf);
   const mock = createMock();
   const port = await mock.start();
-  mock.state.e2eEnabled = false; // the downgrade lie (#313)
+  mock.state.e2eEnabled = false; // the downgrade lie
 
   const { code, stderr } = await runCli(['message', '--title', 'secret plan'], port,
     { PIDGE_SECRET: SECRET, XDG_CONFIG_HOME: xdg });
@@ -152,7 +152,7 @@ test('unpinned machines keep the old contract: server-off ⇒ clear send, no ref
   assert.equal(readPin(xdg), undefined, 'a clear send never latches the pin');
 });
 
-// cross-audit HIGH: --file/--image used to upload the bytes BEFORE the pin
+// Regression: --file/--image used to upload the bytes BEFORE the pin
 // refused the /notify — so a lying server captured the file even on a "refusal".
 // The preflight now dies BEFORE resolveMedia: nothing reaches the wire.
 test('pinned + server-off + --file ⇒ exit 2 and NO upload reached the server (nothing on the wire)', async () => {
@@ -174,7 +174,7 @@ test('pinned + server-off + --file ⇒ exit 2 and NO upload reached the server (
   assert.match(stderr, /REFUSING to send CLEAR/);
 });
 
-// cross-audit MEDIUM: a copy value that fits in CLEAR (≤512) can exceed the cap
+// Regression: a copy value that fits in CLEAR (≤512) can exceed the cap
 // once the seal inflates it ~33% — refuse locally with a CAUSE-naming message
 // instead of letting the server 422 with a bare "too long".
 test('a copy value too long ONCE sealed is refused locally, naming the cause', async () => {

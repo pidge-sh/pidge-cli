@@ -1,6 +1,6 @@
 'use strict';
-// Acceptance tests for the #119 resilience ladder + the #118 realtime client.
-// Includes the two criteria from the original bug reporter:
+// Acceptance tests for the resilience ladder + the realtime client.
+// Includes the two criteria from the original field bug report:
 //   1. ?wait= behind a proxy with a short response-timeout must not leave the
 //      CLI deaf — it degrades to plain GETs and keeps the channel alive;
 //   2. an hours-long `listen` must survive a server deploy/restart (the WS
@@ -16,16 +16,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function runCli(args, port, env = {}, cwd = undefined) {
   const child = spawn(process.execPath, [CLI, ...args], {
-    cwd, // #274 F4: setup's skill fuse writes .claude/skills/pidge into cwd — point it at a tmp dir
+    cwd, // setup's skill fuse writes .claude/skills/pidge into cwd — point it at a tmp dir
     env: {
       ...process.env,
       PIDGE_URL: `http://127.0.0.1:${port}`,
       PIDGE_TOKEN: 'hld_test',
       PIDGE_DEGRADED_INTERVAL: '1', // keep the degraded pace test-fast
-      // Isolate per spawn: state.json (manifest nag, #313 e2e pins) must never
+      // Isolate per spawn: state.json (manifest nag, e2e pins) must never
       // touch the REAL ~/.config/pidge — nor leak between tests.
       XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-test-')),
-      // #69: os.homedir() drives the HOME skill self-heal candidate — isolate it
+      // os.homedir() drives the HOME skill self-heal candidate — isolate it
       // too, so no test ever regenerates the developer's REAL ~/.claude/skills/pidge.
       // A test that exercises the home heal passes its own HOME via `env`.
       HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')),
@@ -42,7 +42,7 @@ function runCli(args, port, env = {}, cwd = undefined) {
   return { child, result };
 }
 
-test('Javier #1 — wait= dying behind the edge (502): degrade to plain GETs, stay alive, deliver', async () => {
+test('field report — wait= dying behind the edge (502): degrade to plain GETs, stay alive, deliver', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.waitMode = '502'; // every HELD poll dies; plain GETs are fine
@@ -57,7 +57,7 @@ test('Javier #1 — wait= dying behind the edge (502): degrade to plain GETs, st
   assert.match(stderr, /degraded to plain GETs/);
 });
 
-test('Javier #1b — a proxy DESTROYING held sockets degrades the same way (wait command)', async () => {
+test('field report — a proxy DESTROYING held sockets degrades the same way (wait command)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.waitMode = 'destroy';
@@ -85,7 +85,7 @@ test('exit 4 — zero healthy round-trips all session must exit LOUD, with aggre
 
   assert.equal(code, 4, `stderr: ${stderr}`);
   assert.match(stderr, /NOT ONE healthy round-trip/);
-  // Aggregation (#119): one deafness note + one degrade note — never a line per attempt.
+  // Aggregation: one deafness note + one degrade note — never a line per attempt.
   const deafLines = stderr.split('\n').filter((l) => /deaf for/.test(l));
   assert.ok(deafLines.length <= 2, `expected aggregated stderr, got:\n${stderr}`);
 });
@@ -102,7 +102,7 @@ test('exit 3 — a healthy but silent session is still just "no answer yet"', as
   assert.match(stderr, /not a failure/);
 });
 
-test('Javier #2 — soak: a realtime listen SURVIVES a server restart and still delivers', async (t) => {
+test('soak — a realtime listen SURVIVES a server restart and still delivers', async (t) => {
   if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
   const mock = createMock();
   const port = await mock.start();
@@ -153,7 +153,7 @@ test('ask over the realtime socket resolves from the InboxChannel frame', async 
     }, 500);
   };
 
-  // #246: ask now requires a way to answer (--actions/--custom-action/--template).
+  // ask now requires a way to answer (--actions/--custom-action/--template).
   const { result } = runCli(['ask', '--realtime', '--title', 'Aprovar?', '--actions', 'yes,no', '--timeout', '30'], port);
   const { code, stdout, stderr } = await result;
   await mock.stop();
@@ -194,7 +194,7 @@ test('listen without a WebSocket-capable runtime quietly uses polling (no crash)
   assert.match(stdout, /polling puro/);
 });
 
-// --- Onboarding v2 (#110): setup --claim / doctor / whoami ------------------
+// --- Onboarding: setup --claim / doctor / whoami -----------------------------
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -256,9 +256,9 @@ test('doctor narrates source + channel + devices and exits 0', async () => {
   assert.deepEqual(JSON.parse(stdout).ok, true);
 });
 
-// #71 — doctor ALWAYS reports the prior-claim state: a CONFIRMATION on false, not
+// Doctor ALWAYS reports the prior-claim state: a CONFIRMATION on false, not
 // silence. "I didn't see the warning" ≠ "there is no orphaned backlog".
-test('#71 — doctor CONFIRMS "prior-claim backlog: none ✓" when the flag is false (not silent)', async () => {
+test('doctor CONFIRMS "prior-claim backlog: none ✓" when the flag is false (not silent)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.staleFromPriorClaim = false; // the healthy, common case
@@ -272,9 +272,9 @@ test('#71 — doctor CONFIRMS "prior-claim backlog: none ✓" when the flag is f
   assert.ok(!/PRIOR claim/.test(stderr), 'no false alarm when the backlog is clean');
 });
 
-// #76 item 3 — doctor NUDGES (never touches) an unmarked home skill: a pre-marker
+// Doctor NUDGES (never touches) an unmarked home skill: a pre-marker
 // pidge copy the self-heal (correctly) won't refresh would otherwise stay silent.
-test('#76 — doctor WARNS when ~/.claude/skills/pidge/SKILL.md exists WITHOUT the pidge marker (never writes it)', async () => {
+test('doctor WARNS when ~/.claude/skills/pidge/SKILL.md exists WITHOUT the pidge marker (never writes it)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-doctorhome-'));
@@ -295,14 +295,14 @@ test('#76 — doctor WARNS when ~/.claude/skills/pidge/SKILL.md exists WITHOUT t
   assert.equal(fs.readFileSync(homeSkill, 'utf8'), unmarked, 'doctor must NEVER touch the file — nudge only');
 });
 
-test('#76 — doctor does NOT warn when the home skill CARRIES the marker (that one self-heals)', async () => {
+test('doctor does NOT warn when the home skill CARRIES the marker (that one self-heals)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-doctorhome2-'));
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
   fs.mkdirSync(path.dirname(homeSkill), { recursive: true });
   // A marked (current) home skill — nothing to nag about.
-  fs.writeFileSync(homeSkill, `---\nname: pidge\ndescription: x.\n# pidge-skill rev=11 manifest=16\n---\n\n# Pidge\n\nok\n\n<!-- pidge-skill-end -->\n`);
+  fs.writeFileSync(homeSkill, `---\nname: pidge\ndescription: x.\n# pidge-skill rev=12 manifest=16\n---\n\n# Pidge\n\nok\n\n<!-- pidge-skill-end -->\n`);
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-doctorcwd2-'));
 
   const { result } = runCli(['doctor'], port, { HOME: home }, cwd);
@@ -326,7 +326,7 @@ test('doctor warns LOUD on 0 devices (sends reach nobody)', async () => {
   assert.match(stderr, /0 devices.*NOBODY/);
 });
 
-test('#171 doctor probes the realtime path: reports ok when the socket confirms', async (t) => {
+test('doctor probes the realtime path: reports ok when the socket confirms', async (t) => {
   if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
   const mock = createMock();
   const port = await mock.start();
@@ -338,14 +338,14 @@ test('#171 doctor probes the realtime path: reports ok when the socket confirms'
   assert.equal(code, 0, `stderr: ${stderr}`);
   assert.match(stderr, /realtime: ok/);
   assert.equal(JSON.parse(stdout).realtime, 'ok');
-  assert.match(stderr, /pidge hello/, 'the hint now leads with the first-contact WOW (#229)');
+  assert.match(stderr, /pidge hello/, 'the hint now leads with the first-contact WOW');
 });
 
-test('#171 doctor: realtime INDISPONÍVEL but the doctor STILL exits 0 (degrade is the contract)', async (t) => {
+test('doctor: realtime INDISPONÍVEL but the doctor STILL exits 0 (degrade is the contract)', async (t) => {
   if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
   const mock = createMock();
   const port = await mock.start();
-  mock.state.wsMode = '1006'; // a proxy/edge refusing the upgrade (#119)
+  mock.state.wsMode = '1006'; // a proxy/edge refusing the upgrade
 
   const { result } = runCli(['doctor'], port);
   const { code, stdout, stderr } = await result;
@@ -376,7 +376,7 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
 
   const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
     cwd: dir,
-    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    // isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
     env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   const out = await new Promise((resolve) => {
@@ -390,7 +390,7 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   assert.equal(out.code, 0, `stderr: ${out.stderr}`);
   const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
   assert.match(skill, /name: pidge/);
-  // #274 F3 INVERTED: the dead content_template MENU is gone. The mock STILL serves
+  // INVERTED assert: the dead content_template MENU is gone. The mock STILL serves
   // templates.decision_table (row text "template decision") — proof the generator now
   // IGNORES it — and the old "Pick the right send" menu heading is absent. (--template
   // now appears ONLY inside the skill's "it's gone, don't use it" warnings — that's the
@@ -400,7 +400,7 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   assert.match(skill, /manifest v16/);
 });
 
-// --- #280 + #33 fix: the local skill self-heals (any pidge command refreshes a stale skill) ---
+// --- self-heal: the local skill self-heals (any pidge command refreshes a stale skill) ---
 // The installed SKILL.md carries the marker `# pidge-skill rev=R manifest=N` as a YAML COMMENT
 // INSIDE the frontmatter (0.15.3+). It must NOT precede the opening `---`: a first line that
 // isn't `---` fails the YAML frontmatter parse, so Claude Code loads the skill with a garbage
@@ -421,7 +421,7 @@ function seedOldSkill(marker, body = 'OLD SKILL BODY') {
 }
 
 // The corrected 0.15.3+ format: `---` on line 1, the marker a `#` comment inside the
-// frontmatter. #38 adds the end-of-file trailer (the cheap integrity check) — seed it
+// frontmatter. The heal also writes an end-of-file trailer (the cheap integrity check) — seed it
 // too so a "fresh" seed reads as INTACT, not as a torn write.
 function seedNewSkill(rev, manifest, body = 'OLD SKILL BODY') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-heal-'));
@@ -431,7 +431,7 @@ function seedNewSkill(rev, manifest, body = 'OLD SKILL BODY') {
   return { dir, file };
 }
 
-test('#33 — a 0.15.2 marker-first install self-heals into the fixed in-frontmatter format', async () => {
+test('self-heal — a 0.15.2 marker-first install self-heals into the fixed in-frontmatter format', async () => {
   const mock = createMock();
   const port = await mock.start();
   // The real-world broken install: marker ABOVE the `---`, rev=1 (0.15.2's SKILL_REVISION).
@@ -446,14 +446,14 @@ test('#33 — a 0.15.2 marker-first install self-heals into the fixed in-frontma
   const healed = fs.readFileSync(file, 'utf8');
   // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
   assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
-  assert.ok(!/<!-- pidge-skill rev=/.test(healed), 'the old HTML-comment marker is gone (the #38 end trailer is not it)');
-  assert.match(healed, /\n# pidge-skill rev=11 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.ok(!/<!-- pidge-skill rev=/.test(healed), 'the old HTML-comment marker is gone (the end trailer is not it)');
+  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
   assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
   assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 11, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 12, manifest v16\)/, 'one stderr note');
 });
 
-test('#280 — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
+test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
   const mock = createMock();
   const port = await mock.start();
   // New-format skill, manifest current (16), spine stale (rev=0 < current 6) — reads the
@@ -467,17 +467,17 @@ test('#280 — a SPINE bump (SKILL_REVISION > installed) self-heals the local sk
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
-  assert.match(healed, /\n# pidge-skill rev=11 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 11, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 12, manifest v16\)/, 'one stderr note');
 });
 
-test('#280 — a MANIFEST bump (server version > installed) self-heals the local skill', async () => {
+test('self-heal — a MANIFEST bump (server version > installed) self-heals the local skill', async () => {
   const mock = createMock();
   const port = await mock.start();
-  // New-format skill, spine current (rev=11) but the baked manifest is stale (15 < the mock's 16).
-  const { dir, file } = seedNewSkill(11, 15, 'STALE BY MANIFEST');
+  // New-format skill, spine current (rev=12) but the baked manifest is stale (15 < the mock's 16).
+  const { dir, file } = seedNewSkill(12, 15, 'STALE BY MANIFEST');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
   const { code, stderr } = await result;
@@ -485,17 +485,17 @@ test('#280 — a MANIFEST bump (server version > installed) self-heals the local
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=11 manifest=16\n/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
 });
 
-test('#280 — a FRESH skill (new-format marker current) is left byte-for-byte, no note', async () => {
+test('self-heal — a FRESH skill (new-format marker current) is left byte-for-byte, no note', async () => {
   const mock = createMock();
   const port = await mock.start();
   // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
   // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
-  const { dir, file } = seedNewSkill(11, 16, 'SENTINEL FRESH — keep me');
+  const { dir, file } = seedNewSkill(12, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -507,7 +507,7 @@ test('#280 — a FRESH skill (new-format marker current) is left byte-for-byte, 
   assert.ok(!/refreshed your local Pidge skill/.test(stderr), 'no refresh note when fresh');
 });
 
-test('#280 — NO local skill present: a command runs normally, nothing is auto-created', async () => {
+test('self-heal — NO local skill present: a command runs normally, nothing is auto-created', async () => {
   const mock = createMock();
   const port = await mock.start();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-heal-none-'));
@@ -522,8 +522,8 @@ test('#280 — NO local skill present: a command runs normally, nothing is auto-
   assert.ok(!/refreshed your local Pidge skill/.test(stderr), 'no refresh note when there is no skill');
 });
 
-// --- #69: the self-heal covers the HOME skill too, not just the cwd project skill ---
-// A live agent (Javier) ran 3 WEEKS on ~/.claude/skills/pidge frozen at rev 6 because
+// --- the self-heal covers the HOME skill too, not just the cwd project skill ---
+// A live agent once ran 3 WEEKS on ~/.claude/skills/pidge frozen at rev 6 because
 // ensureSkillFresh only resolved the cwd project path. Old installs live in HOME.
 
 function seedSkillAt(file, rev, body = 'STALE') {
@@ -531,12 +531,12 @@ function seedSkillAt(file, rev, body = 'STALE') {
   fs.writeFileSync(file, `---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=${rev} manifest=16\n---\n\n# Pidge\n\n${body}\n\n<!-- pidge-skill-end -->\n`);
 }
 
-test('#69 — a STALE home skill self-heals even when there is NO project skill', async () => {
+test('home self-heal — a STALE home skill self-heals even when there is NO project skill', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homeheal-'));
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
-  seedSkillAt(homeSkill, 6, 'STALE HOME DOCTRINE'); // rev 6 = Javier's real incident
+  seedSkillAt(homeSkill, 6, 'STALE HOME DOCTRINE'); // rev 6 = the frozen rev observed in the field
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj-')); // NO project skill here
 
   const { result } = runCli(['whoami'], port, { HOME: home }, cwd);
@@ -545,12 +545,12 @@ test('#69 — a STALE home skill self-heals even when there is NO project skill'
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(homeSkill, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=11 manifest=16\n/, 'the home skill was regenerated to the current rev');
+  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'the home skill was regenerated to the current rev');
   assert.ok(!/STALE HOME DOCTRINE/.test(healed), 'the stale home doctrine was replaced by a real regeneration');
   assert.match(stderr, /refreshed your local Pidge skill/, 'the home heal narrated itself');
 });
 
-test('#69 — BOTH project and home skills stale: both heal in one pass; the note names ~/.claude', async () => {
+test('home self-heal — BOTH project and home skills stale: both heal in one pass; the note names ~/.claude', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homeheal2-'));
@@ -565,17 +565,17 @@ test('#69 — BOTH project and home skills stale: both heal in one pass; the not
   await mock.stop();
 
   assert.equal(code, 0, `stderr: ${stderr}`);
-  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=11 manifest=16/, 'home healed');
-  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=11 manifest=16/, 'project healed');
+  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=12 manifest=16/, 'home healed');
+  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=12 manifest=16/, 'project healed');
   assert.match(stderr, /2 locations incl\. ~\/\.claude/, 'the note reports BOTH locations were refreshed');
 });
 
-test('#69 — a FRESH home skill is left byte-for-byte (no needless home regeneration)', async () => {
+test('home self-heal — a FRESH home skill is left byte-for-byte (no needless home regeneration)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homefresh-'));
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
-  seedSkillAt(homeSkill, 11, 'SENTINEL HOME — keep me'); // current rev
+  seedSkillAt(homeSkill, 12, 'SENTINEL HOME — keep me'); // current rev
   const original = fs.readFileSync(homeSkill, 'utf8');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj2-'));
 
@@ -588,10 +588,10 @@ test('#69 — a FRESH home skill is left byte-for-byte (no needless home regener
   assert.ok(!/refreshed your local Pidge skill/.test(stderr), 'no refresh note when the home skill is fresh');
 });
 
-// #73 cross-audit — the HOME path requires a pidge marker: an unmarked home skill is
+// The HOME path requires a pidge marker: an unmarked home skill is
 // AUTHORIAL (the human wrote it) and must be left alone. (The project path keeps its
-// heal-a-marker-less-file semantics — covered by the #38 "pidge-skill in body PROSE" test.)
-test('#73 — an AUTHORIAL home skill (no pidge marker) is left untouched by the self-heal', async () => {
+// heal-a-marker-less-file semantics — covered by the "pidge-skill in body PROSE" test.)
+test('home self-heal — an AUTHORIAL home skill (no pidge marker) is left untouched by the self-heal', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-authorial-'));
@@ -611,17 +611,17 @@ test('#73 — an AUTHORIAL home skill (no pidge marker) is left untouched by the
   assert.ok(!/refreshed your local Pidge skill/.test(stderr), 'no heal note for an authorial home skill');
 });
 
-// --- #38: atomic self-heal — torn writes, concurrency, read-only, prose marker, .bak ---
+// --- atomic self-heal — torn writes, concurrency, read-only, prose marker, .bak ---
 
-test('#38 — a TORN write (marker intact, tail truncated) is detected and re-healed', async () => {
+test('atomic self-heal — a TORN write (marker intact, tail truncated) is detected and re-healed', async () => {
   const mock = createMock();
   const port = await mock.start();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-heal-torn-'));
   const file = path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md');
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A partial write that died after the frontmatter: rev/manifest read as CURRENT, so
-  // pre-#38 this file looked "fresh" forever and never healed (proven in the review).
-  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=11 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
+  // without the trailer check this file looked "fresh" forever and never healed.
+  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=12 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
   const { code, stderr } = await result;
@@ -634,14 +634,14 @@ test('#38 — a TORN write (marker intact, tail truncated) is detected and re-he
   assert.match(stderr, /refreshed your local Pidge skill/, 'the heal narrated itself');
 });
 
-test('#38 — "pidge-skill" in body PROSE is not the marker: a marker-less skill still heals', async () => {
+test('atomic self-heal — "pidge-skill" in body PROSE is not the marker: a marker-less skill still heals', async () => {
   const mock = createMock();
   const port = await mock.start();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-heal-prose-'));
   const file = path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md');
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // No real marker in the frontmatter — but the body MENTIONS one with a huge rev.
-  // Pre-#38 the first-line-containing scan read rev=99 and suppressed the heal forever.
+  // The old first-line-containing scan read rev=99 and suppressed the heal forever.
   fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n---\n\nsee pidge-skill rev=99 manifest=99 for details\n\n<!-- pidge-skill-end -->\n');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -650,11 +650,11 @@ test('#38 — "pidge-skill" in body PROSE is not the marker: a marker-less skill
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=11 manifest=16\n/, 'a real marker was written by the heal');
+  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'a real marker was written by the heal');
   assert.ok(!/rev=99/.test(healed), 'the prose decoy is gone with the regeneration');
 });
 
-test('#38 — 4 concurrent heals never tear the file (atomic tmp+rename)', async () => {
+test('atomic self-heal — 4 concurrent heals never tear the file (atomic tmp+rename)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const { dir, file } = seedNewSkill(0, 16, 'STALE FOR THE STAMPEDE');
@@ -668,13 +668,13 @@ test('#38 — 4 concurrent heals never tear the file (atomic tmp+rename)', async
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
   assert.equal((healed.match(/# pidge-skill rev=/g) || []).length, 1, 'exactly ONE marker — no interleaved halves');
-  assert.match(healed, /\n# pidge-skill rev=11 manifest=16\n/, 'a whole, current skill won');
+  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'a whole, current skill won');
   assert.match(healed.trimEnd(), /<!-- pidge-skill-end -->$/, 'the trailer closes the file — no torn tail');
   const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
   assert.deepEqual(leftovers, [], 'no tmp litter after concurrent heals');
 });
 
-test('#38 — a read-only skill dir degrades clean: the command succeeds, the file stands', async () => {
+test('atomic self-heal — a read-only skill dir degrades clean: the command succeeds, the file stands', async () => {
   const mock = createMock();
   const port = await mock.start();
   const { dir, file } = seedNewSkill(0, 16, 'STALE BUT UNWRITABLE');
@@ -692,7 +692,7 @@ test('#38 — a read-only skill dir degrades clean: the command succeeds, the fi
   }
 });
 
-test('#38 — healing over a CUSTOMIZED skill saves SKILL.md.bak + one stderr line', async () => {
+test('atomic self-heal — healing over a CUSTOMIZED skill saves SKILL.md.bak + one stderr line', async () => {
   const mock = createMock();
   const port = await mock.start();
   const { dir, file } = seedNewSkill(0, 16, 'MY CUSTOM NOTES — precious');
@@ -709,7 +709,7 @@ test('#38 — healing over a CUSTOMIZED skill saves SKILL.md.bak + one stderr li
   assert.ok(!/MY CUSTOM NOTES/.test(fs.readFileSync(file, 'utf8')), 'the live skill is the regenerated one');
 });
 
-// --- #131: listen --all — the single ear --------------------------------------
+// --- listen --all — the single ear ---------------------------------------------
 
 test('listen --all hears a notification answer and narrates which notification spoke back', async () => {
   const mock = createMock();
@@ -745,7 +745,7 @@ test('listen WITHOUT --all keeps the composer-only contract (answers not served)
   assert.equal(code, 3, 'composer-only listen must time out — the answer is not its stream');
 });
 
-// --- #132: ask obeys the template's suggested timeout -------------------------
+// --- ask obeys the template's suggested timeout ---------------------------------
 
 test('ask without --timeout obeys the 201 suggested_ask_timeout and narrates it', async () => {
   const mock = createMock();
@@ -787,7 +787,7 @@ test('an explicit --timeout always beats the template suggestion', async () => {
   assert.doesNotMatch(stderr, /suggested by template/);
 });
 
-// --- #217: hello = the first-contact WOW (template onboarding, send + wait) ----
+// --- hello = the first-contact WOW (template onboarding, send + wait) -----------
 
 test('hello sends template=onboarding with default copy, narrates the WOW, returns the answer', async () => {
   const mock = createMock();
@@ -820,9 +820,9 @@ test('hello --profile tracking is refused locally (the handshake needs an answer
   assert.match(stderr, /tracking/);
 });
 
-// #71 — hello no longer hangs the session: an unconfirmed handshake times out at
+// Hello no longer hangs the session: an unconfirmed handshake times out at
 // --timeout (default 120s) with a NARRATED exit 3 (mirrors ask/wait), never eternal.
-test('#71 — hello times out NARRATED with exit 3 when the human never confirms', async () => {
+test('hello times out NARRATED with exit 3 when the human never confirms', async () => {
   const mock = createMock();
   const port = await mock.start();
   // No responded notification parked ⇒ the wait never resolves; --timeout ends it.
@@ -835,7 +835,7 @@ test('#71 — hello times out NARRATED with exit 3 when the human never confirms
   assert.match(stderr, /pidge listen --all/, 'it points at where the confirmation will surface');
 });
 
-// --- #157 P2 tails: --follow + local custom-action id validation --------------
+// --- tails: --follow + local custom-action id validation ------------------------
 
 test('listen --follow prints+acks a batch and KEEPS listening, exit 0 at the window end', async () => {
   const mock = createMock();
@@ -856,7 +856,7 @@ test('listen --follow prints+acks a batch and KEEPS listening, exit 0 at the win
   assert.match(stdout, /segundo lote/, 'the follow window must deliver BOTH batches');
   assert.match(stderr, /--follow — still listening/);
   assert.match(stderr, /--follow window ended/);
-  // §2.6: the LOUD supervisor-only warning at startup (a turn-based agent traps its turn).
+  // The LOUD supervisor-only warning at startup (a turn-based agent traps its turn).
   assert.match(stderr, /supervisor mode/);
   assert.match(stderr, /must NOT use --follow/);
 });
@@ -877,7 +877,7 @@ test('an invalid --custom-action id fails fast locally with the spelled-out rule
   assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
 });
 
-// --- shared-config guard (incidente 2026-06-13: cron do Javier sequestrado) ---
+// --- shared-config guard (a cron agent once silently hijacked another channel's stored key) ---
 
 test('setup REFUSES to overwrite a config owned by another live channel — and does not burn the claim code', async () => {
   const mock = createMock();
@@ -923,20 +923,20 @@ test('setup --force overwrites; a REVOKED stored key needs no --force', async ()
   assert.match(written, /hld_minted_by_claim/);
 });
 
-// --- per-agent isolation: PIDGE_AGENT + setup --print (incident follow-up) ----
+// --- per-agent isolation: PIDGE_AGENT + setup --print ---------------------------
 
 test('PIDGE_AGENT namespaces the config file so two agents never share an identity', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-agent-'));
 
-  // agent "javier" claims
+  // agent "alpha" claims
   let r = runCli(['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`], port,
-    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'javier' });
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'alpha' });
   let out = await r.result;
-  assert.equal(out.code, 0, `javier setup: ${out.stderr}`);
-  const javierEnv = path.join(home, 'pidge', 'agents', 'javier', 'env');
-  assert.ok(fs.existsSync(javierEnv), 'javier gets his own file');
+  assert.equal(out.code, 0, `alpha setup: ${out.stderr}`);
+  const alphaEnv = path.join(home, 'pidge', 'agents', 'alpha', 'env');
+  assert.ok(fs.existsSync(alphaEnv), 'alpha gets its own file');
 
   // a SECOND agent "mkt" claims — must NOT trip the guard (different file), no --force
   mock.state.claimCode = 'claim-mkt';
@@ -946,7 +946,7 @@ test('PIDGE_AGENT namespaces the config file so two agents never share an identi
   await mock.stop();
   assert.equal(out.code, 0, `mkt setup must not collide: ${out.stderr}`);
   assert.ok(fs.existsSync(path.join(home, 'pidge', 'agents', 'mkt', 'env')), 'mkt gets a separate file');
-  assert.ok(fs.existsSync(javierEnv), "javier's file is untouched");
+  assert.ok(fs.existsSync(alphaEnv), "alpha's file is untouched");
 });
 
 test('setup --print emits export lines and writes NO file (per-agent, human-run)', async () => {
@@ -969,9 +969,9 @@ test('setup --print emits export lines and writes NO file (per-agent, human-run)
   assert.doesNotMatch(stderr, /token found \(.*pidge.*env\)/);
 });
 
-// --- #274 F4: setup → skill → hello fuse (graceful-degrade) -------------------
+// --- setup → skill → hello fuse (graceful-degrade) ------------------------------
 
-test('#274 F4 — setup fuses the skill install + a `pidge hello` hint, exit 0', async () => {
+test('setup fuses the skill install + a `pidge hello` hint, exit 0', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-fuse-'));
@@ -990,7 +990,7 @@ test('#274 F4 — setup fuses the skill install + a `pidge hello` hint, exit 0',
   assert.match(skill, /Approval has two paths/);
 });
 
-test('#274 F4 — a manifest failure DEGRADES (one-line skip + hello hint), setup STILL exits 0, no USAGE dump', async () => {
+test('setup fuse — a manifest failure DEGRADES (one-line skip + hello hint), setup STILL exits 0, no USAGE dump', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.manifestStatus = 500; // the skill install can't read the manifest
@@ -1010,7 +1010,7 @@ test('#274 F4 — a manifest failure DEGRADES (one-line skip + hello hint), setu
   assert.doesNotMatch(stderr, /send an iPhone notification to a human and block until they answer/);
 });
 
-// --- 0.9.0: Fix 2 (ack-after-work) + Fix 3 (degrade) + #181/#182 -------------
+// --- 0.9.0: Fix 2 (ack-after-work) + Fix 3 (degrade) + claim/contract ----------
 
 test('--version prints the CLI version and exits 0 (was "Unknown option")', async () => {
   const mock = createMock();
@@ -1028,7 +1028,7 @@ test('listen (0.9 default) DELIVERS without consuming + shows the ack-after-work
   const port = await mock.start();
   mock.state.messages = [{ id: 8, channel_id: 1, body: 'trabalho pendente', created_at: 'x' }];
 
-  // Isolate the config dir so the once-per-install ack-notice stamp (Fix 2/#170)
+  // Isolate the config dir so the once-per-install ack-notice stamp (Fix 2)
   // doesn't leak across runs — a fresh install must SEE the notice.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-ack-'));
   const { result } = runCli(['listen', '--no-realtime', '--timeout', '10'], port, { XDG_CONFIG_HOME: home });
@@ -1075,11 +1075,11 @@ test('ack --up-to processes (green); ack --renew heartbeats the lease', async ()
   assert.match(out.stderr, /lease renewed on 1 message/);
 });
 
-// #63: `--summary` is a global BOOLEAN (inbox counts+latency). The ack command
+// `--summary` is a global BOOLEAN (inbox counts+latency). The ack command
 // needs it as a STRING (attribution) — before the fix it parsed as boolean-true
 // and dropped the text to an ignored positional (a SILENT no-op). Now the ack
 // case re-parses its own argv so the value survives, and a bare --summary throws.
-test('#63: ack --ids --summary carries the summary into the ack body (never a silent no-op)', async () => {
+test('ack --ids --summary carries the summary into the ack body (never a silent no-op)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['ack', '--ids', '41,42', '--summary', 'reiniciei o worker'], port).result;
@@ -1090,7 +1090,7 @@ test('#63: ack --ids --summary carries the summary into the ack body (never a si
   assert.match(out.stderr, /with a summary/);
 });
 
-test('#63: ack --up-to --summary works too, and the summary is capped at 1000 chars', async () => {
+test('ack --up-to --summary works too, and the summary is capped at 1000 chars', async () => {
   const mock = createMock();
   const port = await mock.start();
   const big = 'x'.repeat(1500);
@@ -1101,7 +1101,7 @@ test('#63: ack --up-to --summary works too, and the summary is capped at 1000 ch
   assert.equal(mock.state.ackBodies[0].summary.length, 1000, 'the CLI caps the summary before it leaves the machine');
 });
 
-test('#63: ack --summary with NO value is a usage error (exit 1), never a silent no-op', async () => {
+test('ack --summary with NO value is a usage error (exit 1), never a silent no-op', async () => {
   const mock = createMock();
   const port = await mock.start();
   // --summary immediately followed by another recognized flag → parseArgs sees
@@ -1113,7 +1113,7 @@ test('#63: ack --summary with NO value is a usage error (exit 1), never a silent
   assert.equal(mock.state.ackBodies.length, 0, 'nothing was acked on the usage error');
 });
 
-test('#63: ack --summary "" (empty string) is a usage error too — no blank attribution', async () => {
+test('ack --summary "" (empty string) is a usage error too — no blank attribution', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['ack', '--ids', '5', '--summary', '   '], port).result;
@@ -1123,7 +1123,7 @@ test('#63: ack --summary "" (empty string) is a usage error too — no blank att
   assert.equal(mock.state.ackBodies.length, 0, 'nothing was acked');
 });
 
-test('#63: `inbox --summary` still works (the boolean flag was not broken by the ack fix)', async () => {
+test('`inbox --summary` still works (the boolean flag was not broken by the ack fix)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.inboxSummary = { total: 7, scope: 'channel', pending: 2, avg_response_seconds: 300 };
@@ -1178,14 +1178,14 @@ test('contract set rejects an unknown key / bad value LOCALLY (exit 1, no round-
   assert.match(out.stderr, /must be one of: turn_based, persistent, external_daemon, always_on/);
   assert.equal(Object.keys(mock.state.operatingContract).length, 0, 'a bad key never reaches the server');
 
-  // §3c: external_daemon is now ACCEPTED (reaches the server, exit 0)
+  // external_daemon is now ACCEPTED (reaches the server, exit 0)
   out = await runCli(['contract', 'set', 'listen_mode=external_daemon'], port).result;
   assert.equal(out.code, 0, out.stderr);
 
   await mock.stop();
 });
 
-test('setup DECLARES operating_contract (#182 step 5) — default turn_based, --listen-mode overrides', async () => {
+test('setup DECLARES operating_contract — default turn_based, --listen-mode overrides', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-setup-oc-'));
@@ -1210,7 +1210,7 @@ test('setup DECLARES operating_contract (#182 step 5) — default turn_based, --
   assert.equal(mock.state.operatingContract.keep_connection_alive.value, true);
 });
 
-test('whoami reports HONEST reach AND SHOUTS on a claim swap (not just doctor) (§5.2/§4.6)', async () => {
+test('whoami reports HONEST reach AND SHOUTS on a claim swap (not just doctor)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-whoami-'));
@@ -1256,24 +1256,24 @@ test('a server newer than KNOWN_MANIFEST_VERSION nudges ONCE on stderr (KNOWN=36
   const mock = createMock();
   const port = await mock.start();
   mock.state.manifestVersion = 99; // server advertises news the CLI doesn't know
-  // #241: isolate the per-install state cache so the 24h throttle can't leak
+  // isolate the per-install state cache so the 24h throttle can't leak
   // across suite runs (a re-run would otherwise suppress the nag and false-fail).
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-nag-'));
   const out = await runCli(['doctor'], port, { XDG_CONFIG_HOME: home }).result;
   await mock.stop();
   assert.match(out.stderr, /manifest v99/, 'the version nudge fires when the server is ahead');
-  // #26: the nudge reframes as "new capabilities you can use NOW via --param" — a
+  // the nudge reframes as "new capabilities you can use NOW via --param" — a
   // thin-pipe CLI rarely needs a release on a server bump — NOT "your CLI is stale,
   // UPDATE it" as the headline action.
   assert.match(out.stderr, /thin pipe/, 'reframed as new capabilities, not a stale-CLI scold');
   assert.match(out.stderr, /--param/, 'tells the agent how to use the new field today');
   assert.doesNotMatch(out.stderr, /UPDATE the CLI/, 'updating is no longer the headline action');
-  // #249-A: the manifest is PUBLIC — the curl reads without a key; the Bearer is
+  // the manifest is PUBLIC — the curl reads without a key; the Bearer is
   // shown only as the OPTIONAL way to also see the channel's own config.
   assert.match(out.stderr, /Authorization: Bearer \$PIDGE_TOKEN/);
 });
 
-test('doctor reports HONEST device reach and warns when pushable > deliverable (gotcha #9)', async () => {
+test('doctor reports HONEST device reach and warns when pushable > deliverable', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.deviceReach = { total: 3, pushable: 2, deliverable: 1, apns_environment: 'production', by_environment: { production: 1, sandbox: 1 } };
@@ -1287,7 +1287,7 @@ test('doctor reports HONEST device reach and warns when pushable > deliverable (
   assert.match(stderr, /UNREACHABLE/);
 });
 
-test('#181 claim ownership: doctor SHOUTS when another agent took the channel (generation bumped)', async () => {
+test('claim ownership: doctor SHOUTS when another agent took the channel (generation bumped)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-claim-'));
@@ -1315,7 +1315,7 @@ test('#181 claim ownership: doctor SHOUTS when another agent took the channel (g
   assert.match(out.stderr, /ANOTHER AGENT CLAIMED THIS CHANNEL/);
 });
 
-test('Fix 3 — repeated WS close 1006 DEGRADES to polling and still delivers (never deaf, #119)', async (t) => {
+test('Fix 3 — repeated WS close 1006 DEGRADES to polling and still delivers (never deaf)', async (t) => {
   if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
   const mock = createMock();
   const port = await mock.start();
@@ -1369,7 +1369,7 @@ test('doctor warns when reading the SHARED legacy file (no PIDGE_AGENT, no env v
   assert.match(stderr, /PIDGE_AGENT/);
 });
 
-// #205 — reachability self-test (round-trip over the unified queue + ack).
+// Reachability self-test (round-trip over the unified queue + ack).
 test('selftest — PASS: fire a nonce, the listener acks it, the server confirms', async () => {
   const mock = createMock();
   const port = await mock.start();
@@ -1406,11 +1406,11 @@ test('selftest — a non-numeric --window falls back to the default, never a fal
   assert.match(stderr, /SELF-TEST PASSED/);
 });
 
-// #65: the T2 blackout — the selftest read the real queue with lease=60 and any
-// bystander it served went dark for ~60s from every OTHER listen. The fix scopes
-// the read to since=<nonce id − 1> so the pre-existing backlog is excluded by
-// construction, and drops the lease=60 mitigation entirely.
-test('#65: selftest excludes the pre-existing backlog from the read (since=nonce-1) — never served, never leased', async () => {
+// Selftest read-scoping — the selftest used to read the real queue with lease=60
+// and any bystander it served went dark for ~60s from every OTHER listen. The fix
+// scopes the read to since=<nonce id − 1> so the pre-existing backlog is excluded
+// by construction, and drops the lease=60 mitigation entirely.
+test('selftest excludes the pre-existing backlog from the read (since=nonce-1) — never served, never leased', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.leaseMs = 60000; // model the server visibility lease — a served row goes dark for 60s
@@ -1431,10 +1431,10 @@ test('#65: selftest excludes the pre-existing backlog from the read (since=nonce
   await mock.stop();
 });
 
-// PR #66 cross-audit: since= only excludes the PRE-EXISTING backlog. A message with
+// since= only excludes the PRE-EXISTING backlog. A message with
 // id > nonce (a real arrival during the selftest window) IS served — so lease=60
 // must ride along to cap its blackout at ~60s, never the server's ~10-min default.
-test('#65: a served message with id > nonce gets a ~60s lease (lease=60), never the ~10-min default', async () => {
+test('selftest: a served message with id > nonce gets a ~60s lease (lease=60), never the ~10-min default', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.leaseMs = 600000; // the server's DEFAULT stamp_delivered lease = 10 min
@@ -1458,7 +1458,7 @@ test('#65: a served message with id > nonce gets a ~60s lease (lease=60), never 
   await mock.stop();
 });
 
-test('#65: listen exit 3 points at `pidge catchup` (a message may be under another read\'s lease)', async () => {
+test('listen exit 3 points at `pidge catchup` (a message may be under another read\'s lease)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const { result } = runCli(['listen', '--no-realtime', '--timeout', '2', '--interval', '1'], port);
@@ -1469,11 +1469,11 @@ test('#65: listen exit 3 points at `pidge catchup` (a message may be under anoth
   assert.match(stderr, /lease/i, 'and explains WHY a message might be invisible');
 });
 
-// --- 0.12.0 — CLI bugs batch (#240/#241/#242/#243/#244) -----------------------
+// --- 0.12.0 — CLI bugs batch ---------------------------------------------------
 
-// #240: `pidge <sub> --help` must show the SUBCOMMAND's own help, not the global
+// `pidge <sub> --help` must show the SUBCOMMAND's own help, not the global
 // USAGE dump (help exits before any network — no mock server needed).
-test('#240 — `pidge ask --help` shows the subcommand help (own flags), not the global dump', async () => {
+test('subcommand help — `pidge ask --help` shows the subcommand help (own flags), not the global dump', async () => {
   const out = await runCli(['ask', '--help'], 1).result;
   assert.equal(out.code, 0, out.stderr);
   assert.match(out.stdout, /^pidge ask —/, 'leads with the focused ask header');
@@ -1482,7 +1482,7 @@ test('#240 — `pidge ask --help` shows the subcommand help (own flags), not the
   assert.doesNotMatch(out.stdout, /pidge setup --claim CODE/, 'must NOT be the global command list');
 });
 
-test('#240 — other subcommands get their own focused help too (notify / wait / listen / inbox / ack)', async () => {
+test('subcommand help — other subcommands get their own focused help too (notify / wait / listen / inbox / ack)', async () => {
   const cases = [
     ['notify', /^pidge notify —/, /--body-markdown MD/],
     ['wait', /^pidge wait —/, /pidge wait <correlation_id>/],
@@ -1499,7 +1499,7 @@ test('#240 — other subcommands get their own focused help too (notify / wait /
   }
 });
 
-test('#240 — `pidge --help` (no command) keeps the global overview; `pidge help ask` is focused', async () => {
+test('subcommand help — `pidge --help` (no command) keeps the global overview; `pidge help ask` is focused', async () => {
   let out = await runCli(['--help'], 1).result;
   assert.equal(out.code, 0);
   assert.match(out.stdout, /pidge setup --claim CODE/, 'global --help lists all commands');
@@ -1509,8 +1509,8 @@ test('#240 — `pidge --help` (no command) keeps the global overview; `pidge hel
   assert.match(out.stdout, /^pidge ask —/, '`pidge help <cmd>` is the focused form');
 });
 
-// #241: the manifest-version nag is throttled to once / 24h (per-install cache).
-test('#241 — the version nag fires ONCE then is throttled: 5 runs in a row = 1 nag', async () => {
+// The manifest-version nag is throttled to once / 24h (per-install cache).
+test('version nag — fires ONCE then is throttled: 5 runs in a row = 1 nag', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.manifestVersion = 99;
@@ -1525,7 +1525,7 @@ test('#241 — the version nag fires ONCE then is throttled: 5 runs in a row = 1
   assert.equal(nags, 1, 'the nag must be throttled to once per 24h, not once per call');
 });
 
-test('#241 — --quiet-nag and PIDGE_QUIET_NAG=1 silence the nag entirely', async () => {
+test('version nag — --quiet-nag and PIDGE_QUIET_NAG=1 silence the nag entirely', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.manifestVersion = 99;
@@ -1542,8 +1542,8 @@ test('#241 — --quiet-nag and PIDGE_QUIET_NAG=1 silence the nag entirely', asyn
   await mock.stop();
 });
 
-// #242: --actions accepts a JSON array of custom {id,label} actions.
-test('#242 — --actions accepts a JSON array of custom {id,label} actions', async () => {
+// --actions accepts a JSON array of custom {id,label} actions.
+test('--actions accepts a JSON array of custom {id,label} actions', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(
@@ -1561,10 +1561,10 @@ test('#242 — --actions accepts a JSON array of custom {id,label} actions', asy
   assert.equal(sent.actions, undefined, 'the JSON form does not also set the short actions list');
 });
 
-test('#242 — the short comma form still works (compat retro)', async () => {
+test('--actions — the short comma form still works (compat retro)', async () => {
   const mock = createMock();
   const port = await mock.start();
-  // (yes,no,reply would now be REFUSED by lote-5 #2 — use a decision-only combo.)
+  // (yes,no,reply would now be REFUSED by the decision+reply guard — use a decision-only combo.)
   const out = await runCli(['notify', '--title', 'x', '--actions', 'yes,no,later'], port).result;
   await mock.stop();
   assert.equal(out.code, 0, out.stderr);
@@ -1573,7 +1573,7 @@ test('#242 — the short comma form still works (compat retro)', async () => {
   assert.equal(sent.custom_actions, undefined);
 });
 
-test('#242 — JSON --actions composes with --custom-action (both appended)', async () => {
+test('JSON --actions composes with --custom-action (both appended)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(
@@ -1587,7 +1587,7 @@ test('#242 — JSON --actions composes with --custom-action (both appended)', as
   assert.deepEqual(sent.custom_actions.map((c) => c.id), ['approve', 'defer']);
 });
 
-test('#242 — malformed JSON in --actions fails fast LOCALLY (exit 1, no send)', async () => {
+test('malformed JSON in --actions fails fast LOCALLY (exit 1, no send)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['notify', '--title', 'x', '--actions', '[{"id":"approve"'], port).result;
@@ -1597,7 +1597,7 @@ test('#242 — malformed JSON in --actions fails fast LOCALLY (exit 1, no send)'
   assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
 });
 
-test('#242 — a JSON item missing id/label is rejected locally with the spelled-out rule', async () => {
+test('a JSON --actions item missing id/label is rejected locally with the spelled-out rule', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['notify', '--title', 'x', '--actions', '[{"label":"no id"}]'], port).result;
@@ -1607,15 +1607,15 @@ test('#242 — a JSON item missing id/label is rejected locally with the spelled
   assert.equal(mock.state.notifies.length, 0);
 });
 
-// #244: the generated skill carries the always-on recipe for turn-based agents.
-test('#244 — skill install includes the always-on recipe for turn-based agents', async () => {
+// The generated skill carries the always-on recipe for turn-based agents.
+test('skill install includes the always-on recipe for turn-based agents', async () => {
   const mock = createMock();
   const port = await mock.start();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-skill244-'));
 
   const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
     cwd: dir,
-    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    // isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
     env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   const out = await new Promise((resolve) => {
@@ -1633,18 +1633,18 @@ test('#244 — skill install includes the always-on recipe for turn-based agents
   assert.match(skill, /pidge listen --all --timeout 50/, 'Path 2 — supervisor poll');
 });
 
-// #68/#67 — the skill must TEACH `pidge bridge` + `ack --summary`, carry the
+// The skill must TEACH `pidge bridge` + `ack --summary`, carry the
 // multi-agent PIDGE_AGENT block, and ship the 3 prose fixes. Live agents on rev 8
 // found: bridge = 0 hits, `ack --summary` only as an effect, examples without
 // PIDGE_AGENT speak the wrong channel on a multi-agent host.
-test('#68/#67 — skill teaches bridge, ack --summary, the PIDGE_AGENT block + the prose fixes', async () => {
+test('skill teaches bridge, ack --summary, the PIDGE_AGENT block + the prose fixes', async () => {
   const mock = createMock();
   const port = await mock.start();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-skill6867-'));
 
   const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
     cwd: dir,
-    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    // isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
     env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   const out = await new Promise((resolve) => {
@@ -1657,34 +1657,34 @@ test('#68/#67 — skill teaches bridge, ack --summary, the PIDGE_AGENT block + t
 
   assert.equal(out.code, 0, out.stderr);
   const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
-  // #68.1 — the bridge section (was 0 hits on rev 8)
+  // the bridge section (was 0 hits on rev 8)
   assert.match(skill, /pidge bridge/, 'the supervisor section names `pidge bridge`');
   assert.match(skill, /bridge --exec/, 'bridge --exec is taught');
   assert.match(skill, /bridge install/, 'bridge install is taught');
-  // #68.2 — ack --summary as a COMMAND, not just an effect
+  // ack --summary as a COMMAND, not just an effect
   assert.match(skill, /ack --up-to <id> --summary/, 'ack --summary shown as a command');
-  // #67.1 — the multi-agent block, early and explicit
+  // the multi-agent block, early and explicit
   assert.match(skill, /PIDGE_AGENT=<your-id>/, 'the PIDGE_AGENT multi-agent block is present');
   assert.match(skill, /agents\/<your-id>\/env/, 'the per-agent config path is named');
-  // #68.3 — durable-queue framing replaces the fatalist line
+  // durable-queue framing replaces the fatalist line
   assert.ok(!/or you lose it/.test(skill), 'the fatalist "or you lose it" line is gone');
   assert.match(skill, /nothing is ever lost/, 'the queue-is-durable framing is in');
-  // #68.4 — human's language, not English-only
+  // human's language, not English-only
   assert.ok(!/English only/.test(skill), 'the "English only" line is gone');
   assert.match(skill, /mirror the language they use/, 'the human\'s-language guidance is in');
-  // #68.5/#67.3 — the turn-based example spans more than one harness
+  // the turn-based example spans more than one harness
   assert.match(skill, /Claude Code, Codex, Gemini CLI/, 'the turn-based example is no longer a single harness');
 });
 
-// #70 — the session-start ritual in the skill now recommends the O(new) digest read.
-test('#70 — skill recommends `pidge catchup --digest --since <last>` as the session-start read', async () => {
+// The session-start ritual in the skill now recommends the O(new) digest read.
+test('skill recommends `pidge catchup --digest --since <last>` as the session-start read', async () => {
   const mock = createMock();
   const port = await mock.start();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-skill70-'));
 
   const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
     cwd: dir,
-    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    // isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
     env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   const out = await new Promise((resolve) => {
@@ -1701,11 +1701,11 @@ test('#70 — skill recommends `pidge catchup --digest --since <last>` as the se
   assert.match(skill, /pidge catchup --digest --since 480/, 'a concrete --since example is shown');
 });
 
-// --- 0.13.0 — template system (#246): type subcommands + skill --------------
+// --- 0.13.0 — template system: type subcommands + skill ------------------------
 
 // 1) one spec per typed send — each stamps the right template_kind on /notify.
 
-test('perfis-CLI — pidge message stamps template_kind:message and fire-and-forgets', async () => {
+test('typed sends — pidge message stamps template_kind:message and fire-and-forgets', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['message', '--title', 'Build done', '--body', '2m12s'], port).result;
@@ -1716,7 +1716,7 @@ test('perfis-CLI — pidge message stamps template_kind:message and fire-and-for
   assert.equal(sent.title, 'Build done');
 });
 
-test('perfis-CLI — pidge important (⭐ default) stamps template_kind:important', async () => {
+test('typed sends — pidge important (⭐ default) stamps template_kind:important', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['important', '--title', 'Review PR', '--body-markdown', '# Summary'], port).result;
@@ -1725,7 +1725,7 @@ test('perfis-CLI — pidge important (⭐ default) stamps template_kind:importan
   assert.equal(mock.state.notifies.at(-1).template_kind, 'important');
 });
 
-test('perfis-CLI — pidge ask is the shortcut for important + --wait (template_kind:important)', async () => {
+test('typed sends — pidge ask is the shortcut for important + --wait (template_kind:important)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['ask-1'] = {
@@ -1744,7 +1744,7 @@ test('perfis-CLI — pidge ask is the shortcut for important + --wait (template_
   assert.deepEqual(sent.actions, ['yes', 'no']);
 });
 
-test('#246 — pidge event stamps template_kind:event with event_at + lead_minutes', async () => {
+test('typed sends — pidge event stamps template_kind:event with event_at + lead_minutes', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(
@@ -1759,7 +1759,7 @@ test('#246 — pidge event stamps template_kind:event with event_at + lead_minut
   assert.equal(sent.lead_minutes, 15);
 });
 
-test('perfis-CLI — pidge urgent stamps template_kind:urgent; --escalate adds escalate:true', async () => {
+test('typed sends — pidge urgent stamps template_kind:urgent; --escalate adds escalate:true', async () => {
   const mock = createMock();
   const port = await mock.start();
 
@@ -1779,7 +1779,7 @@ test('perfis-CLI — pidge urgent stamps template_kind:urgent; --escalate adds e
   assert.equal(sent.escalate, true);
 });
 
-test('#246→cli#47 — pidge live no longer stamps a /notify send; it starts a REAL card', async () => {
+test('typed sends — pidge live no longer stamps a /notify send; it starts a REAL card', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['live', '--title', 'Deploy v3.2 — building...'], port).result;
@@ -1789,9 +1789,9 @@ test('#246→cli#47 — pidge live no longer stamps a /notify send; it starts a 
   assert.equal(mock.state.liveWrites.at(-1).body.title, 'Deploy v3.2 — building...');
 });
 
-// --- perfis-CLI: the RESPONSE axis (--wait) composes on ANY type --------------
+// --- the RESPONSE axis (--wait) composes on ANY type ----------------------------
 
-test('perfis-CLI — --wait on a normal type blocks until the answer and prints chosen_action', async () => {
+test('typed sends — --wait on a normal type blocks until the answer and prints chosen_action', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['imp-wait'] = {
@@ -1808,7 +1808,7 @@ test('perfis-CLI — --wait on a normal type blocks until the answer and prints 
   assert.equal(mock.state.notifies.at(-1).template_kind, 'important');
 });
 
-test('perfis-CLI — WITHOUT --wait a typed send is fire-and-forget (prints the raw 201, exits 0)', async () => {
+test('typed sends — WITHOUT --wait a typed send is fire-and-forget (prints the raw 201, exits 0)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['important', '--title', 'fyi-ish', '--actions', 'yes,no'], port).result;
@@ -1820,7 +1820,7 @@ test('perfis-CLI — WITHOUT --wait a typed send is fire-and-forget (prints the 
   assert.equal(parsed.action_id, undefined, 'no chosen_action without --wait');
 });
 
-test('perfis-CLI — `live --wait` is refused locally (status-only, never answers)', async () => {
+test('typed sends — `live --wait` is refused locally (status-only, never answers)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['live', '--wait', '--title', 'Deploy'], port).result;
@@ -1830,9 +1830,9 @@ test('perfis-CLI — `live --wait` is refused locally (status-only, never answer
   assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
 });
 
-// --- perfis-CLI: the approval RECIPE (important + Approve/Reject + Face ID + --wait) ---
+// --- the approval RECIPE (important + Approve/Reject + Face ID + --wait) --------
 
-test('perfis-CLI — pidge approval injects Approve(Face ID)/Reject, waits, prints chosen_action', async () => {
+test('typed sends — pidge approval injects Approve(Face ID)/Reject, waits, prints chosen_action', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['appr-1'] = {
@@ -1856,7 +1856,7 @@ test('perfis-CLI — pidge approval injects Approve(Face ID)/Reject, waits, prin
   assert.equal(sent.actions, undefined, 'approval uses custom_actions, not built-in actions');
 });
 
-test('perfis-CLI — pidge approval lets the user OVERRIDE the default pair', async () => {
+test('typed sends — pidge approval lets the user OVERRIDE the default pair', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['appr-2'] = {
@@ -1875,9 +1875,9 @@ test('perfis-CLI — pidge approval lets the user OVERRIDE the default pair', as
   assert.equal(sent.custom_actions, undefined, 'no default pair injected when the user supplies actions');
 });
 
-// --- perfis-CLI: compat aliases (old names → new canonical type) --------------
+// --- compat aliases (old names → new canonical type) ----------------------------
 
-test('perfis-CLI — fyi→message, report→important, alert→urgent (mapped + a rename note)', async () => {
+test('typed sends — fyi→message, report→important, alert→urgent (mapped + a rename note)', async () => {
   const mock = createMock();
   const port = await mock.start();
 
@@ -1900,7 +1900,7 @@ test('perfis-CLI — fyi→message, report→important, alert→urgent (mapped +
   assert.match(out.stderr, /renamed → use `pidge urgent`/);
 });
 
-test('perfis-CLI — the `ask` alias still requires a way to answer (--actions)', async () => {
+test('typed sends — the `ask` alias still requires a way to answer (--actions)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['ask', '--no-realtime', '--title', 'Approve?'], port).result;
@@ -1913,7 +1913,7 @@ test('perfis-CLI — the `ask` alias still requires a way to answer (--actions)'
 // 2) friendly local errors — fail fast, nothing reaches the server.
 // (the `ask`-needs-actions guard is covered above in the alias section.)
 
-test('#246 — pidge event WITHOUT --event-at errors locally with the ISO8601 recipe', async () => {
+test('pidge event WITHOUT --event-at errors locally with the ISO8601 recipe', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['event', '--title', 'Standup'], port).result;
@@ -1924,7 +1924,7 @@ test('#246 — pidge event WITHOUT --event-at errors locally with the ISO8601 re
   assert.equal(mock.state.notifies.length, 0);
 });
 
-test('#246 — pidge event with a non-ISO8601 --event-at errors locally (no send)', async () => {
+test('pidge event with a non-ISO8601 --event-at errors locally (no send)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['event', '--title', 'Standup', '--event-at', 'amanhã às 14h'], port).result;
@@ -1934,7 +1934,7 @@ test('#246 — pidge event with a non-ISO8601 --event-at errors locally (no send
   assert.equal(mock.state.notifies.length, 0);
 });
 
-test('#246 — an unknown subcommand points at the type catalog (exit 1, no send)', async () => {
+test('an unknown subcommand points at the type catalog (exit 1, no send)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['frobnicate', '--title', 'x'], port).result;
@@ -1948,7 +1948,7 @@ test('#246 — an unknown subcommand points at the type catalog (exit 1, no send
 // 3) `pidge notify` is deprecated — warns locally but STILL sends (soft-rollout:
 //    no template_kind, the server falls back to fyi). `pidge send` is the same alias.
 
-test('#246 — pidge notify warns DEPRECATED but still sends WITHOUT a template_kind', async () => {
+test('pidge notify warns DEPRECATED but still sends WITHOUT a template_kind', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['notify', '--title', 'legado'], port).result;
@@ -1961,7 +1961,7 @@ test('#246 — pidge notify warns DEPRECATED but still sends WITHOUT a template_
   assert.equal(sent.template_kind, undefined, 'typeless send, server picks the channel default');
 });
 
-test('#246 — pidge send is a deprecated alias of notify (warns + sends)', async () => {
+test('pidge send is a deprecated alias of notify (warns + sends)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['send', '--title', 'via send'], port).result;
@@ -1973,14 +1973,14 @@ test('#246 — pidge send is a deprecated alias of notify (warns + sends)', asyn
 
 // 4) the generated skill carries the type catalog table.
 
-test('#246 — skill install includes the "Choose the right type" catalog table', async () => {
+test('skill install includes the "Choose the right type" catalog table', async () => {
   const mock = createMock();
   const port = await mock.start();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-skill246-'));
 
   const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
     cwd: dir,
-    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    // isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
     env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   const out = await new Promise((resolve) => {
@@ -1993,8 +1993,8 @@ test('#246 — skill install includes the "Choose the right type" catalog table'
 
   assert.equal(out.code, 0, out.stderr);
   const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
-  // #274 F3 (B1): the "Two axes" heading is GONE — the spine now leads with the
-  // two-approval-paths distinction (the eval-harness probe that was failing).
+  // The "Two axes" heading is GONE — the spine now leads with the
+  // two-approval-paths distinction.
   assert.match(skill, /Approval has two paths/, 'the two-approval-paths section is present');
   assert.match(skill, /composes on ANY type/i, 'the response axis is explained');
   // the married catalog of 5
@@ -2004,12 +2004,12 @@ test('#246 — skill install includes the "Choose the right type" catalog table'
   // the two response shortcuts + send-and-go vs wait
   assert.match(skill, /pidge approval/, 'the approval recipe');
   assert.match(skill, /send-and-go vs wait/i, 'teaches send-and-go vs wait');
-  // #274 F3 POSITIVE asserts — the hand-authored spine landed in full:
+  // POSITIVE asserts — the hand-authored spine landed in full:
   assert.match(skill, /THE PICKER/, 'the situation→command picker table');
   assert.match(skill, /pidge important --actions yes,no --wait/, 'the blocking-decision picker row');
   assert.match(skill, /ack_requires_biometric/, 'Path B names the profile knob');
   assert.match(skill, /--gated/, 'the Face-ID flag is documented');
-  // #274-D skill polish — catalog-first · write-for-the-lock-screen · good reports:
+  // skill polish — catalog-first · write-for-the-lock-screen · good reports:
   assert.match(skill, /Write for the lock screen/, 'the lock-screen guidance section is present');
   assert.match(skill, /catalog action FIRST/, 'the Buttons bullet is catalog-first');
   // every gold example now sets a plain --body alongside the rich --body-markdown:
@@ -2023,11 +2023,11 @@ test('#246 — skill install includes the "Choose the right type" catalog table'
   assert.match(skill, /no answer needed → profile omitted/, 'the profiles appendix renders');
 });
 
-// --- #274 F1 (CLI redesign) -------------------------------------------------
+// --- CLI redesign ---------------------------------------------------------------
 
 // EDIT 1 — the input chain: --body-markdown-file reads markdown from a file (or
 // stdin via "-"), killing the long-markdown shell-quoting footgun.
-test('#274 — --body-markdown-file reads the markdown body from a file', async () => {
+test('--body-markdown-file reads the markdown body from a file', async () => {
   const mock = createMock();
   const port = await mock.start();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-bmf-'));
@@ -2041,7 +2041,7 @@ test('#274 — --body-markdown-file reads the markdown body from a file', async 
   assert.equal(mock.state.notifies.at(-1).body_markdown, md, 'the POST body_markdown equals the file content');
 });
 
-test('#274 — --body-markdown-file - reads the markdown body from stdin', async () => {
+test('--body-markdown-file - reads the markdown body from stdin', async () => {
   const mock = createMock();
   const port = await mock.start();
   const md = '# From stdin\n\npiped markdown — no shell quoting needed';
@@ -2056,7 +2056,7 @@ test('#274 — --body-markdown-file - reads the markdown body from stdin', async
 });
 
 // EDIT 2 — --gated synthesizes exactly one Face-ID confirm custom action.
-test('#274 — --gated synthesizes one Face-ID confirm custom action', async () => {
+test('--gated synthesizes one Face-ID confirm custom action', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['important', '--title', 't', '--gated'], port).result;
@@ -2070,7 +2070,7 @@ test('#274 — --gated synthesizes one Face-ID confirm custom action', async () 
   assert.equal(ca[0].terminal, true);
 });
 
-test('#274 — --gated does NOT double-gate when the agent already sent a biometric action', async () => {
+test('--gated does NOT double-gate when the agent already sent a biometric action', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(
@@ -2085,7 +2085,7 @@ test('#274 — --gated does NOT double-gate when the agent already sent a biomet
 });
 
 // EDIT 4 — --template is off the help menu (still parses as silent input).
-test('#274 — --help strips --template from discovery but lists --gated + --body-markdown-file', async () => {
+test('--help strips --template from discovery but lists --gated + --body-markdown-file', async () => {
   const out = await runCli(['--help'], 1).result;
   assert.equal(out.code, 0, out.stderr);
   assert.doesNotMatch(out.stdout, /--template ID/, '--template is off the help menu');
@@ -2093,7 +2093,7 @@ test('#274 — --help strips --template from discovery but lists --gated + --bod
   assert.match(out.stdout, /--body-markdown-file/, '--body-markdown-file is documented');
 });
 
-test('#274 — --template still PARSES as silent input (back-compat) even though it is undocumented', async () => {
+test('--template still PARSES as silent input (back-compat) even though it is undocumented', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['notify', '--title', 't', '--template', 'reminder'], port).result;
@@ -2103,7 +2103,7 @@ test('#274 — --template still PARSES as silent input (back-compat) even though
 });
 
 // EDIT 3 — `hello` default copy is English (USA-first).
-test('#274 — hello default copy is English (no Portuguese)', async () => {
+test('hello default copy is English (no Portuguese)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['hello-en'] = {
@@ -2120,9 +2120,9 @@ test('#274 — hello default copy is English (no Portuguese)', async () => {
   assert.doesNotMatch(sent.body, /Toque em Feito/);
 });
 
-// EDIT 6 — BLOCKER B2: a --wait send with decision buttons defaults to 60 min,
+// EDIT 6 — a --wait send with decision buttons defaults to 60 min,
 // not 600 s, when the 201 carries no suggested_ask_timeout (requires_action key).
-test('#274 B2 — a --wait send WITH decision buttons defaults the timeout to 60 min', async () => {
+test('decision timeout — a --wait send WITH decision buttons defaults the timeout to 60 min', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['b2-buttons'] = {
@@ -2138,7 +2138,7 @@ test('#274 B2 — a --wait send WITH decision buttons defaults the timeout to 60
   assert.match(out.stderr, /defaulting --wait to 60 min for a decision/, 'the decision-timeout default fired');
 });
 
-test('#274 B2 — a no-buttons --wait send still defaults to 600 s (NOT a decision)', async () => {
+test('decision timeout — a no-buttons --wait send still defaults to 600 s (NOT a decision)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['b2-quiet'] = {
@@ -2155,7 +2155,7 @@ test('#274 B2 — a no-buttons --wait send still defaults to 600 s (NOT a decisi
   assert.doesNotMatch(out.stderr, /suggested by template/, 'and no template suggestion either ⇒ the 600 s else-branch');
 });
 
-test('#274 B2 — `pidge approval` (injected Face-ID pair) reads requires_action and gets 60 min', async () => {
+test('decision timeout — `pidge approval` (injected Face-ID pair) reads requires_action and gets 60 min', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['b2-approval'] = {
@@ -2174,9 +2174,9 @@ test('#274 B2 — `pidge approval` (injected Face-ID pair) reads requires_action
   assert.match(out.stderr, /defaulting --wait to 60 min for a decision/);
 });
 
-// --- #34: `pidge approve` — the hook-shaped, deny-default gate -----------------
+// --- `pidge approve` — the hook-shaped, deny-default gate -----------------------
 
-test('#34 — approve: human taps allow → exit 0, chosen_action JSON on stdout, gated pair in the payload', async () => {
+test('approve: human taps allow → exit 0, chosen_action JSON on stdout, gated pair in the payload', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['appr-allow'] = {
@@ -2201,7 +2201,7 @@ test('#34 — approve: human taps allow → exit 0, chosen_action JSON on stdout
   assert.equal(sent.actions, undefined, 'approve uses custom_actions, not built-in actions');
 });
 
-test('#34 — approve: human taps deny → exit 1 (deny explicit, never a false allow)', async () => {
+test('approve: human taps deny → exit 1 (deny explicit, never a false allow)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['appr-deny'] = {
@@ -2219,7 +2219,7 @@ test('#34 — approve: human taps deny → exit 1 (deny explicit, never a false 
   assert.match(out.stderr, /DENIED/);
 });
 
-test('#34 — approve: no answer before timeout → exit 1 (deny-default, fail closed)', async () => {
+test('approve: no answer before timeout → exit 1 (deny-default, fail closed)', async () => {
   const mock = createMock();
   const port = await mock.start();
   // never responds → the wait runs to the (short) deadline
@@ -2234,7 +2234,7 @@ test('#34 — approve: no answer before timeout → exit 1 (deny-default, fail c
   assert.equal(JSON.parse(out.stdout).decision, 'deny', 'a machine-readable deny on stdout');
 });
 
-test('#34 — approve: a send that never lands → non-zero (fail closed on error)', async () => {
+test('approve: a send that never lands → non-zero (fail closed on error)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifyStatus = 500; // the notify POST fails
@@ -2248,7 +2248,7 @@ test('#34 — approve: a send that never lands → non-zero (fail closed on erro
   assert.equal(out.code, 1, 'approve maps an HTTP send failure to exit 1 (deny-default)');
 });
 
-test('#34 — approve over the realtime socket resolves allow → exit 0 (onAnswer threads through WS)', async (t) => {
+test('approve over the realtime socket resolves allow → exit 0 (onAnswer threads through WS)', async (t) => {
   if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
   const mock = createMock();
   const port = await mock.start();
@@ -2272,7 +2272,7 @@ test('#34 — approve over the realtime socket resolves allow → exit 0 (onAnsw
   assert.match(stdout, /"action_id": "allow"/);
 });
 
-test('#34 — approve: --allow-label / --deny-label rename the buttons', async () => {
+test('approve: --allow-label / --deny-label rename the buttons', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.notifications['appr-lbl'] = {
@@ -2291,25 +2291,25 @@ test('#34 — approve: --allow-label / --deny-label rename the buttons', async (
   assert.equal(ca[1].label, 'Hold');
 });
 
-// --- #39: NaN in --timeout/--interval must fail CLOSED, never hang forever ----
+// --- NaN in --timeout/--interval must fail CLOSED, never hang forever ----
 // parseInt('abc') → NaN made doWait's deadline NaN (never reached): wait/ask/
 // approve/hello/listen polled FOREVER and approve's deny-default timeout branch
 // was unreachable. A typo must die IMMEDIATELY (exit 1), before anything is sent.
 
-test('#39 — wait --timeout abc dies immediately (exit 1), never entering the poll loop', async () => {
+test('wait --timeout abc dies immediately (exit 1), never entering the poll loop', async () => {
   // No server at all (port 1): the strict parse must die BEFORE any network happens.
   const { code, stderr } = await runCli(['wait', 'cid-nan', '--no-realtime', '--timeout', 'abc'], 1).result;
   assert.equal(code, 1, `stderr: ${stderr}`);
   assert.match(stderr, /--timeout "abc" is not a number/);
 });
 
-test('#39 — wait --interval abc dies the same way', async () => {
+test('wait --interval abc dies the same way', async () => {
   const { code, stderr } = await runCli(['wait', 'cid-nan', '--no-realtime', '--interval', 'abc'], 1).result;
   assert.equal(code, 1, `stderr: ${stderr}`);
   assert.match(stderr, /--interval "abc" is not a number/);
 });
 
-test('#39 — approve --timeout abc fails CLOSED (exit 1) BEFORE sending the approval', async () => {
+test('approve --timeout abc fails CLOSED (exit 1) BEFORE sending the approval', async () => {
   const mock = createMock();
   const port = await mock.start();
   const { code, stderr } = await runCli(['approve', 'Deploy?', '--no-realtime', '--timeout', 'abc'], port).result;
@@ -2319,7 +2319,7 @@ test('#39 — approve --timeout abc fails CLOSED (exit 1) BEFORE sending the app
   assert.equal(mock.state.notifies.length, 0, 'nothing was sent — no ghost approval on the phone');
 });
 
-test('#39 — ask --timeout abc refuses before the send too', async () => {
+test('ask --timeout abc refuses before the send too', async () => {
   const mock = createMock();
   const port = await mock.start();
   const { code, stderr } = await runCli(
@@ -2330,7 +2330,7 @@ test('#39 — ask --timeout abc refuses before the send too', async () => {
   assert.equal(mock.state.notifies.length, 0, 'nothing was sent');
 });
 
-test('#39 — hello --interval abc refuses before the send', async () => {
+test('hello --interval abc refuses before the send', async () => {
   const mock = createMock();
   const port = await mock.start();
   const { code, stderr } = await runCli(['hello', '--no-realtime', '--interval', 'abc'], port).result;
@@ -2339,13 +2339,13 @@ test('#39 — hello --interval abc refuses before the send', async () => {
   assert.equal(mock.state.notifies.length, 0, 'nothing was sent');
 });
 
-test('#39 — listen --timeout abc refuses (same eternal-deadline class)', async () => {
+test('listen --timeout abc refuses (same eternal-deadline class)', async () => {
   const { code, stderr } = await runCli(['listen', '--no-realtime', '--timeout', 'abc'], 1).result;
   assert.equal(code, 1, `stderr: ${stderr}`);
   assert.match(stderr, /is not a number/);
 });
 
-test('#39 — approve on a MALFORMED poll body: deny-default holds, exit 1 on timeout', async () => {
+test('approve on a MALFORMED poll body: deny-default holds, exit 1 on timeout', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.pollGarbage = true;
@@ -2357,7 +2357,7 @@ test('#39 — approve on a MALFORMED poll body: deny-default holds, exit 1 on ti
   assert.match(stdout, /"decision":"deny"/, 'the machine-readable deny lands on stdout');
 });
 
-test('#39 — approve when the server is unreachable: exit 2 (the send never left the ground)', async () => {
+test('approve when the server is unreachable: exit 2 (the send never left the ground)', async () => {
   const mock = createMock();
   const port = await mock.start();
   await mock.stop(); // nothing listening — the send throws a raw network error
@@ -2366,7 +2366,7 @@ test('#39 — approve when the server is unreachable: exit 2 (the send never lef
   assert.match(stderr, /send failed \(network\)/);
 });
 
-test('#39 — SIGINT mid-wait: approve exits 1 (deny-default), never 0', async () => {
+test('SIGINT mid-wait: approve exits 1 (deny-default), never 0', async () => {
   const mock = createMock();
   const port = await mock.start();
   const { child, result } = runCli(
@@ -2381,16 +2381,16 @@ test('#39 — SIGINT mid-wait: approve exits 1 (deny-default), never 0', async (
   assert.match(stderr, /interrupted before an answer — DENIED/);
 });
 
-// --- #41: docs drift guards ----------------------------------------------------
+// --- docs drift guards ----------------------------------------------------
 
-test('#41 — the README never re-teaches the refused decision+reply combo and documents approve', () => {
+test('the README never re-teaches the refused decision+reply combo and documents approve', () => {
   const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
   assert.ok(!/--actions yes,no,reply/.test(readme), 'README must not showcase a send the CLI refuses since 0.16.0');
   assert.match(readme, /pidge approve/, 'the approve gate is documented');
   assert.match(readme, /only as trustworthy as/, 'the env trust caveat is spelled out');
 });
 
-test('#41 — approve --help tells the true exit-code story (HTTP fail → 1, raw network → 2) + the env caveat', async () => {
+test('approve --help tells the true exit-code story (HTTP fail → 1, raw network → 2) + the env caveat', async () => {
   const out = await runCli(['approve', '--help'], 1).result;
   assert.equal(out.code, 0, out.stderr);
   assert.match(out.stdout, /an HTTP failure on the send → exit 1/);
@@ -2399,9 +2399,9 @@ test('#41 — approve --help tells the true exit-code story (HTTP fail → 1, ra
   assert.ok(!/A send that never left the ground → exit 2/.test(out.stdout), 'the old over-promise is gone');
 });
 
-// --- lote-5 #2: refuse a decision button + reply in one send ------------------
+// --- refuse a decision button + reply in one send ------------------
 
-test('lote-5 #2 — --actions yes,no,reply is REFUSED locally (exit 1, no send)', async () => {
+test('--actions yes,no,reply is REFUSED locally (exit 1, no send)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['important', '--title', 'x', '--actions', 'yes,no,reply'], port).result;
@@ -2411,7 +2411,7 @@ test('lote-5 #2 — --actions yes,no,reply is REFUSED locally (exit 1, no send)'
   assert.equal(mock.state.notifies.length, 0, 'must not reach the server');
 });
 
-test('lote-5 #2 — --actions reply ALONE is fine (sends)', async () => {
+test('--actions reply ALONE is fine (sends)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['important', '--title', 'x', '--actions', 'reply'], port).result;
@@ -2420,7 +2420,7 @@ test('lote-5 #2 — --actions reply ALONE is fine (sends)', async () => {
   assert.deepEqual(mock.state.notifies.at(-1).actions, ['reply']);
 });
 
-test('lote-5 #2 — done,reply is ALLOWED (done is not a decision; DONE_REPLY is a real category)', async () => {
+test('done,reply is ALLOWED (done is not a decision; DONE_REPLY is a real category)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const out = await runCli(['important', '--title', 'x', '--actions', 'done,reply'], port).result;
@@ -2429,18 +2429,18 @@ test('lote-5 #2 — done,reply is ALLOWED (done is not a decision; DONE_REPLY is
   assert.deepEqual(mock.state.notifies.at(-1).actions, ['done', 'reply']);
 });
 
-// --- lote-5 #3: no stray, description-less `template` line in subcommand help --
+// --- no stray, description-less `template` line in subcommand help --
 
-test('lote-5 #3 — `pidge important --help` no longer prints a bare `template` line', async () => {
+test('`pidge important --help` no longer prints a bare `template` line', async () => {
   const out = await runCli(['important', '--help'], 1).result;
   assert.equal(out.code, 0, out.stderr);
   assert.doesNotMatch(out.stdout, /^\s*template\s*$/m, 'no bare description-less template line');
   assert.match(out.stdout, /--subtitle TEXT/, 'the real flags still render');
 });
 
-// --- lote-5 #4: --quiet collapses setup to a single status line ---------------
+// --- --quiet collapses setup to a single status line ---------------
 
-test('lote-5 #4 — setup --quiet collapses onboarding to ONE status line (verbose lines suppressed)', async () => {
+test('setup --quiet collapses onboarding to ONE status line (verbose lines suppressed)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-quiet-'));
@@ -2461,9 +2461,9 @@ test('lote-5 #4 — setup --quiet collapses onboarding to ONE status line (verbo
   assert.ok(!stderr.includes('hld_minted_by_claim') && !stdout.includes('hld_minted_by_claim'), 'key never leaks');
 });
 
-// --- lote-5 #5: listen --all warns on orphaned backlog -------------------------
+// --- listen --all warns on orphaned backlog -------------------------
 
-test('lote-5 #5 — listen --all WARNS that a quick first batch is old backlog, not new arrivals', async () => {
+test('listen --all WARNS that a quick first batch is old backlog, not new arrivals', async () => {
   const mock = createMock();
   const port = await mock.start();
   // pre-existing queue: a composer message + an old notification answer
@@ -2477,10 +2477,10 @@ test('lote-5 #5 — listen --all WARNS that a quick first batch is old backlog, 
   assert.equal(out.code, 0, out.stderr);
   assert.match(out.stderr, /ALREADY queued when this listen started/, 'the orphan-backlog heads-up');
   assert.match(out.stderr, /1 of them are answers to EARLIER notifications/, 'counts the resurfaced notification answers');
-  assert.match(out.stderr, /not a cross-channel leak/, 'clarifies it is within-channel, not the #289 leak');
+  assert.match(out.stderr, /not a cross-channel leak/, 'clarifies it is within-channel — not a cross-channel leak');
 });
 
-test('lote-5 #5 — listen WITHOUT --all does not print the backlog heads-up', async () => {
+test('listen WITHOUT --all does not print the backlog heads-up', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 30, channel_id: 1, body: 'oi', created_at: 'x', consumed_at: null }];
@@ -2492,9 +2492,9 @@ test('lote-5 #5 — listen WITHOUT --all does not print the backlog heads-up', a
 });
 
 
-// --- #51: strict message ids on ack (a lazy parseInt acked the WRONG watermark) ---
+// --- strict message ids on ack (a lazy parseInt acked the WRONG watermark) ---
 
-test('#51: ack --up-to with a correlation_id dies loud BEFORE any HTTP — no wrong watermark', async () => {
+test('ack --up-to with a correlation_id dies loud BEFORE any HTTP — no wrong watermark', async () => {
   const mock = createMock();
   await mock.start();
   try {
@@ -2507,7 +2507,7 @@ test('#51: ack --up-to with a correlation_id dies loud BEFORE any HTTP — no wr
   } finally { await mock.stop(); }
 });
 
-test('#51: ack --ids with one bad entry dies loud (no silent drop of the bad id)', async () => {
+test('ack --ids with one bad entry dies loud (no silent drop of the bad id)', async () => {
   const mock = createMock();
   await mock.start();
   try {
@@ -2518,7 +2518,7 @@ test('#51: ack --ids with one bad entry dies loud (no silent drop of the bad id)
   } finally { await mock.stop(); }
 });
 
-test('#51 positive control: a real numeric --up-to still acks normally', async () => {
+test('positive control: a real numeric --up-to still acks normally', async () => {
   const mock = createMock();
   await mock.start();
   try {
@@ -2530,9 +2530,9 @@ test('#51 positive control: a real numeric --up-to still acks normally', async (
   } finally { await mock.stop(); }
 });
 
-// --- #52: doctor with a SESSION token must fail loud, not "canal undefined" ---
+// --- doctor with a SESSION token must fail loud, not "canal undefined" ---
 
-test('#52: doctor with a ses_ token says SESSION token + exits 2 (server v57 either-track whoami)', async () => {
+test('doctor with a ses_ token says SESSION token + exits 2 (server v57 either-track whoami)', async () => {
   const mock = createMock();
   await mock.start();
   try {
@@ -2544,7 +2544,7 @@ test('#52: doctor with a ses_ token says SESSION token + exits 2 (server v57 eit
   } finally { await mock.stop(); }
 });
 
-// --- cli#47 / pidge#284 (LA v2): `pidge live` drives the REAL endpoints ------
+// --- `pidge live` drives the REAL Live Activity endpoints --------------------
 
 test('live: --title starts a card via POST /live_activities — /notify is NEVER hit', async () => {
   const mock = createMock();
@@ -2659,7 +2659,7 @@ test('live: --paused sends is_running:false; a plain update omits is_running (om
 });
 
 // ---------------------------------------------------------------------------
-// #58 — `pidge catchup`: the READ-ONLY situational read. GET ?history=true&all=true,
+// `pidge catchup`: the READ-ONLY situational read. GET ?history=true&all=true,
 // print the thread newest-first, NEVER consume (no ack, no lease). Exit 0/2 only.
 // ---------------------------------------------------------------------------
 test('catchup: prints the thread newest-first, sends history=true&all=true, NEVER acks (exit 0)', async () => {
@@ -2737,7 +2737,7 @@ test('catchup: a non-numeric --limit is a usage error (exit 1)', async () => {
   assert.match(stderr, /--limit must be a positive integer/);
 });
 
-test('catchup: a v63 processed row narrates "handled by <who>: <what>" on stderr (#58 item 4)', async () => {
+test('catchup: a processed row narrates "handled by <who>: <what>" on stderr', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [
@@ -2771,9 +2771,9 @@ test('catchup: a server error exits 2 (not 3/4 — there is no wait)', async () 
   assert.match(stderr, /catchup failed/);
 });
 
-// #70 — catchup gains an incremental cursor (--since) + a condensed view (--digest).
+// catchup gains an incremental cursor (--since) + a condensed view (--digest).
 // Situate in O(new), not O(whole thread).
-test('#70: catchup --since <id> shows only NEWER rows (client-side) and forwards the query', async () => {
+test('catchup --since <id> shows only NEWER rows (client-side) and forwards the query', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [
@@ -2793,7 +2793,7 @@ test('#70: catchup --since <id> shows only NEWER rows (client-side) and forwards
   assert.match(stderr, /2 message\(s\) since id 20/, 'the summary names the cursor');
 });
 
-test('#70: catchup --since is STRICT numeric (a correlation-id-shaped value is exit 1, not a wrong watermark)', async () => {
+test('catchup --since is STRICT numeric (a correlation-id-shaped value is exit 1, not a wrong watermark)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const { result } = runCli(['catchup', '--since', 'c-9f2e'], port);
@@ -2803,7 +2803,7 @@ test('#70: catchup --since is STRICT numeric (a correlation-id-shaped value is e
   assert.match(stderr, /--since/, 'the usage error names the flag');
 });
 
-test('#70: catchup --digest prints ONE line per message — id · kind · body · handled/PENDING', async () => {
+test('catchup --digest prints ONE line per message — id · kind · body · handled/PENDING', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [
@@ -2827,10 +2827,10 @@ test('#70: catchup --digest prints ONE line per message — id · kind · body �
   assert.ok(!/pidge: message 40 handled by/.test(stderr), 'digest carries attribution inline, not on stderr');
 });
 
-// #76 item 1 — the digest has THREE states. The bug: a row with `processed_at` but no
-// note printed PENDING (derived from summary/label alone), telling a successor to REDO
-// finished work. The evidence in the issue is exactly the middle case (#417).
-test('#76: catchup --digest — THREE states: handled-with-note / ✓ acked (no note) / PENDING', async () => {
+// The digest has THREE states. The bug: a row with `processed_at` but no note
+// printed PENDING (derived from summary/label alone), telling a successor to REDO
+// finished work — the middle case below.
+test('catchup --digest — THREE states: handled-with-note / ✓ acked (no note) / PENDING', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [
@@ -2854,20 +2854,20 @@ test('#76: catchup --digest — THREE states: handled-with-note / ✓ acked (no 
   assert.match(byId['500'], /· PENDING$/, '(c) truly un-processed ⇒ PENDING');
 });
 
-test('#76: catchup --digest — a processed row with a LABEL but no note reads "✓ acked by X (no note)"', async () => {
+test('catchup --digest — a processed row with a LABEL but no note reads "✓ acked by X (no note)"', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [
-    { id: 22, channel_id: 1, kind: 'message', body: 'x', processed_at: '2026-07-06T23:00:00Z', acked_by_label: 'javier' },
+    { id: 22, channel_id: 1, kind: 'message', body: 'x', processed_at: '2026-07-06T23:00:00Z', acked_by_label: 'bridge-bot' },
   ];
   const { result } = runCli(['catchup', '--digest'], port);
   const { code, stdout } = await result;
   await mock.stop();
   assert.equal(code, 0);
-  assert.match(stdout.trim(), /^22 · message · x · ✓ acked by javier \(no note\)$/);
+  assert.match(stdout.trim(), /^22 · message · x · ✓ acked by bridge-bot \(no note\)$/);
 });
 
-test('#70: catchup --digest --since compose (condensed view of only what is new)', async () => {
+test('catchup --digest --since compose (condensed view of only what is new)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [
@@ -2884,11 +2884,11 @@ test('#70: catchup --digest --since compose (condensed view of only what is new)
   assert.match(lines[0], /^30 · message · nova · PENDING$/);
 });
 
-// #76 item 2: the cursor hint fires on EVERY no-`--since` run that saw messages —
+// the cursor hint fires on EVERY no-`--since` run that saw messages —
 // first run included, and even when nothing new arrived — always on stderr (stdout
 // stays clean). The old gate (prior cursor AND thread-moved) printed nothing on a
 // fresh or quiet channel, the observed bug.
-test('#76: catchup ALWAYS prints the cursor on stderr (no --since) — first run and when nothing is new', async () => {
+test('catchup ALWAYS prints the cursor on stderr (no --since) — first run and when nothing is new', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 55, channel_id: 1, kind: 'message', body: 'oi' }];
@@ -2908,7 +2908,7 @@ test('#76: catchup ALWAYS prints the cursor on stderr (no --since) — first run
   assert.match(second.stderr, /cursor — newest message is id 60 \(1 new since your last read at id 55\).*--since 60/, `second: ${second.stderr}`);
 });
 
-test('#76: a repeat catchup with NOTHING new STILL prints the cursor (the observed bug: silent repeats)', async () => {
+test('a repeat catchup with NOTHING new STILL prints the cursor (the observed bug: silent repeats)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 70, channel_id: 1, kind: 'message', body: 'oi' }];
@@ -2922,7 +2922,7 @@ test('#76: a repeat catchup with NOTHING new STILL prints the cursor (the observ
   assert.ok(!/new since your last read/.test(again.stderr), 'nothing new ⇒ no delta note, just the cursor');
 });
 
-test('#76: --since suppresses the cursor hint (the caller already provided one; stdout+stderr stay focused)', async () => {
+test('--since suppresses the cursor hint (the caller already provided one; stdout+stderr stay focused)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 80, channel_id: 1, kind: 'message', body: 'oi' }];
@@ -2932,9 +2932,9 @@ test('#76: --since suppresses the cursor hint (the caller already provided one; 
   assert.ok(!/cursor — newest message/.test(out.stderr), 'a --since run does not also nag about the cursor');
 });
 
-// #73 cross-audit — the cursor is keyed per CHANNEL (hash(token)), like the #313 pin:
+// The cursor is keyed per CHANNEL (hash(token)), like the server pin:
 // two channels from ONE config dir must not cross-contaminate the suggested --since.
-test('#73: the catchup cursor is per-CHANNEL — channel A never suggests its cursor to channel B', async () => {
+test('the catchup cursor is per-CHANNEL — channel A never suggests its cursor to channel B', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 90, channel_id: 1, kind: 'message', body: 'oi' }];
@@ -2955,9 +2955,9 @@ test('#73: the catchup cursor is per-CHANNEL — channel A never suggests its cu
   assert.ok(!/new since your last read/.test(b.stderr), "channel B has no prior cursor of its own — A's must not leak in");
 });
 
-// #73 cross-audit — a --before page (older rows, lower highest id) must NEVER regress
+// A --before page (older rows, lower highest id) must NEVER regress
 // the stored cursor; the cursor only ever ADVANCES to the newest id seen.
-test('#73: a later read with a LOWER highest id does NOT regress the stored cursor', async () => {
+test('a later read with a LOWER highest id does NOT regress the stored cursor', async () => {
   const mock = createMock();
   const port = await mock.start();
   const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-noregress-'));
@@ -2976,13 +2976,13 @@ test('#73: a later read with a LOWER highest id does NOT regress the stored curs
 });
 
 // ---------------------------------------------------------------------------
-// #58 — `pidge skill install --target claude|agents|gemini`: same content, the
+// `pidge skill install --target claude|agents|gemini`: same content, the
 // destination changes (a Claude skill vs the AGENTS.md/GEMINI.md root conventions).
 // ---------------------------------------------------------------------------
 function runSkillInstall(args, port, cwd) {
   const child = spawn(process.execPath, [CLI, 'skill', 'install', ...args], {
     cwd,
-    // #69/#73: isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
+    // isolate HOME so `skill install` (and its self-heal path) never touches the real ~/.claude.
     env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
   });
   return new Promise((resolve) => {
@@ -3009,7 +3009,7 @@ test('skill install --target agents|gemini writes root files with the SAME conte
   const geminiMd = fs.readFileSync(path.join(dir, 'GEMINI.md'), 'utf8');
   assert.equal(agentsMd, claudeMd, 'AGENTS.md content must equal the claude skill');
   assert.equal(geminiMd, claudeMd, 'GEMINI.md content must equal the claude skill');
-  // the new spine section rode along into every target (verbatim EN prose from #58).
+  // the new spine section rode along into every target.
   assert.match(agentsMd, /Waking up in an interactive session/);
   assert.match(agentsMd, /Only then speak/);
   assert.match(agentsMd, /pidge catchup/);
@@ -3048,7 +3048,7 @@ test('skill install --target agents backs up a differing existing AGENTS.md to .
   assert.match(fs.readFileSync(path.join(dir, 'AGENTS.md'), 'utf8'), /name: pidge/);
 });
 
-test('skill install: a re-install NEVER clobbers an existing .bak — the user original survives (#58 cross-audit)', async () => {
+test('skill install: a re-install NEVER clobbers an existing .bak — the user original survives', async () => {
   const mock = createMock();
   const port = await mock.start();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-target-'));

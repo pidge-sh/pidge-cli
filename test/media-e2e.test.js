@@ -1,13 +1,12 @@
 'use strict';
-// #367 F1 (pidge) — sealed media, both directions, against the mock server.
-// Contract: pidge docs/media-e2e-spec.md + manifest v62.
+// Sealed media, both directions, against the mock server.
 //   send: gate CLOSED ⇒ clear media of always; gate OPEN ⇒ blob sealed BEFORE
 //         upload (generic blob.bin), filename an envelope, media_enc:"v1";
 //         media pin refuses a downgrade PRE-upload; URL --image refused sealed.
 //   receive: a sealed attachment is downloaded + unsealed to a local path with
 //         a SANITIZED name; failures are precise and never write ciphertext.
 // The pure AAD-separation gate (cross-slot/cross-direction replay must fail
-// the tag) is here too — it's the spec's §2 property.
+// the tag) is here too — it's a core property of the wire contract.
 const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
@@ -34,7 +33,7 @@ function runCli(args, port, env = {}, xdg = null) {
       PIDGE_TOKEN: 'hld_test',
       PIDGE_SECRET: '',
       XDG_CONFIG_HOME: xdg || fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-test-')),
-      // #69: isolate HOME so the skill self-heal never touches the real ~/.claude.
+      // Isolate HOME so the skill self-heal never touches the real ~/.claude.
       HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')),
       ...env,
     },
@@ -55,7 +54,7 @@ function tmpFile(name, bytes) {
   return p;
 }
 
-// --- pure: the AAD registry (spec §2) — direction+slot separation ------------
+// --- pure: the AAD registry — direction+slot separation ----------------------
 
 test('blob AAD: a sealed blob opens ONLY in the exact slot it was sealed for', () => {
   const plain = Buffer.from('the-photo-bytes');
@@ -65,7 +64,7 @@ test('blob AAD: a sealed blob opens ONLY in the exact slot it was sealed for', (
   // …every replay class fails the tag:
   for (const [why, badAad] of [
     ['image↔file swap', aad('cid-1', 'file_blob')],
-    ['cross-direction (late-reply reuses the cid — the #367 attack)', aad('cid-1', 'message_blob')],
+    ['cross-direction (late-reply reuses the cid)', aad('cid-1', 'message_blob')],
     ['cross-notification', aad('cid-2', 'image_blob')],
     ['cross-channel', e2e.e2eAad(2, 'cid-1', 'image_blob')],
   ]) {
@@ -205,7 +204,7 @@ test('PIDGE_E2E_MEDIA=on forces sealing even with the gate closed (pre-iOS testi
   assert.equal(mock.state.uploads[0].filename, 'blob.bin');
 });
 
-// --- SEND: the media pin (the #313 latch, extended) ----------------------------
+// --- SEND: the media pin (the anti-downgrade latch, extended) -------------------
 
 test('media pin: a confirmed sealed-media send LATCHES; a later "gate closed" server answer is refused PRE-upload; PIDGE_E2E_MEDIA=off unpins', async () => {
   const mock = createMock();
@@ -344,12 +343,12 @@ test('listen: a CLEAR attachment passes through with its url; --download saves i
   assert.deepEqual(fs.readFileSync(out.attachment.path), plain);
 });
 
-// --- Regression: cross-audit findings (coord 2026-07-06) ------------------------
+// --- Regressions: hostile-server hardening ---------------------------------------
 
 test('listen: a traversal MESSAGE ID (server-chosen) cannot steer the plaintext outside the downloads dir', async () => {
-  // BLOCKER regression: destFor interpolated String(m.id) raw — a hostile server
-  // (the #367/#313 threat model) could ship "../.." to write the decrypted
-  // plaintext anywhere. The id segment is sanitized like any wire string now.
+  // Regression: destFor interpolated String(m.id) raw — a hostile server
+  // could ship "../.." to write the decrypted plaintext anywhere. The id
+  // segment is sanitized like any wire string now.
   const mock = createMock();
   const port = await mock.start();
   const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-idtrav-'));
@@ -369,7 +368,7 @@ test('listen: a traversal MESSAGE ID (server-chosen) cannot steer the plaintext 
 });
 
 test('media pin: a re-key (new kf, same token) PRESERVES the media latch — a text send cannot silently re-open the downgrade lever', async () => {
-  // MAJOR regression: e2eStampPin rewrote the pin WITHOUT spreading cur, dropping
+  // Regression: e2eStampPin rewrote the pin WITHOUT spreading cur, dropping
   // media:true. A secret rotation (new kf, same token) + one text send wiped the
   // media latch and re-armed the server-driven media-downgrade lever.
   const mock = createMock();

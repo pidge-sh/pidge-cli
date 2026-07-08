@@ -1,7 +1,6 @@
 'use strict';
-// E2-CLI (#43): the E2E v1 SEND/RECEIVE wiring, end-to-end against the mock
-// server. Contract: e2e-spec-v1.md + manifest v49 (notifications) / v51
-// (sealed /messages). The pure-crypto gate (fixture round-trips + the shared
+// The E2E v1 SEND/RECEIVE wiring, end-to-end against the mock server.
+// The pure-crypto gate (fixture round-trips + the shared
 // failure cases) lives in test/e2e.test.js — this file proves the WIRE:
 //   send: secret + E2E channel ⇒ envelopes + enc/kf + a client-minted cid;
 //         no secret / non-E2E channel / invalid secret ⇒ the clear send of always
@@ -37,10 +36,10 @@ function runCli(args, port, env = {}, cwd = undefined) {
       PIDGE_URL: `http://127.0.0.1:${port}`,
       PIDGE_TOKEN: 'hld_test',
       PIDGE_SECRET: '', // explicit: no ambient secret leaks into a test
-      // Isolate per spawn: state.json (manifest nag, #313 e2e pins) must never
+      // Isolate per spawn: state.json (manifest nag, e2e pins) must never
       // touch the REAL ~/.config/pidge — nor leak between tests.
       XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-test-')),
-      // #69: isolate HOME so the skill self-heal never touches the real ~/.claude.
+      // Isolate HOME so the skill self-heal never touches the real ~/.claude.
       HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')),
       ...env,
     },
@@ -57,7 +56,7 @@ function runCli(args, port, env = {}, cwd = undefined) {
 
 // --- SEND ------------------------------------------------------------------
 
-// v59/#351: copy (the token field) and url joined the seal; "seen" is a system
+// copy (the token field) and url are part of the seal; "seen" is a system
 // id (the app's opened-signal) whose label must ride CLEAR like the built-ins.
 test('E2E send: copy/url sealed with their own AAD field names; a "seen" label rides CLEAR', async () => {
   const mock = createMock();
@@ -77,7 +76,7 @@ test('E2E send: copy/url sealed with their own AAD field names; a "seen" label r
   const sent = mock.state.notifies[0];
   const cid = sent.correlation_id;
   for (const [field, plain] of [['copy', 'sk-live-9f3a'], ['url', 'https://dash.example/keys']]) {
-    assert.match(sent[field], /^v1:/, `${field} must be sealed (v59 — it is the secret-bearing field)`);
+    assert.match(sent[field], /^v1:/, `${field} must be sealed (it is the secret-bearing field)`);
     assert.equal(e2e.e2eDecryptField(KEY, aad(cid, field), sent[field]), plain, `${field} round-trip`);
   }
   assert.equal(sent.custom_actions[0].label, 'Visto', 'a system id ("seen") label must never be sealed');
@@ -120,11 +119,11 @@ test('E2E send: secret + E2E channel ⇒ content fields + custom labels sealed, 
   assert.ok(!stdout.includes('v1:'), `no envelope may reach stdout:\n${stdout}`);
 });
 
-test('E2E send: a builtin/system action id NEVER gets its label sealed (#313 — never-seal = server RESERVED_ACTION_IDS)', async () => {
-  // The list must match the server's Notification::RESERVED_ACTION_IDS (the 12
-  // built-ins + "dismiss" + "acknowledge" (v52) + "seen" (v59, #313/F7 — the
-  // app's opened-signal id) — the iOS builtin set skips label decrypt for
-  // these ids, so a sealed label on one would render raw "v1:…" on the button.
+test('E2E send: a builtin/system action id NEVER gets its label sealed (never-seal mirrors the server reserved ids)', async () => {
+  // The list must match the server's reserved action-id set: the 12 built-ins
+  // + "dismiss" + "acknowledge" + "seen" (the app's opened-signal id) —
+  // clients skip label decrypt for these ids, so a sealed label on one
+  // would render raw "v1:…" on the button.
   assert.deepStrictEqual([...e2e.E2E_NEVER_SEAL_LABEL_IDS].sort(), [
     'snooze', 'done', 'reschedule', 'mute', 'reply',
     'yes', 'no', 'approve', 'reject', 'accept', 'decline', 'later',
@@ -200,7 +199,7 @@ test('E2E send: an INVALID secret warns loud and degrades to a clear send (a bro
   assert.equal(mock.state.notifies[0].title, 'segredo torto');
 });
 
-// --- RECEIVE: listen (sealed /messages, E1.5) -------------------------------
+// --- RECEIVE: listen (sealed /messages) --------------------------------------
 
 test('listen decrypts a sealed kind=message row (field ALWAYS "message"); clear rows in the batch render as always', async () => {
   const mock = createMock();
@@ -210,7 +209,7 @@ test('listen decrypts a sealed kind=message row (field ALWAYS "message"); clear 
       body: seal('cid-m1', 'message', 'segredo: aprova o deploy'),
       enc: 'v1', kf: FIXTURE.kf, correlation_id: 'cid-m1' },
     { id: 31, channel_id: CHANNEL_ID, kind: 'message', created_at: 'x',
-      body: 'linha antiga em claro' }, // pre-E1.5 history — honest degradation
+      body: 'linha antiga em claro' }, // pre-seal history — honest degradation
   ];
 
   const { result } = runCli(['listen', '--no-realtime', '--timeout', '20', '--interval', '1'],
@@ -251,7 +250,7 @@ test('listen: kf mismatch ⇒ "sealed with ANOTHER key" PRECISELY, body blanked,
   assert.ok(!stdout.includes('v1:'), `ciphertext leaked to stdout:\n${stdout}`);
 });
 
-test('listen: enc present but correlation_id MISSING ⇒ precise "server predates E1.5 / bug" error, not garbage', async () => {
+test('listen: enc present but correlation_id MISSING ⇒ precise "server too old / bug" error, not garbage', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [
@@ -323,7 +322,7 @@ test('listen --all: a notification_reply with ref.enc decrypts text (field "repl
   assert.equal(rows[0].e2e, 'decrypted');
   assert.equal(rows[1].body, 'Ship it now');
   assert.equal(rows[1].ref.title, 'PR 99');
-  // The #131 narration reads the DECRYPTED values too.
+  // The listen --all narration reads the DECRYPTED values too.
   assert.match(stderr, /Deploy da API/);
   assert.match(stderr, /faz o rollback primeiro/);
   assert.ok(!stdout.includes('v1:'), `ciphertext leaked to stdout:\n${stdout}`);
@@ -430,7 +429,7 @@ test('doctor: valid secret + E2E channel ⇒ kf narrated, e2e ok in the JSON, ex
   assert.match(stderr, new RegExp(`e2e secret found \\(env var, 32 bytes, kf ${FIXTURE.kf}\\)`));
   assert.match(stderr, /e2e ON — sends are sealed/);
   const out = JSON.parse(stdout);
-  assert.deepEqual(out.e2e, { channel: true, secret: 'ok', kf: FIXTURE.kf, pinned: true }); // doctor CONFIRMED the sealed context ⇒ the #313 pin latches
+  assert.deepEqual(out.e2e, { channel: true, secret: 'ok', kf: FIXTURE.kf, pinned: true }); // doctor CONFIRMED the sealed context ⇒ the anti-downgrade pin latches
 });
 
 test('doctor: E2E channel but NO secret ⇒ point at the app\'s Connect-screen terminal step (warning, exit 0 — clear sends still work)', async () => {
