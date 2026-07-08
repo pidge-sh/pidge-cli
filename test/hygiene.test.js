@@ -14,11 +14,13 @@ const { execFileSync } = require('node:child_process');
 
 const ROOT = path.join(__dirname, '..');
 const SELF = path.basename(__filename);
+const PRIVATE_PATTERNS = '.hygiene-private-patterns.json'; // untracked, never published
 
 function publicFiles() {
   const files = ['bin/pidge.js', 'README.md', 'CHANGELOG.md', 'package.json'];
   for (const f of fs.readdirSync(path.join(ROOT, 'test'))) {
     if (f === SELF) continue; // this file names the forbidden patterns
+    if (f === PRIVATE_PATTERNS) continue; // untracked local-only pattern source
     if (/\.(js|json)$/.test(f)) files.push(`test/${f}`);
   }
   for (const f of fs.readdirSync(path.join(ROOT, '.github', 'workflows'))) {
@@ -29,6 +31,11 @@ function publicFiles() {
 
 // [label, pattern]. Patterns are line-oriented; keep them precise — fictional
 // example content ("Review PR #42", "PO #4471") must NOT trip them.
+//
+// Only generic, structural patterns live here: this file is itself published, so
+// it must not become an index of the very things it hides. Anything whose literal
+// value would leak just by being written here (people, codenames, incident dates,
+// infra providers) lives in an untracked private file, loaded below.
 const FORBIDDEN = [
   ['parenthesized tracker ref', /\(#\d+/],
   ['prefixed tracker ref', /\b(?:pidge|cli|server)#\d+/],
@@ -36,18 +43,25 @@ const FORBIDDEN = [
   ['audit narration', /\bcross-audit\b/i],
   ['internal spec doc', /e2e-spec-v1/],
   ['closed-suite reference', /\bXCTest\b/],
-  ['server implementation internals', /Notification::|RESERVED_ACTION_IDS|\bE2EContent\b|OPERATING_CONTRACT_KEYS|notification\.rb/],
-  ['person name', /\bJavier\b/i],
-  ['pre-launch codename in prose', /\bHerald\b/], // the HERALD_* env aliases stay
-  ['incident date', /2026-06-13|2026-06-14/],
+  ['namespaced server class', /\b[A-Z][a-zA-Z]+::[A-Z]/],
+  ['server source file', /\b[a-z_]+\.rb\b/],
   ['memory-link syntax', /\[\[[a-z][a-z-]*\]\]/],
   ['dogfooding narration', /\bdogfood/i],
-  ['infra provider', /\bRailway\b/],
   ['tracker ref in test title', /test\('#\d/],
   ['leading tracker-ref comment', /^\s*\/\/ ?(---+ )?#\d+\b/],
   ['internal batch name', /\blote-\d+ #\d/],
   ['issue/section tracker ref', /#\d+\/[A-Z§]/],
 ];
+
+// Optional local-only patterns for values that can't be named in a public file.
+// Absent on the public CI checkout — the generic guards above still run; the
+// maintainer's working copy carries the file and gets the full sweep.
+try {
+  const raw = fs.readFileSync(path.join(ROOT, 'test', PRIVATE_PATTERNS), 'utf8');
+  for (const { label, source, flags } of JSON.parse(raw)) {
+    FORBIDDEN.push([label, new RegExp(source, flags || '')]);
+  }
+} catch { /* no private patterns on this checkout — generic guards still apply */ }
 
 test('public files carry no internal references', () => {
   const offenders = [];

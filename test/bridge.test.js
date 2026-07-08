@@ -287,7 +287,7 @@ test('--handler-timeout — a hung handler is SIGTERMed, treated as a FAILED bat
   assert.ok(await waitFor(() => /handler running for/.test(out.stderr)), `no heartbeat; stderr:\n${out.stderr}`);
   assert.ok(await waitFor(() => /exceeded --handler-timeout/.test(out.stderr)), `no timeout kill; stderr:\n${out.stderr}`);
   assert.ok(await waitFor(() => /NOT acked/.test(out.stderr)), `stderr:\n${out.stderr}`);
-  assert.match(out.stderr, /timed out \(--handler-timeout 2s\)/);
+  assert.ok(await waitFor(() => /timed out \(--handler-timeout 2s\)/.test(out.stderr)), `stderr:\n${out.stderr}`);
   await sleep(300);
   assert.equal(mock.state.ackBodies.length, 0, 'a timed-out handler must NEVER ack');
   assert.equal(out.code, null, 'the bridge itself stays alive (the failure is the handler\'s)');

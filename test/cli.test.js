@@ -306,7 +306,7 @@ test('doctor does NOT warn when the home skill CARRIES the marker (that one self
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
   fs.mkdirSync(path.dirname(homeSkill), { recursive: true });
   // A marked (current) home skill — nothing to nag about.
-  fs.writeFileSync(homeSkill, `---\nname: pidge\ndescription: x.\n# pidge-skill rev=12 manifest=16\n---\n\n# Pidge\n\nok\n\n<!-- pidge-skill-end -->\n`);
+  fs.writeFileSync(homeSkill, `---\nname: pidge\ndescription: x.\n# pidge-skill rev=13 manifest=16\n---\n\n# Pidge\n\nok\n\n<!-- pidge-skill-end -->\n`);
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-doctorcwd2-'));
 
   const { result } = runCli(['doctor'], port, { HOME: home }, cwd);
@@ -451,10 +451,10 @@ test('self-heal — a 0.15.2 marker-first install self-heals into the fixed in-f
   // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
   assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
   assert.ok(!/<!-- pidge-skill rev=/.test(healed), 'the old HTML-comment marker is gone (the end trailer is not it)');
-  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=13 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
   assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
   assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 12, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 13, manifest v16\)/, 'one stderr note');
 });
 
 test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
@@ -471,16 +471,16 @@ test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the loc
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
-  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=13 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 12, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 13, manifest v16\)/, 'one stderr note');
 });
 
 test('self-heal — a MANIFEST bump (server version > installed) self-heals the local skill', async () => {
   const mock = createMock();
   const port = await mock.start();
-  // New-format skill, spine current (rev=12) but the baked manifest is stale (15 < the mock's 16).
+  // New-format skill, spine current (rev=13) but the baked manifest is stale (15 < the mock's 16).
   const { dir, file } = seedNewSkill(12, 15, 'STALE BY MANIFEST');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -489,7 +489,7 @@ test('self-heal — a MANIFEST bump (server version > installed) self-heals the 
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=13 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
 });
@@ -499,7 +499,7 @@ test('self-heal — a FRESH skill (new-format marker current) is left byte-for-b
   const port = await mock.start();
   // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
   // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
-  const { dir, file } = seedNewSkill(12, 16, 'SENTINEL FRESH — keep me');
+  const { dir, file } = seedNewSkill(13, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -549,7 +549,7 @@ test('home self-heal — a STALE home skill self-heals even when there is NO pro
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(homeSkill, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'the home skill was regenerated to the current rev');
+  assert.match(healed, /\n# pidge-skill rev=13 manifest=16\n/, 'the home skill was regenerated to the current rev');
   assert.ok(!/STALE HOME DOCTRINE/.test(healed), 'the stale home doctrine was replaced by a real regeneration');
   assert.match(stderr, /refreshed your local Pidge skill/, 'the home heal narrated itself');
 });
@@ -569,8 +569,8 @@ test('home self-heal — BOTH project and home skills stale: both heal in one pa
   await mock.stop();
 
   assert.equal(code, 0, `stderr: ${stderr}`);
-  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=12 manifest=16/, 'home healed');
-  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=12 manifest=16/, 'project healed');
+  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=13 manifest=16/, 'home healed');
+  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=13 manifest=16/, 'project healed');
   assert.match(stderr, /2 locations incl\. ~\/\.claude/, 'the note reports BOTH locations were refreshed');
 });
 
@@ -579,7 +579,7 @@ test('home self-heal — a FRESH home skill is left byte-for-byte (no needless h
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homefresh-'));
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
-  seedSkillAt(homeSkill, 12, 'SENTINEL HOME — keep me'); // current rev
+  seedSkillAt(homeSkill, 13, 'SENTINEL HOME — keep me'); // current rev
   const original = fs.readFileSync(homeSkill, 'utf8');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj2-'));
 
@@ -625,7 +625,7 @@ test('atomic self-heal — a TORN write (marker intact, tail truncated) is detec
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A partial write that died after the frontmatter: rev/manifest read as CURRENT, so
   // without the trailer check this file looked "fresh" forever and never healed.
-  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=12 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
+  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=13 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
   const { code, stderr } = await result;
@@ -654,7 +654,7 @@ test('atomic self-heal — "pidge-skill" in body PROSE is not the marker: a mark
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'a real marker was written by the heal');
+  assert.match(healed, /\n# pidge-skill rev=13 manifest=16\n/, 'a real marker was written by the heal');
   assert.ok(!/rev=99/.test(healed), 'the prose decoy is gone with the regeneration');
 });
 
@@ -672,7 +672,7 @@ test('atomic self-heal — 4 concurrent heals never tear the file (atomic tmp+re
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
   assert.equal((healed.match(/# pidge-skill rev=/g) || []).length, 1, 'exactly ONE marker — no interleaved halves');
-  assert.match(healed, /\n# pidge-skill rev=12 manifest=16\n/, 'a whole, current skill won');
+  assert.match(healed, /\n# pidge-skill rev=13 manifest=16\n/, 'a whole, current skill won');
   assert.match(healed.trimEnd(), /<!-- pidge-skill-end -->$/, 'the trailer closes the file — no torn tail');
   const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
   assert.deepEqual(leftovers, [], 'no tmp litter after concurrent heals');
@@ -2746,7 +2746,7 @@ test('catchup: a processed row narrates "handled by <who>: <what>" on stderr', a
   const port = await mock.start();
   mock.state.messages = [
     { id: 40, channel_id: 1, kind: 'message', body: 'faz o deploy',
-      acked_by_label: 'bridge-24x7', handler_summary: 'shipped PR #382, main deployed' },
+      acked_by_label: 'bridge-24x7', handler_summary: 'shipped the weekly report, main deployed' },
     { id: 41, channel_id: 1, kind: 'message', body: 'ainda não tratada' }, // no attribution → no line
   ];
   const { result } = runCli(['catchup'], port);
@@ -2757,7 +2757,7 @@ test('catchup: a processed row narrates "handled by <who>: <what>" on stderr', a
   // the attribution rides in the printed JSON (present-only passthrough)...
   assert.equal(JSON.parse(stdout).messages.find((m) => m.id === 40).acked_by_label, 'bridge-24x7');
   // ...and is narrated so the reader sees the other consumer's work, not just the message.
-  assert.match(stderr, /message 40 handled by bridge-24x7: shipped PR #382, main deployed/);
+  assert.match(stderr, /message 40 handled by bridge-24x7: shipped the weekly report, main deployed/);
   // the un-acked row produces NO handled-by line.
   assert.ok(!/message 41 handled by/.test(stderr), 'a row without attribution stays silent');
 });
@@ -2812,7 +2812,7 @@ test('catchup --digest prints ONE line per message — id · kind · body · han
   const port = await mock.start();
   mock.state.messages = [
     { id: 40, channel_id: 1, kind: 'message', body: 'faz o deploy',
-      acked_by_label: 'bridge-24x7', handler_summary: 'shipped PR #382' },
+      acked_by_label: 'bridge-24x7', handler_summary: 'shipped the weekly report' },
     { id: 41, channel_id: 1, kind: 'message', body: 'ainda não tratada' },
   ];
   const { result } = runCli(['catchup', '--digest'], port);
@@ -2826,7 +2826,7 @@ test('catchup --digest prints ONE line per message — id · kind · body · han
   assert.equal(lines.length, 2, 'exactly one line per message');
   // newest first (id desc): 41 (PENDING) then 40 (attributed).
   assert.match(lines[0], /^41 · message · ainda não tratada · PENDING$/);
-  assert.match(lines[1], /^40 · message · faz o deploy · handled by bridge-24x7: shipped PR #382$/);
+  assert.match(lines[1], /^40 · message · faz o deploy · handled by bridge-24x7: shipped the weekly report$/);
   // the per-row "handled by" stderr narration is inline in the digest, not doubled on stderr.
   assert.ok(!/pidge: message 40 handled by/.test(stderr), 'digest carries attribution inline, not on stderr');
 });
@@ -2840,7 +2840,7 @@ test('catchup --digest — THREE states: handled-with-note / ✓ acked (no note)
   mock.state.messages = [
     // (a) processed WITH a note → handled by X: <note>
     { id: 10, channel_id: 1, kind: 'message', body: 'com nota', processed_at: '2026-07-06T23:00:00Z',
-      acked_by_label: 'bridge-24x7', handler_summary: 'shipped PR #382' },
+      acked_by_label: 'bridge-24x7', handler_summary: 'shipped the weekly report' },
     // (b) THE BUG: processed (processed_at) but NO note/label → ✓ acked (no note), NOT PENDING
     { id: 417, channel_id: 1, kind: 'notification_reply', body: 'Sim', processed_at: '2026-07-06T23:26:33Z' },
     // (c) genuinely un-processed → PENDING
@@ -2852,7 +2852,7 @@ test('catchup --digest — THREE states: handled-with-note / ✓ acked (no note)
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const byId = Object.fromEntries(stdout.trim().split('\n').map((l) => [l.split(' · ')[0], l]));
-  assert.match(byId['10'], /· handled by bridge-24x7: shipped PR #382$/, '(a) note present ⇒ handled by X');
+  assert.match(byId['10'], /· handled by bridge-24x7: shipped the weekly report$/, '(a) note present ⇒ handled by X');
   assert.match(byId['417'], /· ✓ acked \(no note\)$/, '(b) processed_at + no note ⇒ ✓ acked, NEVER PENDING');
   assert.ok(!/PENDING/.test(byId['417']), 'the anti-redo lie is dead: a processed row is not PENDING');
   assert.match(byId['500'], /· PENDING$/, '(c) truly un-processed ⇒ PENDING');
@@ -3127,11 +3127,12 @@ test('multi-runtime — every HTTP verb carries X-Pidge-Fingerprint + URI-encode
   }
 });
 
-test('multi-runtime — the WS subscribe carries fingerprint/label params (Conversation + Inbox), un-encoded', async () => {
+test('multi-runtime — the WS subscribe carries fingerprint/label params (Conversation + Inbox), un-encoded', async (t) => {
+  if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [];
-  const label = 'invest-bridge';
+  const label = 'team-bridge';
   // No message queued + a short timeout: the socket subscribes, waits, times out
   // (exit 3) — both channels are subscribed before the deadline.
   const { result } = runCli(['listen', '--all', '--realtime', '--timeout', '3'], port, { PIDGE_LABEL: label });
@@ -3146,7 +3147,8 @@ test('multi-runtime — the WS subscribe carries fingerprint/label params (Conve
   assert.ok(inbox && /^fp_/.test(inbox.fingerprint || '') && inbox.label === label, 'InboxChannel identifies too');
 });
 
-test('multi-runtime — the doctor realtime probe subscribes ANONYMOUSLY (no phantom consumer)', async () => {
+test('multi-runtime — the doctor realtime probe subscribes ANONYMOUSLY (no phantom consumer)', async (t) => {
+  if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
   const mock = createMock();
   const port = await mock.start();
   const { result } = runCli(['doctor'], port, { PIDGE_LABEL: 'diag' });
@@ -3221,7 +3223,7 @@ test('multi-runtime — catchup --digest renders being_handled_by for a SIBLING,
     { id: 10, kind: 'message', body: 'held by ME', channel_id: 1, created_at: 'x',
       being_handled_by: { fingerprint: ourFp, label: 'me', since: '2026-07-07T12:00:00Z' } },
     { id: 11, kind: 'message', body: 'held by a sibling', channel_id: 1, created_at: 'x',
-      being_handled_by: { fingerprint: 'fp_bridge', label: 'invest-bridge', since: '2026-07-07T12:22:04Z' } },
+      being_handled_by: { fingerprint: 'fp_bridge', label: 'team-bridge', since: '2026-07-07T12:22:04Z' } },
   ];
   const { result } = runCli(['catchup', '--digest'], port, env);
   const { code, stdout } = await result;
@@ -3230,7 +3232,7 @@ test('multi-runtime — catchup --digest renders being_handled_by for a SIBLING,
   const lines = stdout.trim().split('\n');
   const l11 = lines.find((l) => l.startsWith('11 '));
   const l10 = lines.find((l) => l.startsWith('10 '));
-  assert.match(l11, /being handled by invest-bridge since 2026-07-07T12:22:04Z/, 'a sibling in-flight shows');
+  assert.match(l11, /being handled by team-bridge since 2026-07-07T12:22:04Z/, 'a sibling in-flight shows');
   assert.ok(!/being handled by/.test(l10), 'OUR OWN in-flight lease is self-filtered (no self-noise)');
 });
 
@@ -3283,7 +3285,7 @@ test('multi-runtime — whoami nudges on unattributed_listening (an old-CLI list
   const mock = createMock();
   const port = await mock.start();
   mock.state.consumers = [
-    { fingerprint: 'fp_bridge', label: 'invest-bridge', listening: false, live: true },
+    { fingerprint: 'fp_bridge', label: 'team-bridge', listening: false, live: true },
   ];
   mock.state.unattributedListening = true; // channels.listening_until live, no attributed row covers it
   const { result } = runCli(['whoami'], port);

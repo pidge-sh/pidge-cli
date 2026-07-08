@@ -4,3 +4,4 @@ node_modules/
 .claude/skills/pidge/SKILL.md
 .claude/skills/pidge/SKILL.md.bak*
 scratchpad/
+test/.hygiene-private-patterns.json

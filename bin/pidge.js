@@ -582,7 +582,7 @@ const OPTION_DOCS = {
   download: '--download               also save CLEAR inbound attachments to disk (sealed ones always save)',
   'no-download': '--no-download            catchup: skip fetching/unsealing attachments (--digest implies it)',
   'download-dir': '--download-dir DIR       where inbound attachments land (default ~/.config/pidge/downloads)',
-  note: '--note TEXT              send: WHY this runtime sent it (sent_note — clear metadata, no secrets, #385)',
+  note: '--note TEXT              send: WHY this runtime sent it (sent_note — clear metadata, no secrets)',
   limit: '--limit N                cap the number of rows',
   before: '--before ID              catchup: page the thread OLDER than this message id (walk back through history)',
   since: '--since ID               catchup: incremental cursor — only messages NEWER than this id (O(new), not O(thread))',
@@ -899,7 +899,7 @@ const KNOWN_MANIFEST_VERSION = 67;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 12;
+const SKILL_REVISION = 13;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -1786,13 +1786,13 @@ async function e2eProcessAttachment(m, out, fail, dl = {}) {
     const dest = destFor(name);
     if (noDownload) {
       out.attachment.sealed = true; // present-only marker — bytes NOT fetched
-      e2eNote(`attachment ${name || '(sealed)'} not downloaded (--no-download / --digest, #74)`);
+      e2eNote(`attachment ${name || '(sealed)'} not downloaded (--no-download / --digest)`);
       return;
     }
     if (skipIfExists && cached(dest)) {
       out.attachment.path = dest;
       delete out.attachment.enc;
-      e2eNote(`attachment already on disk → ${dest} (skipped re-download, #74)`);
+      e2eNote(`attachment already on disk → ${dest} (skipped re-download)`);
       return;
     }
     try {
@@ -1807,7 +1807,7 @@ async function e2eProcessAttachment(m, out, fail, dl = {}) {
   } else if (!noDownload && (v.download || v['download-dir'])) {
     const dest = destFor(att.filename);
     if (skipIfExists && cached(dest)) {
-      out.attachment.path = dest; // #74: reuse the copy already saved
+      out.attachment.path = dest; // reuse the copy already saved
       return;
     }
     try {
@@ -3423,7 +3423,7 @@ WantedBy=default.target
   console.error(`pidge: enable it with:  ${enable}`);
 
   // Declare listen_mode=external_daemon (ADVISORY, honest — the "same instance
-  // forever" gotcha the human should see). Best-effort like setup's declaration.
+  // forever" sharp edge the human should see). Best-effort like setup's declaration.
   let declared = null;
   try {
     const who = await fetchWhoami();
@@ -4002,7 +4002,7 @@ generate_report | pidge important --title "Report ready" \\
   --body "Q2 report ready — revenue, churn, and 3 risks inside" --body-markdown-file - --actions reply
 \`\`\`
 
-## Gotchas we already paid for
+## Sharp edges (paid for in production)
 
 - **There is no \`pidge reply\`.** \`reply\` is a built-in action id, not a command. To answer the human's composer message, send a normal \`pidge message --thread <id>\` reusing the message's \`thread_id\`.
 - **\`urgent\` is a trust contract, not a button.** It arms an AlarmKit alarm; once delivered you **cannot abort it** (\`pidge cancel\` → 409). Real + unpostponable only, <1/day. Never test it without warning the human.
@@ -4039,7 +4039,7 @@ Your channel may already have a LIVE consumer — an always-on bridge or daemon 
 
 **The rule: one channel = one consumer. Reads are free (\`catchup\`, \`pidge wait <cid>\`); the consume loop (\`listen\`/\`ack\`) belongs to exactly one process.**
 
-**New signals when you DO share a channel (server v66+):** the CLI now identifies itself on every call, so \`pidge doctor\`/\`whoami\` LIST the live consumers on your channel — you'll see "\`invest-bridge (you)\` · \`claude-interactive\`" and a ⚠️ \`consumer_conflict\` when 2+ are live (\`listen\` warns the same, once per run). In \`--digest\`, a message another runtime is actively working shows "\`· being handled by <who> since <T>\`" (self-filtered — never your own) so you don't redo it. And when you fire-and-forget a scheduled send, add \`--note "<why>"\` (\`sent_note\`, clear metadata — no secrets) so a successor reads WHY it's armed. Set \`PIDGE_AGENT=<id>\` (or \`PIDGE_LABEL\`) per runtime so those consumer names are meaningful.
+**New signals when you DO share a channel (server v66+):** the CLI now identifies itself on every call, so \`pidge doctor\`/\`whoami\` LIST the live consumers on your channel — you'll see "\`team-bridge (you)\` · \`claude-interactive\`" and a ⚠️ \`consumer_conflict\` when 2+ are live (\`listen\` warns the same, once per run). In \`--digest\`, a message another runtime is actively working shows "\`· being handled by <who> since <T>\`" (self-filtered — never your own) so you don't redo it. And when you fire-and-forget a scheduled send, add \`--note "<why>"\` (\`sent_note\`, clear metadata — no secrets) so a successor reads WHY it's armed. Set \`PIDGE_AGENT=<id>\` (or \`PIDGE_LABEL\`) per runtime so those consumer names are meaningful.
 
 \`\`\`bash
 pidge catchup --digest                  # the whole thread, one line per message (the session-start read)

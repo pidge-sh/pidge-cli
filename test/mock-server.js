@@ -95,7 +95,7 @@ function createMock() {
           state.claimCode = null; // single-use
           return json(res, 200, {
             key: 'hld_minted_by_claim', channel: { id: 1, name: 'mock' },
-            user: 'Thiago', base_url: `http://127.0.0.1:${port}`,
+            user: 'Ana', base_url: `http://127.0.0.1:${port}`,
           });
         }
         json(res, 404, { error: 'not_found' });
@@ -108,7 +108,7 @@ function createMock() {
       // (no channel block). Mirrored here so doctor's branch is testable.
       if (/^Bearer ses_/.test(auth)) {
         return json(res, 200, {
-          user: { name: 'Thiago', timezone: 'America/Sao_Paulo' },
+          user: { name: 'Ana', timezone: 'America/Sao_Paulo' },
           devices: state.devices ?? 1,
           device_reach: state.deviceReach,
           transport_budgets: { scope: 'process', ws_sockets: { held: 0, cap: 32 }, longpoll: { held: 0, capacity: 6 } },
@@ -125,7 +125,7 @@ function createMock() {
                    // media gate: a test flips state.e2eMediaReady.
                    e2e_media_ready: !!state.e2eMediaReady },
         operating_contract: state.operatingContract,
-        user: { name: 'Thiago', timezone: 'America/Sao_Paulo' },
+        user: { name: 'Ana', timezone: 'America/Sao_Paulo' },
         claim: state.claim,
         devices: state.devices ?? 1,
         device_reach: state.deviceReach,                     // null unless a test sets it
