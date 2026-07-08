@@ -23,9 +23,22 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
-      # timeout: a hung suite must fail in minutes with a process dump below,
-      # never sit until the runner's 6-hour kill.
-      - run: timeout -k 30 720 npm test
+      # One file at a time, each under its own timeout: the TAP stream buffers a
+      # whole file's output, so a single hung test reads as global silence — this
+      # names the file (and its last lines) instead.
+      - run: |
+          status=0
+          for f in test/*.test.js; do
+            echo "== $f"
+            if timeout -k 10 240 node --test "$f" > /tmp/out.log 2>&1; then
+              tail -3 /tmp/out.log
+            else
+              echo "FAILED OR HUNG: $f — last 60 lines:"
+              tail -60 /tmp/out.log
+              status=1
+            fi
+          done
+          exit $status
       - name: dump surviving processes on failure
         if: failure()
         run: ps -ef
