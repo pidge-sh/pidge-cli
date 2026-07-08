@@ -492,3 +492,25 @@ test('#61: no warning when the flag is absent/false (the default)', async () => 
   await mock.stop();
   assert.ok(!/PRIOR claim/.test(r.stderr), `unexpected warning:\n${r.stderr}`);
 });
+
+test('#385/C1 (m2a) — bridge warns on consumer_conflict at BOOT (whoami), once', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // v66 whoami: a live sibling consumer alongside whoever boots this bridge.
+  mock.state.consumers = [
+    { fingerprint: 'fp_sibling', label: 'claude-interactive', listening: true, live: true },
+    { fingerprint: 'fp_other', label: 'another', listening: false, live: true },
+  ];
+  mock.state.consumerConflict = true;
+
+  const b = runCli(['bridge', '--exec', 'true', '--no-realtime', '--interval', '1'], port);
+  assert.ok(await waitFor(() => /consumer_conflict/.test(b.out.stderr)),
+    `bridge boot must warn on consumer_conflict; stderr:\n${b.out.stderr}`);
+  // let a couple of poll ticks pass — the warning must NOT repeat per tick
+  await sleep(1500);
+  const hits = b.out.stderr.split('\n').filter((l) => /another consumer is live on this channel/.test(l)).length;
+  assert.equal(hits, 1, `once per process, not once per tick; stderr:\n${b.out.stderr}`);
+  b.child.kill('SIGTERM');
+  await b.result;
+  await mock.stop();
+});
