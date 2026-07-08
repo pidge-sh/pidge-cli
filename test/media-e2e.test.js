@@ -402,3 +402,77 @@ test('media pin: a re-key (new kf, same token) PRESERVES the media latch — a t
   assert.match(r.stderr, /REFUSING to send CLEAR MEDIA/);
   assert.equal(mock.state.uploads.length, uploadsBefore, 'refused before upload');
 });
+
+// --- #74: catchup must not re-download/unseal attachments every session -------
+
+test('catchup --digest does NOT fetch or unseal a sealed attachment (#74)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-c74d-'));
+  mock.state.messages = [sealedAttachmentRow(mock, { id: 40, cid: 'cid-att-1', name: 'report.pdf' })];
+
+  const { code, stdout, stderr } = await runCli(['catchup', '--digest'], port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const blobHits = mock.state.reqLog.filter((r) => r.pathname === '/blobs/a1');
+  assert.equal(blobHits.length, 0, '--digest implies --no-download: the blob is never fetched');
+  const downloads = path.join(xdg, 'pidge', 'downloads');
+  assert.ok(!fs.existsSync(downloads) || fs.readdirSync(downloads).length === 0, 'nothing written to disk');
+  assert.match(stdout, /^40 · /m, 'the message still appears in the digest');
+});
+
+test('catchup --no-download skips attachment bytes even without --digest (#74)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-c74n-'));
+  mock.state.messages = [sealedAttachmentRow(mock, { id: 42, cid: 'cid-att-1', name: 'r.pdf' })];
+
+  const { code, stdout, stderr } = await runCli(['catchup', '--no-download'], port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.equal(mock.state.reqLog.filter((r) => r.pathname === '/blobs/a1').length, 0, 'no blob fetch under --no-download');
+  const row = JSON.parse(stdout).messages.find((m) => m.id === 42);
+  assert.equal(row.attachment.sealed, true, 'the attachment is marked sealed (not-downloaded)');
+  assert.equal(row.attachment.path, undefined, 'no local path — the bytes were not fetched');
+  assert.equal(row.attachment.filename, 'r.pdf', 'the filename still opens (it rides the row, no network)');
+});
+
+test('catchup (full) reuses an attachment already on disk instead of re-downloading (#74 skip-if-exists)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-c74s-'));
+  const plain = Buffer.from('the-real-pdf-bytes');
+  mock.state.messages = [sealedAttachmentRow(mock, { id: 41, cid: 'cid-att-1', name: 'r.pdf', bytes: plain })];
+  // Pre-place the decrypted copy where the CLI would have written it.
+  const dest = path.join(xdg, 'pidge', 'downloads', '41', 'r.pdf');
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.writeFileSync(dest, plain);
+
+  const { code, stdout, stderr } = await runCli(['catchup'], port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.equal(mock.state.reqLog.filter((r) => r.pathname === '/blobs/a1').length, 0, 'the cached copy is reused; no re-download');
+  const row = JSON.parse(stdout).messages.find((m) => m.id === 41);
+  assert.equal(row.attachment.path, dest, 'the JSON points at the cached file');
+  assert.equal(row.attachment.enc, undefined, 'the row reads as opened');
+});
+
+// --- #385/C1 D6: sent_note is CLEAR metadata even on an E2E channel -----------
+
+test('sent_note rides CLEAR on an E2E channel (D6 honesty — content sealed, note is not)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const { code, stderr } = await runCli(
+    ['important', '--title', 'secret thing', '--note', 'armed by nightly'],
+    port, { PIDGE_SECRET: SECRET });
+  await mock.stop();
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const sent = mock.state.notifies[0];
+  assert.equal(sent.enc, 'v1', 'the content IS sealed on this E2E channel');
+  assert.match(String(sent.title), /^v\d+:/, 'the title rode as ciphertext');
+  assert.equal(sent.sent_note, 'armed by nightly', 'sent_note stays CLEAR (never sealed) — it is server-read attribution');
+});
