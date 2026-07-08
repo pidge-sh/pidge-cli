@@ -22,6 +22,15 @@ after(() => {
     try { c.kill('SIGKILL'); } catch { /* already gone */ }
     for (const s of [c.stdin, c.stdout, c.stderr]) { if (s) s.destroy(); }
   }
+  // Escape hatch: if a leaked handle still holds the event loop open 5s after
+  // the last test (seen on Linux CI), exit with the code the runner already
+  // decided instead of hanging forever. unref'd — it never fires on a clean run.
+  const t = setTimeout(() => {
+    console.error('spawn-tracker: event loop still alive 5s after the tests — leaked handles:',
+      JSON.stringify(process.getActiveResourcesInfo ? process.getActiveResourcesInfo() : ['n/a']));
+    process.exit(process.exitCode ?? 0);
+  }, 5000);
+  if (t.unref) t.unref();
 });
 
 module.exports = { track };

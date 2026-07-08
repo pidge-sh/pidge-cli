@@ -99,7 +99,7 @@ const FILE_ENV = configEnv();
 const BASE = process.env.PIDGE_URL || process.env.HERALD_URL || FILE_ENV.PIDGE_URL || 'http://localhost:3000';
 const TOKEN = process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN || FILE_ENV.PIDGE_TOKEN;
 
-// Config paths are computed EARLY (multi-runtime v2, #385/C1): the per-request
+// Config paths are computed EARLY (multi-runtime v2): the per-request
 // agent fingerprint hashes CONFIG_FILE, and the shared `headers` const stamps
 // that fingerprint on every call — so both must exist before line-863's headers.
 const CONFIG_DIR = pidgeConfigDir();
@@ -2479,7 +2479,7 @@ const idStrict = (val, flag) => {
 // ---------------------------------------------------------------------------
 
 // (CONFIG_DIR/CONFIG_FILE are defined early — right after TOKEN — so the identity
-// headers can hash CONFIG_FILE at the module-level `headers` const, #385/C1.)
+// headers can hash CONFIG_FILE at the module-level `headers` const.)
 // True when we're reading the LEGACY shared file (no PIDGE_AGENT, no env var) —
 // the multi-agent footgun. doctor warns on it.
 const ON_SHARED_FILE = !AGENT_ID && !process.env.PIDGE_TOKEN && !process.env.HERALD_TOKEN && !!FILE_ENV.PIDGE_TOKEN;

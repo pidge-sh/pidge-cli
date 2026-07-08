@@ -46,6 +46,7 @@ const FORBIDDEN = [
   ['tracker ref in test title', /test\('#\d/],
   ['leading tracker-ref comment', /^\s*\/\/ ?(---+ )?#\d+\b/],
   ['internal batch name', /\blote-\d+ #\d/],
+  ['issue/section tracker ref', /#\d+\/[A-Z§]/],
 ];
 
 test('public files carry no internal references', () => {

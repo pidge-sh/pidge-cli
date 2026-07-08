@@ -13,8 +13,8 @@ function createMock() {
   const state = {
     sockets: new Set(),
     subscriptions: [],     // channel names confirmed, in order
-    subscribeIdentifiers: [], // #385/C1: the FULL parsed subscribe identifier (channel + fingerprint/label params)
-    reqLog: [],            // #385/C1: {method, pathname, fingerprint, label} per HTTP request — assert header emission
+    subscribeIdentifiers: [], // the FULL parsed subscribe identifier (channel + fingerprint/label params)
+    reqLog: [],            // {method, pathname, fingerprint, label} per HTTP request — assert header emission
     onSubscribe: null,     // (channel, sock) => {} test hook
     waitMode: 'ok',
     wsMode: 'ok',          // '1006' = drop every WS abruptly (a proxy/edge refusing the upgrade)
@@ -459,7 +459,7 @@ function createMock() {
           const ident = JSON.parse(f.identifier);
           const channel = ident.channel;
           state.subscriptions.push(channel);
-          state.subscribeIdentifiers.push(ident); // #385/C1: capture fingerprint/label params
+          state.subscribeIdentifiers.push(ident); // capture fingerprint/label params
           // Real ActionCable tags every broadcast frame with the EXACT identifier
           // string the client sent (params included) — the client matches on it.
           // Track it per-socket so broadcast() echoes it faithfully (the
