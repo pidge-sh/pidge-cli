@@ -3080,3 +3080,237 @@ test('skill install: a re-install NEVER clobbers an existing .bak — the user o
   assert.equal(fs.readFileSync(path.join(dir, tsBaks[0]), 'utf8'), 'A LATER EDIT that differs from the generated skill\n');
   assert.match(second.stderr, /saved to .*AGENTS\.md\.bak\.\d+/);
 });
+
+// ===========================================================================
+// Multi-runtime v2 — identity headers, consumers/provenance
+// surfacing, being_handled_by self-filter, conflict warning, --note.
+// Every new surface is PRESENT-ONLY: a mock WITHOUT the fields (an old server)
+// must degrade cleanly. A stable config dir (fixed XDG_CONFIG_HOME + HOME)
+// gives a STABLE fingerprint across two runCli calls — needed to assert "(you)".
+// ===========================================================================
+
+function stableIdentityEnv() {
+  return {
+    XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-c1-xdg-')),
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-c1-home-')),
+  };
+}
+
+test('multi-runtime — every HTTP verb carries X-Pidge-Fingerprint + URI-encoded label', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [];
+  const label = 'inÿest bridge'; // non-ASCII + space ⇒ MUST be URI-encoded in the header
+  const env = { PIDGE_LABEL: label };
+  await runCli(['whoami'], port, env).result;
+  await runCli(['important', '--title', 'hi'], port, env).result;
+  await runCli(['ack', '--up-to', '1'], port, env).result;
+  await runCli(['inbox'], port, env).result;
+  await runCli(['catchup'], port, env).result;
+  await mock.stop();
+
+  const enc = encodeURIComponent(label);
+  const verbs = [
+    ['GET', '/api/v1/whoami'],
+    ['POST', '/api/v1/notify'],
+    ['POST', '/api/v1/messages/ack'],
+    ['GET', '/api/v1/notifications'], // inbox list
+    ['GET', '/api/v1/messages'],      // catchup history read
+  ];
+  for (const [method, pathname] of verbs) {
+    const reqs = mock.state.reqLog.filter((r) => r.pathname === pathname && r.method === method);
+    assert.ok(reqs.length, `no ${method} ${pathname} recorded`);
+    for (const r of reqs) {
+      assert.match(r.fingerprint || '', /^fp_[0-9a-f]+$/, `fingerprint header on ${pathname}`);
+      assert.equal(r.label, enc, `URI-encoded label header on ${pathname}`);
+    }
+  }
+});
+
+test('multi-runtime — the WS subscribe carries fingerprint/label params (Conversation + Inbox), un-encoded', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [];
+  const label = 'invest-bridge';
+  // No message queued + a short timeout: the socket subscribes, waits, times out
+  // (exit 3) — both channels are subscribed before the deadline.
+  const { result } = runCli(['listen', '--all', '--realtime', '--timeout', '3'], port, { PIDGE_LABEL: label });
+  await result;
+  await mock.stop();
+
+  const convo = mock.state.subscribeIdentifiers.find((i) => i.channel === 'ConversationChannel');
+  assert.ok(convo, 'ConversationChannel subscribed');
+  assert.match(convo.fingerprint || '', /^fp_[0-9a-f]+$/, 'fingerprint on the WS params');
+  assert.equal(convo.label, label, 'RAW (un-encoded) label on the WS params — it is a JSON string, not a header');
+  const inbox = mock.state.subscribeIdentifiers.find((i) => i.channel === 'InboxChannel');
+  assert.ok(inbox && /^fp_/.test(inbox.fingerprint || '') && inbox.label === label, 'InboxChannel identifies too');
+});
+
+test('multi-runtime — the doctor realtime probe subscribes ANONYMOUSLY (no phantom consumer)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { result } = runCli(['doctor'], port, { PIDGE_LABEL: 'diag' });
+  await result;
+  await mock.stop();
+  const probe = mock.state.subscribeIdentifiers.find((i) => i.channel === 'ConversationChannel');
+  assert.ok(probe, 'the probe subscribed to ConversationChannel');
+  assert.equal(probe.fingerprint, undefined, 'the probe carries NO fingerprint — a diagnosis must not mint a consumer');
+  assert.equal(probe.label, undefined, 'the probe carries NO label');
+});
+
+test('multi-runtime — whoami lists live consumers with "(you)" + a consumer_conflict warning', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const env = stableIdentityEnv();
+  // Step 1: learn OUR fingerprint (stable because the config dir is fixed).
+  await runCli(['whoami'], port, env).result;
+  const ourFp = mock.state.reqLog.find((r) => r.pathname === '/api/v1/whoami').fingerprint;
+  assert.match(ourFp || '', /^fp_/);
+  // Step 2: the server now reports two live consumers incl. us.
+  mock.state.consumers = [
+    { fingerprint: ourFp, label: 'me-here', listening: true, live: true },
+    { fingerprint: 'fp_sibling', label: 'other-runtime', listening: false, live: true },
+  ];
+  mock.state.consumerConflict = true;
+  const { result } = runCli(['whoami'], port, env);
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, stderr);
+  assert.match(stderr, /consumers — 2 live/);
+  assert.match(stderr, /me-here \(you\)/, 'our own row is marked (you) by fingerprint compare');
+  assert.match(stderr, /other-runtime/);
+  assert.match(stderr, /consumer_conflict/, 'the conflict is flagged');
+});
+
+test('multi-runtime — whoami provenance block nudges on blind acks (v67)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.provenance = {
+    since: '2026-07-01T00:00:00Z', processed: 41,
+    processed_without_summary: 7, processed_unattributed: 2,
+  };
+  const { result } = runCli(['whoami'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, stderr);
+  assert.match(stderr, /provenance/);
+  assert.match(stderr, /41 processed/);
+  assert.match(stderr, /7 acked WITHOUT a note/);
+});
+
+test('multi-runtime — a pre-v66/v67 server (no consumers/provenance) degrades silently', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // consumers/provenance stay null (default) ⇒ the whoami omits both blocks.
+  const { result } = runCli(['whoami'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, stderr);
+  assert.ok(!/consumers —/.test(stderr), 'no consumers line against an old server');
+  assert.ok(!/provenance/.test(stderr), 'no provenance line against an old server');
+  assert.ok(!/consumer_conflict/.test(stderr), 'no conflict line against an old server');
+});
+
+test('multi-runtime — catchup --digest renders being_handled_by for a SIBLING, self-filtered', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const env = stableIdentityEnv();
+  await runCli(['whoami'], port, env).result; // learn our fp
+  const ourFp = mock.state.reqLog.find((r) => r.pathname === '/api/v1/whoami').fingerprint;
+  mock.state.messages = [
+    { id: 10, kind: 'message', body: 'held by ME', channel_id: 1, created_at: 'x',
+      being_handled_by: { fingerprint: ourFp, label: 'me', since: '2026-07-07T12:00:00Z' } },
+    { id: 11, kind: 'message', body: 'held by a sibling', channel_id: 1, created_at: 'x',
+      being_handled_by: { fingerprint: 'fp_bridge', label: 'invest-bridge', since: '2026-07-07T12:22:04Z' } },
+  ];
+  const { result } = runCli(['catchup', '--digest'], port, env);
+  const { code, stdout } = await result;
+  await mock.stop();
+  assert.equal(code, 0);
+  const lines = stdout.trim().split('\n');
+  const l11 = lines.find((l) => l.startsWith('11 '));
+  const l10 = lines.find((l) => l.startsWith('10 '));
+  assert.match(l11, /being handled by invest-bridge since 2026-07-07T12:22:04Z/, 'a sibling in-flight shows');
+  assert.ok(!/being handled by/.test(l10), 'OUR OWN in-flight lease is self-filtered (no self-noise)');
+});
+
+test('multi-runtime — listen warns ONCE on consumer_conflict from the consume GET (v66)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.consumeConflict = true;
+  mock.state.messages = [{ id: 5, channel_id: 1, body: 'hi', created_at: 'x', consumed_at: null }];
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '20', '--interval', '1'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, stderr);
+  const hits = (stderr.match(/another consumer is live on this channel \(consumer_conflict\)/g) || []).length;
+  assert.equal(hits, 1, 'the conflict warning fires exactly once per run');
+});
+
+test('multi-runtime — notify --note rides as sent_note', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const { result } = runCli(['important', '--title', 'x', '--note', 'armed by the nightly job'], port);
+  const { code } = await result;
+  await mock.stop();
+  assert.equal(code, 0);
+  assert.equal(mock.state.notifies[0].sent_note, 'armed by the nightly job');
+});
+
+test('multi-runtime — ack narrates "annotated N" when the server backfilled a prior consumer (v67)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.ackAnnotated = 3;
+  const { result } = runCli(['ack', '--up-to', '9'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, stderr);
+  assert.match(stderr, /annotated 3 previously-acked message\(s\)/);
+});
+
+test('multi-runtime — ack against a pre-v67 server (annotated 0) says nothing extra', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.ackAnnotated = 0; // the default — models an old server / nothing to annotate
+  const { result } = runCli(['ack', '--up-to', '9'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, stderr);
+  assert.ok(!/annotated/.test(stderr), 'no annotation narration when there is nothing to annotate');
+});
+
+test('multi-runtime — whoami nudges on unattributed_listening (an old-CLI listener)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.consumers = [
+    { fingerprint: 'fp_bridge', label: 'invest-bridge', listening: false, live: true },
+  ];
+  mock.state.unattributedListening = true; // channels.listening_until live, no attributed row covers it
+  const { result } = runCli(['whoami'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, stderr);
+  assert.match(stderr, /UNIDENTIFIED consumer is listening/, 'the upgrade nudge fires');
+  assert.match(stderr, /pre-0\.25/, 'names the cause (an old CLI)');
+});
+
+test('multi-runtime — a >80-code-unit label with an astral char at the slice boundary must NOT crash the CLI', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // 79 ASCII + an emoji: .slice(0, 80) cuts the surrogate pair in half — the raw
+  // lone surrogate made encodeURIComponent throw URIError AT MODULE LOAD (the
+  // shared `headers` const), killing EVERY verb before argv parsing.
+  const label = 'a'.repeat(79) + '😀';
+  const { result } = runCli(['whoami'], port, { PIDGE_LABEL: label });
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, `the CLI must boot and run: stderr:\n${stderr}`);
+  const req = mock.state.reqLog.find((r) => r.pathname === '/api/v1/whoami');
+  assert.ok(req.label, 'the label header still rides');
+  // The header must be decodable (well-formed percent-encoding of well-formed
+  // UTF-16) — decodeURIComponent throws on garbage.
+  const decoded = decodeURIComponent(req.label);
+  assert.ok(decoded.startsWith('a'.repeat(79)), 'the intact prefix survives');
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(decoded),
+    'no lone surrogate in the decoded label (well-formed)');
+});

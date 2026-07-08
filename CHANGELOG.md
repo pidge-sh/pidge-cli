@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.25.0 — 2026-07-08
+
+Multi-runtime v2 (épico #385) — the CLI consumption layer (PR C1). Two live agents (a 24/7
+bridge + an interactive session) legitimately share one channel key; this release makes each
+runtime **identify itself on every call** and SURFACES the queue's now-attributed state — who
+else is consuming, whose work is in flight, and who armed each scheduled send. Everything is
+**ADVISORY** (nothing about delivery/serving changes). Skill spine → **rev 12**.
+
+**Release gate:** publish 0.25.0 only AFTER the server PRs **S1 (manifest v66)** and **S2 (v67)**
+are deployed. The identity headers are harmless against an older server (unknown headers are
+ignored) — no lockstep — but the PRINTED features (consumers list, `being_handled_by`,
+provenance, `annotated`) only exist once S1/S2 ship.
+
+- **Per-request identity on EVERY call.** The CLI sends `X-Pidge-Fingerprint` + `X-Pidge-Label`
+  (label URI-encoded) headers on all HTTP calls and `{fingerprint, label}` params on the WS
+  `ConversationChannel`/`InboxChannel` subscribes — the SAME values the #181 claim already
+  computes. The claim becomes the server's FALLBACK. The `doctor` realtime probe stays
+  ANONYMOUS (a diagnosis must not mint a phantom consumer). Advisory, never auth.
+- **`doctor`/`whoami` list live consumers.** "consumers — 2 live: invest-bridge (you) ·
+  claude-interactive" ("(you)" is a client-side fingerprint match) + a ⚠️ on `consumer_conflict`
+  and a nudge on an unidentified (old-CLI) listener. Plus a **provenance** block — your
+  predecessor's blind acks ("7 acked WITHOUT a note") so you know to use `ack --summary`.
+- **`listen`/`bridge` warn once per run on `consumer_conflict`** (the field rides the consume
+  GET / boot whoami — you learn a sibling started consuming without a second call).
+- **`catchup --digest` shows "being handled by X since T"** on a message another runtime is
+  actively working — self-filtered (never your own lease), so you don't redo a sibling's work.
+- **`notify --note "<why>"` → `sent_note`.** The WHY of a fire-and-forget/scheduled send,
+  attributed to this runtime. CLEAR metadata (never sealed on E2E channels) — keep secrets out.
+- **`ack` narrates "annotated N previously-acked message(s)"** when the server (v67) backfilled
+  attribution a prior consumer left blank.
+- **`catchup` stops re-downloading sealed attachments every session.** `--digest` implies
+  `--no-download` (the digest rarely needs the bytes); a full `catchup` reuses a copy already on
+  disk (skip-if-exists — byte_size match for clear rows, existence for sealed); explicit
+  `--no-download` too. The session-start `catchup --digest --since <last>` ritual no longer
+  re-fetches + re-unseals N attachments on every run.
+- **Robustness fixes.** a `PIDGE_LABEL` >80 code units with an astral char
+  (emoji) at the slice boundary left a lone surrogate → `encodeURIComponent` threw `URIError`
+  at MODULE LOAD (the shared `headers` const) and EVERY verb died — `agentLabel()` now
+  sanitizes to well-formed UTF-16 (`toWellFormed()`, regex fallback for Node 18). m3: attachment
+  saves are now atomic (tmp+rename) and a 0-byte file at the cache path is never trusted as
+  cache. m6: `catchup --help` lists `--download` too. Plus tests for the bridge-boot
+  `consumer_conflict` warning and the `unattributed_listening` nudge (m2), and README coverage
+  of the 0.25.0 surface (m1).
+
 ## 0.24.1 — 2026-07-07
 
 Three fixes based on early feedback on 0.24.0.

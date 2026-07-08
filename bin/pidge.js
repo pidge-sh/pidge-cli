@@ -99,6 +99,12 @@ const FILE_ENV = configEnv();
 const BASE = process.env.PIDGE_URL || process.env.HERALD_URL || FILE_ENV.PIDGE_URL || 'http://localhost:3000';
 const TOKEN = process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN || FILE_ENV.PIDGE_TOKEN;
 
+// Config paths are computed EARLY (multi-runtime v2, #385/C1): the per-request
+// agent fingerprint hashes CONFIG_FILE, and the shared `headers` const stamps
+// that fingerprint on every call — so both must exist before line-863's headers.
+const CONFIG_DIR = pidgeConfigDir();
+const CONFIG_FILE = path.join(CONFIG_DIR, 'env');
+
 function die(msg, code = 1) { console.error(msg); process.exit(code); }
 // NB: the TOKEN requirement is enforced AFTER help/usage handling (below) — a
 // first-time `npx pidge-cli --help` must work without any setup.
@@ -288,7 +294,9 @@ const OPTIONS = {
   'collapse-key': { type: 'string' },
   param: { type: 'string', multiple: true },   // key=value escape hatch → raw /notify field
   download: { type: 'boolean' },               // save CLEAR inbound attachments too (sealed ones always save)
+  'no-download': { type: 'boolean' },          // catchup: don't fetch/unseal attachments (digest implies it)
   'download-dir': { type: 'string' },          // where attachments land (default <config dir>/downloads)
+  note: { type: 'string' },                    // /notify sent_note — WHY this runtime sent it (clear metadata, no secrets)
   timeout: { type: 'string' },
   interval: { type: 'string' },
   // The response axis: --wait blocks until the human answers (composes on
@@ -572,7 +580,9 @@ const OPTION_DOCS = {
   'all-inbox': '--all                    whole-account scope (not just this channel)',
   'all-listen': '--all                    single ear: also hear notification ANSWERS, not just messages',
   download: '--download               also save CLEAR inbound attachments to disk (sealed ones always save)',
+  'no-download': '--no-download            catchup: skip fetching/unsealing attachments (--digest implies it)',
   'download-dir': '--download-dir DIR       where inbound attachments land (default ~/.config/pidge/downloads)',
+  note: '--note TEXT              send: WHY this runtime sent it (sent_note — clear metadata, no secrets, #385)',
   limit: '--limit N                cap the number of rows',
   before: '--before ID              catchup: page the thread OLDER than this message id (walk back through history)',
   since: '--since ID               catchup: incremental cursor — only messages NEWER than this id (O(new), not O(thread))',
@@ -617,7 +627,7 @@ const OPTION_DOCS = {
 const CONTENT_OPTS = ['title', 'body', 'body-markdown', 'body-markdown-file', 'subtitle', 'profile',
   'event-at', 'lead-minutes', 'urgency', 'image', 'file', 'url', 'copy', 'actions',
   'custom-action', 'deliver-at', 'reply-to', 'correlation-id', 'thread', 'after',
-  'collapse-key', 'param'];
+  'collapse-key', 'note', 'param'];
 // Typed sends also carry the RESPONSE axis: --wait (block on the answer) + the
 // blocking knobs. (`live` is status-only — it never answers, so it skips these.)
 const SEND_OPTS = [...CONTENT_OPTS, 'gated', 'wait', 'timeout', 'interval', 'realtime', 'no-realtime'];
@@ -800,7 +810,7 @@ const HELP = {
   },
   catchup: {
     summary: 'READ-ONLY peek at the whole conversation (GET ?history=true) — the thread newest-first, answers included. NEVER consumes.',
-    usage: 'pidge catchup [--since ID] [--digest] [--limit N] [--before ID]',
+    usage: 'pidge catchup [--since ID] [--digest] [--limit N] [--before ID] [--no-download]',
     body: [
       'Prints the channel\'s conversation as JSON (newest first) over GET /messages?history=true&all=true — the WHOLE thread, notification answers included. It NEVER consumes: no ack, no delivered stamp, no visibility lease. Safe to run any number of times.',
       '',
@@ -810,7 +820,7 @@ const HELP = {
       '',
       'Exit 0 = printed (even the empty `{"messages":[]}`) · 2 = error. There is no wait, so no exit 3/4.',
     ].join('\n'),
-    opts: ['since', 'digest', 'limit', 'before'],
+    opts: ['since', 'digest', 'limit', 'before', 'download', 'no-download', 'download-dir'],
   },
 };
 
@@ -860,7 +870,10 @@ if (!TOKEN && command !== 'setup')
   die('pidge: set PIDGE_TOKEN (env var, or put PIDGE_TOKEN=… in ~/.config/pidge/env) — or onboard with: pidge setup --claim <code> (ask your human for the code: Pidge app → Canais → o canal → copiar prompt de setup)');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
+// The shared header set for every channel-key call — carries the per-request
+// agent identity, so every verb (notify/ack/inbox/messages/catchup/…)
+// self-identifies without a per-call spread.
+const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json', ...identityHeaders() };
 
 // fetch with a hard timeout: a wedged edge proxy can stall even a
 // short POST forever, and a hung ack on the realtime listen path would pin the
@@ -878,9 +891,10 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // than what this CLI shipped knowing, nudge on stderr — the agent re-reads the
 // manifest (whats_new) and learns the new capabilities without polling.
 // The newest server manifest additions this CLI narrates natively: ack
-// attribution — acked_by_label/handler_summary on history rows (catchup
-// narrates them) + stale_from_prior_claim. See `pidge catchup`.
-const KNOWN_MANIFEST_VERSION = 63;
+// attribution (acked_by_label/handler_summary on history rows — catchup
+// narrates them), stale_from_prior_claim, per-request identity headers,
+// whoami consumers/provenance, being_handled_by and sent_note.
+const KNOWN_MANIFEST_VERSION = 67;
 // The hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
@@ -1148,12 +1162,15 @@ function wantRealtime() {
 // The server pings every ~3 s — that heartbeat is the liveness check (silence
 // >15 s ⇒ the socket is dead even if TCP hasn't noticed; close → caller
 // reconnects). Returns {close()} or null if the constructor itself failed.
-function cableSubscribe({ channel, onUp, onFrame, onDown, base = BASE, token = TOKEN }) {
+function cableSubscribe({ channel, params = {}, onUp, onFrame, onDown, base = BASE, token = TOKEN }) {
   let ws;
   try {
     ws = new WebSocket(base.replace(/^http/, 'ws') + '/cable', ['actioncable-v1-json', token]);
   } catch (e) { onDown(e.message); return null; }
-  const identifier = JSON.stringify({ channel });
+  // the per-request identity (fingerprint/label) rides the subscribe
+  // params on the REAL consume subscribes (listen/wait/bridge) so the server can
+  // attribute presence; the doctor probe passes none (no phantom consumer).
+  const identifier = JSON.stringify({ channel, ...params });
   let lastBeat = Date.now();
   let closed = false;
   const die = (why) => {
@@ -1186,7 +1203,7 @@ function cableSubscribe({ channel, onUp, onFrame, onDown, base = BASE, token = T
 // criterion: hours-long listens must SURVIVE it). onUp/onFrame get a
 // `finish(reason)` to end the session (e.g. when the answer landed over HTTP).
 // Resolves 'deadline' | 'ws-unavailable'.
-async function cableSession({ channel, deadline, onUp, onFrame }) {
+async function cableSession({ channel, params = {}, deadline, onUp, onFrame }) {
   let wsFails = 0;      // consecutive drops SINCE the last healthy connect — the degrade gate
   let wsReconnects = 0; // monotonic total this session — what we DISPLAY (never reset)
   while (Date.now() < deadline) {
@@ -1202,6 +1219,7 @@ async function cableSession({ channel, deadline, onUp, onFrame }) {
       const guard = setTimeout(() => finish('deadline'), Math.max(0, deadline - Date.now()));
       sub = cableSubscribe({
         channel,
+        params,
         onUp: () => { wsFails = 0; onUp(finish); },
         onFrame: (frame) => onFrame(frame, finish),
         onDown: (why) => finish(`down: ${why}`),
@@ -1638,14 +1656,14 @@ function e2eOpenEcho(info, payload) {
 // On success the plaintext replaces the ciphertext and enc/kf are swapped for
 // e2e:"decrypted" (an agent re-gating on `enc` must never mistake plaintext for
 // an envelope); on failure the sealed fields are BLANKED and e2e_error says why.
-async function e2eOpenMessageRow(m) {
+async function e2eOpenMessageRow(m, dl = {}) {
   const refEnc = m.ref && m.ref.enc;
   const out = { ...m };
   const fail = (reason) => { if (!out.e2e_error) out.e2e_error = reason; e2eNote(reason); };
   if (!m.enc && !refEnc) {
     // a clear line renders as always (pre-E2E history) — but a clear ATTACHMENT
     // may still want the opt-in --download save.
-    if (m.attachment) await e2eProcessAttachment(m, out, fail);
+    if (m.attachment) await e2eProcessAttachment(m, out, fail, dl);
     return m.attachment ? out : m;
   }
   if (m.enc) {
@@ -1678,7 +1696,7 @@ async function e2eOpenMessageRow(m) {
       out.body = null;
     }
   }
-  if (m.attachment) await e2eProcessAttachment(m, out, fail); // inbound media
+  if (m.attachment) await e2eProcessAttachment(m, out, fail, dl); // inbound media
   if (!out.e2e_error) {
     delete out.enc; delete out.kf;
     if (out.ref) { delete out.ref.enc; delete out.ref.kf; }
@@ -1695,10 +1713,17 @@ async function e2eOpenMessageRow(m) {
 // directly fetchable) unless --download asks for the same save. Failures are
 // precise e2e_error/stderr — and ciphertext is NEVER written where a file is
 // expected.
-async function e2eProcessAttachment(m, out, fail) {
+async function e2eProcessAttachment(m, out, fail, dl = {}) {
   const att = m.attachment;
   if (!att || typeof att !== 'object') return;
   out.attachment = { ...att };
+  // catchup (esp. the --digest session-start ritual) must not re-fetch +
+  // re-unseal every attachment every run. `noDownload` skips the bytes entirely
+  // (the row already carries the name/sealed flag — enough to LIST it);
+  // `skipIfExists` reuses a copy already on disk (byte_size match for clear
+  // rows; existence for sealed, whose plaintext size ≠ the ciphertext byte_size).
+  const noDownload = !!dl.noDownload;
+  const skipIfExists = !!dl.skipIfExists;
   const absUrl = (u) => (typeof u === 'string' && u.startsWith('/') ? `${BASE}${u}` : u);
   const download = async () => {
     const res = await fetchT(absUrl(att.url));
@@ -1715,6 +1740,27 @@ async function e2eProcessAttachment(m, out, fail) {
     const name = sanitizeAttachmentName(filename) || `attachment-${idSeg}`;
     return path.join(dir, idSeg, name);
   };
+  // a copy already on disk (existence for sealed; size match for clear)?
+  // a 0-byte file is NEVER cache — a crash mid-write (pre-
+  // atomic builds) or an ENOSPC could leave a truncated husk that would
+  // otherwise become a permanent "cached" lie. Writes below are tmp+rename
+  // (atomic on the same fs), so a partial write can't land at dest at all.
+  const cached = (dest) => {
+    try {
+      const st = fs.statSync(dest); // throws if missing
+      if (st.size === 0) return false;
+      if (att.enc) return true; // sealed: plaintext already decrypted here once
+      return att.byte_size == null || st.size === att.byte_size;
+    } catch { return false; }
+  };
+  // m3: atomic write — tmp in the SAME dir then rename, so a crash/ENOSPC
+  // mid-write never leaves a truncated file where cached() would trust it.
+  const writeAtomic = (dest, bytes) => {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    const tmp = `${dest}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, bytes);
+    fs.renameSync(tmp, dest);
+  };
   if (att.enc) {
     if (att.enc !== 'v1') {
       return fail(`attachment sealed with an unknown envelope version ${JSON.stringify(att.enc)} — this CLI speaks v1 (update pidge-cli)`);
@@ -1725,6 +1771,8 @@ async function e2eProcessAttachment(m, out, fail) {
     if (reason) return fail(reason);
     const mat = e2eKeyMaterial();
     // The real filename is a "message_filename" envelope on a sealed attachment.
+    // Decrypted from the ROW (no network) — so we can name/dest a sealed blob
+    // even under --no-download.
     let name = att.filename;
     if (isEnvelope(name)) {
       try {
@@ -1735,23 +1783,36 @@ async function e2eProcessAttachment(m, out, fail) {
         return fail(`attachment filename failed to open: ${e.message}`);
       }
     }
+    const dest = destFor(name);
+    if (noDownload) {
+      out.attachment.sealed = true; // present-only marker — bytes NOT fetched
+      e2eNote(`attachment ${name || '(sealed)'} not downloaded (--no-download / --digest, #74)`);
+      return;
+    }
+    if (skipIfExists && cached(dest)) {
+      out.attachment.path = dest;
+      delete out.attachment.enc;
+      e2eNote(`attachment already on disk → ${dest} (skipped re-download, #74)`);
+      return;
+    }
     try {
       const plain = e2eDecryptBlob(mat.key, e2eAad(m.channel_id, m.correlation_id, 'message_blob'), await download());
-      const dest = destFor(name);
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.writeFileSync(dest, plain);
+      writeAtomic(dest, plain); // m3: never a truncated plaintext at dest
       out.attachment.path = dest;
       delete out.attachment.enc;
       e2eNote(`attachment decrypted → ${dest}`);
     } catch (e) {
       fail(`attachment failed to open: ${e.message}`);
     }
-  } else if (v.download || v['download-dir']) {
+  } else if (!noDownload && (v.download || v['download-dir'])) {
+    const dest = destFor(att.filename);
+    if (skipIfExists && cached(dest)) {
+      out.attachment.path = dest; // #74: reuse the copy already saved
+      return;
+    }
     try {
       const bytes = await download();
-      const dest = destFor(att.filename);
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.writeFileSync(dest, bytes);
+      writeAtomic(dest, bytes); // m3: same atomicity for the clear save
       out.attachment.path = dest;
     } catch (e) {
       console.error(`pidge: WARNING — attachment download failed (${e.message}); the url in the JSON is still fetchable`);
@@ -1814,6 +1875,10 @@ function buildBody(extra = {}) {
   if (v['correlation-id'] !== undefined) body.correlation_id = v['correlation-id'];
   if (v.thread !== undefined) body.thread_id = v.thread;
   if (v.after !== undefined) body.after = v.after;
+  // --note → sent_note — the WHY of this send, attributed to this
+  // runtime so a successor reads "who armed what, and why". CLEAR metadata (never
+  // sealed on E2E channels, D6) — keep secrets out. Server truncates; it never 422s.
+  if (v.note !== undefined) body.sent_note = v.note;
   if (v['collapse-key'] !== undefined) body.collapse_key = v['collapse-key'];
 
   // --actions: the short comma form (built-in catalog ids → body.actions) OR a
@@ -1903,7 +1968,7 @@ async function uploadBlob(bytes, filename, type) {
   let res, raw;
   try {
     res = await fetch(`${BASE}/api/v1/uploads`, {
-      method: 'POST', headers: { authorization: `Bearer ${TOKEN}` }, body: fd,
+      method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, ...identityHeaders() }, body: fd,
     });
     raw = await res.text();
   } catch (e) {
@@ -2340,6 +2405,7 @@ async function realtimeWait(cid, { timeout, interval, onAnswer, onTimeout } = {}
   let safety = null;
   const outcome = await cableSession({
     channel: 'InboxChannel',
+    params: wsIdentityParams(),
     deadline,
     onUp: (finish) => {
       health.ok();
@@ -2412,8 +2478,8 @@ const idStrict = (val, flag) => {
 // Onboarding v2: setup --claim / doctor / whoami / skill install.
 // ---------------------------------------------------------------------------
 
-const CONFIG_DIR = pidgeConfigDir();
-const CONFIG_FILE = path.join(CONFIG_DIR, 'env');
+// (CONFIG_DIR/CONFIG_FILE are defined early — right after TOKEN — so the identity
+// headers can hash CONFIG_FILE at the module-level `headers` const, #385/C1.)
 // True when we're reading the LEGACY shared file (no PIDGE_AGENT, no env var) —
 // the multi-agent footgun. doctor warns on it.
 const ON_SHARED_FILE = !AGENT_ID && !process.env.PIDGE_TOKEN && !process.env.HERALD_TOKEN && !!FILE_ENV.PIDGE_TOKEN;
@@ -2428,7 +2494,7 @@ function tokenSource() {
 // GET /whoami — which channel does this key speak for. Returns {res, data}.
 async function fetchWhoami(base = BASE, token = TOKEN) {
   const res = await fetchT(`${base}/api/v1/whoami`, {
-    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...identityHeaders() },
   });
   let data = {};
   try { data = await res.json(); } catch { /* leave {} */ }
@@ -2444,7 +2510,39 @@ function agentFingerprint() {
   return 'fp_' + crypto.createHash('sha256').update(material).digest('hex').slice(0, 24);
 }
 function agentLabel() {
-  return (process.env.PIDGE_LABEL || AGENT_ID || os.hostname() || 'pidge-cli').slice(0, 80);
+  const raw = (process.env.PIDGE_LABEL || AGENT_ID || os.hostname() || 'pidge-cli').slice(0, 80);
+  // .slice(0, 80) cuts by CODE UNIT and can split a
+  // surrogate pair (an astral char — emoji — at the 80 boundary). A lone
+  // surrogate makes encodeURIComponent THROW URIError, and identityHeaders()
+  // feeds the module-level `headers` const — so EVERY verb would die at load,
+  // purely input-dependent. Sanitize to well-formed UTF-16: toWellFormed()
+  // (Node ≥20) swaps lone surrogates for U+FFFD; the regex fallback (engines
+  // allow Node ≥18) strips them instead — either way, encodable.
+  return raw.toWellFormed
+    ? raw.toWellFormed()
+    : raw.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+}
+
+// Multi-runtime v2: the per-REQUEST agent identity, sent on EVERY HTTP
+// call as headers. Same fingerprint/label the claim computes — the claim
+// becomes the server's FALLBACK; these headers are the primary. The label is
+// URI-encoded (PIDGE_LABEL may be UTF-8, and raw bytes >127 are undefined across
+// proxies/undici; the server decodes + sanitizes). Advisory, never auth (any key
+// holder can wear any identity). An OLDER server ignores
+// unknown headers, so this is harmless against an older server (release is gated
+// on S1+S2 only so the PRINTED features exist, not because headers need lockstep).
+function identityHeaders() {
+  return {
+    'x-pidge-fingerprint': agentFingerprint(),
+    'x-pidge-label': encodeURIComponent(agentLabel()),
+  };
+}
+// WS transport: identity rides the ActionCable subscribe params as
+// JSON (NOT URI-encoded — it's a JSON string value, not a header). Passed only on
+// the REAL consume subscribes (listen/wait/bridge), never the doctor realtime
+// probe — a read-only diagnosis must not mint a phantom consumer.
+function wsIdentityParams() {
+  return { fingerprint: agentFingerprint(), label: agentLabel() };
 }
 
 // first-run notice: show the ack-after-work BREAKING-flip contract ONCE PER
@@ -2504,7 +2602,7 @@ async function claimOwnership(base, token) {
   try {
     const res = await fetchT(`${base}/api/v1/claim/ownership`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...identityHeaders() },
       body: JSON.stringify({ fingerprint: agentFingerprint(), label: agentLabel() }),
     });
     if (res.status !== 200) return null;
@@ -2531,7 +2629,7 @@ async function declareOperatingContract(base, token, channelId) {
   try {
     const res = await fetchT(`${base}/api/v1/channels/${channelId}`, {
       method: 'PATCH',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...identityHeaders() },
       body: JSON.stringify({ operating_contract: contract }),
     });
     if (res.status >= 200 && res.status < 300) {
@@ -2690,6 +2788,71 @@ function warnStalePriorClaim(data, hint = STALE_PRIOR_CLAIM_HINT) {
   if (!data || data.stale_from_prior_claim !== true || stalePriorClaimWarned) return;
   stalePriorClaimWarned = true;
   console.error(`pidge: ⚠️ this channel holds unprocessed messages from a PRIOR claim — probably a previous owner's leftover work, not fresh asks for you (advisory). ${hint}`);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-runtime v2 surfacing — all PRESENT-ONLY: an older server omits the
+// fields, so it yields silence, never a break.
+// ---------------------------------------------------------------------------
+
+// whoami/doctor: the channel's LIVE consumers. "(you)" is marked CLIENT-side
+// by fingerprint compare — the server stays symmetric (no `you` flag).
+// ⚠️ on consumer_conflict; a nudge on unattributed_listening.
+function reportConsumers(data) {
+  if (!Array.isArray(data.consumers)) return; // older server / no block
+  const ours = agentFingerprint();
+  const live = data.consumers.filter((c) => c && c.live);
+  if (!live.length) {
+    console.error('pidge: consumers — none live on this channel right now');
+  } else {
+    const line = live.map((c) => {
+      const you = c.fingerprint === ours ? ' (you)' : '';
+      const listening = c.listening ? ', listening' : '';
+      return `${c.label || c.fingerprint || 'unknown'}${you}${listening}`;
+    }).join(' · ');
+    console.error(`pidge: consumers — ${live.length} live: ${line}`);
+  }
+  if (data.consumer_conflict === true)
+    console.error('pidge: ⚠️  consumer_conflict — 2+ live consumers on this channel. One channel = one consumer: if that\'s a bridge/daemon, SITUATE with `pidge catchup` and do NOT `listen` here (double-consume).');
+  if (data.unattributed_listening === true)
+    console.error('pidge: note — an UNIDENTIFIED consumer is listening here (an old CLI, pre-0.25). It won\'t show above; upgrade it so its identity surfaces.');
+}
+
+// whoami/doctor: the predecessor's ack hygiene (the provenance block) — the
+// "left N acks blind" nudge the successor reads first.
+function reportProvenance(data) {
+  const p = data.provenance;
+  if (!p || typeof p !== 'object') return; // older server / no block
+  const bits = [];
+  if (p.processed != null) bits.push(`${p.processed} processed`);
+  if (p.processed_without_summary) bits.push(`${p.processed_without_summary} acked WITHOUT a note`);
+  if (p.processed_unattributed) bits.push(`${p.processed_unattributed} with no identity at all`);
+  if (!bits.length) return;
+  const since = p.since ? ` (since ${p.since})` : '';
+  console.error(`pidge: provenance${since} — ${bits.join(' · ')}. A note-less ack means the work was done SILENTLY (\`pidge catchup\` can't say what) — get in the habit of \`ack --summary\`.`);
+}
+
+// listen + bridge: consumer_conflict, warned ONCE per process. The field rides
+// whoami (bridge boot) AND the consume GET /messages (listen loop) — so a
+// consuming loop learns a sibling started consuming without a second call.
+let consumerConflictWarned = false;
+function warnConsumerConflict(data) {
+  if (!data || data.consumer_conflict !== true || consumerConflictWarned) return;
+  consumerConflictWarned = true;
+  console.error('pidge: ⚠️  another consumer is live on this channel (consumer_conflict). One channel = one consumer: you may be double-consuming a bridge/daemon\'s queue. Situate with `pidge catchup`; if a bridge owns this channel, stop this `listen`.');
+}
+
+// The in-flight lease holder on a delivered-but-unprocessed row, self-FILTERED
+// — the CLI suppresses the block when the holder is its own fingerprint
+// (self-noise). Returns a one-line "being handled by X since T" or null
+// (absent block, or held by us).
+function beingHandledLine(m) {
+  const b = m && m.being_handled_by;
+  if (!b || typeof b !== 'object') return null;
+  if (b.fingerprint && b.fingerprint === agentFingerprint()) return null; // self
+  const who = b.label || b.fingerprint || 'another consumer';
+  const since = b.since ? ` since ${b.since}` : '';
+  return `being handled by ${who}${since}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -2871,6 +3034,7 @@ async function runBridge() {
     if (who.res.status === 200 && who.data.channel) {
       console.error(`pidge: bridge — canal "${who.data.channel.name}" · ${who.data.devices ?? '?'} device(s)`);
       warnStalePriorClaim(who.data); // the boot warning
+      warnConsumerConflict(who.data); // another consumer live at boot (whoami)
       const oc = who.data.operating_contract || {};
       if (!(oc.listen_mode && oc.listen_mode.value === 'external_daemon')) {
         v['listen-mode'] = 'external_daemon';
@@ -2892,6 +3056,7 @@ async function runBridge() {
       if (shuttingDown) return;
       const sub = cableSubscribe({
         channel,
+        params: wsIdentityParams(),
         onUp: () => {
           if (!announced) { announced = true; console.error('pidge: bridge — realtime socket up (the human sees "ouvindo agora"); the long-poll stays the data path'); }
           if (wake) wake();
@@ -2999,6 +3164,7 @@ async function runBridge() {
       transportFails = 0; alerted401 = false; alertedBroken = false;
     }
     warnStalePriorClaim(data); // newer servers serve the flag on this GET too
+    warnConsumerConflict(data); // the consume GET flags a live sibling
 
     const msgs = Array.isArray(data.messages) ? data.messages : [];
     if (msgs.length === 0) {
@@ -3010,7 +3176,7 @@ async function runBridge() {
 
     // ONE handler invocation per batch — the whole tick as JSON on stdin.
     // Sealed rows are opened BEFORE the handler sees them (same path as listen).
-    const opened = await Promise.all(msgs.map(e2eOpenMessageRow));
+    const opened = await Promise.all(msgs.map((m) => e2eOpenMessageRow(m)));
     const batchIds = opened.map((m) => Number(m.id)).filter(Number.isInteger);
     const batch = { messages: opened, ...(firstBatch ? { history_hint: true } : {}) };
     console.error(`pidge: bridge — batch of ${opened.length} message(s) → handler${firstBatch ? ' (history_hint: first batch since this bridge started — the handler may want `pidge catchup` to situate)' : ''}`);
@@ -3396,7 +3562,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   }
   if (res.status === 404) {
     // Older server: no /whoami yet — the key may still be fine; prove it on the manifest.
-    const m = await fetchT(`${base}/api/v1/manifest`, { headers: { authorization: `Bearer ${token}` } }).catch(() => null);
+    const m = await fetchT(`${base}/api/v1/manifest`, { headers: { authorization: `Bearer ${token}`, ...identityHeaders() } }).catch(() => null);
     if (m && m.status === 200) {
       console.error('pidge doctor: key VALID (server predates /whoami — channel/device detail unavailable; update the server to see it)');
       console.log(JSON.stringify({ ok: true, base_url: base, channel: null, devices: null }));
@@ -3425,6 +3591,10 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   // device-reach honesty + install ownership — shared with whoami.
   const unreachable = reportDeviceReach(data);
   reportClaimMismatch(data);
+  // Live consumers on this channel + predecessor ack hygiene (present-only —
+  // an older server omits them and these no-op).
+  reportConsumers(data);
+  reportProvenance(data);
   // SHOUT on a stale prior-claim backlog (advisory tone — the anchor has
   // known false ±). Warning only, never exit 2: the messages are
   // real and drainable; the human/agent decides what they're worth.
@@ -3565,7 +3735,7 @@ async function runSetup() {
   let res, data = {};
   try {
     res = await fetchT(`${base}/api/v1/claim`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json', ...identityHeaders() },
       body: JSON.stringify({ code }),
     });
     try { data = await res.json(); } catch { /* leave {} */ }
@@ -3671,7 +3841,7 @@ const SKILL_TARGETS = {
 async function installSkill(base = BASE, token = TOKEN, target = 'claude', destFileOverride = null) {
   const destFor = destFileOverride ? () => destFileOverride : SKILL_TARGETS[target];
   if (!destFor) throw new Error(`unknown skill target ${JSON.stringify(target)} — use claude, agents or gemini`);
-  const hdrs = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+  const hdrs = { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...identityHeaders() };
   let res, m;
   try {
     res = await fetchT(`${base}/api/v1/manifest`, { headers: hdrs });
@@ -3869,6 +4039,8 @@ Your channel may already have a LIVE consumer — an always-on bridge or daemon 
 
 **The rule: one channel = one consumer. Reads are free (\`catchup\`, \`pidge wait <cid>\`); the consume loop (\`listen\`/\`ack\`) belongs to exactly one process.**
 
+**New signals when you DO share a channel (server v66+):** the CLI now identifies itself on every call, so \`pidge doctor\`/\`whoami\` LIST the live consumers on your channel — you'll see "\`invest-bridge (you)\` · \`claude-interactive\`" and a ⚠️ \`consumer_conflict\` when 2+ are live (\`listen\` warns the same, once per run). In \`--digest\`, a message another runtime is actively working shows "\`· being handled by <who> since <T>\`" (self-filtered — never your own) so you don't redo it. And when you fire-and-forget a scheduled send, add \`--note "<why>"\` (\`sent_note\`, clear metadata — no secrets) so a successor reads WHY it's armed. Set \`PIDGE_AGENT=<id>\` (or \`PIDGE_LABEL\`) per runtime so those consumer names are meaningful.
+
 \`\`\`bash
 pidge catchup --digest                  # the whole thread, one line per message (the session-start read)
 pidge catchup --digest --since 480      # only what's NEW since message id 480 (O(new))
@@ -3956,6 +4128,9 @@ ${SKILL_END_MARKER}
       // not just doctor — the same shared helpers (deliverable, ANOTHER AGENT…).
       reportDeviceReach(data);
       reportClaimMismatch(data);
+      // live consumers + predecessor provenance (present-only).
+      reportConsumers(data);
+      reportProvenance(data);
       process.exit(0);
       break;
     }
@@ -4170,6 +4345,11 @@ ${SKILL_END_MARKER}
       try { adata = JSON.parse(raw); } catch { /* leave {} */ }
       if (av.renew) console.error(`pidge: lease renewed on ${adata.renewed ?? 0} message(s) (still yours; ack again when done)`);
       else console.error(`pidge: processed ${adata.acked ?? 0} message(s)${ackBody.summary ? ' with a summary (visible in `pidge catchup`)' : ''} — green ✓✓ (the human sees "lida pelo agente")`);
+      // the ack may have annotated messages a PRIOR
+      // consumer already acked without a note — narrate it (present-only; a
+      // an older server omits `annotated`).
+      if (Number(adata.annotated) > 0)
+        console.error(`pidge: annotated ${adata.annotated} previously-acked message(s) — filled in the attribution a prior consumer left blank.`);
       process.exit(0);
       break;
     }
@@ -4295,7 +4475,12 @@ ${SKILL_END_MARKER}
       // Open sealed rows locally (E2E history is ciphertext on the wire) — same path
       // listen uses; on a channel with no secret / clear rows this is a passthrough.
       const rows = Array.isArray(data.messages) ? data.messages : [];
-      const opened = await Promise.all(rows.map(e2eOpenMessageRow));
+      // catchup re-runs constantly (the --digest session-start ritual), so
+      // don't re-fetch/re-unseal attachments each time. --digest (rarely needs the
+      // bytes) OR explicit --no-download ⇒ skip the download; a full catchup reuses
+      // a copy already on disk (skip-if-exists) instead of re-downloading.
+      const catchupDl = { noDownload: !!(v.digest || v['no-download']), skipIfExists: true };
+      const opened = await Promise.all(rows.map((m) => e2eOpenMessageRow(m, catchupDl)));
       // Newest first (the situational read wants the latest context up top); the
       // server orders history this way already, but sort defensively by id desc.
       opened.sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0));
@@ -4316,7 +4501,11 @@ ${SKILL_END_MARKER}
         for (const m of printed) {
           const kind = m.kind || 'message';
           const body = String(m.body ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
-          console.log(`${m.id} · ${kind} · ${body} · ${digestHandledState(m)}`);
+          // an in-flight lease held by ANOTHER runtime (self-filtered)
+          // appends "being handled by X since T" — the sibling took it, don't redo.
+          const inflight = beingHandledLine(m);
+          const state = inflight ? `${digestHandledState(m)} · ${inflight}` : digestHandledState(m);
+          console.log(`${m.id} · ${kind} · ${body} · ${state}`);
         }
       } else {
         console.log(JSON.stringify({ messages: printed }, null, 2));
@@ -4434,7 +4623,7 @@ ${SKILL_END_MARKER}
         // can't open is blanked with a precise e2e_error, never base64).
         // async now — a sealed attachment is downloaded + unsealed to a
         // local path here (attachment.path in the printed JSON).
-        const msgs = await Promise.all(msgsRaw.map(e2eOpenMessageRow));
+        const msgs = await Promise.all(msgsRaw.map((m) => e2eOpenMessageRow(m)));
         console.log(JSON.stringify(msgs, null, 2));
         // Heads-up on ORPHANED backlog served on the first quick read
         // (--all only). It's within-channel — NOT the cross-channel leak.
@@ -4496,6 +4685,7 @@ ${SKILL_END_MARKER}
               health.ok();
               const data = await res.json().catch(() => ({}));
               warnStalePriorClaim(data); // session-header warning, once
+              warnConsumerConflict(data); // the consume GET flags a live sibling
               const msgs = data.messages || [];
               if (msgs.length) {
                 if (!v.follow) finish('got-messages');
@@ -4513,6 +4703,7 @@ ${SKILL_END_MARKER}
         let announced = false;
         const sessions = [cableSession({
           channel: 'ConversationChannel',
+          params: wsIdentityParams(),
           deadline,
           onUp: (finish) => {
             if (!announced) { announced = true; console.error(`pidge: listening over the realtime socket${v.all ? ' — single ear: composer + notification answers' : ''} (the human sees "ouvindo agora")`); }
@@ -4526,6 +4717,7 @@ ${SKILL_END_MARKER}
         if (v.all) {
           sessions.push(cableSession({
             channel: 'InboxChannel',
+            params: wsIdentityParams(),
             deadline,
             onUp: (finish) => drain(finish),
             onFrame: (m, finish) => { if (m.type === 'event' && m.responded) drain(finish); },
@@ -4557,6 +4749,7 @@ ${SKILL_END_MARKER}
             health.ok();
             const data = await res.json().catch(() => ({}));
             warnStalePriorClaim(data); // session-header warning, once
+            warnConsumerConflict(data); // the consume GET flags a live sibling
             const msgs = data.messages || [];
             if (msgs.length) await printAndAck(msgs);
           } else if (res.status >= 500) {

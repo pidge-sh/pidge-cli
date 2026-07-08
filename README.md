@@ -54,6 +54,20 @@ The bare `~/.config/pidge/env` (no `PIDGE_AGENT`) is fine for a **single** agent
 Just re-claim — the claim flow returns the channel's **same** key, so re-running
 setup restores the exact identity.
 
+### Multi-runtime identity (v0.25.0)
+
+The CLI **identifies itself on every call** (`X-Pidge-Fingerprint`/`X-Pidge-Label`
+headers + WS subscribe params — the same values the ownership claim uses). Set
+`PIDGE_AGENT`/`PIDGE_LABEL` per runtime so the name means something. What you get:
+`doctor`/`whoami` list the channel's **live consumers** ("`invest-bridge (you)` ·
+`claude-interactive`") with a ⚠️ on `consumer_conflict` (2+ live consumers —
+`listen`/`bridge` also warn once per run) and a **provenance** block (a
+predecessor's note-less acks); `catchup --digest` marks a sibling's in-flight work
+*"being handled by X since T"* (never your own); and **`--note "<why>"`** on any
+send records `sent_note` — why this runtime armed it (clear metadata, never
+sealed — keep secrets out). All of it is **advisory** and present-only: against an
+older server the CLI just stays silent.
+
 ## Use it (no install — via npx)
 
 ```bash
@@ -139,7 +153,7 @@ bundle both: **`pidge ask`** = `important --wait` (needs `--actions`); **`pidge 
 | `wait <correlation_id>` | Block on an already-sent notification until it's answered. |
 | `cancel <correlation_id>` | Cancel a **still-scheduled** notification before it fires (idempotent; 409 once it reached the phone). |
 | `inbox` | What you sent: list, `--pending` slice, or `--summary` (counts + answer latency). |
-| `catchup` | A **READ-ONLY** peek at the whole conversation — the thread newest-first, notification answers included. **NEVER consumes**: no ack, no delivered stamp, no lease. Run it to **situate yourself** at the start of an interactive session on a channel whose real consumer is **another runtime** (a bridge/daemon) — so you learn what's already handled without stealing a message. `--limit N` / `--before ID` to page. Exit `0` (printed, even empty) / `2`. **One consumer per channel** — if another runtime consumes this channel, `catchup` here and **never `listen`** (that double-consumes). |
+| `catchup` | A **READ-ONLY** peek at the whole conversation — the thread newest-first, notification answers included. **NEVER consumes**: no ack, no delivered stamp, no lease. Run it to **situate yourself** at the start of an interactive session on a channel whose real consumer is **another runtime** (a bridge/daemon) — so you learn what's already handled without stealing a message. `--limit N` / `--before ID` to page. `--digest` marks a sibling's in-flight work *"being handled by X since T"* (self-filtered — never your own) and implies `--no-download`; a full `catchup` reuses attachments already on disk (`--download` still saves clear ones). Exit `0` (printed, even empty) / `2`. **One consumer per channel** — if another runtime consumes this channel, `catchup` here and **never `listen`** (that double-consumes). |
 | `listen` | Block until the human **messages you** from the app; prints them, exits `0`. One-shot — loop it. A read message is DELIVERED (gray ✓✓), **not** done — `ack` it after the work (`--ack-on-read` for immediate consume). ⚠️ `listen` **consumes** — run it only on a channel YOU are the sole consumer of; to read a channel another runtime consumes, use `catchup`. Refuses (exit `2`) while a live `pidge bridge` holds this channel's lock. |
 | `bridge --exec '<handler>'` | The **24/7 supervisor** — paste a prompt and the agent stays online. Long-polls the channel (`--all`); your handler runs **once per batch** with the batch JSON on stdin (`{"messages":[…]}` + `history_hint:true` on the first batch since boot); handler exit `0` ⇒ ack of the batch's **exact ids** · non-zero ⇒ **not acked** (the server lease re-serves — make the handler **idempotent**). One run is capped by `--handler-timeout` (default 30 min: SIGTERM, SIGKILL 5s later, counts as a failed batch), with a stderr heartbeat every 5 min while the handler runs. Model-agnostic: `--exec 'claude -p …' \| 'codex exec …' \|` any script. **One instance per channel**: a PID-checked lockfile refuses a second bridge/`listen` (a stale lock from a crash is recovered). 401 / broken channel → narrated + **local alert** + long **jittered** backoff — never a silent death, never a blind hot loop. SIGTERM/SIGINT are clean: in-flight batch NOT acked, lock released, exit `0`. Deliberately DUMB: no local queue — durability is the server's ack/lease. **Attribution:** the handler tells the next session what it did by printing a final marker line — `pidge-summary: <one sentence>` — to stdout; the bridge scans for the **last** such line and acks with that summary so `catchup` shows *"handled by X: <summary>"*. No marker ⇒ acked without one (never invented). Example: `pidge bridge --exec 'claude -p "handle this pidge batch (JSON on stdin), then print a final line: pidge-summary: <what you did>"'`. |
 | `bridge install --exec '<handler>'` | Write the launchd (Mac) / systemd user (Linux) **template** that runs the bridge with `Restart=on-failure` semantics, and declare `listen_mode=external_daemon` (advisory). The template **never embeds the key** (it stays in `~/.config/pidge/env`); enable with the printed `launchctl`/`systemctl` command. |
@@ -147,7 +161,7 @@ bundle both: **`pidge ask`** = `important --wait` (needs `--actions`); **`pidge 
 | `contract set <k>=<v>` / `contract show` | DECLARE how you operate (`keep_connection_alive`, `mirror_in_origin_session`, `listen_mode=turn_based\|persistent\|external_daemon`, `quiet_when_idle`). **Advisory, never policy** — you declare, the human registers their expectation and *sees* if you honor it; Pidge enforces nothing. An unknown key/bad value is rejected locally (exit 1). |
 | `selftest [--window N]` | Prove your listener works by ROUND-TRIP — fire a nonce, run the listener, confirm it picks it up + acks in time (PASS exit `0` / FAIL exit `2` with the likely cause: timeout / orphan / transport). Run it as the last onboarding step + whenever sends seem to go unheard. |
 | `setup --claim <code>` | One-shot onboarding: exchange the single-use code for the key, store it in `~/.config/pidge/env` (600), claim channel ownership (so `doctor` can warn on a silent key swap), declare your `operating_contract` (default `listen_mode=turn_based`; `--listen-mode persistent\|external_daemon` for a supervisor/daemon), run doctor. |
-| `doctor` | Validate the setup **without exposing secrets**: env source, server reachable, key valid, **honest device reach**, channel ownership, and a **realtime probe** (`realtime: ok / INDISPONÍVEL` — exit stays 0; an unavailable WS just degrades `listen` to polling). Exit 0/2. |
+| `doctor` | Validate the setup **without exposing secrets**: env source, server reachable, key valid, **honest device reach**, channel ownership, and a **realtime probe** (`realtime: ok / INDISPONÍVEL` — exit stays 0; an unavailable WS just degrades `listen` to polling). On newer servers it also lists the channel's **live consumers** ("`invest-bridge (you)`" — "(you)" by local fingerprint match) with a ⚠️ on `consumer_conflict`, nudges when an UNIDENTIFIED (pre-0.25) listener is on the channel, and prints the **provenance** block (a predecessor's note-less acks). Exit 0/2. |
 | `whoami` | Which channel does this key speak for (JSON). |
 | `skill install [--target T]` | Write the generated Pidge skill — persistent Pidge knowledge for an AI agent; re-run to update. `--target` picks the destination (same content): `claude` (default) → `.claude/skills/pidge/SKILL.md` · `agents` → `AGENTS.md` · `gemini` → `GEMINI.md`. An existing file whose content differs is backed up to `<dest>.bak` first (or `<dest>.bak.<timestamp>`), so a re-install never destroys your original. The `claude` target **self-heals**: any networked pidge command silently refreshes a stale `.claude` skill; `AGENTS.md`/`GEMINI.md` do **not** auto-update — re-run `skill install` yourself to refresh them. |
 | `--version` | Print the CLI version. |
@@ -250,6 +264,8 @@ compromised agent machine — `PIDGE_SECRET` sits in your env/config in the clea
                         and saves on the phone; uploaded automatically (≤25 MB)
 --url URL               deep link the app opens when the user taps (PR, dashboard, log)
 --copy TEXT             value offered as tap-to-copy on the detail (code, token)
+--note TEXT             WHY this runtime armed the send — recorded as sent_note
+                        (clear metadata, never sealed; visible to sibling runtimes)
 --actions LIST|JSON     comma list of catalog ids: yes,no,approve,reject,accept,
                         decline,later,done,snooze,reschedule,reply,mute — OR a JSON
                         array of custom actions for your own labels:
@@ -260,6 +276,9 @@ compromised agent machine — `PIDGE_SECRET` sits in your env/config in the clea
                         print chosen_action JSON. Without it: fire-and-forget (the
                         answer arrives later in `pidge listen --all`). ask/approval imply it.
 --deliver-at ISO8601    schedule for later
+--note TEXT             WHY this runtime sent it (sent_note, server v67) — a successor
+                        session reads who armed what and why. CLEAR metadata even on an
+                        E2E channel (attribution the server must read) — no secrets here
 --reply-to URL          also POST the answer to your webhook (HMAC-signed)
 --correlation-id ID     idempotency + routing key (auto-generated if omitted)
 --collapse-key KEY      replace/update a prior notification

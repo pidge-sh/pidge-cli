@@ -13,6 +13,8 @@ function createMock() {
   const state = {
     sockets: new Set(),
     subscriptions: [],     // channel names confirmed, in order
+    subscribeIdentifiers: [], // #385/C1: the FULL parsed subscribe identifier (channel + fingerprint/label params)
+    reqLog: [],            // #385/C1: {method, pathname, fingerprint, label} per HTTP request — assert header emission
     onSubscribe: null,     // (channel, sock) => {} test hook
     waitMode: 'ok',
     wsMode: 'ok',          // '1006' = drop every WS abruptly (a proxy/edge refusing the upgrade)
@@ -50,6 +52,15 @@ function createMock() {
     // stale_from_prior_claim rides top-level on the channel-key GET /messages
     // and on whoami — a test flips it true.
     staleFromPriorClaim: false,
+    // All default to the older-server shape (absent):
+    // a test sets them to exercise the surfacing; null ⇒ the field is omitted so
+    // the CLI's present-only degradation is tested against an "old server".
+    consumers: null,            // whoami consumers[] (null ⇒ block omitted)
+    consumerConflict: false,    // whoami consumer_conflict (only served WITH consumers)
+    unattributedListening: false, // whoami unattributed_listening (served WITH consumers)
+    provenance: null,           // whoami provenance{} (null ⇒ omitted)
+    consumeConflict: null,      // GET /messages consumer_conflict (null ⇒ omitted)
+    ackAnnotated: 0,            // POST /ack annotated count
   };
   let server = null;
   let wss = null;
@@ -62,6 +73,13 @@ function createMock() {
 
   const handler = (req, res) => {
     const url = new URL(req.url, 'http://mock');
+    // record the per-request agent identity headers on EVERY request so
+    // a test can assert header emission across verbs.
+    state.reqLog.push({
+      method: req.method, pathname: url.pathname,
+      fingerprint: req.headers['x-pidge-fingerprint'] || null,
+      label: req.headers['x-pidge-label'] || null,
+    });
     const held = url.searchParams.has('wait');
     if (held && state.waitMode === '502') return json(res, 502, { error: 'bad gateway' });
     if (held && state.waitMode === 'destroy') return setTimeout(() => res.destroy(), 300);
@@ -112,6 +130,14 @@ function createMock() {
         devices: state.devices ?? 1,
         device_reach: state.deviceReach,                     // null unless a test sets it
         stale_from_prior_claim: state.staleFromPriorClaim,
+        // Present-only — a null state omits the block (models an older server),
+        // so the CLI's silent degradation is testable.
+        ...(state.consumers != null ? {
+          consumers: state.consumers,
+          consumer_conflict: !!state.consumerConflict,
+          unattributed_listening: !!state.unattributedListening,
+        } : {}),
+        ...(state.provenance != null ? { provenance: state.provenance } : {}),
         manifest_version: 16,
       });
     }
@@ -208,6 +234,9 @@ function createMock() {
       return json(res, 200, {
         messages: rows.map(({ _leasedUntil, ...rest }) => rest),
         stale_from_prior_claim: state.staleFromPriorClaim,
+        // the consume path warns in-band when a sibling consumes the same
+        // queue. Present-only (null ⇒ omitted, models an older server).
+        ...(state.consumeConflict != null ? { consumer_conflict: state.consumeConflict } : {}),
       });
     }
     if (req.method === 'POST' && url.pathname === '/api/v1/messages/ack') {
@@ -225,7 +254,10 @@ function createMock() {
         const ackedIds = Array.isArray(p.ids) ? p.ids : state.messages.map((mm) => mm.id);
         for (const st of Object.values(state.selftests)) if (ackedIds.includes(st.id)) st.processed = true;
         state.messages = Array.isArray(p.ids) ? state.messages.filter((mm) => !p.ids.includes(mm.id)) : [];
-        json(res, 200, { acked: 1 });
+        // `annotated` = rows a prior consumer acked
+        // without a note that THIS ack filled in. 0 by default (models nothing to
+        // annotate / an older server the CLI treats identically — no narration).
+        json(res, 200, { acked: 1, annotated: state.ackAnnotated });
       });
       return;
     }
@@ -348,6 +380,10 @@ function createMock() {
           kf: parsed.kf || null,
           // per-template suggestion the real server echoes
           suggested_ask_timeout: parsed.template === 'approval' ? 3600 : null,
+          // provenance v2 — the server stamps sent_by_label from the
+          // identity header (URI-decoded) and echoes the optional sent_note.
+          sent_note: parsed.sent_note ?? null,
+          sent_by_label: req.headers['x-pidge-label'] ? decodeURIComponent(req.headers['x-pidge-label']) : null,
         });
       });
       return;
@@ -420,8 +456,16 @@ function createMock() {
       sock.on('message', (raw) => {
         let f; try { f = JSON.parse(raw); } catch { return; }
         if (f.command === 'subscribe') {
-          const channel = JSON.parse(f.identifier).channel;
+          const ident = JSON.parse(f.identifier);
+          const channel = ident.channel;
           state.subscriptions.push(channel);
+          state.subscribeIdentifiers.push(ident); // #385/C1: capture fingerprint/label params
+          // Real ActionCable tags every broadcast frame with the EXACT identifier
+          // string the client sent (params included) — the client matches on it.
+          // Track it per-socket so broadcast() echoes it faithfully (the
+          // client identifier now carries fingerprint/label, so a hardcoded
+          // {channel} identifier would no longer match).
+          (sock._subs || (sock._subs = {}))[channel] = f.identifier;
           sock.send(JSON.stringify({ type: 'confirm_subscription', identifier: f.identifier }));
           if (state.onSubscribe) state.onSubscribe(channel, sock);
         }
@@ -440,9 +484,12 @@ function createMock() {
   });
 
   const broadcast = (channel, message) => {
-    const identifier = JSON.stringify({ channel });
     for (const sock of state.sockets) {
-      if (sock.readyState === 1) sock.send(JSON.stringify({ identifier, message }));
+      if (sock.readyState !== 1) continue;
+      // Echo the EXACT identifier this socket subscribed with for `channel` (params
+      // and all, mirroring ActionCable) so the client's string-equality match holds.
+      const identifier = (sock._subs && sock._subs[channel]) || JSON.stringify({ channel });
+      sock.send(JSON.stringify({ identifier, message }));
     }
   };
 
