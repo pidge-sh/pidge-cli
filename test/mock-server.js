@@ -1,9 +1,9 @@
 'use strict';
 // A controllable Pidge stand-in for the CLI tests: the HTTP surface the CLI
 // touches + an ActionCable-speaking WebSocket (via the `ws` devDependency).
-// `state.waitMode` simulates the production failure classes of #119:
+// `state.waitMode` simulates held-poll failure classes seen in production:
 //   'ok'      — held polls answer normally
-//   '502'     — the edge kills held responses as 502 (the Railway incident)
+//   '502'     — an edge/proxy kills held responses as 502
 //   'destroy' — a proxy with a short response-timeout drops the held socket
 // stop()/start() on the same port simulate a server deploy/restart.
 const http = require('node:http');
@@ -13,54 +13,54 @@ function createMock() {
   const state = {
     sockets: new Set(),
     subscriptions: [],     // channel names confirmed, in order
-    subscribeIdentifiers: [], // #385/C1: the FULL parsed subscribe identifier (channel + fingerprint/label params)
-    reqLog: [],            // #385/C1: {method, pathname, fingerprint, label} per HTTP request — assert header emission
+    subscribeIdentifiers: [], // the FULL parsed subscribe identifier (channel + fingerprint/label params)
+    reqLog: [],            // {method, pathname, fingerprint, label} per HTTP request — assert header emission
     onSubscribe: null,     // (channel, sock) => {} test hook
     waitMode: 'ok',
-    wsMode: 'ok',          // '1006' = drop every WS abruptly (the #119 prod failure)
+    wsMode: 'ok',          // '1006' = drop every WS abruptly (a proxy/edge refusing the upgrade)
     messages: [],          // served by GET /api/v1/messages
-    messageReads: [],      // #58: every GET /api/v1/messages req.url (assert catchup's history=true&all=true)
+    messageReads: [],      // every GET /api/v1/messages req.url (assert catchup's history=true&all=true)
     notifications: {},     // cid → body for GET /api/v1/notifications/:cid
-    inboxNotifications: [], // #83: rows for GET /api/v1/notifications (the list)
-    inboxSummary: null,     // #83: body for GET /api/v1/inbox/summary (null → default zeros)
+    inboxNotifications: [], // rows for GET /api/v1/notifications (the list)
+    inboxSummary: null,     // body for GET /api/v1/inbox/summary (null → default zeros)
     acks: [],
-    ackBodies: [], // #51: the parsed ack payloads, so tests can assert up_to/ids exactly
+    ackBodies: [], // the parsed ack payloads, so tests can assert up_to/ids exactly
     notifies: [],
     uploads: [],
-    blobs: {},             // #367: name → Buffer, served at GET /blobs/<name>
-    claimCode: 'claim-ok',   // #110: POST /api/v1/claim exchanges this once
+    blobs: {},             // name → Buffer, served at GET /blobs/<name>
+    claimCode: 'claim-ok',   // POST /api/v1/claim exchanges this once
     devices: 1,
-    // #181 ownership + #182 contract/device_reach surfaces (v27).
+    // claim ownership + operating-contract/device_reach surfaces.
     claim: { claimed_by_label: null, claimed_by_fingerprint: null, claimed_at: null, claim_generation: 0 },
     deviceReach: null,       // set by a test to exercise the honesty warning
     operatingContract: {},   // PATCH /channels/:id merges into this
     manifestVersion: 16,     // X-Pidge-Manifest-Version header — a test bumps it to fire the news nudge
-    manifestStatus: 200,     // #274 F4: a test sets 500 to force a manifest read failure (skill fuse degrades)
-    notifyStatus: 201,       // #34: a test forces a non-2xx to exercise approve's fail-closed send
-    selftests: {},           // #205: id → {nonce, window_seconds, created, processed}
+    manifestStatus: 200,     // a test sets 500 to force a manifest read failure (skill fuse degrades)
+    notifyStatus: 201,       // a test forces a non-2xx to exercise approve's fail-closed send
+    selftests: {},           // id → {nonce, window_seconds, created, processed}
     selftestSeq: 100,        // next selftest/message id
-    // cli#47 / pidge#284 (LA v2): the /live_activities wire.
+    // the /live_activities wire.
     liveWrites: [],          // every {method, path, body} the CLI sent
     liveCards: {},           // cid → true (existence drives started|updated + PATCH 404)
     liveDegrade: false,      // a test forces the dedicated-budget degrade echo
-    // #59 bridge: a test forces a non-200 on GET /messages (401 = rotated key).
+    // bridge: a test forces a non-200 on GET /messages (401 = rotated key).
     messagesStatus: 200,
-    // #62 cross-audit: >0 models the server VISIBILITY LEASE — a delivered row
-    // is NOT re-served within the window (ack removes it regardless). Default 0
-    // keeps the legacy always-re-serve behavior the older tests rely on.
+    // >0 models the server VISIBILITY LEASE — a delivered row is NOT re-served
+    // within the window (ack removes it regardless). Default 0 keeps the
+    // legacy always-re-serve behavior the older tests rely on.
     leaseMs: 0,
-    // #61: server v63 serves stale_from_prior_claim (top-level) on the
-    // channel-key GET /messages and on whoami — a test flips it true.
+    // stale_from_prior_claim rides top-level on the channel-key GET /messages
+    // and on whoami — a test flips it true.
     staleFromPriorClaim: false,
-    // #385/C1 (multi-runtime v2) — all default to the PRE-v66/v67 shape (absent):
+    // All default to the older-server shape (absent):
     // a test sets them to exercise the surfacing; null ⇒ the field is omitted so
     // the CLI's present-only degradation is tested against an "old server".
-    consumers: null,            // v66 whoami consumers[] (null ⇒ block omitted)
-    consumerConflict: false,    // v66 whoami consumer_conflict (only served WITH consumers)
-    unattributedListening: false, // v66 whoami unattributed_listening (served WITH consumers)
-    provenance: null,           // v67 whoami provenance{} (null ⇒ omitted)
-    consumeConflict: null,      // v66 GET /messages consumer_conflict (null ⇒ omitted)
-    ackAnnotated: 0,            // v67 POST /ack annotated count
+    consumers: null,            // whoami consumers[] (null ⇒ block omitted)
+    consumerConflict: false,    // whoami consumer_conflict (only served WITH consumers)
+    unattributedListening: false, // whoami unattributed_listening (served WITH consumers)
+    provenance: null,           // whoami provenance{} (null ⇒ omitted)
+    consumeConflict: null,      // GET /messages consumer_conflict (null ⇒ omitted)
+    ackAnnotated: 0,            // POST /ack annotated count
   };
   let server = null;
   let wss = null;
@@ -73,7 +73,7 @@ function createMock() {
 
   const handler = (req, res) => {
     const url = new URL(req.url, 'http://mock');
-    // #385/C1: record the per-request agent identity headers on EVERY request so
+    // record the per-request agent identity headers on EVERY request so
     // a test can assert header emission across verbs.
     state.reqLog.push({
       method: req.method, pathname: url.pathname,
@@ -84,7 +84,7 @@ function createMock() {
     if (held && state.waitMode === '502') return json(res, 502, { error: 'bad gateway' });
     if (held && state.waitMode === 'destroy') return setTimeout(() => res.destroy(), 300);
 
-    // Onboarding v2 (#110): claim exchange (public, single-use) + whoami.
+    // Onboarding: claim exchange (public, single-use) + whoami.
     if (req.method === 'POST' && url.pathname === '/api/v1/claim') {
       let body = '';
       req.on('data', (c) => { body += c; });
@@ -95,7 +95,7 @@ function createMock() {
           state.claimCode = null; // single-use
           return json(res, 200, {
             key: 'hld_minted_by_claim', channel: { id: 1, name: 'mock' },
-            user: 'Thiago', base_url: `http://127.0.0.1:${port}`,
+            user: 'Ana', base_url: `http://127.0.0.1:${port}`,
           });
         }
         json(res, 404, { error: 'not_found' });
@@ -104,11 +104,11 @@ function createMock() {
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/whoami') {
       const auth = req.headers.authorization || '';
-      // #52: server v57 made whoami either-track — a ses_ token gets a 200 with
-      // the HUMAN view (no channel block). Mirrored here so doctor's branch is testable.
+      // whoami is either-track — a ses_ token gets a 200 with the HUMAN view
+      // (no channel block). Mirrored here so doctor's branch is testable.
       if (/^Bearer ses_/.test(auth)) {
         return json(res, 200, {
-          user: { name: 'Thiago', timezone: 'America/Sao_Paulo' },
+          user: { name: 'Ana', timezone: 'America/Sao_Paulo' },
           devices: state.devices ?? 1,
           device_reach: state.deviceReach,
           transport_budgets: { scope: 'process', ws_sockets: { held: 0, cap: 32 }, longpoll: { held: 0, capacity: 6 } },
@@ -119,29 +119,29 @@ function createMock() {
       // corpse be overwritten without --force).
       if (!/^Bearer hld_/.test(auth) || auth === 'Bearer hld_revoked') return json(res, 401, { error: 'unauthorized' });
       return json(res, 200, {
-        // E2E (E2-CLI): e2e_enabled mirrors prod whoami — the ONLY signal that
-        // turns the CLI's send-side sealing on (a test flips state.e2eEnabled).
+        // e2e_enabled mirrors prod whoami — the ONLY signal that turns the
+        // CLI's send-side sealing on (a test flips state.e2eEnabled).
         channel: { id: 1, name: 'mock', icon: 'bot', color: 'violet', e2e_enabled: !!state.e2eEnabled,
-                   // #367 media gate: a test flips state.e2eMediaReady.
+                   // media gate: a test flips state.e2eMediaReady.
                    e2e_media_ready: !!state.e2eMediaReady },
-        operating_contract: state.operatingContract,         // #182
-        user: { name: 'Thiago', timezone: 'America/Sao_Paulo' },
-        claim: state.claim,                                  // #181
+        operating_contract: state.operatingContract,
+        user: { name: 'Ana', timezone: 'America/Sao_Paulo' },
+        claim: state.claim,
         devices: state.devices ?? 1,
-        device_reach: state.deviceReach,                     // #182 (null unless a test sets it)
-        stale_from_prior_claim: state.staleFromPriorClaim,   // #61 (server v63)
-        // #385/C1: present-only — a null state omits the block (models a pre-v66/
-        // v67 server), so the CLI's silent degradation is testable.
+        device_reach: state.deviceReach,                     // null unless a test sets it
+        stale_from_prior_claim: state.staleFromPriorClaim,
+        // Present-only — a null state omits the block (models an older server),
+        // so the CLI's silent degradation is testable.
         ...(state.consumers != null ? {
-          consumers: state.consumers,                        // v66
-          consumer_conflict: !!state.consumerConflict,       // v66
-          unattributed_listening: !!state.unattributedListening, // v66
+          consumers: state.consumers,
+          consumer_conflict: !!state.consumerConflict,
+          unattributed_listening: !!state.unattributedListening,
         } : {}),
-        ...(state.provenance != null ? { provenance: state.provenance } : {}), // v67
+        ...(state.provenance != null ? { provenance: state.provenance } : {}),
         manifest_version: 16,
       });
     }
-    // #181: POST /claim/ownership — bump generation only on a DIFFERENT fingerprint.
+    // POST /claim/ownership — bump generation only on a DIFFERENT fingerprint.
     if (req.method === 'POST' && url.pathname === '/api/v1/claim/ownership') {
       const auth = req.headers.authorization || '';
       if (!/^Bearer hld_/.test(auth) || auth === 'Bearer hld_revoked') return json(res, 401, { error: 'unauthorized' });
@@ -163,7 +163,7 @@ function createMock() {
       });
       return;
     }
-    // #182: PATCH /channels/:id — merge operating_contract (CONTRACT, never policy).
+    // PATCH /channels/:id — merge operating_contract (CONTRACT, never policy).
     const pmatch = url.pathname.match(/^\/api\/v1\/channels\/(\d+)$/);
     if (req.method === 'PATCH' && pmatch) {
       let body = '';
@@ -183,7 +183,7 @@ function createMock() {
       return;
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/manifest') {
-      // #274 F4: a test can force a manifest read failure (the skill fuse must degrade).
+      // a test can force a manifest read failure (the skill fuse must degrade).
       if (state.manifestStatus && state.manifestStatus !== 200) return json(res, state.manifestStatus, { error: 'boom' });
       return json(res, 200, {
         manifest_version: 16,
@@ -195,21 +195,21 @@ function createMock() {
       });
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/messages') {
-      // #58: record every read so a test can assert catchup's query (history/all).
+      // record every read so a test can assert catchup's query (history/all).
       state.messageReads.push(req.url);
-      // #59: a test forces a 401 (rotated key) / 5xx — the bridge must narrate,
+      // a test forces a 401 (rotated key) / 5xx — the bridge must narrate,
       // alert locally and back off LONG, never a blind hot loop.
       if (state.messagesStatus && state.messagesStatus !== 200)
         return json(res, state.messagesStatus, { error: 'unauthorized' });
-      // #131: notification_reply rows are served only on the unified queue.
+      // notification_reply rows are served only on the unified queue.
       const all = url.searchParams.get('all') === 'true';
-      // #58: history=true is the READ-ONLY thread read (server never consumes/stamps
-      // delivered/opens a lease — it just returns the conversation). The mock never
-      // deletes on GET anyway, so the observable contract under test is that catchup
-      // NEVER POSTs an ack (state.acks stays empty).
+      // history=true is the READ-ONLY thread read (never consumes, stamps
+      // delivered or opens a lease). The mock never deletes on GET anyway, so
+      // the observable contract under test is that catchup NEVER POSTs an ack
+      // (state.acks stays empty).
       let rows = all ? state.messages
         : state.messages.filter((m) => !m.kind || m.kind === 'message');
-      // #65: `since=<id>` scopes the read to rows with a STRICTLY GREATER id (the
+      // `since=<id>` scopes the read to rows with a STRICTLY GREATER id (the
       // selftest reads since=<nonce id − 1> so the pre-existing real backlog — all
       // lower ids — is excluded by construction and never served/leased here).
       const since = url.searchParams.get('since');
@@ -217,14 +217,14 @@ function createMock() {
         const floor = Number(since);
         if (Number.isFinite(floor)) rows = rows.filter((m) => Number(m.id) > floor);
       }
-      // #62: the lease model applies only to the CONSUME path — a history read
+      // the lease model applies only to the CONSUME path — a history read
       // (catchup) is read-only and never opens/honors a lease.
       const history = url.searchParams.get('history') === 'true';
       if (state.leaseMs > 0 && !history) {
         const now = Date.now();
-        // PR #66 cross-audit: a `lease=<seconds>` query param OVERRIDES the default
-        // lease (the selftest passes lease=60 to cap the blackout on anything it
-        // serves; the server's stamp_delivered default is the ~10-min state.leaseMs).
+        // a `lease=<seconds>` query param OVERRIDES the default lease (the
+        // selftest passes lease=60 to cap the blackout on anything it serves;
+        // the server default is the ~10-min state.leaseMs).
         const leaseParam = url.searchParams.get('lease');
         const leaseMs = leaseParam && Number.isFinite(Number(leaseParam)) ? Number(leaseParam) * 1000 : state.leaseMs;
         rows = rows.filter((m) => !m._leasedUntil || m._leasedUntil <= now);
@@ -234,8 +234,8 @@ function createMock() {
       return json(res, 200, {
         messages: rows.map(({ _leasedUntil, ...rest }) => rest),
         stale_from_prior_claim: state.staleFromPriorClaim,
-        // #385/C1: the consume path warns in-band when a sibling consumes the same
-        // queue. Present-only (null ⇒ omitted, models a pre-v66 server).
+        // the consume path warns in-band when a sibling consumes the same
+        // queue. Present-only (null ⇒ omitted, models an older server).
         ...(state.consumeConflict != null ? { consumer_conflict: state.consumeConflict } : {}),
       });
     }
@@ -247,26 +247,26 @@ function createMock() {
         state.acks.push(req.url);
         state.ackBodies.push(p);
         if (state.hangAck) return; // simulate a wedged proxy stalling the ack POST
-        // #170: state=delivered RENEWS the lease (not consumed); else PROCESS it.
+        // state=delivered RENEWS the lease (not consumed); else PROCESS it.
         if (p.state === 'delivered') return json(res, 200, { renewed: 1 });
-        // #205: mark an acked selftest PROCESSED (the round-trip PASS signal). ids
+        // mark an acked selftest PROCESSED (the round-trip PASS signal). ids
         // acks just those; up_to (no ids) processes + clears the whole queue.
         const ackedIds = Array.isArray(p.ids) ? p.ids : state.messages.map((mm) => mm.id);
         for (const st of Object.values(state.selftests)) if (ackedIds.includes(st.id)) st.processed = true;
         state.messages = Array.isArray(p.ids) ? state.messages.filter((mm) => !p.ids.includes(mm.id)) : [];
-        // #385/C1 (server #393/v67): `annotated` = rows a prior consumer acked
+        // `annotated` = rows a prior consumer acked
         // without a note that THIS ack filled in. 0 by default (models nothing to
-        // annotate / a pre-v67 server the CLI treats identically — no narration).
+        // annotate / an older server the CLI treats identically — no narration).
         json(res, 200, { acked: 1, annotated: state.ackAnnotated });
       });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/v1/uploads') {
-      // Record THE upload (the CLI's #313 pin must refuse BEFORE any bytes
-      // reach here — cross-audit HIGH). #367 also captures the multipart's
-      // filename + the file part's raw bytes, so sealed-media tests prove WHAT
-      // left the machine (sealed framing + generic blob.bin, never plaintext +
-      // the real name). Naive single-part extraction — the CLI sends one part.
+      // Record THE upload (the CLI's e2e pin must refuse BEFORE any bytes
+      // reach here). Also captures the multipart's filename + the file part's
+      // raw bytes, so sealed-media tests prove WHAT left the machine (sealed
+      // framing + generic blob.bin, never plaintext + the real name). Naive
+      // single-part extraction — the CLI sends one part.
       const chunks = [];
       req.on('data', (c) => { chunks.push(c); });
       req.on('end', () => {
@@ -281,7 +281,7 @@ function createMock() {
       });
       return;
     }
-    // #367: attachment blob download (the signed-URL stand-in). A test parks
+    // attachment blob download (the signed-URL stand-in). A test parks
     // bytes in state.blobs['a1'] and points a message's attachment.url at
     // '/blobs/a1' (relative — the CLI prefixes its BASE).
     if (req.method === 'GET' && url.pathname.startsWith('/blobs/')) {
@@ -290,7 +290,7 @@ function createMock() {
       res.writeHead(200, { 'content-type': 'application/octet-stream' });
       return res.end(blob);
     }
-    // cli#47 / pidge#284: the three Live Activity endpoints (LA v2 shapes).
+    // the three Live Activity endpoints.
     const laEnd = url.pathname.match(/^\/api\/v1\/live_activities\/([^/]+)\/end$/);
     const laOne = url.pathname.match(/^\/api\/v1\/live_activities\/([^/]+)$/);
     if (url.pathname === '/api/v1/live_activities' && req.method === 'POST') {
@@ -355,13 +355,13 @@ function createMock() {
         let parsed = {};
         try { parsed = JSON.parse(body); } catch { /* keep {} */ }
         state.notifies.push(parsed);
-        // #34: a test forces a non-2xx so `approve` fails CLOSED on a send error.
+        // a test forces a non-2xx so `approve` fails CLOSED on a send error.
         if (state.notifyStatus && state.notifyStatus !== 201)
           return json(res, state.notifyStatus, { error: 'notify_failed' });
-        // #274/perfis-S2: the real server keys requires_action on the PRESENCE of
-        // decision buttons (any custom_action, or a built-in action beyond a bare
-        // `done`) — NOT on the type. Mirror that so the CLI's B2 timeout default is
-        // exercised exactly as in prod.
+        // the real server keys requires_action on the PRESENCE of decision
+        // buttons (any custom_action, or a built-in action beyond a bare
+        // `done`) — NOT on the type. Mirror that so the CLI's decision-timeout
+        // default is exercised exactly as in prod.
         const acts = Array.isArray(parsed.actions) ? parsed.actions : [];
         const customs = Array.isArray(parsed.custom_actions) ? parsed.custom_actions : [];
         const requires_action = customs.length > 0 || acts.some((a) => a !== 'done');
@@ -371,16 +371,16 @@ function createMock() {
           registered_devices: 1, render_mode: 'banner',
           template: parsed.template || null,
           requires_action,
-          // E2E (E1): prod echoes the content byte-identical, enc/kf alongside —
+          // E2E: prod echoes the content byte-identical, enc/kf alongside —
           // the CLI's trust-the-echo display decrypt is exercised against this.
           title: parsed.title ?? null,
           subtitle: parsed.subtitle ?? null,
           body: parsed.body ?? null,
           enc: parsed.enc || null,
           kf: parsed.kf || null,
-          // #132: per-template suggestion the real server echoes
+          // per-template suggestion the real server echoes
           suggested_ask_timeout: parsed.template === 'approval' ? 3600 : null,
-          // #385/C1: provenance v2 — the server stamps sent_by_label from the
+          // provenance v2 — the server stamps sent_by_label from the
           // identity header (URI-decoded) and echoes the optional sent_note.
           sent_note: parsed.sent_note ?? null,
           sent_by_label: req.headers['x-pidge-label'] ? decodeURIComponent(req.headers['x-pidge-label']) : null,
@@ -388,8 +388,8 @@ function createMock() {
       });
       return;
     }
-    // #83 inbox: the list (GET /notifications) and the one-call summary
-    // (GET /inbox/summary). #63 uses these to prove `inbox --summary` still hits
+    // inbox: the list (GET /notifications) and the one-call summary
+    // (GET /inbox/summary) — used to prove `inbox --summary` still hits
     // the summary path after the ack `--summary` type split.
     if (req.method === 'GET' && url.pathname === '/api/v1/notifications') {
       return json(res, 200, { notifications: state.inboxNotifications || [] });
@@ -400,7 +400,7 @@ function createMock() {
     }
     const m = url.pathname.match(/^\/api\/v1\/notifications\/([^/]+)$/);
     if (req.method === 'GET' && m) {
-      // #39: a test forces a MALFORMED 200 body — the poller must read it as
+      // a test forces a MALFORMED 200 body — the poller must read it as
       // "no answer yet" and a blocked approve must still fail CLOSED on timeout.
       if (state.pollGarbage) {
         res.writeHead(200, { 'content-type': 'application/json' });
@@ -409,7 +409,7 @@ function createMock() {
       const cid = decodeURIComponent(m[1]);
       return json(res, 200, state.notifications[cid] || { responded: false, correlation_id: cid });
     }
-    // #205: reachability self-test. POST mints a nonce + a kind:'system' selftest
+    // reachability self-test. POST mints a nonce + a kind:'system' selftest
     // message on the queue; GET reads PASS (acked in window) / FAILED / pending.
     if (req.method === 'POST' && url.pathname === '/api/v1/selftest') {
       let body = '';
@@ -446,7 +446,7 @@ function createMock() {
     });
     wss.on('connection', (sock) => {
       // wsMode '1006': drop EVERY socket abruptly (no close frame) → the client
-      // sees close code 1006, the intermittent prod failure (#119 dogfooding).
+      // sees close code 1006, an intermittent failure mode seen in production.
       if (state.wsMode === '1006') { try { sock.terminate(); } catch { /* gone */ } return; }
       state.sockets.add(sock);
       sock.send(JSON.stringify({ type: 'welcome' }));
@@ -459,10 +459,10 @@ function createMock() {
           const ident = JSON.parse(f.identifier);
           const channel = ident.channel;
           state.subscriptions.push(channel);
-          state.subscribeIdentifiers.push(ident); // #385/C1: capture fingerprint/label params
+          state.subscribeIdentifiers.push(ident); // capture fingerprint/label params
           // Real ActionCable tags every broadcast frame with the EXACT identifier
           // string the client sent (params included) — the client matches on it.
-          // Track it per-socket so broadcast() echoes it faithfully (#385/C1: the
+          // Track it per-socket so broadcast() echoes it faithfully (the
           // client identifier now carries fingerprint/label, so a hardcoded
           // {channel} identifier would no longer match).
           (sock._subs || (sock._subs = {}))[channel] = f.identifier;

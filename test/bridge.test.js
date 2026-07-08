@@ -1,5 +1,5 @@
 'use strict';
-// #59 `pidge bridge` acceptance tests — the hard cases the issue names:
+// `pidge bridge` acceptance tests — the hard cases:
 //   · ONE handler invocation per batch (batch JSON on stdin, history_hint on
 //     the first batch post-restart), exit 0 ⇒ ack --up-to the LAST id;
 //   · a failing handler NEVER acks (the server lease is the durability);
@@ -7,14 +7,18 @@
 //     STALE lock (dead pid — crashed bridge), and `listen` refuses under it;
 //   · SIGTERM with a batch in flight: no ack, lock released, exit 0;
 //   · 401 = narrate + LOCAL alert + LONG jittered backoff, never a hot loop.
-// Plus #61: stale_from_prior_claim surfaced on listen/catchup/doctor/bridge.
+// Plus: stale_from_prior_claim surfaced on listen/catchup/doctor/bridge.
 const { test } = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { spawn } = require('node:child_process');
+const { spawn: rawSpawn } = require('node:child_process');
+const { track } = require('./spawn-tracker');
+// Own process group per child + group-kill when the file's tests end — a
+// straggler (grand)child must never hold this process's event loop open.
+const spawn = (cmd, args, opts = {}) => track(rawSpawn(cmd, args, { ...opts, detached: true }));
 const { createMock } = require('./mock-server');
 
 const CLI = path.join(__dirname, '..', 'bin', 'pidge.js');
@@ -37,7 +41,7 @@ function runCli(args, port, env = {}) {
       PIDGE_BRIDGE_BACKOFF_BASE: '200',  // test-fast backoff ladder
       PIDGE_BRIDGE_BACKOFF_MAX: '500',
       PIDGE_BRIDGE_BACKOFF_LONG: '600',
-      // #69: isolate HOME so the self-heal never regenerates the developer's REAL
+      // Isolate HOME so the self-heal never regenerates the developer's REAL
       // ~/.claude/skills/pidge during a test (bridge tests run with cwd = repo).
       HOME: tmpDir('pidge-bridge-home-'),
       ...env,
@@ -82,8 +86,8 @@ test('bridge: ONE handler invocation per batch — batch JSON on stdin, exit 0 a
   const batch = JSON.parse(fs.readFileSync(outFile, 'utf8'));
   assert.equal(batch.messages.length, 2, 'the WHOLE tick in one invocation');
   assert.equal(batch.messages[1].body, 'segunda');
-  assert.equal(batch.history_hint, true, 'first batch post-restart carries history_hint (#58 synergy)');
-  assert.deepEqual(mock.state.ackBodies[0], { ids: [7, 9] }, 'ack the batch\'s EXACT ids — never an up_to watermark (#62 cross-audit)');
+  assert.equal(batch.history_hint, true, 'first batch post-restart carries history_hint');
+  assert.deepEqual(mock.state.ackBodies[0], { ids: [7, 9] }, 'ack the batch\'s EXACT ids — never an up_to watermark');
 
   // A second batch is ordinary: no history_hint, its own ack.
   mock.state.messages = [{ id: 12, kind: 'message', body: 'terceira', created_at: 'x' }];
@@ -211,7 +215,7 @@ test('bridge: 401 — narrated LOCAL ALERT + LONG jittered backoff; never a hot 
   await mock.stop();
 });
 
-test('cross-audit BLOCKER: a leased row from a FAILED batch is never stamped by a later batch\'s success (ack by exact ids)', async () => {
+test('regression: a leased row from a FAILED batch is never stamped by a later batch\'s success (ack by exact ids)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.leaseMs = 60000; // model the server visibility lease
@@ -237,7 +241,7 @@ test('cross-audit BLOCKER: a leased row from a FAILED batch is never stamped by 
   await mock.stop();
 });
 
-test('cross-audit: two starters racing for the SAME stale lock — exactly ONE wins (atomic rename), the loser exits 2', async () => {
+test('lock race: two starters racing for the SAME stale lock — exactly ONE wins (atomic rename), the loser exits 2', async () => {
   const mock = createMock();
   const port = await mock.start();
   const xdg = tmpDir('pidge-race-');
@@ -270,7 +274,7 @@ test('cross-audit: two starters racing for the SAME stale lock — exactly ONE w
   assert.ok(!fs.existsSync(lockPathFor(xdg)), 'the winner releases on the way out');
 });
 
-test('cross-audit: --handler-timeout — a hung handler is SIGTERMed, treated as a FAILED batch (no ack), with periodic narration', async () => {
+test('--handler-timeout — a hung handler is SIGTERMed, treated as a FAILED batch (no ack), with periodic narration', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 4, kind: 'message', body: 'trava', created_at: 'x' }];
@@ -283,7 +287,7 @@ test('cross-audit: --handler-timeout — a hung handler is SIGTERMed, treated as
   assert.ok(await waitFor(() => /handler running for/.test(out.stderr)), `no heartbeat; stderr:\n${out.stderr}`);
   assert.ok(await waitFor(() => /exceeded --handler-timeout/.test(out.stderr)), `no timeout kill; stderr:\n${out.stderr}`);
   assert.ok(await waitFor(() => /NOT acked/.test(out.stderr)), `stderr:\n${out.stderr}`);
-  assert.match(out.stderr, /timed out \(--handler-timeout 2s\)/);
+  assert.ok(await waitFor(() => /timed out \(--handler-timeout 2s\)/.test(out.stderr)), `stderr:\n${out.stderr}`);
   await sleep(300);
   assert.equal(mock.state.ackBodies.length, 0, 'a timed-out handler must NEVER ack');
   assert.equal(out.code, null, 'the bridge itself stays alive (the failure is the handler\'s)');
@@ -294,7 +298,7 @@ test('cross-audit: --handler-timeout — a hung handler is SIGTERMed, treated as
   assert.equal(r.code, 0);
 });
 
-test('#59: `listen` REFUSES when a LIVE bridge holds the channel lock (points at catchup)', async () => {
+test('`listen` REFUSES when a LIVE bridge holds the channel lock (points at catchup)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const xdg = tmpDir('pidge-listen-lock-');
@@ -326,7 +330,7 @@ test('bridge install: launchd template — handler embedded (xml-escaped), Resta
   const plist = fs.readFileSync(info.file, 'utf8');
   assert.match(plist, /claude -p &quot;handle batch&quot;/, 'the handler must be xml-escaped');
   assert.match(plist, /SuccessfulExit/, 'KeepAlive.SuccessfulExit=false = Restart=on-failure');
-  assert.match(plist, /<key>PATH<\/key>/, 'the daemon needs the current PATH — launchd\'s minimal one 127s a homebrew/nvm handler (#62)');
+  assert.match(plist, /<key>PATH<\/key>/, 'the daemon needs the current PATH — launchd\'s minimal one 127s a homebrew/nvm handler');
   assert.ok(!plist.includes('hld_test'), 'the template must NEVER embed the key');
   assert.equal(mock.state.operatingContract.listen_mode.value, 'external_daemon', 'install declares the contract');
   assert.equal(info.listen_mode_declared, true);
@@ -348,8 +352,8 @@ test('bridge install: systemd template — Restart=on-failure, quoted ExecStart,
   assert.ok(info.file.startsWith(path.join(run.xdg, 'systemd', 'user')), info.file);
   const unit = fs.readFileSync(info.file, 'utf8');
   assert.match(unit, /Restart=on-failure/);
-  assert.match(unit, /Wants=network-online\.target/, 'After alone only orders — Wants pulls the target in (#62)');
-  assert.match(unit, /Environment="PATH=/, 'the daemon needs the current PATH (#62)');
+  assert.match(unit, /Wants=network-online\.target/, 'After alone only orders — Wants pulls the target in');
+  assert.match(unit, /Environment="PATH=/, 'the daemon needs the current PATH');
   assert.match(unit, /bridge --exec "codex exec \\"handle batch\\""/, 'ExecStart must quote+escape the handler');
   assert.ok(!unit.includes('hld_test'), 'the template must NEVER embed the key');
 });
@@ -366,7 +370,7 @@ test('bridge install without --exec is a usage error (exit 1)', async () => {
   assert.match(r2.stderr, /--exec/);
 });
 
-test('#61: stale_from_prior_claim — warned ONCE on the listen header, on catchup, on doctor, and at bridge boot', async () => {
+test('stale_from_prior_claim — warned ONCE on the listen header, on catchup, on doctor, and at bridge boot', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.staleFromPriorClaim = true;
@@ -381,7 +385,7 @@ test('#61: stale_from_prior_claim — warned ONCE on the listen header, on catch
 
   const doctor = await runCli(['doctor'], port).result;
   assert.match(doctor.stderr, /PRIOR claim/);
-  assert.equal(doctor.code, 0, 'the #61 warning is advisory — never exit 2');
+  assert.equal(doctor.code, 0, 'the warning is advisory — never exit 2');
 
   const b = runCli(['bridge', '--exec', 'true', '--no-realtime', '--interval', '1'], port);
   assert.ok(await waitFor(() => /PRIOR claim/.test(b.out.stderr)), `bridge stderr:\n${b.out.stderr}`);
@@ -390,7 +394,7 @@ test('#61: stale_from_prior_claim — warned ONCE on the listen header, on catch
   await mock.stop();
 });
 
-// #64: the handler tells the next session WHAT it did via a marker line on stdout
+// Summary marker: the handler tells the next session WHAT it did via a marker line on stdout
 // — `pidge-summary: <text>`. The bridge tees stdout to its log AND scans it
 // (streamed, never buffered) for the LAST such line, then acks with that summary.
 // A helper: a handler that drains stdin, prints the given lines, exits 0. The JS
@@ -402,7 +406,7 @@ test('#61: stale_from_prior_claim — warned ONCE on the listen header, on catch
 const summaryHandler = (lines) =>
   `${process.execPath} -e "require('fs').readFileSync(0); ${lines.map((l) => `console.log('${l}')`).join('; ')}"`;
 
-test('#64: a handler that prints `pidge-summary:` → the ack carries that summary', async () => {
+test('summary marker: a handler that prints `pidge-summary:` → the ack carries that summary', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 7, kind: 'message', body: 'oi', created_at: 'x' }];
@@ -419,7 +423,7 @@ test('#64: a handler that prints `pidge-summary:` → the ack carries that summa
   await mock.stop();
 });
 
-test('#64: NO marker → the ack has no summary field (never invented)', async () => {
+test('summary marker: NO marker → the ack has no summary field (never invented)', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 7, kind: 'message', body: 'oi', created_at: 'x' }];
@@ -434,7 +438,7 @@ test('#64: NO marker → the ack has no summary field (never invented)', async (
   await mock.stop();
 });
 
-test('#64: a marker in the MIDDLE of the output — the LAST one wins', async () => {
+test('summary marker: a marker in the MIDDLE of the output — the LAST one wins', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 7, kind: 'message', body: 'oi', created_at: 'x' }];
@@ -449,7 +453,7 @@ test('#64: a marker in the MIDDLE of the output — the LAST one wins', async ()
   await mock.stop();
 });
 
-test('#64: a marker longer than 1000 chars is truncated without error', async () => {
+test('summary marker: a marker longer than 1000 chars is truncated without error', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 7, kind: 'message', body: 'oi', created_at: 'x' }];
@@ -465,7 +469,7 @@ test('#64: a marker longer than 1000 chars is truncated without error', async ()
   await mock.stop();
 });
 
-test('#64 (adversarial): a handler that dumps MB of output then a trailing marker — no wedge, no OOM, marker still captured', async () => {
+test('summary marker (adversarial): a handler that dumps MB of output then a trailing marker — no wedge, no OOM, marker still captured', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 7, kind: 'message', body: 'oi', created_at: 'x' }];
@@ -485,7 +489,7 @@ test('#64 (adversarial): a handler that dumps MB of output then a trailing marke
   await mock.stop();
 });
 
-test('#61: no warning when the flag is absent/false (the default)', async () => {
+test('stale_from_prior_claim: no warning when the flag is absent/false (the default)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const r = await runCli(['listen', '--no-realtime', '--timeout', '2', '--interval', '1'], port).result;
@@ -493,10 +497,10 @@ test('#61: no warning when the flag is absent/false (the default)', async () => 
   assert.ok(!/PRIOR claim/.test(r.stderr), `unexpected warning:\n${r.stderr}`);
 });
 
-test('#385/C1 (m2a) — bridge warns on consumer_conflict at BOOT (whoami), once', async () => {
+test('multi-runtime — bridge warns on consumer_conflict at BOOT (whoami), once', async () => {
   const mock = createMock();
   const port = await mock.start();
-  // v66 whoami: a live sibling consumer alongside whoever boots this bridge.
+  // whoami: a live sibling consumer alongside whoever boots this bridge.
   mock.state.consumers = [
     { fingerprint: 'fp_sibling', label: 'claude-interactive', listening: true, live: true },
     { fingerprint: 'fp_other', label: 'another', listening: false, live: true },

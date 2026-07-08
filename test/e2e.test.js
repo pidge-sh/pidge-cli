@@ -1,9 +1,8 @@
 'use strict';
-// E0 (#180): the shared E2E v1 crypto lib — round-trip every committed vector,
-// prove every failure case fails LOUD, pin the fixture against drift, and
-// check e2eLoadSecret's slot/precedence (the same as PIDGE_TOKEN).
-// Contract: e2e-spec-v1.md (ratified 2026-07-02). NO command uses any of this
-// yet — E0 is lib + vectors only (wire/send integration is E1..E3).
+// The shared E2E v1 crypto lib — round-trip every committed vector, prove
+// every failure case fails LOUD, pin the fixture against drift, and check
+// e2eLoadSecret's slot/precedence (the same as PIDGE_TOKEN). This file covers
+// the lib + vectors only; the wire/send integration has its own suites.
 const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
@@ -32,7 +31,7 @@ test('fixture drift — regenerating the vectors reproduces the committed bytes 
   const committed = fs.readFileSync(path.join(__dirname, 'e2e_vectors.json'), 'utf8');
   const regenerated = JSON.stringify(buildVectors(), null, 2) + '\n';
   assert.equal(regenerated, committed,
-    'test/e2e_vectors.json does not match test/gen-e2e-vectors.js output — the lib or the generator moved without re-ratifying the contract (the fixture is committed byte-identical in BOTH repos)');
+    'test/e2e_vectors.json does not match test/gen-e2e-vectors.js output — the lib or the generator moved without a contract change (the vectors are canonical for any implementation of wire format v1)');
 });
 
 test('field vectors round-trip: encrypt(fixed nonce) reproduces the envelope; decrypt returns the plaintext', () => {

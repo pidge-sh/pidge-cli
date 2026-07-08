@@ -1,12 +1,10 @@
 'use strict';
-// Generates test/e2e_vectors.json — the SHARED E2E v1 fixture (#180, phase E0;
-// contract: e2e-spec-v1.md, ratified 2026-07-02).
+// Generates test/e2e_vectors.json — the SHARED E2E v1 fixture.
 //
 // Deterministic ON PURPOSE: a fixed test key + SHA-256-derived nonces, so the
-// output is byte-identical on every run and platform. The fixture is committed
-// in BOTH repos (this one asserts it via node --test; the product repo's
-// server/iOS suites assert the SAME bytes — that cross-SDK byte-identity IS the
-// gate, e.g. against base64url encoding drift). Regenerate ONLY on a ratified
+// output is byte-identical on every run and platform. The vectors are canonical
+// for ANY implementation of wire format v1 — cross-implementation byte-identity
+// IS the gate, e.g. against base64url encoding drift. Regenerate ONLY on a
 // contract change:
 //
 //   node test/gen-e2e-vectors.js
@@ -25,7 +23,7 @@ const CHANNEL_ID = 42;
 const nonceFor = (label) => crypto.createHash('sha256').update(`pidge e2e v1 nonce:${label}`).digest().subarray(0, 12);
 
 // The "markdown longo" case must exceed 10 KB by contract (a verbose
-// body_markdown is the realistic big field — gotcha #15 territory).
+// body_markdown is the realistic big field).
 function longMarkdown() {
   const lines = ['# Relatório diário — build & deploy', ''];
   for (let i = 1; lines.join('\n').length <= 10 * 1024; i++) {
@@ -126,18 +124,17 @@ function buildVectors() {
 
   return {
     _readme: [
-      'pidge E2E v1 — SHARED test vectors (#180, phase E0). Contract: e2e-spec-v1.md (ratified 2026-07-02).',
+      'pidge E2E v1 — SHARED test vectors for wire format v1.',
       'AES-256-GCM · key 32 B · nonce 12 B · tag 16 B. Field envelope: "v1:" + base64url(nonce || ciphertext || tag).',
       'Blob framing: [0x01][nonce 12B][ciphertext][tag 16B] — binary, NO base64 on the wire (b64url here is JSON transport only).',
       'AAD = "ch<channel_id>:<correlation_id>:<field_name>" (ASCII; channel_id is the PUBLIC id). base64url is UNPADDED.',
       'kf = base64url(SHA-256(key)[0..3]) — 4 bytes, rides clear next to enc:"v1" so a key mismatch is a precise error.',
       'DETERMINISTIC test material — key/nonces fixed here only; production nonces are crypto.randomBytes(12). NEVER reuse this key.',
-      'Committed byte-identical in pidge-cli AND the product repo; node --test (CLI), the server suite and XCTest (iOS) all assert THESE bytes.',
-      'Regenerate only on a ratified contract change: node test/gen-e2e-vectors.js',
+      'These vectors are canonical for ANY implementation of wire format v1 — every implementation asserts THESE bytes.',
+      'Regenerate only on a contract change: node test/gen-e2e-vectors.js',
       'field_vectors/blob_vectors round-trip both ways; failure_cases MUST throw/fail in every implementation.',
     ],
     suite: 'pidge-e2e-v1',
-    ratified: '2026-07-02',
     algorithm: 'AES-256-GCM',
     key_b64url: KEY.toString('base64url'),
     wrong_key_b64url: WRONG_KEY.toString('base64url'),
