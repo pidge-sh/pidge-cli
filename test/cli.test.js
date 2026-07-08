@@ -3274,3 +3274,39 @@ test('#385/C1 — ack against a pre-v67 server (annotated 0) says nothing extra'
   assert.equal(code, 0, stderr);
   assert.ok(!/annotated/.test(stderr), 'no annotation narration when there is nothing to annotate');
 });
+
+test('#385/C1 (m2b) — whoami nudges on unattributed_listening (an old-CLI listener)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.consumers = [
+    { fingerprint: 'fp_bridge', label: 'invest-bridge', listening: false, live: true },
+  ];
+  mock.state.unattributedListening = true; // channels.listening_until live, no attributed row covers it
+  const { result } = runCli(['whoami'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, stderr);
+  assert.match(stderr, /UNIDENTIFIED consumer is listening/, 'the upgrade nudge fires');
+  assert.match(stderr, /pre-0\.25/, 'names the cause (an old CLI)');
+});
+
+test('#385/C1 (M1) — a >80-code-unit label with an astral char at the slice boundary must NOT crash the CLI', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // 79 ASCII + an emoji: .slice(0, 80) cuts the surrogate pair in half — the raw
+  // lone surrogate made encodeURIComponent throw URIError AT MODULE LOAD (the
+  // shared `headers` const), killing EVERY verb before argv parsing.
+  const label = 'a'.repeat(79) + '😀';
+  const { result } = runCli(['whoami'], port, { PIDGE_LABEL: label });
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, `the CLI must boot and run: stderr:\n${stderr}`);
+  const req = mock.state.reqLog.find((r) => r.pathname === '/api/v1/whoami');
+  assert.ok(req.label, 'the label header still rides');
+  // The header must be decodable (well-formed percent-encoding of well-formed
+  // UTF-16) — decodeURIComponent throws on garbage.
+  const decoded = decodeURIComponent(req.label);
+  assert.ok(decoded.startsWith('a'.repeat(79)), 'the intact prefix survives');
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(decoded),
+    'no lone surrogate in the decoded label (well-formed)');
+});

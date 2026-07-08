@@ -810,7 +810,7 @@ const HELP = {
   },
   catchup: {
     summary: 'READ-ONLY peek at the whole conversation (GET ?history=true) — the thread newest-first, answers included. NEVER consumes.',
-    usage: 'pidge catchup [--since ID] [--digest] [--limit N] [--before ID]',
+    usage: 'pidge catchup [--since ID] [--digest] [--limit N] [--before ID] [--no-download]',
     body: [
       'Prints the channel\'s conversation as JSON (newest first) over GET /messages?history=true&all=true — the WHOLE thread, notification answers included. It NEVER consumes: no ack, no delivered stamp, no visibility lease. Safe to run any number of times.',
       '',
@@ -820,7 +820,7 @@ const HELP = {
       '',
       'Exit 0 = printed (even the empty `{"messages":[]}`) · 2 = error. There is no wait, so no exit 3/4.',
     ].join('\n'),
-    opts: ['since', 'digest', 'limit', 'before', 'no-download', 'download-dir'],
+    opts: ['since', 'digest', 'limit', 'before', 'download', 'no-download', 'download-dir'],
   },
 };
 
@@ -1767,12 +1767,25 @@ async function e2eProcessAttachment(m, out, fail, dl = {}) {
     return path.join(dir, idSeg, name);
   };
   // #74: a copy already on disk (existence for sealed; size match for clear)?
+  // m3 (cross-audit): a 0-byte file is NEVER cache — a crash mid-write (pre-
+  // atomic builds) or an ENOSPC could leave a truncated husk that would
+  // otherwise become a permanent "cached" lie. Writes below are tmp+rename
+  // (atomic on the same fs), so a partial write can't land at dest at all.
   const cached = (dest) => {
     try {
-      if (!fs.existsSync(dest)) return false;
+      const st = fs.statSync(dest); // throws if missing
+      if (st.size === 0) return false;
       if (att.enc) return true; // sealed: plaintext already decrypted here once
-      return att.byte_size == null || fs.statSync(dest).size === att.byte_size;
+      return att.byte_size == null || st.size === att.byte_size;
     } catch { return false; }
+  };
+  // m3: atomic write — tmp in the SAME dir then rename, so a crash/ENOSPC
+  // mid-write never leaves a truncated file where cached() would trust it.
+  const writeAtomic = (dest, bytes) => {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    const tmp = `${dest}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, bytes);
+    fs.renameSync(tmp, dest);
   };
   if (att.enc) {
     if (att.enc !== 'v1') {
@@ -1810,8 +1823,7 @@ async function e2eProcessAttachment(m, out, fail, dl = {}) {
     }
     try {
       const plain = e2eDecryptBlob(mat.key, e2eAad(m.channel_id, m.correlation_id, 'message_blob'), await download());
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.writeFileSync(dest, plain);
+      writeAtomic(dest, plain); // m3: never a truncated plaintext at dest
       out.attachment.path = dest;
       delete out.attachment.enc;
       e2eNote(`attachment decrypted → ${dest}`);
@@ -1826,8 +1838,7 @@ async function e2eProcessAttachment(m, out, fail, dl = {}) {
     }
     try {
       const bytes = await download();
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.writeFileSync(dest, bytes);
+      writeAtomic(dest, bytes); // m3: same atomicity for the clear save
       out.attachment.path = dest;
     } catch (e) {
       console.error(`pidge: WARNING — attachment download failed (${e.message}); the url in the JSON is still fetchable`);
@@ -2525,7 +2536,17 @@ function agentFingerprint() {
   return 'fp_' + crypto.createHash('sha256').update(material).digest('hex').slice(0, 24);
 }
 function agentLabel() {
-  return (process.env.PIDGE_LABEL || AGENT_ID || os.hostname() || 'pidge-cli').slice(0, 80);
+  const raw = (process.env.PIDGE_LABEL || AGENT_ID || os.hostname() || 'pidge-cli').slice(0, 80);
+  // M1 (cross-audit cli#79): .slice(0, 80) cuts by CODE UNIT and can split a
+  // surrogate pair (an astral char — emoji — at the 80 boundary). A lone
+  // surrogate makes encodeURIComponent THROW URIError, and identityHeaders()
+  // feeds the module-level `headers` const — so EVERY verb would die at load,
+  // purely input-dependent. Sanitize to well-formed UTF-16: toWellFormed()
+  // (Node ≥20) swaps lone surrogates for U+FFFD; the regex fallback (engines
+  // allow Node ≥18) strips them instead — either way, encodable.
+  return raw.toWellFormed
+    ? raw.toWellFormed()
+    : raw.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
 }
 
 // Multi-runtime v2 (#385/D1): the per-REQUEST agent identity, sent on EVERY HTTP

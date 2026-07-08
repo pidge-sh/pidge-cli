@@ -35,6 +35,14 @@ provenance, `annotated`) only exist once S1/S2 ship.
   disk (skip-if-exists — byte_size match for clear rows, existence for sealed); explicit
   `--no-download` too. The session-start `catchup --digest --since <last>` ritual no longer
   re-fetches + re-unseals N attachments on every run.
+- **Cross-audit fixes (M1 + minors).** M1: a `PIDGE_LABEL` >80 code units with an astral char
+  (emoji) at the slice boundary left a lone surrogate → `encodeURIComponent` threw `URIError`
+  at MODULE LOAD (the shared `headers` const) and EVERY verb died — `agentLabel()` now
+  sanitizes to well-formed UTF-16 (`toWellFormed()`, regex fallback for Node 18). m3: attachment
+  saves are now atomic (tmp+rename) and a 0-byte file at the cache path is never trusted as
+  cache. m6: `catchup --help` lists `--download` too. Plus tests for the bridge-boot
+  `consumer_conflict` warning and the `unattributed_listening` nudge (m2), and README coverage
+  of the 0.25.0 surface (m1).
 
 ## 0.24.1 — 2026-07-07
 

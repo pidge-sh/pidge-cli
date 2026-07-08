@@ -476,3 +476,24 @@ test('sent_note rides CLEAR on an E2E channel (D6 honesty — content sealed, no
   assert.match(String(sent.title), /^v\d+:/, 'the title rode as ciphertext');
   assert.equal(sent.sent_note, 'armed by nightly', 'sent_note stays CLEAR (never sealed) — it is server-read attribution');
 });
+
+test('a 0-byte file at the cache path is NOT trusted — catchup re-downloads (#74/m3)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-c74z-'));
+  const plain = Buffer.from('real-bytes');
+  mock.state.messages = [sealedAttachmentRow(mock, { id: 43, cid: 'cid-att-1', name: 'r.pdf', bytes: plain })];
+  // A truncated husk (crash mid-write on a pre-atomic build): 0 bytes at dest.
+  const dest = path.join(xdg, 'pidge', 'downloads', '43', 'r.pdf');
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.writeFileSync(dest, Buffer.alloc(0));
+
+  const { code, stdout, stderr } = await runCli(['catchup'], port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.equal(mock.state.reqLog.filter((r) => r.pathname === '/blobs/a1').length, 1, 'the husk is NOT cache — re-downloaded');
+  const row = JSON.parse(stdout).messages.find((m) => m.id === 43);
+  assert.equal(row.attachment.path, dest);
+  assert.deepEqual(fs.readFileSync(dest), plain, 'the real plaintext replaced the 0-byte husk');
+});
