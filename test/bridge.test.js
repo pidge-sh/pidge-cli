@@ -14,7 +14,11 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { spawn } = require('node:child_process');
+const { spawn: rawSpawn } = require('node:child_process');
+const { track } = require('./spawn-tracker');
+// Own process group per child + group-kill when the file's tests end — a
+// straggler (grand)child must never hold this process's event loop open.
+const spawn = (cmd, args, opts = {}) => track(rawSpawn(cmd, args, { ...opts, detached: true }));
 const { createMock } = require('./mock-server');
 
 const CLI = path.join(__dirname, '..', 'bin', 'pidge.js');
