@@ -33,8 +33,9 @@ jobs:
             if timeout -k 10 240 node --test "$f" > /tmp/out.log 2>&1; then
               tail -3 /tmp/out.log
             else
-              echo "FAILED OR HUNG: $f — last 60 lines:"
-              tail -60 /tmp/out.log
+              echo "FAILED OR HUNG: $f — failing tests:"
+              grep -B3 -A30 'not ok' /tmp/out.log | head -220
+              tail -8 /tmp/out.log
               status=1
             fi
           done
