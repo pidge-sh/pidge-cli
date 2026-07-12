@@ -497,6 +497,69 @@ test('stale_from_prior_claim: no warning when the flag is absent/false (the defa
   assert.ok(!/PRIOR claim/.test(r.stderr), `unexpected warning:\n${r.stderr}`);
 });
 
+// 0.26.0 — issue #82: during a long handler run the loop issues no consume GET,
+// so (WS down) presence starved and the human saw "offline" while the bridge
+// worked. Fix: while the handler thinks, renew the batch's lease every RENEW_MS
+// (POST /ack {ids, state:"delivered"}) — the lease can't lapse mid-run, and a
+// v79+ server refreshes "listening now" presence on the renew. The heartbeat
+// stops the MOMENT the handler exits: a FAILED batch must lapse back to the queue.
+test('bridge: renew heartbeat during a handler run — the batch\'s EXACT ids every interval, gone the moment the handler exits', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 7, kind: 'message', body: 'demorada', created_at: 'x' }];
+  // thinks for ~1.4s — at PIDGE_BRIDGE_RENEW=300ms that's several pings mid-run
+  const handler = `${process.execPath} -e "require('fs').readFileSync(0); setTimeout(() => {}, 1400)"`;
+
+  const { child, result, out } = runCli(
+    ['bridge', '--exec', handler, '--no-realtime', '--interval', '1'],
+    port, { PIDGE_BRIDGE_RENEW: '300' },
+  );
+  // pings land WHILE the handler runs — before any terminal ack
+  assert.ok(await waitFor(() => mock.state.ackBodies.some((b) => b.state === 'delivered')), `expected a renew ping; stderr:\n${out.stderr}`);
+  assert.deepEqual(mock.state.ackBodies.find((b) => b.state === 'delivered'), { ids: [7], state: 'delivered' },
+    'the ping renews the batch\'s EXACT ids (state=delivered — never a consume)');
+  assert.ok(!mock.state.ackBodies.some((b) => b.state === undefined), 'no terminal ack yet — the handler is still running');
+
+  // the terminal ack still lands when the handler exits 0 — the heartbeat never replaces it
+  assert.ok(await waitFor(() => mock.state.ackBodies.some((b) => b.state === undefined)), `expected the terminal ack; stderr:\n${out.stderr}`);
+  assert.deepEqual(mock.state.ackBodies.find((b) => b.state === undefined).ids, [7]);
+
+  // after the handler exited, the heartbeat is GONE (>2 renew windows of silence)
+  const pingsAtExit = mock.state.ackBodies.filter((b) => b.state === 'delivered').length;
+  assert.ok(pingsAtExit >= 1, 'at least one mid-run ping');
+  await sleep(800);
+  assert.equal(mock.state.ackBodies.filter((b) => b.state === 'delivered').length, pingsAtExit,
+    'the heartbeat stops the moment the handler exits — a later batch failure must be able to lapse');
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
+});
+
+// `pidge online` — sugar for `listen --all`, one word, so a pasted prompt can
+// say "stay online: pidge online". Same loop (fallthrough, no duplicated
+// implementation); --all forced; exit 3 carries the relaunch nudge.
+test('`pidge online` = listen --all: reads the UNIFIED queue, exits 3 empty with the relaunch nudge', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const r = await runCli(['online', '--no-realtime', '--timeout', '2', '--interval', '1'], port).result;
+  await mock.stop();
+  assert.equal(r.code, 3, `stderr:\n${r.stderr}`);
+  assert.ok(mock.state.messageReads.some((u) => u.includes('all=true')),
+    `online must consume the UNIFIED queue (--all forced); reads:\n${mock.state.messageReads.join('\n')}`);
+  assert.match(r.stderr, /Relaunch the listener/);
+});
+
+test('`pidge online` delivers like listen --all — a notification_reply row reaches stdout', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 9, kind: 'notification_reply', text: 'yes', created_at: 'x', ref: { correlation_id: 'c1', title: 'Q', event_kind: 'action' } }];
+  const r = await runCli(['online', '--no-realtime', '--timeout', '10', '--interval', '1'], port).result;
+  await mock.stop();
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+  assert.match(r.stdout, /notification_reply/, 'the single ear hears answers, not just composer messages');
+});
+
 test('multi-runtime — bridge warns on consumer_conflict at BOOT (whoami), once', async () => {
   const mock = createMock();
   const port = await mock.start();
