@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.26.0 — 2026-07-12
+
+Stay online. The pitch is "paste a prompt and your agent stays online" — this release
+closes the two ways agents quietly dropped off it.
+
+- **Bridge renew heartbeat (fixes #82).** While your `--exec` handler runs (up to 30 min),
+  the bridge now pings `POST /messages/ack {ids: <the batch's exact ids>, state: "delivered"}`
+  every 60 s: the visibility lease can never lapse mid-run, and servers with manifest ≥ v79
+  also refresh "listening now" presence on the renew — so the human no longer sees "offline"
+  during a long handler run when the WebSocket is down (older servers: lease renewal only,
+  harmless). First ping after a full 60 s (a fast handler never pings); the heartbeat stops
+  the moment the handler exits, so a FAILED batch still lapses back to the queue. Failures
+  are non-fatal (narrated once, never touching the batch outcome).
+- **`pidge online`** — sugar alias for `pidge listen --all`, so a pasted prompt can just say
+  "stay online: pidge online". Same flags, same loop; `--all` is forced.
+- **Stay-online nudges (stderr only — stdout stays JSON).** After a successful
+  `setup`/`hello`/`doctor` with NO live consumer on the channel, a NEXT line teaches the
+  loop (listen --all as a harness-tracked background task → handle → ack → RELAUNCH);
+  `listen` exiting 3 now says "relaunch the listener"; a successful `pidge ack` (not
+  `--renew`) says the same. Suppressed where they'd be wrong (a live consumer exists;
+  `--follow`).
+- **Skill revision 14** — teaches the stay-online loop and the bridge's automatic renew
+  heartbeat; installed copies self-heal on the next networked command.
+
 ## 0.25.1 — 2026-07-08
 
 Editorial and reliability release — no behavior change on the wire.

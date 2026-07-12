@@ -425,6 +425,9 @@ USAGE
                                           --ack-on-read = the old immediate-consume (ack on print)
                                           --follow      = KEEP listening until --timeout (supervisor-only)
                                           --all  = the SINGLE EAR: also hear notification ANSWERS
+  pidge online [listen flags]             = pidge listen --all, one word — so a pasted prompt can
+                                          just say "stay online: pidge online". Run it as a background
+                                          task your harness TRACKS; when it exits: handle → ack → RELAUNCH.
   pidge ack --up-to <id> | --ids a,b [--renew]
                                           mark messages PROCESSED (green ✓✓) after you handled them;
                                           --renew heartbeats the lease on a long task (state=delivered)
@@ -769,13 +772,19 @@ const HELP = {
     body: 'One-shot by design (loop it, don\'t daemonize). a read message is DELIVERED (gray ✓✓), NOT done — ack it AFTER the work with `pidge ack --up-to <id>` (a ~10-min lease re-serves un-acked messages, so a crash never loses one). a message may carry an `attachment` (a photo/file from the app\'s composer) — a SEALED one is auto-downloaded + decrypted to a local file (`attachment.path` in the JSON); a clear one keeps its fetchable `url` (--download saves it too).',
     opts: ['timeout', 'all-listen', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
   },
+  online: {
+    summary: 'sugar for `pidge listen --all` — the stay-online loop, one word.',
+    usage: 'pidge online [--timeout N] [--ack-on-read] [--follow] [--download] [--download-dir DIR]',
+    body: 'It exists so a pasted prompt can just say "stay online: pidge online". Every listen flag forwards; --all is forced (the single ear: composer messages + notification answers). The LOOP is the contract: run it as a background task your harness TRACKS (never a loose shell &); it blocks until something lands — handle it, `pidge ack`, then RELAUNCH it. That loop is what "online" means.',
+    opts: ['timeout', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
+  },
   bridge: {
     summary: '24/7 supervisor: long-poll the channel, run YOUR handler once per batch, ack only on exit 0. Model-agnostic.',
     usage: "pidge bridge --exec '<handler>'  ·  pidge bridge install --exec '<handler>'",
     body: [
       'The productized "paste a prompt and the agent stays online". The bridge is deliberately DUMB — no local queue, no own retry ledger: durability is the SERVER\'s ack/lease.',
       '',
-      'LOOP: long-poll GET /messages?all=true (the robust floor; a realtime socket, when available, adds presence — "ouvindo agora" — and early wake-ups, never the data path) → your --exec command runs ONCE per batch with the batch JSON on stdin ({"messages":[…]} + "history_hint":true on the first batch since boot — the handler may want `pidge catchup` to situate) → handler exit 0 ⇒ ack of the batch\'s EXACT ids (never a --up-to watermark: that would stamp rows under lease from an EARLIER batch the handler FAILED on) · non-zero ⇒ NOT acked: the ~10-min server lease re-serves the batch. At-least-once is the contract — make the handler IDEMPOTENT. One run is capped by --handler-timeout (default 30 min): over it the handler is SIGTERMed (SIGKILL 5s later) and the batch counts as FAILED; while it runs, a heartbeat line lands on stderr every 5 min.',
+      'LOOP: long-poll GET /messages?all=true (the robust floor; a realtime socket, when available, adds presence — "ouvindo agora" — and early wake-ups, never the data path) → your --exec command runs ONCE per batch with the batch JSON on stdin ({"messages":[…]} + "history_hint":true on the first batch since boot — the handler may want `pidge catchup` to situate) → handler exit 0 ⇒ ack of the batch\'s EXACT ids (never a --up-to watermark: that would stamp rows under lease from an EARLIER batch the handler FAILED on) · non-zero ⇒ NOT acked: the ~10-min server lease re-serves the batch. At-least-once is the contract — make the handler IDEMPOTENT. One run is capped by --handler-timeout (default 30 min): over it the handler is SIGTERMed (SIGKILL 5s later) and the batch counts as FAILED; while it runs, a heartbeat line lands on stderr every 5 min AND the batch\'s lease is RENEWED every 60 s (POST /ack {ids, state:"delivered"}) — so a long run neither lapses the ~10-min lease mid-work nor reads as offline (servers with manifest ≥ v79 refresh "listening now" presence on the renew; a failed batch still lapses back: the renew stops the moment the handler exits).',
       'SUMMARY: the handler tells the NEXT session WHAT it did by printing a marker line to stdout — `pidge-summary: <one sentence>`. The bridge tees the handler\'s stdout to its own log AND scans it (streamed, never buffered) for the LAST such line; found ⇒ the ack carries that summary (capped ~1000 chars) so `pidge catchup` shows "handled by X: <summary>"; not found ⇒ acked without one (never invented). An LLM handler is instructable in its own prompt: end with `echo "pidge-summary: <what you did>"` (or have the model print it). Only a line that STARTS with the marker counts — incidental output never becomes attribution.',
       'Model-agnostic by construction: --exec \'claude -p "…"\' | \'codex exec "…"\' | \'gemini "…"\' | any script. This is the multi-LLM answer: no dependence on a harness that wakes on background-task exit.',
       'ONE INSTANCE PER CHANNEL: a lockfile keyed by hash(token) (~/.config/pidge/bridge-<hash>.lock, PID-checked so a crashed bridge never wedges the channel) — a second bridge, or a `listen`, on the same channel is REFUSED (exit 2). Read with `pidge catchup` instead.',
@@ -899,7 +908,7 @@ const KNOWN_MANIFEST_VERSION = 67;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 13;
+const SKILL_REVISION = 14;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -1123,7 +1132,7 @@ const health = {
       console.error(`pidge: deaf for ${mins} min — ${this.fails} consecutive failure(s) (latest: ${what})`);
     }
   },
-  exitTimeout(message, hint) {
+  exitTimeout(message, hint, nudge) {
     // REAL elapsed wall-clock — never the configured deadline (the
     // "timed out after 28800s" lie). If only seconds passed, the number says so.
     const elapsed = Math.round((performance.now() - SESSION_START_MONO) / 1000);
@@ -1133,8 +1142,11 @@ const health = {
       // a crashed listener, a bridge), invisible until the lease lapses. Point at
       // the read-only diagnostic that sees the whole queue regardless. Only on
       // exit 3 (channel proven healthy) — on exit 4 (channel broken) it's noise.
+      // `nudge` (listen-only, suppressed under --follow) rides the SAME gate:
+      // "relaunch the listener" is only true advice on a channel proven healthy.
       console.error(`pidge: ${message} after ${elapsed}s (= 'no answer yet', not a failure)`);
       if (hint) console.error(`pidge: ${hint}`);
+      if (nudge) console.error(`pidge: ${nudge}`);
       process.exit(3);
     }
     console.error(`pidge: ${message} after ${elapsed}s — and NOT ONE healthy round-trip all session: the CHANNEL looks broken (server/network), not the human ignoring you. Surface this to your human.`);
@@ -2832,6 +2844,24 @@ function reportProvenance(data) {
   console.error(`pidge: provenance${since} — ${bits.join(' · ')}. A note-less ack means the work was done SILENTLY (\`pidge catchup\` can't say what) — get in the habit of \`ack --summary\`.`);
 }
 
+// The stay-online nudge — the product's core loop, said out loud at the moments
+// an agent decides what to do NEXT (setup/hello/doctor just succeeded). Presence
+// is a LOOP, not a state: listen (background, harness-tracked) → handle → ack →
+// RELAUNCH. The relaunch is the step turn-based agents forget — the queue keeps
+// messages safe meanwhile, but the human sees "offline" until something listens.
+// stderr ONLY (stdout stays parseable JSON for agents), and SUPPRESSED when the
+// channel already has a live consumer: nudging `listen` next to a live
+// bridge/daemon would bait the exact double-consume the lockfile exists to stop.
+const STAY_ONLINE_NUDGE = 'pidge: NEXT — stay online: run `npx -y pidge-cli@latest listen --all` (or its alias `pidge online`) as a background task YOUR HARNESS TRACKS (never a loose shell &). It blocks until a message lands: handle it, ack, RELAUNCH it. That loop is what "online" means.';
+async function nudgeStayOnline(data = null) {
+  try {
+    if (!data) data = (await fetchWhoami()).data; // hello has no whoami in hand — best-effort
+  } catch { return; } // the nudge must never fail the command that just succeeded
+  const live = Array.isArray(data.consumers) ? data.consumers.filter((c) => c && c.live) : [];
+  if (live.length) return; // someone IS online — the nudge would be wrong here
+  console.error(STAY_ONLINE_NUDGE);
+}
+
 // listen + bridge: consumer_conflict, warned ONCE per process. The field rides
 // whoami (bridge boot) AND the consume GET /messages (listen loop) — so a
 // consuming loop learns a sibling started consuming without a second call.
@@ -2980,6 +3010,8 @@ async function runBridge() {
   // (default 30 min — an LLM handler can legitimately think for many minutes).
   const handlerTimeoutS = numStrict(v['handler-timeout'], '--handler-timeout', 1800);
   const HANDLER_NARRATE_MS = parseInt(process.env.PIDGE_BRIDGE_NARRATE || '', 10) || 300000; // 5 min
+  // Lease/presence renew pace while a handler runs (issue #82) — see the heartbeat below.
+  const RENEW_MS = parseInt(process.env.PIDGE_BRIDGE_RENEW || '', 10) || 60000; // 60 s
   const BACKOFF_BASE_MS = parseInt(process.env.PIDGE_BRIDGE_BACKOFF_BASE || '', 10) || 2000;
   const BACKOFF_MAX_MS = parseInt(process.env.PIDGE_BRIDGE_BACKOFF_MAX || '', 10) || 120000;
   const BACKOFF_LONG_MS = parseInt(process.env.PIDGE_BRIDGE_BACKOFF_LONG || '', 10) || 300000;
@@ -3236,9 +3268,39 @@ async function runBridge() {
         console.error(`pidge: bridge — handler running for ${shown} (SIGTERM at --handler-timeout ${handlerTimeoutS}s)`);
       }, HANDLER_NARRATE_MS);
       if (narrate.unref) narrate.unref();
+      // Lease/presence heartbeat while the handler thinks (issue #82): renew the
+      // batch's EXACT ids every 60 s — POST /ack {ids, state:"delivered"}. Two jobs
+      // in one ping: (a) the visibility lease can't lapse mid-run (a 30-min handler
+      // outlives the ~10-min lease — without this the batch re-serves WHILE it's
+      // being worked), and (b) servers ≥ manifest v79 refresh "listening now"
+      // presence on a renew that actually renewed rows — so the human never sees
+      // "offline" during a long handler run even when the WS is down (older
+      // servers: lease renewal only, harmless). First ping only after a full
+      // interval — a fast handler never pings. Cleared in done(), BEFORE the
+      // ack/failure verdict: a FAILED batch must lapse back to the queue, so we
+      // never renew after the child exits. Failures are NON-FATAL and can never
+      // touch the handler or the batch outcome: narrate the FIRST one, then stay
+      // silent (a line per ping would drown a long outage's log).
+      let renewFailed = false;
+      const renew = batchIds.length === 0 ? null : setInterval(() => {
+        fetchT(`${BASE}/api/v1/messages/ack`, {
+          method: 'POST', headers, body: JSON.stringify({ ids: batchIds, state: 'delivered' }),
+        }).then((r) => {
+          if (r.status >= 200 && r.status < 300) return;
+          if (renewFailed) return;
+          renewFailed = true;
+          console.error(`pidge: bridge — renew heartbeat failed (${r.status}) — non-fatal: the handler keeps running; the lease may lapse early (at-least-once covers a re-serve)`);
+        }).catch((e) => {
+          if (renewFailed) return;
+          renewFailed = true;
+          console.error(`pidge: bridge — renew heartbeat failed (network: ${e.message}) — non-fatal: the handler keeps running; the lease may lapse early (at-least-once covers a re-serve)`);
+        });
+      }, RENEW_MS);
+      if (renew && renew.unref) renew.unref();
       const done = (o) => {
         if (settled) return; settled = true;
         clearTimeout(killT); if (hardKill) clearTimeout(hardKill); clearInterval(narrate);
+        if (renew) clearInterval(renew);
         if (graceT) clearTimeout(graceT);
         // A final marker line with NO trailing newline still counts.
         if (markerTail) { takeMarker(markerTail); markerTail = ''; }
@@ -3654,6 +3716,11 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     console.error(`pidge: ✓ setup ok — canal "${data.channel && data.channel.name}" · ${devices} device(s) · realtime ${realtime} (run \`pidge doctor\` for the full check)`);
   else
     console.error('pidge doctor: all good — try: pidge hello   (first-contact WOW — send + wait in one)');
+  // setup/doctor just proved the channel works — say what keeps it WORKING.
+  // Consumer-gated: silent when someone (a bridge, another session) is live.
+  // Deliberately printed even under --quiet: the loop IS the product's pitch,
+  // and the pasted-prompt onboarding (which uses --quiet) is exactly who needs it.
+  await nudgeStayOnline(data);
   console.log(JSON.stringify({ ok: true, base_url: base, channel: data.channel, devices, manifest_version: data.manifest_version, realtime, e2e: { channel: e2e.channelOn, secret: e2e.status, kf: e2e.kf, pinned: !!e2e.pinned } }));
   process.exit(0);
 }
@@ -4052,6 +4119,11 @@ In \`--digest\` each line already carries its state — \`handled by <who>: <sum
 ## Stay "always-on" while you're turn-based
 
 A turn-based agent (e.g. Claude Code, Codex, Gemini CLI — anything invoked on demand) stays COMMANDABLE without a daemon:
+
+### Stay online (the loop)
+
+"Online" is a LOOP, not a state: run \`pidge online\` (sugar for \`pidge listen --all\`) as a background task YOUR HARNESS TRACKS (never a loose shell \`&\`). It blocks until something lands; when it exits: **handle what it printed → \`pidge ack --up-to <id> --summary "…"\` → RELAUNCH it immediately** (exit 3 = nothing arrived — relaunch anyway). The RELAUNCH is the step turn-based agents forget: the queue keeps messages safe meanwhile (at-least-once, nothing lost), but the human sees you offline until something listens again.
+
 - **Active session:** \`pidge listen --follow --timeout 300\` holds for 5 min, printing messages as they arrive. \`--follow\` traps the turn — use it only when you intend to sit and wait.
 - **Supervisor poll (24/7):** a cron/systemd timer invokes you every N min; each tick runs ONE one-shot \`pidge listen --all --timeout 50\` (block up to 50s, print, exit 0; exit 3 = nothing this tick — the \`--all\` ear also catches answers to questions you fire-and-forgot), do the work, \`pidge ack --up-to <id>\`, sleep. \`--timeout\` is always SECONDS. Do NOT background \`pidge listen\` with \`&\`.
 - **Ack with attribution:** \`pidge ack --up-to <id> --summary "<what you did>"\` — a successor runtime (or your own next session) reads it in \`pidge catchup\` instead of redoing the work. Make it a habit on every ack.
@@ -4060,7 +4132,7 @@ A turn-based agent (e.g. Claude Code, Codex, Gemini CLI — anything invoked on 
 
 When your human wants you reachable around the clock without a harness session, run the built-in supervisor instead of hand-rolling a loop:
 
-\`pidge bridge --exec '<your handler>'\` — it long-polls the queue, runs your handler ONCE per batch (batch JSON on stdin), and acks the batch's exact ids only when the handler exits 0. A lockfile enforces ONE consumer per channel (a second bridge or \`listen\` is refused). \`pidge bridge install\` writes a launchd/systemd template and declares \`listen_mode: external_daemon\` for you.
+\`pidge bridge --exec '<your handler>'\` — it long-polls the queue, runs your handler ONCE per batch (batch JSON on stdin), and acks the batch's exact ids only when the handler exits 0. A lockfile enforces ONE consumer per channel (a second bridge or \`listen\` is refused). While your handler runs (up to 30 min), the bridge automatically RENEWS the batch's lease every 60 s — the lease never lapses mid-run and the human keeps seeing "listening now"; you do nothing for it. \`pidge bridge install\` writes a launchd/systemd template and declares \`listen_mode: external_daemon\` for you.
 
 Tell the next session WHAT you did: end your handler's output with one line — \`pidge-summary: <one sentence>\` — and the ack carries it; \`pidge catchup\` then shows "handled by <you>: <that sentence>". Full contract: \`pidge bridge --help\`.
 
@@ -4248,6 +4320,14 @@ ${SKILL_END_MARKER}
       await waitForAnswer(cid, {
         timeout: timeoutArg,
         interval: intervalArg,
+        // the default print-and-exit-0, plus the stay-online nudge — the
+        // handshake closing is EXACTLY when the agent decides what to do next.
+        // nudgeStayOnline fetches whoami itself (best-effort, consumer-gated).
+        onAnswer: async (chosen) => {
+          console.log(JSON.stringify(chosen, null, 2));
+          await nudgeStayOnline();
+          process.exit(0);
+        },
         onTimeout: () => {
           const elapsed = Math.round((performance.now() - SESSION_START_MONO) / 1000);
           console.error(`pidge: no confirmation yet after ${elapsed}s — it stays in your queue (at-least-once, nothing lost); \`pidge listen --all\` picks it up when your human taps. (exit 3 = no answer yet, not a failure)`);
@@ -4350,6 +4430,12 @@ ${SKILL_END_MARKER}
       // an older server omits `annotated`).
       if (Number(adata.annotated) > 0)
         console.error(`pidge: annotated ${adata.annotated} previously-acked message(s) — filled in the attribution a prior consumer left blank.`);
+      // The "what next" line, LAST so it reads as the next step. Only a real
+      // ack (work done) — a --renew is a mid-task heartbeat, the listener is
+      // deliberately NOT running then. The bridge never takes this path (its
+      // internal ackBatch above owns that loop), so no suppression needed here.
+      if (!av.renew)
+        console.error('pidge: ✓ acked. Relaunch your listener (`pidge listen --all`) to stay online.');
       process.exit(0);
       break;
     }
@@ -4554,6 +4640,13 @@ ${SKILL_END_MARKER}
       process.exit(0);
       break;
     }
+    case 'online':
+      // `pidge online` = `pidge listen --all`, one word — so a pasted prompt can
+      // just say "stay online: pidge online". Sugar ONLY: it forces --all (the
+      // single ear) and falls through into listen — same loop, same flags, no
+      // duplicated implementation.
+      v.all = true;
+      // fall through
     case 'listen': {
       // block until the human messages this channel (the app's composer),
       // print the messages as JSON, ACK them, exit 0. One-shot by design (loop
@@ -4583,6 +4676,11 @@ ${SKILL_END_MARKER}
       // from another read (a selftest, a crashed listener, a bridge), invisible to
       // this listen until it lapses. `pidge catchup` shows the whole queue read-only.
       const LEASE_HINT = 'if you expected a message, it may be under a visibility lease from another read (a selftest / crashed listener / bridge) — `pidge catchup` shows the whole queue read-only (delivered_at/lease), never consuming.';
+      // the exit-3 companion: the RELAUNCH reflex. A one-shot listener that
+      // isn't relaunched is an agent that quietly went offline — say so every
+      // empty round. Suppressed under --follow (a supervisor window ending is
+      // its own contract, not a lapse in the loop).
+      const RELAUNCH_NUDGE = v.follow ? null : 'Nothing arrived this round. Relaunch the listener now — the loop (listen → handle → ack → relaunch) is what keeps you online.';
       // The FIRST batch that comes back QUICKLY was already sitting in
       // the queue when this listen started — with --all that includes answers to
       // EARLIER notifications, which read as "new" if we don't say otherwise. A
@@ -4728,7 +4826,7 @@ ${SKILL_END_MARKER}
         // 'ws-unavailable' degrades to polling below (never an early timeout lie).
         if (outcome === 'deadline' && Date.now() >= deadline - 1500) {
           followEnd();
-          health.exitTimeout('no message from the human', LEASE_HINT);
+          health.exitTimeout('no message from the human', LEASE_HINT, RELAUNCH_NUDGE);
         }
         if (outcome === 'got-messages') {
           await new Promise(() => {}); // printAndAck is in flight and exits the process
@@ -4763,7 +4861,7 @@ ${SKILL_END_MARKER}
         }
         if (Date.now() >= deadline) {
           followEnd();
-          health.exitTimeout('no message from the human', LEASE_HINT);
+          health.exitTimeout('no message from the human', LEASE_HINT, RELAUNCH_NUDGE);
         }
         const pace = health.degraded ? DEGRADED_INTERVAL_S : listenInterval;
         if (Date.now() - askedAt < 2000) {
