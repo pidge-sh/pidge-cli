@@ -16,7 +16,7 @@ then gets the answer as JSON — no webhook, no polling loop to write.
 ```bash
 # The human copies a setup prompt from the Pidge app (Canais → the channel) —
 # it carries a SINGLE-USE claim code (15 min TTL), never the key:
-npx pidge-cli setup --claim <code> --url https://pidge.sh
+npx pidge-cli setup --claim <code> --url https://api.pidge.sh
 # → exchanges the code for the real key, stores it (chmod 600), runs `pidge doctor`.
 #   The secret never appears on screen or in any chat (the CLI writes it).
 
@@ -75,7 +75,7 @@ older server the CLI just stays silent.
 ## Use it (no install — via npx)
 
 ```bash
-export PIDGE_URL=https://pidge.sh                  # your Pidge server
+export PIDGE_URL=https://api.pidge.sh              # your Pidge server
 export PIDGE_TOKEN=hld_xxx                          # your channel's bearer key
 # (or skip the exports: the CLI reads ~/.config/pidge/env — KEY=VALUE — so the
 #  key never has to appear in an agent's chat; explicit env vars win)
