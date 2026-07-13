@@ -5,7 +5,7 @@
 // iPhone notification AND block until the human answers (polling — the primary
 // read path for terminal/CLI use, where there's no webhook to receive a reply).
 //
-//   export PIDGE_URL=https://pidge.sh              # default http://localhost:3000
+//   export PIDGE_URL=https://api.pidge.sh          # default http://localhost:3000
 //   export PIDGE_TOKEN=hld_xxx                     # the channel's bearer key
 //   (HERALD_URL / HERALD_TOKEN are legacy env names, still honored as a
 //    fallback; with no env vars set, ~/.config/pidge/env — KEY=VALUE — is read
@@ -592,7 +592,7 @@ const OPTION_DOCS = {
   digest: '--digest                 catchup: one condensed line per message (id · kind · 60 chars · handled by X: <note> / ✓ acked (no note) / PENDING)',
   target: '--target T               skill install: claude (default) → .claude/skills/pidge/SKILL.md · agents → AGENTS.md · gemini → GEMINI.md',
   claim: '--claim CODE             the single-use setup code (the human copies it from the Pidge app)',
-  'url-base': '--url BASE               the Pidge server base URL (default https://pidge.sh)',
+  'url-base': '--url BASE               the Pidge server base URL (default https://api.pidge.sh)',
   print: '--print                  emit `export …` lines instead of writing a file (per-agent; you run it)',
   force: '--force                  overwrite a shared config owned by another channel',
   'listen-mode': '--listen-mode MODE       declare how you operate: turn_based | persistent | external_daemon',
@@ -3775,7 +3775,7 @@ function reportE2eHealth(data) {
 async function runSetup() {
   const code = v.claim;
   if (!code) die('pidge: usage: pidge setup --claim <code> [--url <base>]   (the human copies the code from the Pidge app)', 1);
-  const base = (v.url || process.env.PIDGE_URL || FILE_ENV.PIDGE_URL || 'https://pidge.sh').replace(/\/+$/, '');
+  const base = (v.url || process.env.PIDGE_URL || FILE_ENV.PIDGE_URL || 'https://api.pidge.sh').replace(/\/+$/, '');
 
   // THE SHARED-CONFIG GUARD (a real incident: a shared config file let one
   // agent's setup hijack another's cron). Only the FILE path can

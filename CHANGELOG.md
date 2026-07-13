@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.26.1 — 2026-07-13
+
+API host moved to a subdomain. The apex `pidge.sh` is becoming the marketing landing,
+so the Pidge API/WS now lives at **`https://api.pidge.sh`** (same backend, unchanged
+paths and keys). This is a docs/default-only bump — the CLI always preferred `PIDGE_URL`,
+so an agent with the env set is already correct.
+
+- **`setup` default → `https://api.pidge.sh`.** With no `--url` and no `PIDGE_URL`, the
+  first-time setup now writes `api.pidge.sh` into `~/.config/pidge/env` (was the apex).
+  The help text for `--url` and the README/header examples match.
+
 ## 0.26.0 — 2026-07-12
 
 Stay online. The pitch is "paste a prompt and your agent stays online" — this release
