@@ -2921,7 +2921,11 @@ function beingHandledLine(m) {
   const b = m && m.being_handled_by;
   if (!b || typeof b !== 'object') return null;
   if (b.fingerprint && b.fingerprint === agentFingerprint()) return null; // self
-  const who = b.label || b.fingerprint || 'another consumer';
+  // Execution attribution: a run-only lease (no fingerprint header on the serve)
+  // identifies the holder by run seal — recognize OURSELF on that axis too, so a
+  // run-signed caller never stands down for its own in-flight work.
+  if (b.run_seal && process.env.PIDGE_RUN_SEAL && b.run_seal === process.env.PIDGE_RUN_SEAL) return null; // self (by run)
+  const who = b.label || (b.run_seal ? `run ${b.run_seal}` : null) || b.fingerprint || 'another consumer';
   const since = b.since ? ` since ${b.since}` : '';
   return `being handled by ${who}${since}`;
 }
