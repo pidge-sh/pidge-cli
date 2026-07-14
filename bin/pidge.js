@@ -98,6 +98,13 @@ const FILE_ENV = configEnv();
 
 const BASE = process.env.PIDGE_URL || process.env.HERALD_URL || FILE_ENV.PIDGE_URL || 'http://localhost:3000';
 const TOKEN = process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN || FILE_ENV.PIDGE_TOKEN;
+// Execution attribution: the per-run bearer SIGNS every agent-track call
+// (header `x-pidge-run`) so the human sees WHICH execution spoke. It is ENV-ONLY
+// on purpose — a run is a disposable, per-execution signature, NEVER a stored
+// credential (it must never land in the config file the way TOKEN does; a stale
+// run token in FILE_ENV would mis-sign a later, unrelated session). Advisory
+// everywhere: an expired/invalid token degrades to unsigned, never a 401.
+const RUN_TOKEN = process.env.PIDGE_RUN_TOKEN || null;
 
 // Config paths are computed EARLY (multi-runtime v2): the per-request
 // agent fingerprint hashes CONFIG_FILE, and the shared `headers` const stamps
@@ -357,6 +364,15 @@ const OPTIONS = {
   end: { type: 'boolean' },                    // live: end the entry (shows done + outcome, lingers, leaves)
   outcome: { type: 'string' },                 // live --end: the line shown next to the ✓
   linger: { type: 'string' },                  // live --end: seconds the final snapshot stays (default 30)
+  // execution attribution — `pidge run start` knobs (+ `--json` raw body).
+  mode: { type: 'string' },                    // run start: interactive | poll | bridge | custom (default custom)
+  role: { type: 'string' },                    // run start: main | worker | subagent (display-only)
+  label: { type: 'string' },                   // run start: the friendly execution label (default agentLabel())
+  'parent-seal': { type: 'string' },           // run start: a subagent points its parent run's seal
+  ephemeral: { type: 'boolean' },              // run start: a disposable, per-message execution
+  ttl: { type: 'string' },                     // run start: sliding TTL in seconds → ttl_seconds
+  json: { type: 'boolean' },                   // run start: print the raw server body instead of the export lines
+  'no-defer': { type: 'boolean' },             // bridge: turn OFF the polite poller (never defer to an interactive run)
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -622,6 +638,14 @@ const OPTION_DOCS = {
   end: '--end                    end the entry: done ✓ + outcome, lingers --linger seconds, then leaves the card',
   outcome: '--outcome TEXT           end: the line shown next to the ✓ (falls back to the final --status)',
   linger: '--linger N               end: seconds the final snapshot stays visible (default 30)',
+  mode: '--mode M                 run start: interactive | poll | bridge | custom (default custom)',
+  role: '--role R                 run start: main | worker | subagent (display-only)',
+  label: '--label L                run start: the friendly execution label (default your PIDGE_LABEL/agent id)',
+  'parent-seal': '--parent-seal S          run start: a subagent points at its parent run\'s seal ($PIDGE_RUN_SEAL)',
+  ephemeral: '--ephemeral              run start: mark a disposable, per-message execution',
+  ttl: '--ttl N                  run start: sliding TTL in seconds (server clamps; default 24h)',
+  json: '--json                   run start: print the raw server body instead of the two export lines',
+  'no-defer': '--no-defer               bridge: never hold back for a live interactive run (turn OFF the polite poller)',
 };
 // Content flags shared by every send.
 // `template` is intentionally OFF the menu (content_template is
@@ -793,6 +817,18 @@ const HELP = {
     ].join('\n'),
     opts: ['exec', 'handler-timeout', 'interval', 'realtime', 'no-realtime'],
   },
+  run: {
+    summary: 'execution attribution: mint a per-run SIGNATURE so the human sees WHICH execution spoke (attribution, not a credential).',
+    usage: 'pidge run start [--mode M] [--role R] [--label L] [--parent-seal S] [--ephemeral] [--ttl N] [--json]  ·  pidge run end  ·  pidge run status',
+    body: [
+      'A run is a short, server-issued seal for ONE execution. Every agent-track call then rides `x-pidge-run: $PIDGE_RUN_TOKEN`, so each message you send is stamped with the exact run — the human can tell three cold sessions apart from one continuous mind. It is ATTRIBUTION, never a channel credential: `Authorization: Bearer hld_…` still authenticates; the run token only signs. An expired/invalid run degrades to unsigned (never a 401), and a server that predates runs (/runs 404) turns the feature off for this process — you keep sending unsigned exactly as before.',
+      '',
+      '`pidge run start` prints two shell-eval lines on stdout — `export PIDGE_RUN_TOKEN=…` and `export PIDGE_RUN_SEAL=…` — so `eval "$(pidge run start --mode interactive --role main)"` arms the whole session; a friendly narration goes to stderr. `--json` prints the raw server body instead. The token is NEVER written to a config file (env-only, disposable). `pidge run end` reads $PIDGE_RUN_TOKEN and ends that run (best-effort, idempotent; no token ⇒ a no-op). `pidge run status` lists the channel\'s live runs (your own marked `*`).',
+      '',
+      'A subagent/worker inherits attribution by passing `--role subagent --parent-seal $PIDGE_RUN_SEAL`. `pidge bridge` mints its OWN bridge run per handler automatically — you do not run these there.',
+    ].join('\n'),
+    opts: ['mode', 'role', 'label', 'parent-seal', 'ephemeral', 'ttl', 'json'],
+  },
   ack: {
     summary: 'mark messages PROCESSED (green ✓✓) after you handled them, or --renew the lease on a long task.',
     usage: 'pidge ack --up-to <id> | --ids a,b [--renew] [--summary "<what you did>"]',
@@ -908,7 +944,7 @@ const KNOWN_MANIFEST_VERSION = 67;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 14;
+const SKILL_REVISION = 15;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -2547,6 +2583,11 @@ function identityHeaders() {
   return {
     'x-pidge-fingerprint': agentFingerprint(),
     'x-pidge-label': encodeURIComponent(agentLabel()),
+    // SIGN the call with the execution when a run bearer is in the env — so the
+    // human sees which run spoke. Present-only: no run ⇒ unsigned (identical to
+    // before). Advisory (never auth) and rides EVERY channel-key call because
+    // this set feeds the shared `headers` const + whoami/claim/contract/skill.
+    ...(RUN_TOKEN ? { 'x-pidge-run': RUN_TOKEN } : {}),
   };
 }
 // WS transport: identity rides the ActionCable subscribe params as
@@ -2990,6 +3031,110 @@ function localAlert(title, msg) {
   } catch { /* the stderr line above is the alert of record */ }
 }
 
+// ── execution attribution (runs) ────────────────────────────────────────────
+// A run is a server-issued, per-execution SIGNATURE — attribution, never a
+// credential (the channel key still authenticates; the run token only stamps who
+// spoke). An old server (/runs 404) makes every run verb degrade honestly.
+const RUN_MODES = ['interactive', 'poll', 'bridge', 'custom'];
+const RUN_ROLES = ['main', 'worker', 'subagent'];
+
+async function runRunCommand() {
+  const sub = parsed.positionals[1];
+  if (sub === 'start') return runRunStart();
+  if (sub === 'end') return runRunEnd();
+  if (sub === 'status') return runRunStatus();
+  die('pidge: usage: pidge run start [--mode M] [--role R] [--label L] [--parent-seal S] [--ephemeral] [--ttl N] [--json]  |  pidge run end  |  pidge run status', 1);
+}
+
+async function runRunStart() {
+  const mode = (v.mode || 'custom').trim().toLowerCase();
+  if (!RUN_MODES.includes(mode))
+    die(`pidge: run start --mode must be ${RUN_MODES.join(' | ')} (got ${JSON.stringify(v.mode)})`, 1);
+  let role = null;
+  if (v.role !== undefined) {
+    role = String(v.role).trim().toLowerCase();
+    if (!RUN_ROLES.includes(role))
+      die(`pidge: run start --role must be ${RUN_ROLES.join(' | ')} (got ${JSON.stringify(v.role)})`, 1);
+  }
+  const label = (v.label !== undefined ? String(v.label) : agentLabel()).slice(0, 80);
+  const body = { mode, label };
+  if (role) body.role = role;
+  if (v['parent-seal']) body.parent_seal = String(v['parent-seal']);
+  if (v.ephemeral) body.ephemeral = true;
+  if (v.ttl !== undefined) body.ttl_seconds = numStrict(v.ttl, '--ttl', undefined);
+  let res, data;
+  try {
+    res = await fetchT(`${BASE}/api/v1/runs`, { method: 'POST', headers, body: JSON.stringify(body) });
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    die(`pidge: run start failed (network): ${e.message}`, 1);
+  }
+  await checkManifestNews(res);
+  if (res.status === 404)
+    die('pidge: run start — this server predates execution attribution (/runs 404). Update the server, or just keep sending: the channel key works unsigned.', 1);
+  if (res.status < 200 || res.status >= 300 || !data.run_token)
+    die(`pidge: run start failed (${res.status}): ${JSON.stringify(data)}`, 1);
+  if (v.json) { console.log(JSON.stringify(data, null, 2)); process.exit(0); }
+  const run = data.run || {};
+  // stdout is EXACTLY the two export lines so `eval "$(pidge run start …)"`
+  // arms the session; every narration goes to stderr (never pollutes the eval).
+  console.log(`export PIDGE_RUN_TOKEN=${data.run_token}`);
+  console.log(`export PIDGE_RUN_SEAL=${run.seal || ''}`);
+  console.error(`pidge: run ${run.seal || '?'} started · mode ${run.mode || mode}${run.role ? ` · role ${run.role}` : ''}${run.ephemeral ? ' · ephemeral' : ''} — messages you send now are SIGNED with this execution (attribution, not a credential). End it with \`pidge run end\`.`);
+  process.exit(0);
+}
+
+async function runRunEnd() {
+  // env-ONLY, like every run bearer — never from FILE_ENV.
+  const token = process.env.PIDGE_RUN_TOKEN || null;
+  if (!token) {
+    console.error('pidge: run end — no PIDGE_RUN_TOKEN in the environment; nothing to end (no-op).');
+    process.exit(0);
+  }
+  let res, data;
+  try {
+    res = await fetchT(`${BASE}/api/v1/runs/end`, { method: 'POST', headers: { ...headers, 'x-pidge-run': token } });
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    console.error(`pidge: run end — best-effort POST failed (network: ${e.message}); the server expiry reaps the run.`);
+    process.exit(0);
+  }
+  await checkManifestNews(res);
+  if (res.status >= 200 && res.status < 300)
+    console.error(`pidge: run ${data.seal || process.env.PIDGE_RUN_SEAL || ''} ended.`);
+  else
+    console.error(`pidge: run end — server said ${res.status} (best-effort; the run expires on its own).`);
+  process.exit(0);
+}
+
+async function runRunStatus() {
+  let res, data;
+  try {
+    res = await fetchT(`${BASE}/api/v1/runs/active`, { headers });
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    die(`pidge: run status failed (network): ${e.message}`, 1);
+  }
+  await checkManifestNews(res);
+  if (res.status === 404)
+    die('pidge: run status — this server predates execution attribution (/runs 404).', 1);
+  if (res.status < 200 || res.status >= 300)
+    die(`pidge: run status failed (${res.status}): ${JSON.stringify(data)}`, 1);
+  const runs = Array.isArray(data.runs) ? data.runs : [];
+  const own = process.env.PIDGE_RUN_SEAL || null; // mark THIS execution's row with a *
+  if (runs.length === 0) { console.log('(no live runs)'); process.exit(0); }
+  const header = ['RUN', 'MODE', 'ROLE', 'LABEL', 'LAST SEEN'];
+  const rows = runs.map((r) => [
+    (own && r.seal === own ? '*' : ' ') + (r.seal || '?'),
+    r.mode || '-', r.role || '-', (r.label || '-').slice(0, 24), r.last_seen_at || '-',
+  ]);
+  const widths = header.map((h, i) => Math.max(h.length, ...rows.map((row) => String(row[i]).length)));
+  const fmt = (cols) => cols.map((c, i) => String(c).padEnd(widths[i])).join('  ');
+  console.log(fmt(header));
+  for (const row of rows) console.log(fmt(row));
+  process.exit(0);
+}
+
 async function runBridge() {
   const handlerCmd = v.exec;
   if (!handlerCmd)
@@ -3114,19 +3259,90 @@ async function runBridge() {
   let alerted401 = false;     // ONE local alert per outage, not one per retry
   let alertedBroken = false;
 
+  // Execution attribution — the bridge mints ONE run per handler invocation so
+  // each spawned handler signs the messages it answers. A server that predates
+  // runs (/runs 404) latches OFF for the whole process: no vars are injected and
+  // the bridge behaves EXACTLY as before (attribution can never gate messages).
+  let runsUnsupported = false;
+  // Polite poller: hold back when a live INTERACTIVE run is the human's turn —
+  // a client-side courtesy (delivery is unchanged server-side). Bounded so a
+  // dead-but-unexpired interactive run can never wedge the bridge forever.
+  let politeUnsupported = false;       // /runs/active 404 ⇒ turn the courtesy off
+  let deferSince = null;               // when THIS continuous deference streak began
+  const deferEnabled = !v['no-defer']; // --no-defer opts out entirely
+  const DEFER_CAP_MS = parseInt(process.env.PIDGE_BRIDGE_DEFER_CAP || '', 10) || 600000; // 10 min ceiling
+
+  // Mint a bridge run for ONE handler. 404 ⇒ latch runsUnsupported (old server);
+  // any other failure ⇒ spawn UNSIGNED (a message must never fail to be handled
+  // because attribution hiccuped). Returns {token, seal} or null.
+  const startBridgeRun = async () => {
+    if (runsUnsupported) return null;
+    try {
+      const res = await fetchT(`${BASE}/api/v1/runs`, {
+        method: 'POST', headers,
+        body: JSON.stringify({ mode: 'bridge', ephemeral: true, label: agentLabel() }),
+      });
+      if (res.status === 404) { runsUnsupported = true; return null; }
+      if (res.status < 200 || res.status >= 300) {
+        console.error(`pidge: bridge — run start failed (${res.status}) — handling this batch WITHOUT execution attribution`);
+        return null;
+      }
+      const data = await res.json().catch(() => ({}));
+      if (!data.run_token) return null;
+      return { token: data.run_token, seal: (data.run && data.run.seal) || '' };
+    } catch (e) {
+      console.error(`pidge: bridge — run start failed (network: ${e.message}) — handling this batch WITHOUT execution attribution`);
+      return null;
+    }
+  };
+  // Best-effort run end (idempotent; server expiry covers a miss).
+  const endBridgeRun = async (token) => {
+    if (!token) return;
+    try {
+      await fetchT(`${BASE}/api/v1/runs/end`, {
+        method: 'POST', headers: { ...headers, 'x-pidge-run': token },
+      });
+    } catch { /* best-effort — the server reaps it on expiry */ }
+  };
+  // The polite-poller probe: a live interactive run (last seen < 120 s, not our
+  // own seal) ⇒ return it. 404 ⇒ latch politeUnsupported. Any error ⇒ null (never
+  // block the loop on a bad probe).
+  const liveInteractiveRun = async () => {
+    if (politeUnsupported) return null;
+    try {
+      const res = await fetchT(`${BASE}/api/v1/runs/active`, { headers });
+      if (res.status === 404) { politeUnsupported = true; return null; }
+      if (res.status < 200 || res.status >= 300) return null;
+      const data = await res.json().catch(() => ({}));
+      const runs = Array.isArray(data.runs) ? data.runs : [];
+      const own = process.env.PIDGE_RUN_SEAL || null;
+      const now = Date.now();
+      for (const r of runs) {
+        if (r.mode !== 'interactive') continue;
+        if (own && r.seal === own) continue;
+        const seen = r.last_seen_at ? Date.parse(r.last_seen_at) : NaN;
+        if (Number.isFinite(seen) && now - seen < 120000) return r;
+      }
+      return null;
+    } catch { return null; }
+  };
+
   // Ack the batch's EXACT ids, never `up_to`.
   // The server's up_to flips EVERY unprocessed row ≤ id — including rows under
   // lease from an EARLIER batch the handler FAILED on (or never saw): a later
   // success would stamp "processed" on work that never happened. ids:[…] can
   // only stamp what this handler demonstrably just handled.
-  const ackBatch = async (ids, summary) => {
+  const ackBatch = async (ids, summary, runToken) => {
     const body = { ids };
     // attribution — WHAT the handler did, captured from its stdout marker
     // line (below). Absent ⇒ no field (never invent one). Server slices; we cap.
     if (summary) body.summary = String(summary).slice(0, 1000);
+    // Sign the ack with THIS batch's run (the handler that just did the work),
+    // never the parent bridge's — so the human sees who processed the message.
+    const ackHeaders = runToken ? { ...headers, 'x-pidge-run': runToken } : headers;
     try {
       const res = await fetchT(`${BASE}/api/v1/messages/ack`, {
-        method: 'POST', headers, body: JSON.stringify(body),
+        method: 'POST', headers: ackHeaders, body: JSON.stringify(body),
       });
       if (res.status >= 200 && res.status < 300) {
         console.error(`pidge: bridge — acked ${ids.length} message(s) (exact ids of the batch — green ✓✓)${body.summary ? ` · summary: ${body.summary.length > 80 ? body.summary.slice(0, 77) + '…' : body.summary}` : ''}`);
@@ -3141,6 +3357,31 @@ async function runBridge() {
 
   for (;;) {
     if (shuttingDown) return;
+
+    // Polite poller (CLIENT-side courtesy — server delivery is UNCHANGED): if a
+    // live interactive run is the human's turn, hold this cycle so the daemon
+    // doesn't consume a message meant for the person at the keyboard. Bounded to
+    // DEFER_CAP_MS of CONTINUOUS deference (then consume anyway — a stuck
+    // interactive run must never wedge the bridge); the budget resets only when
+    // the interactive run clears. For anyone who never started an interactive
+    // run, `other` is always null ⇒ behaviour is IDENTICAL to before.
+    if (deferEnabled && !politeUnsupported) {
+      const other = await liveInteractiveRun();
+      if (shuttingDown) return;
+      if (other) {
+        if (deferSince === null) deferSince = Date.now();
+        if (Date.now() - deferSince < DEFER_CAP_MS) {
+          console.error(`pidge bridge: deferring to interactive run ${other.seal}`);
+          await sleepInterruptible(jitter(intervalS * 1000));
+          continue;
+        }
+        // past the ceiling — consume this cycle, but keep deferSince set so we
+        // don't re-arm the whole budget while the interactive run lingers.
+      } else {
+        deferSince = null; // interactive run gone → the courtesy budget resets
+      }
+    }
+
     let res = null, data = null, failWhat = null;
     const waitS = 25;
     const askedAt = Date.now();
@@ -3212,6 +3453,11 @@ async function runBridge() {
     const batchIds = opened.map((m) => Number(m.id)).filter(Number.isInteger);
     const batch = { messages: opened, ...(firstBatch ? { history_hint: true } : {}) };
     console.error(`pidge: bridge — batch of ${opened.length} message(s) → handler${firstBatch ? ' (history_hint: first batch since this bridge started — the handler may want `pidge catchup` to situate)' : ''}`);
+    // Mint ONE run for this handler and inject its bearer + seal — the handler's
+    // own pidge calls (and this batch's ack) then sign with it. null ⇒ old server
+    // or a hiccup: spawn unsigned, exactly as before.
+    const runInfo = await startBridgeRun();
+    if (runInfo) console.error(`pidge: bridge — run ${runInfo.seal || '?'} signs this batch`);
     // capture the handler's summary from a MARKER LINE on its stdout —
     // `pidge-summary: <text>`. We STREAM, never buffer the whole output: stdout is
     // teed to the bridge's own stdout (the existing log is preserved) while a
@@ -3239,7 +3485,12 @@ async function runBridge() {
     const outcome = await new Promise((resolve) => {
       let child;
       try {
-        child = spawn(handlerCmd, { shell: true, stdio: ['pipe', 'pipe', 'inherit'] });
+        // Inject the run bearer + seal so the handler's pidge calls self-sign;
+        // no run ⇒ plain process.env (unchanged behaviour).
+        const childEnv = runInfo
+          ? { ...process.env, PIDGE_RUN_TOKEN: runInfo.token, PIDGE_RUN_SEAL: runInfo.seal }
+          : process.env;
+        child = spawn(handlerCmd, { shell: true, stdio: ['pipe', 'pipe', 'inherit'], env: childEnv });
       } catch (e) { return resolve({ code: null, error: e.message }); }
       currentChild = child;
       let timedOut = false;
@@ -3347,7 +3598,7 @@ async function runBridge() {
       handlerFails = 0;
       if (batchIds.length === 0) {
         console.error('pidge: bridge — WARNING: batch had no numeric ids — nothing to ack (server bug?)');
-      } else if (await ackBatch(batchIds, lastSummary)) {
+      } else if (await ackBatch(batchIds, lastSummary, runInfo && runInfo.token)) {
         // Only a DELIVERED + ACKED first batch retires the hint: if the ack
         // failed, the re-served batch is still effectively "first post-restart".
         firstBatch = false;
@@ -3363,6 +3614,9 @@ async function runBridge() {
       // LLM call per message. Jittered like every other sleep.
       await sleepInterruptible(jitter(Math.min(BACKOFF_BASE_MS * 2 ** (handlerFails - 1), BACKOFF_MAX_MS)));
     }
+    // End the handler's run AFTER the ack (which had to sign with it). Best-effort:
+    // a miss is reaped by the server's run expiry.
+    await endBridgeRun(runInfo && runInfo.token);
   }
 }
 
@@ -4136,6 +4390,16 @@ When your human wants you reachable around the clock without a harness session, 
 
 Tell the next session WHAT you did: end your handler's output with one line — \`pidge-summary: <one sentence>\` — and the ack carries it; \`pidge catchup\` then shows "handled by <you>: <that sentence>". Full contract: \`pidge bridge --help\`.
 
+## Sign your messages with the execution (\`pidge run\`)
+
+So the human can tell ONE continuous session apart from three disposable cold ones, sign your messages with an **execution attribution run**:
+
+- **At the start of an interactive session:** \`eval "$(pidge run start --mode interactive --role main --label <your-agent-name>)"\`. This sets \`PIDGE_RUN_TOKEN\`/\`PIDGE_RUN_SEAL\` in your env; every \`pidge\` call you make afterward is stamped with that execution, so each message shows WHO spoke.
+- **Subagents / workers you spawn:** \`eval "$(pidge run start --mode interactive --role subagent --parent-seal $PIDGE_RUN_SEAL)"\` inside the child, so it signs as its own execution under yours.
+- **When you finish:** \`pidge run end\`.
+
+This is **attribution, not a credential** — your channel key still authenticates; the run only reveals which execution is talking (the human sees "label · mode/SEAL"). An old server just ignores it (you keep sending unsigned). \`pidge run status\` lists the channel's live runs. \`pidge bridge\` mints its own run per handler automatically — don't call these inside it.
+
 ## Full spec
 
 \`curl $PIDGE_URL/api/v1/manifest -H "Authorization: Bearer $PIDGE_TOKEN"\` — the always-current contract (fields, profiles, custom actions, media, threads, realtime).
@@ -4441,6 +4705,12 @@ ${SKILL_END_MARKER}
     }
     case 'contract': {
       await runContract();
+      break;
+    }
+    case 'run': {
+      // execution attribution — start/end/status. start exits after printing
+      // the eval-friendly export lines; end/status exit inside their handlers.
+      await runRunCommand();
       break;
     }
     case 'bridge': {

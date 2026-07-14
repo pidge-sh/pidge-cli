@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.27.0 — 2026-07-14
+
+Execution attribution. Every agent message can now reveal WHICH execution sent it — so a
+human can tell one continuous session apart from three disposable cold ones. It is
+**attribution, never a credential**: the channel key still authenticates; a per-run bearer
+only *signs* the call (a new `x-pidge-run` header).
+
+- **`pidge run start` / `end` / `status`.** `run start` mints a server-issued run and prints
+  two eval-friendly lines on stdout — `export PIDGE_RUN_TOKEN=…` and `export PIDGE_RUN_SEAL=…`
+  — so `eval "$(pidge run start --mode interactive --role main)"` arms a whole session; the
+  friendly narration goes to stderr. Flags: `--mode interactive|poll|bridge|custom` (default
+  custom), `--role main|worker|subagent`, `--label`, `--parent-seal`, `--ephemeral`, `--ttl`,
+  `--json` (raw body). The run token is env-only — NEVER written to a config file. `run end`
+  ends the run in `$PIDGE_RUN_TOKEN` (best-effort, idempotent; no token ⇒ a no-op). `run
+  status` lists the channel's live runs (your own marked `*`).
+- **Every agent-track call signs with the run** when `PIDGE_RUN_TOKEN` is in the env — the
+  `x-pidge-run` header rides notify/ack/inbox/whoami/etc. Advisory only: an expired/invalid
+  token degrades to unsigned, never a 401.
+- **`pidge bridge` mints one run per handler.** Before spawning the handler for a batch it
+  starts a `bridge` run and injects `PIDGE_RUN_TOKEN`/`PIDGE_RUN_SEAL` into the handler's env;
+  the batch ack is signed with that run and the run is ended afterwards (best-effort). So each
+  disposable handler is a distinct, visible execution.
+- **Polite poller (bridge).** Each cycle the bridge checks for a live `interactive` run on the
+  channel; if one is the human's turn (seen < 120 s ago), it defers this cycle rather than
+  consuming — a client-side courtesy that changes nothing server-side. Bounded to 10 minutes
+  of continuous deference, then it consumes anyway (a stuck interactive run can never wedge the
+  bridge). `--no-defer` turns it off; the default for anyone who never started an interactive
+  run is IDENTICAL to before.
+- **Degrades on an old server.** A server that predates runs answers `/runs` with 404 — the CLI
+  turns the feature off for the process and keeps sending unsigned, exactly as before.
+- **Skill revision 15** — teaches interactive sessions to sign with `pidge run start`
+  (subagents pass `--role subagent --parent-seal $PIDGE_RUN_SEAL`) and end with `pidge run end`;
+  installed copies self-heal on the next networked command.
+
 ## 0.26.1 — 2026-07-13
 
 API host moved to a subdomain. The apex `pidge.sh` is becoming the marketing landing,

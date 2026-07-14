@@ -162,6 +162,7 @@ bundle both: **`pidge ask`** = `important --wait` (needs `--actions`); **`pidge 
 | `online` | Sugar for **`pidge listen --all`** — the stay-online loop, one word, so a pasted prompt can just say *"stay online: pidge online"*. Same flags; `--all` forced. The loop is the contract: run it as a background task your harness **tracks** (never a loose shell `&`); when it exits, handle → `ack` → **relaunch**. The CLI now nudges this loop on stderr at the moments that matter: after a successful `setup`/`hello`/`doctor` (only when NO consumer is live on the channel), on a `listen`/`online` that exits `3` empty, and after a successful `ack` (not `--renew`). stdout stays parseable JSON. |
 | `bridge --exec '<handler>'` | The **24/7 supervisor** — paste a prompt and the agent stays online. Long-polls the channel (`--all`); your handler runs **once per batch** with the batch JSON on stdin (`{"messages":[…]}` + `history_hint:true` on the first batch since boot); handler exit `0` ⇒ ack of the batch's **exact ids** · non-zero ⇒ **not acked** (the server's **~10-min** visibility lease re-serves — make the handler **idempotent**). One run is capped by `--handler-timeout` (default 30 min: SIGTERM, SIGKILL 5s later, counts as a failed batch), with a stderr heartbeat every 5 min while the handler runs **and an automatic lease/presence renew every 60 s** (`POST /messages/ack {ids, state:"delivered"}` on the batch's exact ids — the lease never lapses mid-run; servers with manifest ≥ v79 also refresh *"listening now"* on it). The renew stops the moment the handler exits, so a failed batch still lapses back to the queue; renew failures are non-fatal (narrated once). Model-agnostic: `--exec 'claude -p …' \| 'codex exec …' \|` any script. **One instance per channel**: a PID-checked lockfile refuses a second bridge/`listen` (a stale lock from a crash is recovered). 401 / broken channel → narrated + **local alert** + long **jittered** backoff — never a silent death, never a blind hot loop. SIGTERM/SIGINT are clean: in-flight batch NOT acked, lock released, exit `0`. Deliberately DUMB: no local queue — durability is the server's ack/lease. **Attribution:** the handler tells the next session what it did by printing a final marker line — `pidge-summary: <one sentence>` — to stdout; the bridge scans for the **last** such line and acks with that summary so `catchup` shows *"handled by X: <summary>"*. No marker ⇒ acked without one (never invented). Example: `pidge bridge --exec 'claude -p "handle this pidge batch (JSON on stdin), then print a final line: pidge-summary: <what you did>"'`. |
 | `bridge install --exec '<handler>'` | Write the launchd (Mac) / systemd user (Linux) **template** that runs the bridge with `Restart=on-failure` semantics, and declare `listen_mode=external_daemon` (advisory). The template **never embeds the key** (it stays in `~/.config/pidge/env`); enable with the printed `launchctl`/`systemctl` command. |
+| `run start` / `end` / `status` | **Execution attribution** — sign your messages with the exact execution so the human sees WHO spoke. `run start` prints two `export` lines (`eval "$(pidge run start --mode interactive --role main)"` arms a whole session); `--mode interactive\|poll\|bridge\|custom`, `--role main\|worker\|subagent`, `--label`, `--parent-seal`, `--ephemeral`, `--ttl`, `--json`. `run end` ends `$PIDGE_RUN_TOKEN` (best-effort; no token ⇒ no-op). `run status` lists the channel's live runs (own marked `*`). Attribution, **not a credential** — see [Execution attribution](#execution-attribution-runs). |
 | `ack --up-to <id>` | Mark messages PROCESSED (green ✓✓) **after** you've handled them; `--renew` heartbeats the **~10-min** visibility-timeout lease on a long task. `--summary "<what you did>"` attaches a one-line note to the acked messages — a **successor session** sees it as *"handled by X: <summary>"* in `pidge catchup`. A bare `--summary` with no value is a usage error, never a silent no-op. |
 | `contract set <k>=<v>` / `contract show` | DECLARE how you operate (`keep_connection_alive`, `mirror_in_origin_session`, `listen_mode=turn_based\|persistent\|external_daemon`, `quiet_when_idle`). **Advisory, never policy** — you declare, the human registers their expectation and *sees* if you honor it; Pidge enforces nothing. An unknown key/bad value is rejected locally (exit 1). |
 | `selftest [--window N]` | Prove your listener works by ROUND-TRIP — fire a nonce, run the listener, confirm it picks it up + acks in time (PASS exit `0` / FAIL exit `2` with the likely cause: timeout / orphan / transport). Run it as the last onboarding step + whenever sends seem to go unheard. |
@@ -170,6 +171,39 @@ bundle both: **`pidge ask`** = `important --wait` (needs `--actions`); **`pidge 
 | `whoami` | Which channel does this key speak for (JSON). |
 | `skill install [--target T]` | Write the generated Pidge skill — persistent Pidge knowledge for an AI agent; re-run to update. `--target` picks the destination (same content): `claude` (default) → `.claude/skills/pidge/SKILL.md` · `agents` → `AGENTS.md` · `gemini` → `GEMINI.md`. An existing file whose content differs is backed up to `<dest>.bak` first (or `<dest>.bak.<timestamp>`), so a re-install never destroys your original. The `claude` target **self-heals**: any networked pidge command silently refreshes a stale `.claude` skill; `AGENTS.md`/`GEMINI.md` do **not** auto-update — re-run `skill install` yourself to refresh them. |
 | `--version` | Print the CLI version. |
+
+## Execution attribution (runs)
+
+A solo dev launches agents without designing an identity system — but a human still needs to
+know **which execution is talking**: one continuous interactive session, or a fresh cold poll
+process that just woke up with no memory of the last. A **run** answers that. It is a short,
+server-issued signature for one execution — **attribution, never a credential**: your channel
+key (`hld_…`) still authenticates every call; a per-run bearer only *signs* it (a new
+`x-pidge-run` header the server stamps onto the messages you send).
+
+```bash
+# at the start of an interactive session — arms PIDGE_RUN_TOKEN/PIDGE_RUN_SEAL for the session
+eval "$(pidge run start --mode interactive --role main --label supervisor-eli)"
+
+# a subagent/worker you spawn signs as its own execution under yours
+eval "$(pidge run start --mode interactive --role subagent --parent-seal $PIDGE_RUN_SEAL)"
+
+pidge run status      # the channel's live runs (your own marked *)
+pidge run end         # end this execution when you're done
+```
+
+Once `PIDGE_RUN_TOKEN` is in the environment, **every** `pidge` call carries it, so each message
+shows *label · mode/SEAL* to the human. Honest degradation throughout: an expired/invalid run
+degrades to **unsigned** (never a 401), and a server that predates runs simply ignores it (you
+keep sending exactly as before). The token is **env-only** — never written to a config file.
+
+**`pidge bridge` does this for you.** It mints one `bridge` run per handler invocation and injects
+`PIDGE_RUN_TOKEN`/`PIDGE_RUN_SEAL` into the handler's environment, so each disposable handler is a
+distinct, visible execution and its batch ack is signed with it. The bridge also runs a **polite
+poller**: if a live `interactive` run is the human's turn on the channel, the bridge holds back
+that cycle rather than consuming it (a client-side courtesy — delivery is unchanged server-side),
+bounded to 10 minutes of deference before it consumes anyway. `--no-defer` turns it off; if you
+never start an interactive run, the bridge behaves exactly as before.
 
 ## Realtime
 

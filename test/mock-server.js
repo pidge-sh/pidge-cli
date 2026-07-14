@@ -61,6 +61,13 @@ function createMock() {
     provenance: null,           // whoami provenance{} (null ⇒ omitted)
     consumeConflict: null,      // GET /messages consumer_conflict (null ⇒ omitted)
     ackAnnotated: 0,            // POST /ack annotated count
+    // execution attribution (runs). runsSupported:false makes every /runs
+    // endpoint 404 (models an OLD server → the CLI degrades silently).
+    runsSupported: true,
+    runSeq: 0,                  // deterministic seal/token counter (TST1, run_test_token_1, …)
+    runStarts: [],              // {body, run} of every POST /runs
+    runEnds: [],                // the x-pidge-run header of every POST /runs/end
+    activeRuns: [],             // rows served by GET /runs/active (a test configures it)
   };
   let server = null;
   let wss = null;
@@ -79,6 +86,7 @@ function createMock() {
       method: req.method, pathname: url.pathname,
       fingerprint: req.headers['x-pidge-fingerprint'] || null,
       label: req.headers['x-pidge-label'] || null,
+      run: req.headers['x-pidge-run'] || null, // execution attribution signature
     });
     const held = url.searchParams.has('wait');
     if (held && state.waitMode === '502') return json(res, 502, { error: 'bad gateway' });
@@ -426,6 +434,41 @@ function createMock() {
         json(res, 201, { id, status: 'pending', nonce, window_seconds: windowS, expires_at: new Date(Date.now() + windowS * 1000).toISOString() });
       });
       return;
+    }
+    // execution attribution (runs). runsSupported:false → 404 everywhere
+    // (the CLI must degrade silently and turn the feature off in-process).
+    if (req.method === 'POST' && url.pathname === '/api/v1/runs') {
+      if (!state.runsSupported) return json(res, 404, { error: 'not_found' });
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
+        const n = ++state.runSeq;
+        const run = {
+          seal: `TST${n}`,
+          label: p.label ?? null,
+          mode: p.mode || 'custom',
+          role: p.role ?? null,
+          ephemeral: !!p.ephemeral,
+          context_state: p.context_state || 'unknown',
+          started_at: new Date().toISOString(),
+          expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+        };
+        state.runStarts.push({ body: p, run });
+        json(res, 201, { run, run_token: `run_test_token_${n}` });
+      });
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/runs/end') {
+      if (!state.runsSupported) return json(res, 404, { error: 'not_found' });
+      const xrun = req.headers['x-pidge-run'] || null;
+      state.runEnds.push(xrun);
+      // idempotent — always 200.
+      return json(res, 200, { ended: true, seal: null });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/v1/runs/active') {
+      if (!state.runsSupported) return json(res, 404, { error: 'not_found' });
+      return json(res, 200, { runs: state.activeRuns || [] });
     }
     const stMatch = url.pathname.match(/^\/api\/v1\/selftest\/(\d+)$/);
     if (req.method === 'GET' && stMatch) {
