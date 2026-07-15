@@ -581,3 +581,94 @@ test('multi-runtime — bridge warns on consumer_conflict at BOOT (whoami), once
   await b.result;
   await mock.stop();
 });
+
+// Gate hygiene (server >= manifest v83): a notification_reply with ref.gated
+// (a Face-ID gate outcome — pidge approve allow / approval grant / --gated
+// confirm) is acked by the bridge itself and NEVER handed to a handler: its
+// bare label ("Submit") reads like a fresh imperative command to an LLM, and
+// the asker already heard the answer on its own wait/webhook. Old servers
+// never set ref.gated, so the filter is a no-op there.
+test('bridge: a gated reply is acked WITHOUT a handler; the rest of the batch still spawns', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [
+    { id: 21, kind: 'notification_reply', body: 'Submit', created_at: 'x',
+      ref: { correlation_id: 'gate-1', title: 'Approve: submit?', event_kind: 'acted', gated: true } },
+    { id: 22, kind: 'message', body: 'trabalho real', created_at: 'x' },
+  ];
+  const outFile = path.join(tmpDir('pidge-gated-'), 'batch.json');
+
+  const { child, result, out } = runCli(
+    ['bridge', '--exec', CAPTURE_HANDLER, '--no-realtime', '--interval', '1'],
+    port, { OUT: outFile },
+  );
+
+  // Two acks land: the gated auto-ack (id 21) and the handler batch (id 22).
+  assert.ok(await waitFor(() => mock.state.ackBodies.length >= 2), `expected both acks; stderr:\n${out.stderr}`);
+  const gatedAck = mock.state.ackBodies.find((b) => Array.isArray(b.ids) && b.ids.includes(21));
+  assert.ok(gatedAck, 'the gated row is acked by the bridge itself');
+  assert.match(gatedAck.summary || '', /gate answer/i, 'the ack summary says WHY (provenance, not silence)');
+  const batchAck = mock.state.ackBodies.find((b) => Array.isArray(b.ids) && b.ids.includes(22));
+  assert.ok(batchAck, 'the real work is still handled + acked');
+  assert.ok(!(batchAck.ids || []).includes(21), 'the gated id never rides the handler batch ack');
+
+  const batch = JSON.parse(fs.readFileSync(outFile, 'utf8'));
+  assert.equal(batch.messages.length, 1, 'the handler sees ONLY the real work');
+  assert.equal(batch.messages[0].id, 22);
+  assert.ok(!JSON.stringify(batch).includes('Submit'), 'no gate body ever reaches an LLM handler');
+  assert.match(out.stderr, /gate answer\(s\) acked WITHOUT spawning/, 'loud log line, never a silent eat');
+
+  child.kill('SIGTERM');
+  const r = await result;
+  await mock.stop();
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+});
+
+test('bridge: incident regression — an all-gated batch (approve --allow-label Submit) spawns NOTHING', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [
+    { id: 31, kind: 'notification_reply', body: 'Submit', created_at: 'x',
+      ref: { correlation_id: 'gate-2', title: 'Approve: submit the order?', event_kind: 'acted', gated: true } },
+  ];
+  const outFile = path.join(tmpDir('pidge-gated-only-'), 'batch.json');
+
+  const { child, result, out } = runCli(
+    ['bridge', '--exec', CAPTURE_HANDLER, '--no-realtime', '--interval', '1'],
+    port, { OUT: outFile },
+  );
+
+  assert.ok(await waitFor(() => mock.state.ackBodies.some((b) => (b.ids || []).includes(31))),
+    `the gated row must be acked; stderr:\n${out.stderr}`);
+  await sleep(500); // give a buggy spawn a chance to write before asserting
+  assert.ok(!fs.existsSync(outFile), 'no handler ever ran — no LLM call for a gate outcome');
+
+  child.kill('SIGTERM');
+  const r = await result;
+  await mock.stop();
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+});
+
+test('bridge: an UNMARKED reply (old server / normal answer) still spawns a handler — no over-filtering', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [
+    { id: 41, kind: 'notification_reply', body: 'Approve', created_at: 'x',
+      ref: { correlation_id: 'pathb-1', title: 'Deploy pronto', event_kind: 'acted' } },
+  ];
+  const outFile = path.join(tmpDir('pidge-unmarked-'), 'batch.json');
+
+  const { child, result, out } = runCli(
+    ['bridge', '--exec', CAPTURE_HANDLER, '--no-realtime', '--interval', '1'],
+    port, { OUT: outFile },
+  );
+
+  assert.ok(await waitFor(() => mock.state.ackBodies.some((b) => (b.ids || []).includes(41))), `stderr:\n${out.stderr}`);
+  const batch = JSON.parse(fs.readFileSync(outFile, 'utf8'));
+  assert.equal(batch.messages[0].id, 41, 'a Path-B approve / old-server reply keeps flowing to the handler');
+
+  child.kill('SIGTERM');
+  const r = await result;
+  await mock.stop();
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+});

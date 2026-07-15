@@ -2237,6 +2237,9 @@ test('approve: human taps allow → exit 0, chosen_action JSON on stdout, gated 
     { id: 'deny', label: 'Deny', style: 'destructive', terminal: true },
   ], 'the gated allow(Face-ID)/deny pair is on the wire');
   assert.equal(sent.actions, undefined, 'approve uses custom_actions, not built-in actions');
+  // Closed circuit: approve blocks on its own cid (deny-default), so the answer
+  // must not ALSO mirror onto the queue and wake a bridge handler as a "command".
+  assert.equal(sent.mirror_reply, false, 'approve opts out of the queue mirror (mirror_reply:false)');
 });
 
 test('approve: human taps deny → exit 1 (deny explicit, never a false allow)', async () => {

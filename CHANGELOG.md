@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.28.0 — 2026-07-15
+
+Gate-mirror hygiene. A Face-ID gate outcome must never reach an autonomous handler
+looking like a fresh command — the incident: `pidge approve --allow-label Submit` was
+answered, its queue mirror row carried the bare body "Submit", and a running
+`pidge bridge` spawned an LLM handler that woke with what read like a new imperative
+order (the asker had already heard the answer on its own poll).
+
+- **`pidge bridge` acks gated answers without spawning.** A `notification_reply` whose
+  `ref.gated` is `true` (server manifest ≥ v83 marks the mirror of a `biometric:true`
+  tap) is acked directly — one loud log line + an ack summary ("Face-ID gate answer —
+  auto-acked by the bridge, no handler spawned"), never a silent eat. Everything else
+  in the batch still spawns the handler. Old servers never set the flag ⇒ behavior
+  unchanged. Covers `pidge approve` (allow), the `approval` recipe (`grant`) and
+  `--gated` (`confirm_action`) — only the biometric tap itself; a deny/reject/reply/
+  snooze on the same ask still reaches your handler.
+- **`pidge approve` sends `mirror_reply:false`.** Approve is a closed circuit (it
+  blocks on its own correlation_id, deny-default), so on servers ≥ v83 the answer no
+  longer mirrors onto the queue at all — nothing for any consumer to trip on, allow
+  AND deny alike. The canonical answer (poll/webhook) is untouched. Ordinary `--wait`
+  asks deliberately KEEP the mirror — it is the crash fallback a successor hears the
+  answer through.
+
 ## 0.27.0 — 2026-07-14
 
 Execution attribution. Every agent message can now reveal WHICH execution sent it — so a
