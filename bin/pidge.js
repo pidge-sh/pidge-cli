@@ -2328,7 +2328,14 @@ async function doApprove() {
   const cid = v['correlation-id'] || crypto.randomUUID();
   v['correlation-id'] = cid;
   console.error(`pidge: correlation_id=${cid}`);
-  const { ok, info } = await doNotify({ template_kind: 'important', custom_actions: customActions });
+  // mirror_reply:false — approve is a CLOSED CIRCUIT (this process blocks on the
+  // cid below, deny-default), so the answer must NOT also mirror onto the
+  // /messages queue: a bridge would wake a fresh handler with the bare
+  // allow-label ("Submit") reading like a new imperative command. Losing the
+  // mirror is safe HERE ONLY because no-answer already means deny; a normal
+  // --wait ask keeps the mirror (its crash fallback). Old servers (< manifest
+  // v83) ignore the param — the bridge-side ref.gated filter covers them.
+  const { ok, info } = await doNotify({ template_kind: 'important', custom_actions: customActions, mirror_reply: false });
   if (!ok) {
     // Couldn't even ask the human ⇒ fail closed. (doNotify already narrated the
     // HTTP failure; a raw network error exits 2 inside doNotify — also non-zero.)
@@ -3443,7 +3450,21 @@ async function runBridge() {
     warnStalePriorClaim(data); // newer servers serve the flag on this GET too
     warnConsumerConflict(data); // the consume GET flags a live sibling
 
-    const msgs = Array.isArray(data.messages) ? data.messages : [];
+    const allMsgs = Array.isArray(data.messages) ? data.messages : [];
+    // Gate hygiene (server ≥ manifest v83): a notification_reply whose ref
+    // carries gated:true is the outcome of a Face-ID gate (pidge approve /
+    // approval grant / --gated confirm) — the asker already heard it on its own
+    // wait/webhook, and its bare label ("Submit") must never reach an
+    // autonomous handler looking like a fresh command. Ack it here (loudly,
+    // with a summary so provenance says WHY) and spawn nothing for it. Old
+    // servers never set ref.gated ⇒ this filter is a no-op, behavior unchanged.
+    const gatedRows = allMsgs.filter((m) => m && m.kind === 'notification_reply' && m.ref && m.ref.gated === true);
+    if (gatedRows.length) {
+      console.error(`pidge: bridge — ${gatedRows.length} Face-ID gate answer(s) acked WITHOUT spawning a handler (a gate outcome is not a command; the asker already heard it — canonical answer stays on the notification)`);
+      const gatedIds = gatedRows.map((m) => Number(m.id)).filter(Number.isInteger);
+      if (gatedIds.length) await ackBatch(gatedIds, 'Face-ID gate answer — auto-acked by the bridge, no handler spawned', null);
+    }
+    const msgs = allMsgs.filter((m) => !gatedRows.includes(m));
     if (msgs.length === 0) {
       // The long-poll hold IS the pacing; only a fast empty return sleeps (a
       // server that doesn't hold ?wait= must not become a hot loop).
