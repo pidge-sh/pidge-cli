@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.29.0 — 2026-07-15
+
+Onboarding that survives a multi-agent machine. The paste-one-prompt promise used to assume
+one agent per machine — the shared `~/.config/pidge/env` was the only default slot, so the
+second agent hit the clobber guard mid-onboarding and had to grope for `PIDGE_AGENT`/`--force`.
+Identity is now scoped to the PROJECT by default: where the agent actually lives.
+
+- **Project-scoped identity (the new default).** `pidge setup` run inside a git project stores
+  the key at `~/.config/pidge/projects/<hash-of-toplevel>/env`; every later command run
+  anywhere inside that project resolves it by walking up to the same toplevel (a linked git
+  worktree counts as its own project — its `.git` FILE marks the root). N agents in N
+  projects/worktrees never collide, the guard never fires between them, and a future session
+  in the same project rediscovers its key with zero ceremony. Resolution order:
+  `PIDGE_TOKEN` env → `PIDGE_AGENT` file → project file (when it exists) → shared file.
+  An existing shared-file install keeps resolving the shared file untouched — project scope
+  takes over only once a `setup` writes it.
+- **`setup --global`.** Targets the legacy shared machine file on purpose (a daemon/cron that
+  runs outside any project). Conflicts with `PIDGE_AGENT` (exit 1) — that var is already an
+  isolated scope.
+- **The clobber guard now talks to its actual reader — an agent.** When the target file still
+  authenticates as another live channel, the refusal leads with the agent-correct exits (run
+  setup inside your project / re-run with `PIDGE_AGENT=<suggested-id>`) instead of offering
+  `--print` — which an agent must never run (the key would land in its context). `--force`
+  stays the explicit human override. The guard checks the file setup would WRITE (not the one
+  reads happen to resolve), and still lets a dead (401) key be overwritten without `--force`.
+- **Retry-safe setup (with server v84+).** The claim exchange binds the code to this install's
+  fingerprint on first success; within the code's 15-min TTL, re-running the SAME `setup`
+  returns the key again instead of "already used" — a network fumble or a killed process no
+  longer burns the code and sends you back to the human. Older servers keep the strict
+  single-use behavior; nothing changes for them.
+- `state.json` (manifest nag, E2E pins) and the default downloads dir follow the resolved
+  scope — pins live next to the identity they belong to. An install whose token comes from
+  the ENVIRONMENT (`PIDGE_TOKEN`) never adopts a project env it doesn't own: env-specified
+  identity resolves exactly as 0.27 did, wherever it runs — so a `cd` into someone else's
+  repo can never flip its server URL, its E2E pin state, or its fingerprint.
+- Known, accepted tradeoff: a legacy shared-file process whose working directory sits
+  INSIDE a project switches to that project's env once one is written there (that is the
+  resolution rule working as designed). A daemon/cron that must stay on the shared file
+  should pass its own `PIDGE_TOKEN`, set `PIDGE_AGENT`, or run outside the project tree.
+  `$HOME` itself is never treated as a project (dotfiles-in-git users keep the shared
+  scope everywhere).
+
 ## 0.28.0 — 2026-07-15
 
 Gate-mirror hygiene. A Face-ID gate outcome must never reach an autonomous handler

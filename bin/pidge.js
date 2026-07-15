@@ -60,28 +60,69 @@ if (process.argv.includes('--version') || process.argv.includes('-v')) {
   process.exit(0);
 }
 
-// Per-agent isolation (a real incident: a shared config file made one agent's
+// Identity isolation (a real incident: a shared config file made one agent's
 // setup hijack another's cron): ~/.config/pidge/env is one slot per
-// machine-user, so N agents sharing a HOME share an identity. The fix is a NON-secret namespacing var the
-// human sets ONCE at each agent's launch: PIDGE_AGENT=<id> → the config lives
-// at ~/.config/pidge/agents/<id>/env, isolated by construction. The CLI still
-// WRITES the key (the agent never sees it — token hygiene intact), it's just
-// per-agent now. No PIDGE_AGENT ⇒ the legacy shared file (single-agent only).
+// machine-user, so N agents sharing a HOME share an identity. Two isolation
+// mechanisms, project-first since 0.28:
+//   1. PROJECT scope (the default) — an agent lives in a project directory
+//      (each git worktree is one), so `setup` run inside a git project stores
+//      the key at ~/.config/pidge/projects/<hash-of-toplevel>/env and every
+//      later command run anywhere inside that project finds it by walking up
+//      to the same toplevel. Two projects can NEVER collide, and the identity
+//      has a durable home a future session rediscovers with zero ceremony.
+//   2. PIDGE_AGENT=<id> — a NON-secret namespacing var the human sets at the
+//      agent's launch → ~/.config/pidge/agents/<id>/env. Wins over project
+//      scope (explicit beats inferred); the answer for two agents sharing ONE
+//      directory, or an agent with no project at all.
+// The CLI still WRITES the key in every scope (the agent never sees it — token
+// hygiene intact). No PIDGE_AGENT + no project env ⇒ the legacy shared file
+// (single-agent machines and daemons; `setup --global` targets it on purpose).
 // (An explicit PIDGE_TOKEN env var still wins over any file — the purest
 // per-agent path.)
 const AGENT_ID = (process.env.PIDGE_AGENT || '').trim().replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 64);
-function pidgeConfigDir() {
-  const base = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'pidge');
-  return AGENT_ID ? path.join(base, 'agents', AGENT_ID) : base;
+function pidgeBaseDir() {
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'pidge');
 }
+function pidgeConfigDir() {
+  return AGENT_ID ? path.join(pidgeBaseDir(), 'agents', AGENT_ID) : pidgeBaseDir();
+}
+// The project toplevel: walk up from cwd to the first `.git` entry (a DIR in a
+// normal checkout, a FILE in a linked worktree — both count, so every worktree
+// is its own project). null outside any git project — identity then falls back
+// to the shared file, which keeps a cron in $HOME exactly as it always was.
+// $HOME itself is never a project: a dotfiles-in-git home would otherwise turn
+// EVERY directory under it into one project and make "outside any project"
+// unreachable for those users. Fully guarded: a deleted cwd (process.cwd()
+// throws ENOENT) must degrade to "no project", never kill `--help` at load.
+function findProjectRoot() {
+  try {
+    let dir = process.cwd();
+    for (;;) {
+      try {
+        fs.statSync(path.join(dir, '.git'));
+        return dir === os.homedir() ? null : dir;
+      } catch { /* keep walking */ }
+      const up = path.dirname(dir);
+      if (up === dir) return null;
+      dir = up;
+    }
+  } catch { return null; }
+}
+const PROJECT_ROOT = findProjectRoot();
+// Keyed by a hash of the toplevel PATH (not a file inside the repo): the key
+// can never be committed, the repo stays untouched, and a deleted worktree
+// leaves only a prunable orphan dir here.
+const PROJECT_CONFIG_DIR = PROJECT_ROOT
+  ? path.join(pidgeBaseDir(), 'projects',
+      crypto.createHash('sha256').update(PROJECT_ROOT).digest('hex').slice(0, 16))
+  : null;
 
 // token hygiene: when the env vars are unset, fall back to the config file
 // (KEY=VALUE the CLI writes during setup, or the HUMAN writes once) so the raw
 // hld_… key never rides the agent's chat/context. Explicit env vars always win;
 // `export ` prefixes, quotes and #comments are tolerated.
-function configEnv() {
+function readEnvFile(file) {
   try {
-    const file = path.join(pidgeConfigDir(), 'env');
     const out = {};
     for (let line of fs.readFileSync(file, 'utf8').split('\n')) {
       line = line.trim().replace(/^export\s+/, '');
@@ -94,7 +135,28 @@ function configEnv() {
     return out;
   } catch { return {}; }
 }
-const FILE_ENV = configEnv();
+
+// Config paths are computed EARLY (multi-runtime v2): the per-request
+// agent fingerprint hashes CONFIG_FILE, and the shared `headers` const stamps
+// that fingerprint on every call — so both must exist before line-863's headers.
+// READ resolution: PIDGE_AGENT (explicit) → the project's env WHEN IT EXISTS →
+// the legacy shared file. An existing shared-file install inside a git repo
+// keeps resolving the shared file (no project env yet), so nothing moves under
+// a working setup — the project scope takes over only once `setup` writes it.
+// An install whose TOKEN comes from the ENVIRONMENT is fully specified already:
+// it must NEVER adopt a project env it doesn't own (state.json pins, PIDGE_URL,
+// the fingerprint all belong to the env-var identity — resolving a foreign
+// project file here would let a mere `cd` bleed another channel's config into
+// it, including silently bypassing the E2E anti-downgrade pin).
+// `let` (not const): runSetup retargets these to the file it is about to WRITE
+// (which may not exist yet), so the fingerprint that binds the claim is the
+// identity the install will actually live at.
+const ENV_TOKEN_SET = !!(process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN);
+let CONFIG_DIR = AGENT_ID ? pidgeConfigDir()
+  : (!ENV_TOKEN_SET && PROJECT_CONFIG_DIR && fs.existsSync(path.join(PROJECT_CONFIG_DIR, 'env'))) ? PROJECT_CONFIG_DIR
+  : pidgeConfigDir();
+let CONFIG_FILE = path.join(CONFIG_DIR, 'env');
+const FILE_ENV = readEnvFile(CONFIG_FILE);
 
 const BASE = process.env.PIDGE_URL || process.env.HERALD_URL || FILE_ENV.PIDGE_URL || 'http://localhost:3000';
 const TOKEN = process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN || FILE_ENV.PIDGE_TOKEN;
@@ -105,12 +167,6 @@ const TOKEN = process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN || FILE_ENV.PI
 // run token in FILE_ENV would mis-sign a later, unrelated session). Advisory
 // everywhere: an expired/invalid token degrades to unsigned, never a 401.
 const RUN_TOKEN = process.env.PIDGE_RUN_TOKEN || null;
-
-// Config paths are computed EARLY (multi-runtime v2): the per-request
-// agent fingerprint hashes CONFIG_FILE, and the shared `headers` const stamps
-// that fingerprint on every call — so both must exist before line-863's headers.
-const CONFIG_DIR = pidgeConfigDir();
-const CONFIG_FILE = path.join(CONFIG_DIR, 'env');
 
 function die(msg, code = 1) { console.error(msg); process.exit(code); }
 // NB: the TOKEN requirement is enforced AFTER help/usage handling (below) — a
@@ -222,10 +278,12 @@ function e2eKeyFingerprint(key) {
 }
 
 // PIDGE_SECRET reads from the SAME slot/precedence as PIDGE_TOKEN: env var wins
-// over the config file (per-agent aware via PIDGE_AGENT/XDG_CONFIG_HOME) — the
-// {TOKEN, SECRET} pair always travels together from one source.
+// over the config file (scope-aware via PIDGE_AGENT/project/XDG_CONFIG_HOME) —
+// the {TOKEN, SECRET} pair always travels together from one source. Fresh read
+// of the RESOLVED file (not the load-time FILE_ENV): setup retargets the scope
+// mid-process and its post-setup doctor must read the file it just wrote.
 function e2eLoadSecret() {
-  return process.env.PIDGE_SECRET || FILE_ENV.PIDGE_SECRET || null;
+  return process.env.PIDGE_SECRET || readEnvFile(CONFIG_FILE).PIDGE_SECRET || null;
 }
 
 // PIDGE_SECRET is the channel's 32-byte key, base64url. Returns the key Buffer,
@@ -333,6 +391,7 @@ const OPTIONS = {
   follow: { type: 'boolean' },
   force: { type: 'boolean' },                  // setup: overwrite a config owned by ANOTHER channel
   print: { type: 'boolean' },                  // setup: print export lines instead of writing a file (per-agent, human runs it)
+  global: { type: 'boolean' },                 // setup: target the shared machine file instead of the project scope
   'listen-mode': { type: 'string' },           // setup: declare operating_contract listen mode (turn_based|always_on; default turn_based)
   target: { type: 'string' },                  // skill install: claude (default) | agents | gemini — same content, different destination file
   // Read-receipt split — `ack` after the work; listen no longer consumes on read.
@@ -380,12 +439,16 @@ const USAGE = `pidge — send an iPhone notification to a human and block until 
 USAGE
   pidge setup --claim CODE [--url BASE]   one-shot onboarding: exchange the single-use
                                           code for the channel key, store it, run doctor.
-                                          MULTI-AGENT: set PIDGE_AGENT=<id> at each agent's launch
-                                          → isolated config ~/.config/pidge/agents/<id>/env.
+                                          Run it INSIDE your project (git): the key is scoped
+                                          to that project — N agents in N projects never collide.
+                                          Same directory, 2+ agents? PIDGE_AGENT=<id> at each
+                                          launch → ~/.config/pidge/agents/<id>/env.
+                                          --global store in the shared machine file instead
+                                                   (a daemon/cron outside any project)
                                           --print  emit 'export PIDGE_TOKEN=…' instead of a file
                                                    (you run it in YOUR terminal; paste into the
                                                    agent's launcher — never run --print as an agent)
-                                          --force  overwrite a shared file owned by another channel
+                                          --force  overwrite a file owned by another channel
                                           --listen-mode turn_based|persistent|external_daemon
                                                    declare how you operate (default turn_based)
   pidge doctor                            validate the setup WITHOUT exposing secrets:
@@ -526,15 +589,20 @@ ENV
   PIDGE_TOKEN   your channel's bearer key (required; HERALD_TOKEN honored). Setting
                 this per agent at launch is the cleanest multi-agent isolation —
                 env var always wins over any file.
-  PIDGE_AGENT   <id> namespacing the config file to ~/.config/pidge/agents/<id>/env
-                so N agents on one machine never share an identity (the CLI still
-                writes the key — no secret in the agent's chat). Unset ⇒ the legacy
-                shared ~/.config/pidge/env (single-agent only).
+  PIDGE_AGENT   <id> namespacing the config file to ~/.config/pidge/agents/<id>/env —
+                for 2+ agents sharing ONE directory (the CLI still writes the
+                key — no secret in the agent's chat). Unset ⇒ project scope when
+                setup ran inside a git project (~/.config/pidge/projects/<hash>/env,
+                resolved by walking up to the toplevel), else the legacy shared
+                ~/.config/pidge/env (single-agent machines and daemons).
   PIDGE_SECRET  the channel's E2E key (base64url, 32 bytes). When the human turns
                 on end-to-end encryption, the app's Connect screen shows a separate
-                TERMINAL step that writes it to ~/.config/pidge/env — the secret
-                never travels in the chat prompt (never paste it in chat). Same
-                slot and precedence as PIDGE_TOKEN (the pair travels together).
+                TERMINAL step that writes it next to the token — into THIS
+                install's config file (pidge doctor prints the path; export it in
+                the shell before setup and setup persists it in the right scope).
+                The secret never travels in the chat prompt (never paste it in
+                chat). Same slot and precedence as PIDGE_TOKEN (the pair travels
+                together).
                 With it set and the channel E2E, sends are sealed and sealed
                 answers/messages decrypt automatically; without it, sends go clear
                 and the app marks them "⚠️ sem criptografia". Validate with
@@ -608,6 +676,7 @@ const OPTION_DOCS = {
   digest: '--digest                 catchup: one condensed line per message (id · kind · 60 chars · handled by X: <note> / ✓ acked (no note) / PENDING)',
   target: '--target T               skill install: claude (default) → .claude/skills/pidge/SKILL.md · agents → AGENTS.md · gemini → GEMINI.md',
   claim: '--claim CODE             the single-use setup code (the human copies it from the Pidge app)',
+  global: '--global                 store in the shared machine file (~/.config/pidge/env) instead of the project scope — for a daemon/cron that runs outside any project',
   'url-base': '--url BASE               the Pidge server base URL (default https://api.pidge.sh)',
   print: '--print                  emit `export …` lines instead of writing a file (per-agent; you run it)',
   force: '--force                  overwrite a shared config owned by another channel',
@@ -662,9 +731,9 @@ const SEND_OPTS = [...CONTENT_OPTS, 'gated', 'wait', 'timeout', 'interval', 'rea
 const HELP = {
   setup: {
     summary: 'one-shot onboarding: exchange a single-use claim code for the channel key, store it, run doctor.',
-    usage: 'pidge setup --claim CODE [--url BASE] [--print] [--force] [--listen-mode MODE]',
-    body: 'The CLI writes the key itself (chmod 600) — it never appears on screen or in the agent\'s chat. MULTI-AGENT: set PIDGE_AGENT=<id> at each agent\'s launch for an isolated config. --quiet collapses the onboarding to one status line.',
-    opts: ['claim', 'url-base', 'print', 'force', 'listen-mode', 'quiet'],
+    usage: 'pidge setup --claim CODE [--url BASE] [--global] [--print] [--force] [--listen-mode MODE]',
+    body: 'The CLI writes the key itself (chmod 600) — it never appears on screen or in the agent\'s chat. Run it INSIDE your project (git): the key is scoped to that project, so N agents in N projects never collide (--global targets the shared machine file instead — for daemons/cron). Two agents in the SAME directory: set PIDGE_AGENT=<id> at each agent\'s launch. A fumbled setup is safe to re-run: within the code\'s 15-min TTL the same install gets its key again (server v84+). --quiet collapses the onboarding to one status line.',
+    opts: ['claim', 'url-base', 'global', 'print', 'force', 'listen-mode', 'quiet'],
   },
   doctor: {
     summary: 'validate the setup WITHOUT exposing secrets (env source, server, key, device reach, realtime probe).',
@@ -884,13 +953,30 @@ function helpFor(topic) {
   return lines.join('\n');
 }
 
+// A machine-minted claim code may legitimately START with '-' (urlsafe base64
+// alphabet — ~1 in 64 codes): parseArgs would read it as an unknown OPTION and
+// die with a cryptic "ambiguous" error exactly at onboarding. Pull the value
+// out by hand when it looks like a code (long base64url token), leaving real
+// flags (short, known names) to the normal parser — belt-and-braces for codes
+// minted by servers that predate the no-leading-dash mint rule.
+const RAW_ARGV = process.argv.slice(2);
+let rescuedClaim = null;
+{
+  const ci = RAW_ARGV.indexOf('--claim');
+  const next = ci >= 0 ? RAW_ARGV[ci + 1] : undefined;
+  if (next && /^-[A-Za-z0-9_-]{10,}$/.test(next)) {
+    rescuedClaim = next;
+    RAW_ARGV.splice(ci, 2); // remove the pair; re-added onto v.claim below
+  }
+}
 let parsed;
 try {
-  parsed = parseArgs({ options: OPTIONS, allowPositionals: true });
+  parsed = parseArgs({ args: RAW_ARGV, options: OPTIONS, allowPositionals: true });
 } catch (e) {
   die(`pidge: ${e.message}\n\n${USAGE}`, 1);
 }
 const v = parsed.values;
+if (rescuedClaim && v.claim === undefined) v.claim = rescuedClaim;
 const command = parsed.positionals[0];
 // silence the manifest-version nag entirely (per run via --quiet-nag, or
 // per environment via PIDGE_QUIET_NAG=1) — for scripts and CI where the nudge is noise.
@@ -956,18 +1042,19 @@ let newsWarned = false;
 // repeatable; this only latches once an actual heal is attempted.
 let skillHealed = false;
 
-// a tiny per-install state cache (~/.config/pidge/state.json, per-agent
-// when PIDGE_AGENT is set — same dir as the env file). Best-effort: a read-only
+// a tiny per-install state cache (state.json in the SAME dir as the resolved
+// env file — per-agent/per-project/shared alike, so pins and stamps live next
+// to the identity they belong to). Best-effort: a read-only
 // fs just means the throttle falls back to once-per-process. Date is fine here
 // (this is the CLI process, not a workflow script).
-function stateFilePath() { return path.join(pidgeConfigDir(), 'state.json'); }
+function stateFilePath() { return path.join(CONFIG_DIR, 'state.json'); }
 function readState() {
   try { return JSON.parse(fs.readFileSync(stateFilePath(), 'utf8')) || {}; } catch { return {}; }
 }
 function writeState(patch) {
   try {
     const next = { ...readState(), ...patch };
-    const dir = pidgeConfigDir();
+    const dir = CONFIG_DIR;
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     // Atomic: write a temp then rename, so a crash/ENOSPC mid-write can't leave
     // a TRUNCATED state.json (which readState would silently treat as {} and
@@ -1473,7 +1560,9 @@ function e2eOpenValue({ enc, kf, channelId, cid, field, value, onError }) {
 // PIDGE_E2E=off (env var or the env file). A server response alone can never
 // unpin — that's the whole point.
 function e2eOverrideOff() {
-  return String(process.env.PIDGE_E2E || FILE_ENV.PIDGE_E2E || '').toLowerCase() === 'off';
+  // Fresh read of the resolved file — the unpin override must belong to the
+  // SAME scope as the pin it disables (never a stale/other-scope FILE_ENV).
+  return String(process.env.PIDGE_E2E || readEnvFile(CONFIG_FILE).PIDGE_E2E || '').toLowerCase() === 'off';
 }
 // The pin is keyed by a HASH of the channel token — per CHANNEL, not per
 // install (one machine can drive an E2E channel and a clear one from the same
@@ -1522,7 +1611,8 @@ const E2E_UNPIN_HINT = 'If your human GENUINELY turned E2E off in the app, unpin
 // force-seals (testing before the iOS wave); PIDGE_E2E=off keeps voiding
 // everything E2E, media included.
 function e2eMediaOverride() {
-  const raw = String(process.env.PIDGE_E2E_MEDIA || FILE_ENV.PIDGE_E2E_MEDIA || '').toLowerCase();
+  // Fresh read of the resolved file — same scope rule as e2eOverrideOff.
+  const raw = String(process.env.PIDGE_E2E_MEDIA || readEnvFile(CONFIG_FILE).PIDGE_E2E_MEDIA || '').toLowerCase();
   return raw === 'on' || raw === 'off' ? raw : null;
 }
 // Pure (exported for tests): should this send seal its media?
@@ -1779,7 +1869,7 @@ async function e2eProcessAttachment(m, out, fail, dl = {}) {
     return Buffer.from(await res.arrayBuffer());
   };
   const destFor = (filename) => {
-    const dir = v['download-dir'] || path.join(pidgeConfigDir(), 'downloads');
+    const dir = v['download-dir'] || path.join(CONFIG_DIR, 'downloads');
     // m.id comes off the wire — a hostile server (the E2E threat model)
     // could ship "../.." to steer the decrypted plaintext OUTSIDE the downloads
     // dir. Sanitize the id segment AND the fallback name exactly like any other
@@ -2535,14 +2625,23 @@ const idStrict = (val, flag) => {
 
 // (CONFIG_DIR/CONFIG_FILE are defined early — right after TOKEN — so the identity
 // headers can hash CONFIG_FILE at the module-level `headers` const.)
-// True when we're reading the LEGACY shared file (no PIDGE_AGENT, no env var) —
-// the multi-agent footgun. doctor warns on it.
-const ON_SHARED_FILE = !AGENT_ID && !process.env.PIDGE_TOKEN && !process.env.HERALD_TOKEN && !!FILE_ENV.PIDGE_TOKEN;
+// True when we're reading the LEGACY shared file (no PIDGE_AGENT, no env var,
+// NOT the project scope) — the multi-agent footgun. doctor warns on it. A
+// FUNCTION (not a load-time const): setup retargets CONFIG_DIR mid-process, and
+// a project-scoped identity must never be scolded as "the shared file".
+function onSharedFile() {
+  return !AGENT_ID && !ENV_TOKEN_SET && CONFIG_DIR === pidgeBaseDir()
+    && !!readEnvFile(CONFIG_FILE).PIDGE_TOKEN;
+}
 
 // Where the token came from — doctor narrates it, setup respects precedence.
 function tokenSource() {
-  if (process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN) return 'env var (per-agent)';
-  if (FILE_ENV.PIDGE_TOKEN) return CONFIG_FILE + (AGENT_ID ? ` (PIDGE_AGENT=${AGENT_ID})` : ' (shared)');
+  if (ENV_TOKEN_SET) return 'env var (per-agent)';
+  if (FILE_ENV.PIDGE_TOKEN) {
+    const scope = AGENT_ID ? ` (PIDGE_AGENT=${AGENT_ID})`
+      : CONFIG_DIR === PROJECT_CONFIG_DIR ? ' (this project)' : ' (shared)';
+    return CONFIG_FILE + scope;
+  }
   return null;
 }
 
@@ -2639,8 +2738,14 @@ function reportDeviceReach(data) {
 // generation), 'soft' (we never claimed locally — informational), or null.
 function reportClaimMismatch(data) {
   if (!data.claim) return null;
-  const localGen = parseInt(FILE_ENV.PIDGE_CLAIM_GENERATION || '', 10);
-  const ourFp = FILE_ENV.PIDGE_FINGERPRINT || agentFingerprint();
+  // Fresh read of the RESOLVED config file, not the load-time FILE_ENV: inside
+  // `setup` the scope was retargeted and the generation/fingerprint were just
+  // appended — comparing against a stale (possibly other-scope) snapshot made
+  // the post-setup doctor scream "ANOTHER AGENT" about the claim it had itself
+  // made seconds earlier.
+  const storedEnv = readEnvFile(CONFIG_FILE);
+  const localGen = parseInt(storedEnv.PIDGE_CLAIM_GENERATION || '', 10);
+  const ourFp = storedEnv.PIDGE_FINGERPRINT || agentFingerprint();
   const srvGen = data.claim.claim_generation;
   const srvFp = data.claim.claimed_by_fingerprint;
   if (srvFp && srvFp !== ourFp && Number.isFinite(localGen) && srvGen > localGen) {
@@ -3959,8 +4064,8 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   //   secret + non-E2E channel  → an ORPHAN secret (never used); warn
   //   e2e_enabled + bad/mismatched secret → BROKEN (exit 2): the seal promise can't hold
   const e2e = reportE2eHealth(data);
-  if (ON_SHARED_FILE)
-    console.error(`pidge doctor: WARNING — reading the SHARED file ${CONFIG_FILE}. If another agent runs on this machine, it reads the SAME key and you'll send as each other (a real incident, not a hypothetical). Isolate: set PIDGE_AGENT=<id> at this agent's launch (config → ~/.config/pidge/agents/<id>/env) or give it its own PIDGE_TOKEN.`);
+  if (onSharedFile())
+    console.error(`pidge doctor: WARNING — reading the SHARED file ${CONFIG_FILE}. If another agent runs on this machine, it reads the SAME key and you'll send as each other (a real incident, not a hypothetical). Isolate: run setup from inside your project directory (git — the key gets its own per-project file), or set PIDGE_AGENT=<id> at this agent's launch, or give it its own PIDGE_TOKEN.`);
   // devices exist but 0 are deliverable ⇒ a send reaches NOBODY — BROKEN
   // (exit 2). (0 devices total stays a warning above: a fresh setup before the
   // app is installed isn't "broken".) The claim mismatch SHOUTS but stays exit 0
@@ -3970,7 +4075,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     process.exit(2);
   }
   if (e2e.broken) {
-    console.error('pidge doctor: BROKEN (exit 2) — this channel is E2E but the PIDGE_SECRET cannot seal/open anything on it. The app\'s Connect screen shows a separate TERMINAL step that writes PIDGE_SECRET to ~/.config/pidge/env — ask your human to run THAT (never paste the secret in chat), then re-run `pidge doctor`.');
+    console.error(`pidge doctor: BROKEN (exit 2) — this channel is E2E but the PIDGE_SECRET cannot seal/open anything on it. The app's Connect screen shows a separate TERMINAL step that writes PIDGE_SECRET — ask your human to run THAT (never paste the secret in chat) and make sure the line lands in THIS install's config file (${CONFIG_FILE}), then re-run \`pidge doctor\`.`);
     process.exit(2);
   }
   // probe the realtime path (the held-poll failure class an HTTP-only doctor
@@ -4054,19 +4159,48 @@ function reportE2eHealth(data) {
 async function runSetup() {
   const code = v.claim;
   if (!code) die('pidge: usage: pidge setup --claim <code> [--url <base>]   (the human copies the code from the Pidge app)', 1);
-  const base = (v.url || process.env.PIDGE_URL || FILE_ENV.PIDGE_URL || 'https://api.pidge.sh').replace(/\/+$/, '');
 
-  // THE SHARED-CONFIG GUARD (a real incident: a shared config file let one
-  // agent's setup hijack another's cron). Only the FILE path can
-  // collide; --print writes nothing, so skip it there. CONFIG_FILE is now
-  // per-agent when PIDGE_AGENT is set (no collision by construction), but on the
-  // legacy shared file two agents still share it — refuse to clobber a file that
-  // still authenticates as some channel unless --force. Checked BEFORE the
-  // exchange so the single-use code survives the refusal.
-  if (!v.print && !v.force && FILE_ENV.PIDGE_TOKEN) {
+  // WHERE the key will live — decided BEFORE anything touches the network so
+  // the fingerprint that binds the claim (identityHeaders hashes CONFIG_FILE)
+  // is the identity this install will actually resolve on its next command.
+  // PIDGE_AGENT (explicit) → agent file · --global → the shared machine file ·
+  // inside a git project (the default) → the project-scoped file · no project →
+  // the shared file. Retargeting the module-level CONFIG_DIR/CONFIG_FILE also
+  // points state.json / ownership at the same home.
+  if (!AGENT_ID) {
+    if (v.global || !PROJECT_CONFIG_DIR) {
+      CONFIG_DIR = pidgeBaseDir();
+    } else {
+      CONFIG_DIR = PROJECT_CONFIG_DIR;
+    }
+    CONFIG_FILE = path.join(CONFIG_DIR, 'env');
+  } else if (v.global) {
+    die('pidge: --global conflicts with PIDGE_AGENT — unset one (PIDGE_AGENT is already an isolated scope).', 1);
+  }
+  const projectScoped = !AGENT_ID && !v.global && CONFIG_DIR === PROJECT_CONFIG_DIR;
+
+  // Everything scope-derived below reads the TARGET file, never the load-time
+  // FILE_ENV (which may belong to a DIFFERENT scope after the retarget): the
+  // URL fallback, the clobber guard's key, and the E2E secret all follow the
+  // file this setup will actually write.
+  const targetEnv = readEnvFile(CONFIG_FILE);
+  const base = (v.url || process.env.PIDGE_URL || targetEnv.PIDGE_URL || FILE_ENV.PIDGE_URL || 'https://api.pidge.sh').replace(/\/+$/, '');
+
+  // THE CLOBBER GUARD (a real incident: a shared config file let one agent's
+  // setup hijack another's cron). Only the FILE path can collide; --print
+  // writes nothing, so skip it there. Project/agent scopes collide only with
+  // THEMSELVES (a re-setup of the same project/agent), the shared file with any
+  // process that reads it — refuse to clobber a file that still authenticates
+  // as some channel unless --force. Checked BEFORE the exchange so the code
+  // survives the refusal (and since server v84 even a consumed code retries).
+  // The stored key is validated against the TARGET file's OWN server when it
+  // names one — whoami-ing it against an unrelated base would 401 and read as
+  // "dead key", silently waving the clobber through (the incident class again).
+  if (!v.print && !v.force && targetEnv.PIDGE_TOKEN) {
+    const guardBase = (targetEnv.PIDGE_URL || base).replace(/\/+$/, '');
     let owner = null;
     try {
-      const { res: wres, data: wdata } = await fetchWhoami(base, FILE_ENV.PIDGE_TOKEN);
+      const { res: wres, data: wdata } = await fetchWhoami(guardBase, targetEnv.PIDGE_TOKEN);
       if (wres.status === 200 && wdata.channel) owner = wdata.channel.name;
       else if (wres.status !== 401) owner = 'um canal (servidor não confirmou)';
       // 401 ⇒ the stored key is dead — overwriting a corpse needs no --force.
@@ -4074,7 +4208,15 @@ async function runSetup() {
       owner = 'um canal (servidor inalcançável para confirmar)';
     }
     if (owner) {
-      die(`pidge: ${CONFIG_FILE} já guarda a chave de "${owner}". Sobrescrever faria qualquer agente que lê esse arquivo enviar como o canal novo (incidente real: um cron foi sequestrado assim). O jeito certo de rodar VÁRIOS agentes na mesma máquina: dê a cada um um PIDGE_AGENT=<id> no launch (cada um ganha ~/.config/pidge/agents/<id>/env isolado), ou um PIDGE_TOKEN próprio, ou rode com --print e cole o export no launcher DESTE agente. Substituir mesmo assim? --force (o claim code continua válido — nada foi consumido).`, 2);
+      // The reader of this message is almost always an AGENT mid-onboarding
+      // (the human pasted the prompt into it) — lead with the agent-correct
+      // exits. --print exists but is NOT offered here on purpose: an agent
+      // running --print would land the key in its own context.
+      const suggestion = (path.basename(process.cwd()).replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 32) || 'meu-agente');
+      const exits = projectScoped
+        ? `Este PROJETO já fala como esse canal. Se a intenção é REAPONTAR o projeto para o canal novo, re-rode com --force. Se você é um SEGUNDO agente convivendo neste mesmo diretório, re-rode com PIDGE_AGENT=<seu-id> na frente (env isolado por agente): PIDGE_AGENT=${suggestion} npx -y pidge-cli@latest setup --claim ${code}`
+        : `Como conectar SEM colidir: rode este MESMO comando de dentro da pasta do seu projeto (git) — cada projeto ganha um env isolado automaticamente. Sem projeto? Re-rode com PIDGE_AGENT=<seu-id> na frente: PIDGE_AGENT=${suggestion} npx -y pidge-cli@latest setup --claim ${code}. Substituir o arquivo compartilhado mesmo assim (você sabe que nenhum outro processo lê ele)? --force.`;
+      die(`pidge: ${CONFIG_FILE} já guarda a chave de "${owner}". Sobrescrever faria qualquer processo que lê esse arquivo enviar como o canal novo (incidente real: um cron foi sequestrado assim). ${exits} (o claim code continua válido — nada foi consumido; num servidor v84+ até um retry pós-exchange funciona dentro do TTL de 15 min).`, 2);
     }
   }
 
@@ -4128,13 +4270,19 @@ async function runSetup() {
   // gets there via the app's Connect-screen terminal step, never the chat
   // prompt), and never silently DROP a secret the file already held: the human
   // may be re-claiming the same E2E channel with a fresh code.
-  const e2eSecret = process.env.PIDGE_SECRET || FILE_ENV.PIDGE_SECRET || null;
+  // TARGET scope only (never load-time FILE_ENV): re-claiming the same identity
+  // must keep ITS secret, but a secret from a DIFFERENT scope must never bleed
+  // into a new channel's file (it belongs to another channel's E2E).
+  const e2eSecret = process.env.PIDGE_SECRET || targetEnv.PIDGE_SECRET || null;
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(CONFIG_FILE,
     `PIDGE_URL=${finalBase}\nPIDGE_TOKEN=${data.key}\n${e2eSecret ? `PIDGE_SECRET=${e2eSecret}\n` : ''}`,
     { mode: 0o600 });
   try { fs.chmodSync(CONFIG_FILE, 0o600); } catch { /* mode set on create */ }
-  note(`pidge: canal "${channelName}" configurado — chave em ${CONFIG_FILE} (chmod 600, nunca exibida)`);
+  const scopeNote = projectScoped
+    ? ` — escopo DESTE projeto (${PROJECT_ROOT}): qualquer sessão futura rodando dentro dele me encontra sozinha`
+    : AGENT_ID ? ` — escopo do agente "${AGENT_ID}"` : '';
+  note(`pidge: canal "${channelName}" configurado — chave em ${CONFIG_FILE} (chmod 600, nunca exibida)${scopeNote}`);
   if (e2eSecret) note('pidge: PIDGE_SECRET stored next to the token (the {TOKEN, SECRET} pair travels together) — E2E sends seal automatically when the channel is E2E');
   // claim ownership of the channel for THIS install and record the
   // generation locally, so a later `pidge doctor` can DETECT a silent key swap
@@ -4144,8 +4292,8 @@ async function runSetup() {
     fs.appendFileSync(CONFIG_FILE, `PIDGE_CLAIM_GENERATION=${claim.claim_generation}\nPIDGE_FINGERPRINT=${agentFingerprint()}\n`, { mode: 0o600 });
     note(`pidge: ownership claimed as "${agentLabel()}" (generation ${claim.claim_generation}) — doctor WARNS if another agent takes this channel.`);
   }
-  if (!AGENT_ID)
-    note('pidge: este é o arquivo COMPARTILHADO (single-agent). Vai rodar 2+ agentes nesta máquina? Dê a cada um PIDGE_AGENT=<id> no launch (arquivo isolado por agente) — senão eles enviam como o mesmo canal.');
+  if (!AGENT_ID && !projectScoped)
+    note('pidge: este é o arquivo COMPARTILHADO da máquina (single-agent). Vai rodar 2+ agentes aqui? Rode o setup de dentro da pasta de cada projeto (env isolado automático), ou dê a cada um PIDGE_AGENT=<id> no launch — senão eles enviam como o mesmo canal.');
   await fuseSkillAndHello(finalBase, data.key);
   await runDoctor(finalBase, data.key, CONFIG_FILE);
 }
@@ -4219,7 +4367,7 @@ Generated from manifest v${m.manifest_version} of ${BASE} — re-run \`pidge ski
 
 All commands: \`npx pidge-cli …\` (Node ≥18; reads \`~/.config/pidge/env\` — no token in your context). Not set up? Run \`pidge doctor\`. Onboard with \`pidge setup --claim <code>\` (the human copies the code from the Pidge app), then \`pidge hello\`.
 
-**Many agents on this machine?** Export \`PIDGE_AGENT=<your-id>\` in EVERY session before any pidge command — your config then lives at \`~/.config/pidge/agents/<your-id>/env\` and you can never speak through another agent's channel. Without it, commands use the DEFAULT config (\`~/.config/pidge/env\`), which may be someone else's channel. Never run \`setup --force\`.
+**Many agents on this machine?** Your identity is scoped to YOUR PROJECT: when setup ran inside this git project, every pidge command run inside it resolves this project's own key — a sibling project can never speak through your channel. Run pidge commands from inside the project. Two agents sharing ONE directory (rare): export \`PIDGE_AGENT=<your-id>\` in every session before any pidge command (config at \`~/.config/pidge/agents/<your-id>/env\`). Outside any project, commands fall back to the machine-shared config (\`~/.config/pidge/env\`), which may be someone else's channel. Never run \`setup --force\`.
 
 ## One breath
 
