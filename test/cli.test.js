@@ -203,29 +203,84 @@ test('listen without a WebSocket-capable runtime quietly uses polling (no crash)
 const fs = require('node:fs');
 const os = require('node:os');
 
-test('setup --claim exchanges the code, writes the env file (600) and runs doctor — secret never printed', async () => {
+const crypto = require('node:crypto');
+// A throwaway "git project" directory (the .git DIR marks the toplevel) + the
+// project-scoped env path the CLI derives for it (hash of the REAL toplevel
+// path — the spawned process sees the symlink-resolved cwd on macOS /var→/private).
+function makeProject() {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-proj-')));
+  fs.mkdirSync(path.join(dir, '.git'));
+  return dir;
+}
+function projectEnvPath(home, projDir) {
+  const hash = crypto.createHash('sha256').update(projDir).digest('hex').slice(0, 16);
+  return path.join(home, 'pidge', 'projects', hash, 'env');
+}
+// A non-git cwd: the shared-file (legacy/global) path. mkdtemp under os.tmpdir()
+// has no .git ancestor.
+const nonGitCwd = () => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-nogit-')));
+
+test('setup --claim INSIDE a git project writes the PROJECT-scoped env (600) and runs doctor — secret never printed', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-setup-'));
+  const proj = makeProject();
+
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, proj,
+  );
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const file = projectEnvPath(home, proj);
+  const written = fs.readFileSync(file, 'utf8');
+  assert.match(written, /PIDGE_TOKEN=hld_minted_by_claim/);
+  assert.match(written, new RegExp(`PIDGE_URL=http://127.0.0.1:${port}`));
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600, 'env file must be chmod 600');
+  assert.ok(!fs.existsSync(path.join(home, 'pidge', 'env')), 'the shared machine file must stay untouched');
+  // the key must NEVER hit the terminal — only the file
+  assert.ok(!stdout.includes('hld_minted_by_claim'), 'key leaked to stdout');
+  assert.ok(!stderr.includes('hld_minted_by_claim'), 'key leaked to stderr');
+  assert.match(stderr, /escopo DESTE projeto/, 'setup narrates the project scope');
+  assert.match(stderr, /canal "mock"/);
+  assert.match(stderr, /doctor: all good/);
+});
+
+test('setup OUTSIDE any project writes the legacy shared file (single-agent machine unchanged)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-setup-'));
 
   const { result } = runCli(
     ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
-    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home },
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, nonGitCwd(),
   );
-  const { code, stdout, stderr } = await result;
+  const { code, stderr } = await result;
   await mock.stop();
 
   assert.equal(code, 0, `stderr: ${stderr}`);
-  const file = path.join(home, 'pidge', 'env');
-  const written = fs.readFileSync(file, 'utf8');
+  const written = fs.readFileSync(path.join(home, 'pidge', 'env'), 'utf8');
   assert.match(written, /PIDGE_TOKEN=hld_minted_by_claim/);
-  assert.match(written, new RegExp(`PIDGE_URL=http://127.0.0.1:${port}`));
-  assert.equal(fs.statSync(file).mode & 0o777, 0o600, 'env file must be chmod 600');
-  // the key must NEVER hit the terminal — only the file
-  assert.ok(!stdout.includes('hld_minted_by_claim'), 'key leaked to stdout');
-  assert.ok(!stderr.includes('hld_minted_by_claim'), 'key leaked to stderr');
-  assert.match(stderr, /canal "mock"/);
-  assert.match(stderr, /doctor: all good/);
+  assert.match(stderr, /arquivo COMPARTILHADO/, 'the shared-file write warns about multi-agent machines');
+});
+
+test('setup tolerates a DASH-LEADING claim code (legal urlsafe-base64 that argv parsers read as a flag)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimCode = '-dashLeadingCode123';
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-dash-'));
+
+  const { result } = runCli(
+    ['setup', '--claim', '-dashLeadingCode123', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, nonGitCwd(),
+  );
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `a machine-minted code must never die at the flag parser: ${stderr}`);
+  assert.match(fs.readFileSync(path.join(home, 'pidge', 'env'), 'utf8'), /hld_minted_by_claim/);
 });
 
 test('setup with a used/expired code fails LOUD with the re-mint recipe', async () => {
@@ -893,13 +948,15 @@ test('setup REFUSES to overwrite a config owned by another live channel — and 
 
   const { result } = runCli(
     ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
-    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home },
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, nonGitCwd(),
   );
   const { code, stderr } = await result;
 
   assert.equal(code, 2);
   assert.match(stderr, /já guarda a chave de "mock"/);
   assert.match(stderr, /--force/);
+  assert.match(stderr, /PIDGE_AGENT=/, 'the refusal leads with an agent-correct exit');
+  assert.ok(!stderr.includes('--print'), 'the refusal must NOT offer --print to an agent (key would land in its context)');
   assert.equal(mock.state.claimCode, 'claim-ok', 'the single-use code must SURVIVE the refusal');
   const kept = fs.readFileSync(path.join(home, 'pidge', 'env'), 'utf8');
   assert.match(kept, /hld_existing_live/, 'the existing config must be untouched');
@@ -917,7 +974,7 @@ test('setup --force overwrites; a REVOKED stored key needs no --force', async ()
   // dead key in the file ⇒ proceeds without --force
   const { result } = runCli(
     ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
-    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home },
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, nonGitCwd(),
   );
   const { code, stderr } = await result;
   await mock.stop();
@@ -925,6 +982,223 @@ test('setup --force overwrites; a REVOKED stored key needs no --force', async ()
   assert.equal(code, 0, `stderr: ${stderr}`);
   const written = fs.readFileSync(path.join(home, 'pidge', 'env'), 'utf8');
   assert.match(written, /hld_minted_by_claim/);
+});
+
+// --- project-scoped identity (0.28): the multi-agent machine default -------------
+
+test('THE INCIDENT, fixed: an occupied shared file does NOT block a project setup — no guard, no --force, isolated env', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-multi-'));
+  // another agent (a cron, a sibling) owns the machine-shared file
+  fs.mkdirSync(path.join(home, 'pidge'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'pidge', 'env'),
+    `PIDGE_URL=http://127.0.0.1:${port}\nPIDGE_TOKEN=hld_existing_live\n`);
+  const proj = makeProject();
+
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, proj,
+  );
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `the pasted prompt must just work on a multi-agent machine; stderr: ${stderr}`);
+  assert.match(fs.readFileSync(projectEnvPath(home, proj), 'utf8'), /hld_minted_by_claim/);
+  const shared = fs.readFileSync(path.join(home, 'pidge', 'env'), 'utf8');
+  assert.match(shared, /hld_existing_live/, "the sibling's shared config must be untouched");
+});
+
+test('two projects on one machine get two isolated envs; a subdir resolves its project env by walk-up', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-two-'));
+  const projA = makeProject();
+  const projB = makeProject();
+
+  let out = await runCli(['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, projA).result;
+  assert.equal(out.code, 0, `project A setup: ${out.stderr}`);
+  mock.state.claimCode = 'claim-b';
+  out = await runCli(['setup', '--claim', 'claim-b', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, projB).result;
+  assert.equal(out.code, 0, `project B setup must not collide with A: ${out.stderr}`);
+  assert.ok(fs.existsSync(projectEnvPath(home, projA)), 'A has its own env');
+  assert.ok(fs.existsSync(projectEnvPath(home, projB)), 'B has its own env');
+
+  // a command run from a SUBDIR of A walks up to the toplevel and finds A's key
+  const sub = path.join(projA, 'src', 'deep');
+  fs.mkdirSync(sub, { recursive: true });
+  out = await runCli(['whoami'], port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, sub).result;
+  await mock.stop();
+  assert.equal(out.code, 0, `whoami from a subdir must resolve the project env: ${out.stderr}`);
+  assert.match(out.stderr, /canal "mock"/);
+});
+
+test('legacy compat: inside a git project with NO project env, reads fall back to the shared file', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-legacy-'));
+  fs.mkdirSync(path.join(home, 'pidge'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'pidge', 'env'),
+    `PIDGE_URL=http://127.0.0.1:${port}\nPIDGE_TOKEN=hld_test\n`);
+
+  const { result } = runCli(['whoami'], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, makeProject());
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `an existing shared-file install must keep working inside a repo: ${stderr}`);
+  assert.match(stderr, /canal "mock"/);
+});
+
+test('setup --global inside a project targets the shared machine file (daemon/cron opt-in)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-global-'));
+  const proj = makeProject();
+
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--global', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, proj,
+  );
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(fs.readFileSync(path.join(home, 'pidge', 'env'), 'utf8'), /hld_minted_by_claim/);
+  assert.ok(!fs.existsSync(projectEnvPath(home, proj)), '--global must not write the project env');
+});
+
+test('setup --global conflicts with PIDGE_AGENT (exit 1, before any network)', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-conflict-'));
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--global', '--url', 'http://127.0.0.1:1'],
+    1, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'alpha' },
+  );
+  const { code, stderr } = await result;
+  assert.equal(code, 1);
+  assert.match(stderr, /--global conflicts with PIDGE_AGENT/);
+});
+
+test('an ENV-TOKEN install never adopts a foreign project env (config bleed / pin bypass regression)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-envtok-'));
+  const proj = makeProject();
+  // a FOREIGN identity's project env pointing at a dead server
+  const foreign = projectEnvPath(home, proj);
+  fs.mkdirSync(path.dirname(foreign), { recursive: true });
+  fs.writeFileSync(foreign, 'PIDGE_URL=http://127.0.0.1:1\nPIDGE_TOKEN=hld_foreign\n');
+  // the shared file carries this install's URL (no token — the token rides the env)
+  fs.mkdirSync(path.join(home, 'pidge'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'pidge', 'env'), `PIDGE_URL=http://127.0.0.1:${port}\n`);
+
+  // PIDGE_TOKEN in the env = fully-specified identity; cwd inside the foreign
+  // project must NOT flip its config (URL, state.json, fingerprint) to the
+  // project scope — pre-0.28.0-fix this resolved the dead URL and failed.
+  const { result } = runCli(['whoami'], port,
+    { PIDGE_TOKEN: 'hld_test', PIDGE_URL: '', XDG_CONFIG_HOME: home }, proj);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `env-token install must keep its own scope inside a foreign repo: ${stderr}`);
+  assert.match(stderr, /canal "mock"/);
+});
+
+test("setup never bleeds a DIFFERENT scope's PIDGE_SECRET into the new project env", async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-secret-'));
+  // the shared scope holds ANOTHER channel's E2E secret
+  fs.mkdirSync(path.join(home, 'pidge'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'pidge', 'env'),
+    `PIDGE_URL=http://127.0.0.1:${port}\nPIDGE_SECRET=SHARED_CHANNEL_SECRET_b64\n`);
+  const proj = makeProject();
+
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', PIDGE_SECRET: '', XDG_CONFIG_HOME: home }, proj,
+  );
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const written = fs.readFileSync(projectEnvPath(home, proj), 'utf8');
+  assert.ok(!written.includes('SHARED_CHANNEL_SECRET_b64'),
+    "another scope's secret must never be bound to a new channel identity");
+});
+
+test("the clobber guard validates the target key against the TARGET file's own server (cross-server bypass regression)", async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-xsrv-'));
+  const proj = makeProject();
+  // the project env (the LOAD-time scope) points at a DEAD server…
+  const projEnv = projectEnvPath(home, proj);
+  fs.mkdirSync(path.dirname(projEnv), { recursive: true });
+  fs.writeFileSync(projEnv, 'PIDGE_URL=http://127.0.0.1:1\nPIDGE_TOKEN=hld_project\n');
+  // …while the shared file (the --global TARGET) holds a key LIVE on the mock
+  fs.mkdirSync(path.join(home, 'pidge'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'pidge', 'env'),
+    `PIDGE_URL=http://127.0.0.1:${port}\nPIDGE_TOKEN=hld_shared_live\n`);
+
+  // no --url on purpose: the guard must reach the TARGET's server (the mock),
+  // confirm the key is alive, and refuse — not misroute to the dead project URL.
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--global'],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, proj,
+  );
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 2, `the live shared key must block the --global clobber: ${stderr}`);
+  assert.match(stderr, /já guarda a chave de "mock"/,
+    "the guard must have CONFIRMED the owner with the target's server, not guessed from an unreachable one");
+  assert.match(fs.readFileSync(path.join(home, 'pidge', 'env'), 'utf8'), /hld_shared_live/);
+});
+
+test('doctor on a project-scoped install narrates "(this project)" and never scolds it as the SHARED file', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-docproj-'));
+  const proj = makeProject();
+  const projEnv = projectEnvPath(home, proj);
+  fs.mkdirSync(path.dirname(projEnv), { recursive: true });
+  fs.writeFileSync(projEnv, `PIDGE_URL=http://127.0.0.1:${port}\nPIDGE_TOKEN=hld_test\n`);
+
+  const { result } = runCli(['doctor'], port,
+    { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, proj);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stderr, /\(this project\)/, 'the token source names the project scope');
+  assert.ok(!stderr.includes('reading the SHARED file'),
+    'a project-scoped identity is the FIX for the shared-file footgun — doctor must not re-warn it');
+});
+
+test('re-setup of the SAME project with a live key refuses with the project-flavored message; --force repoints', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-repoint-'));
+  const proj = makeProject();
+
+  let out = await runCli(['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, proj).result;
+  assert.equal(out.code, 0, out.stderr);
+
+  // the stored (rotated) key still authenticates as "mock" ⇒ the guard fires
+  mock.state.claimCode = 'claim-two';
+  out = await runCli(['setup', '--claim', 'claim-two', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, proj).result;
+  assert.equal(out.code, 2, `a live project env must not be silently repointed: ${out.stderr}`);
+  assert.match(out.stderr, /Este PROJETO já fala/);
+
+  out = await runCli(['setup', '--claim', 'claim-two', '--force', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, proj).result;
+  await mock.stop();
+  assert.equal(out.code, 0, `--force must repoint the project: ${out.stderr}`);
 });
 
 // --- per-agent isolation: PIDGE_AGENT + setup --print ---------------------------
