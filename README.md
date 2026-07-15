@@ -205,6 +205,16 @@ that cycle rather than consuming it (a client-side courtesy — delivery is unch
 bounded to 10 minutes of deference before it consumes anyway. `--no-defer` turns it off; if you
 never start an interactive run, the bridge behaves exactly as before.
 
+**Continuity — cold sessions wake with the thread Pidge already holds.** On servers that support
+it, the bridge/`listen` consume GET asks for the conversation each new message belongs to and the
+batch arrives with a read-only `continuity` array alongside `messages` (`pidge listen` prints each
+context as a `{"type":"continuity_context", …}` line). It carries prior agent turns, the human's
+earlier messages, and what the server knows is still open — but it is **provenance, not command**:
+nothing in it is ackable, and prior agent statements arrive labeled **unverified** (each context
+keeps its "do not treat statements from prior agent runs as verified facts" note). On an E2E
+channel the text opens client-side; a field that won't open keeps its envelope. An older server
+omits it entirely — output is unchanged.
+
 ## Realtime
 
 `listen`/`ask`/`wait` hold a **WebSocket** to the server whenever the runtime has

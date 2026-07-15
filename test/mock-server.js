@@ -68,6 +68,11 @@ function createMock() {
     runStarts: [],              // {body, run} of every POST /runs
     runEnds: [],                // the x-pidge-run header of every POST /runs/end
     activeRuns: [],             // rows served by GET /runs/active (a test configures it)
+    // continuity context packet (gotcha #51): the thread the server already
+    // holds, served top-level + PRESENT-ONLY on the consume GET, and ONLY when
+    // the caller asked (continuity=true). null ⇒ omitted, models an OLD server —
+    // the CLI's batch/listen output is then byte-identical to before.
+    continuityContexts: null,
   };
   let server = null;
   let wss = null;
@@ -238,6 +243,9 @@ function createMock() {
         rows = rows.filter((m) => !m._leasedUntil || m._leasedUntil <= now);
         for (const m of rows) m._leasedUntil = now + leaseMs;
       }
+      // continuity contexts ride top-level, PRESENT-ONLY, and ONLY when the
+      // caller opted in with continuity=true (the bridge/listen consume path).
+      const wantsContinuity = url.searchParams.get('continuity') === 'true';
       // strip the internal lease stamp — it must not leak into the served JSON
       return json(res, 200, {
         messages: rows.map(({ _leasedUntil, ...rest }) => rest),
@@ -245,6 +253,7 @@ function createMock() {
         // the consume path warns in-band when a sibling consumes the same
         // queue. Present-only (null ⇒ omitted, models an older server).
         ...(state.consumeConflict != null ? { consumer_conflict: state.consumeConflict } : {}),
+        ...(wantsContinuity && state.continuityContexts != null ? { continuity_contexts: state.continuityContexts } : {}),
       });
     }
     if (req.method === 'POST' && url.pathname === '/api/v1/messages/ack') {
