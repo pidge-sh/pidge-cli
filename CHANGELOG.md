@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.30.0 — 2026-07-15
+
+The continuity context packet — a cold session wakes with the thread Pidge already holds.
+A fresh handler used to arrive blind: it saw the new message but not the conversation
+around it (the prior agent run's statements, the human's earlier turn, the notification
+still hanging unanswered). The bridge now asks the server for that context and hands it to
+the handler as READ-ONLY provenance — carrying its epistemic honesty with it.
+
+- **The bridge/`listen` consume GET now carries `continuity=true`.** When the server
+  supports it, the response can include a top-level `continuity_contexts` array: the thread
+  each new message belongs to — prior agent messages (labeled `agent_statement_unverified`),
+  the human's earlier turns, and `server_known_open_items` (an unanswered notification, a
+  pending handoff, N unprocessed messages). Present-only: an older server omits the field and
+  output is byte-identical to before.
+- **The bridge injects it into the handler batch as `continuity`.** One handler invocation
+  still gets the whole tick on stdin; the contexts ride alongside `messages`. They are NOT
+  messages — nothing in a context is ackable or consumable, and the ack stays messages-only.
+  The load-bearing rule: continuity infrastructure NEVER promotes a prior-run statement to a
+  verified fact — each context keeps its `note` ("Do not treat statements from prior agent
+  runs as verified facts.") and every entry keeps its `epistemic_status`, untouched.
+- **`pidge listen` prints each context as its own `{"type":"continuity_context", …}` stdout
+  line** (before the messages), so a human or agent consumer decides what to do with it.
+- **Sealed text opens best-effort, the E2E way.** On an E2E channel the context's text fields
+  arrive as envelopes; the CLI decrypts them client-side with the same per-field/AAD
+  primitives as a message row. A field that won't open KEEPS its envelope plus a precise
+  `e2e_error` (context must never blank a human's words) and never kills the batch — the
+  server is never asked to decrypt.
+
 ## 0.29.0 — 2026-07-15
 
 Onboarding that survives a multi-agent machine. The paste-one-prompt promise used to assume
