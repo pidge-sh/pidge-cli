@@ -3627,3 +3627,55 @@ test('multi-runtime — a >80-code-unit label with an astral char at the slice b
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(decoded),
     'no lone surrogate in the decoded label (well-formed)');
 });
+
+// ===========================================================================
+// Fingerprint salt (claim-retry hardening) + honest cursor `skipped`
+// ===========================================================================
+
+test('fingerprint salt — a FRESH install mints fp-salt once and the fingerprint is stable across calls', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const env = stableIdentityEnv(); // one XDG shared across both calls
+  await runCli(['whoami'], port, env).result;
+  await runCli(['whoami'], port, env).result;
+  await mock.stop();
+
+  const saltFile = path.join(env.XDG_CONFIG_HOME, 'pidge', 'fp-salt');
+  assert.ok(fs.existsSync(saltFile), 'a brand-new identity dir mints fp-salt');
+  assert.match(fs.readFileSync(saltFile, 'utf8').trim(), /^[0-9a-f]{32}$/);
+  const fps = mock.state.reqLog.filter((r) => r.pathname === '/api/v1/whoami').map((r) => r.fingerprint);
+  assert.equal(fps.length, 2);
+  assert.equal(fps[0], fps[1], 'the salted fingerprint is STABLE across invocations');
+  assert.match(fps[0], /^fp_[0-9a-f]+$/);
+});
+
+test('fingerprint salt — an EXISTING install (env on disk, no salt) keeps its legacy fingerprint and mints NOTHING', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const env = stableIdentityEnv();
+  // simulate a pre-salt install: the env file already exists in the identity dir
+  const dir = path.join(env.XDG_CONFIG_HOME, 'pidge');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'env'), `PIDGE_URL=http://127.0.0.1:${port}\nPIDGE_TOKEN=hld_test\n`);
+  await runCli(['whoami'], port, env).result;
+  const first = mock.state.reqLog.filter((r) => r.pathname === '/api/v1/whoami').map((r) => r.fingerprint);
+  await runCli(['whoami'], port, env).result;
+  await mock.stop();
+
+  assert.ok(!fs.existsSync(path.join(dir, 'fp-salt')),
+    'an existing install is NEVER re-identified — no salt file appears');
+  const fps = mock.state.reqLog.filter((r) => r.pathname === '/api/v1/whoami').map((r) => r.fingerprint);
+  assert.equal(fps[0], fps[1], 'legacy fingerprint stays byte-stable');
+  assert.equal(first[0], fps[0]);
+});
+
+test('ack — a v88 `skipped` count is narrated honestly (present-only; old servers stay silent)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.ackSkipped = 2;
+  const r = await runCli(['ack', '--up-to', '9'], port).result;
+  await mock.stop();
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+  assert.match(r.stderr, /skipped 2 message\(s\) below the cursor/, 'the refusal is surfaced, not silent');
+  assert.match(r.stderr, /stay queued and re-serve/, 'and explained as safe');
+});

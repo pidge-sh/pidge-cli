@@ -672,3 +672,31 @@ test('bridge: an UNMARKED reply (old server / normal answer) still spawns a hand
   await mock.stop();
   assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
 });
+
+test('bridge: the per-batch run is minted with a SHORT sliding TTL (never the 24h interactive default)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [
+    { id: 51, kind: 'message', body: 'oi', created_at: 'x' },
+  ];
+  const outFile = path.join(tmpDir('pidge-run-ttl-'), 'batch.json');
+
+  const { child, result, out } = runCli(
+    ['bridge', '--exec', CAPTURE_HANDLER, '--no-realtime', '--interval', '1'],
+    port, { OUT: outFile },
+  );
+
+  assert.ok(await waitFor(() => mock.state.ackBodies.some((b) => (b.ids || []).includes(51))), `stderr:\n${out.stderr}`);
+  child.kill('SIGTERM');
+  const r = await result;
+  await mock.stop();
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+
+  const starts = mock.state.runStarts.filter((s) => s.body.mode === 'bridge');
+  assert.ok(starts.length >= 1, 'the batch minted a bridge run');
+  for (const s of starts) {
+    assert.equal(s.body.ephemeral, true);
+    assert.equal(s.body.ttl_seconds, 3600,
+      'default --handler-timeout (1800s) ⇒ ttl max(3600, 2×timeout) = 3600 — a dead handler expires in ~1h, not 24h');
+  }
+});
