@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.31.0 — 2026-07-17
+
+Two launch-hardening fixes so a bridge never haunts the app and a claim can't be
+re-exchanged by a guesser.
+
+- **Bridge runs now expire like batches.** `pidge bridge` mints an ephemeral run per
+  handler; it used to inherit the server's 24 h default, so a handler that died on
+  SIGTERM (teardown skips the best-effort run-end) left a "live" persona in the app for a
+  day. The bridge now sends `ttl_seconds: max(3600, handler-timeout × 2)` — sliding, so
+  every signed call re-arms it, and the run falls away shortly after the handler stops.
+  `run start` also gains an explicit `--ttl SECONDS`.
+- **Fingerprint gets a random per-install salt.** The claim fingerprint was a
+  deterministic `hostname|username|PIDGE_AGENT|CONFIG_FILE` — someone who saw the setup
+  prompt and guessed the machine could re-exchange the claim inside its 15-min TTL. A
+  fresh identity dir now mints a random `fp-salt` (0600) before any claim binds, making
+  the fingerprint unguessable. **Back-compat is load-bearing:** an EXISTING install (env
+  file present, no salt file) keeps the legacy unsalted derivation forever, so a claim it
+  already bound stays re-exchangeable.
+
 ## 0.30.0 — 2026-07-15
 
 The continuity context packet — a cold session wakes with the thread Pidge already holds.

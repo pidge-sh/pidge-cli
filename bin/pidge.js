@@ -156,6 +156,11 @@ let CONFIG_DIR = AGENT_ID ? pidgeConfigDir()
   : (!ENV_TOKEN_SET && PROJECT_CONFIG_DIR && fs.existsSync(path.join(PROJECT_CONFIG_DIR, 'env'))) ? PROJECT_CONFIG_DIR
   : pidgeConfigDir();
 let CONFIG_FILE = path.join(CONFIG_DIR, 'env');
+// Declared here (not next to fingerprintSalt below) because `identityHeaders()`
+// runs at module load — and a `let` in the TDZ would throw
+// "Cannot access 'FP_SALT_CACHE' before initialization". Keyed on CONFIG_DIR so a
+// runSetup retarget (which reassigns CONFIG_DIR) re-derives the salt.
+let FP_SALT_CACHE = null; // { dir, salt }
 const FILE_ENV = readEnvFile(CONFIG_FILE);
 
 const BASE = process.env.PIDGE_URL || process.env.HERALD_URL || FILE_ENV.PIDGE_URL || 'http://localhost:3000';
@@ -2715,8 +2720,54 @@ async function fetchWhoami(base = BASE, token = TOKEN) {
 // HASH, never raw hostname/PII) so the server can tell THIS install apart from a
 // different agent that grabbed the same key. The label is the human-readable
 // self-name (PIDGE_LABEL, else PIDGE_AGENT, else the hostname).
+//
+// SALT (hardening for the server's retry-safe claim, which re-exchanges a bound
+// code to the SAME fingerprint within its TTL): without one, the fingerprint is
+// derivable from public machine facts (hostname|username|agent|path) — an
+// attacker who swept the pasted prompt AND can guess those could hijack the
+// retry window. A FRESH identity dir mints a random per-install salt
+// (fp-salt, 0600) BEFORE any claim binds, making the fingerprint unguessable.
+// COMPAT IS LOAD-BEARING: an EXISTING install (env file present, no salt file)
+// keeps the legacy unsalted derivation FOREVER — its fingerprint is already
+// bound into server claims and provenance, and changing it would break the
+// v84 mid-setup retry and re-identify the fleet. The salt-file check wins over
+// the env-file check, so a fresh setup that minted a salt and then crashed
+// before writing env stays on ITS salt (the claim it bound is still
+// re-exchangeable — the same retry-safety the salt exists to protect).
+// (FP_SALT_CACHE is declared up by CONFIG_FILE — identityHeaders() reads it at
+// module load, so it must be initialized before then, not here.)
+function fingerprintSalt() {
+  if (FP_SALT_CACHE && FP_SALT_CACHE.dir === CONFIG_DIR) return FP_SALT_CACHE.salt;
+  let salt = '';
+  const saltFile = path.join(CONFIG_DIR, 'fp-salt');
+  try {
+    salt = fs.readFileSync(saltFile, 'utf8').trim();
+  } catch {
+    // No salt file. Existing install (env already on disk) ⇒ legacy, no salt —
+    // NEVER re-identify it. Brand-new identity dir ⇒ mint + persist one now
+    // (before any claim can bind). Persist failure ⇒ degrade to legacy ('')
+    // rather than an UNSTABLE random-per-process identity: a fingerprint that
+    // changes every invocation would break claim retry and "(you)" markers.
+    if (!fs.existsSync(CONFIG_FILE)) {
+      try {
+        fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+        const minted = crypto.randomBytes(16).toString('hex');
+        fs.writeFileSync(saltFile, minted + '\n', { mode: 0o600 });
+        salt = minted;
+      } catch { salt = ''; }
+    }
+  }
+  FP_SALT_CACHE = { dir: CONFIG_DIR, salt };
+  return salt;
+}
 function agentFingerprint() {
-  const material = [ os.hostname(), os.userInfo().username || '', AGENT_ID, CONFIG_FILE ].join('|');
+  const parts = [ os.hostname(), os.userInfo().username || '', AGENT_ID, CONFIG_FILE ];
+  // Legacy compat is byte-exact: no salt ⇒ the material is IDENTICAL to the
+  // pre-salt formula (no trailing separator) — an existing install's
+  // fingerprint must never move.
+  const salt = fingerprintSalt();
+  if (salt) parts.push(salt);
+  const material = parts.join('|');
   return 'fp_' + crypto.createHash('sha256').update(material).digest('hex').slice(0, 24);
 }
 function agentLabel() {
@@ -3452,7 +3503,15 @@ async function runBridge() {
     try {
       const res = await fetchT(`${BASE}/api/v1/runs`, {
         method: 'POST', headers,
-        body: JSON.stringify({ mode: 'bridge', ephemeral: true, label: agentLabel() }),
+        // ttl_seconds: a per-batch run must EXPIRE like one. The server default
+        // is 24 h (sized for interactive sessions) — a bridge handler that dies
+        // ungracefully (SIGTERM teardown skips the best-effort run end below)
+        // would otherwise haunt the app as a "live" persona for a day. Twice
+        // the handler timeout covers the longest legal handler with margin,
+        // floored at 1 h (the server clamps to its own range anyway); expiry is
+        // SLIDING, so every signed call the handler makes re-arms it.
+        body: JSON.stringify({ mode: 'bridge', ephemeral: true, label: agentLabel(),
+                               ttl_seconds: Math.max(3600, handlerTimeoutS * 2) }),
       });
       if (res.status === 404) { runsUnsupported = true; return null; }
       if (res.status < 200 || res.status >= 300) {
@@ -4935,6 +4994,13 @@ ${SKILL_END_MARKER}
       // an older server omits `annotated`).
       if (Number(adata.annotated) > 0)
         console.error(`pidge: annotated ${adata.annotated} previously-acked message(s) — filled in the attribution a prior consumer left blank.`);
+      // v88 (present-only; older servers omit it): the up_to cursor refused
+      // rows it may not finish — a sibling's live in-flight work, or rows never
+      // served to any consumer. They are NOT lost: they stay queued and
+      // re-serve normally. Seeing this on a solo channel usually means another
+      // consumer (a bridge?) is mid-batch below your cursor.
+      if (Number(adata.skipped) > 0)
+        console.error(`pidge: skipped ${adata.skipped} message(s) below the cursor (a sibling's in-flight work, or never-served rows) — they stay queued and re-serve; ack them by exact ids if they're truly yours.`);
       // The "what next" line, LAST so it reads as the next step. Only a real
       // ack (work done) — a --renew is a mid-task heartbeat, the listener is
       // deliberately NOT running then. The bridge never takes this path (its

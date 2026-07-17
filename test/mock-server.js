@@ -274,7 +274,7 @@ function createMock() {
         // `annotated` = rows a prior consumer acked
         // without a note that THIS ack filled in. 0 by default (models nothing to
         // annotate / an older server the CLI treats identically — no narration).
-        json(res, 200, { acked: 1, annotated: state.ackAnnotated });
+        json(res, 200, { acked: 1, annotated: state.ackAnnotated, ...(state.ackSkipped ? { skipped: state.ackSkipped } : {}) });
       });
       return;
     }
