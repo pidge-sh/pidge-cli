@@ -571,8 +571,11 @@ OPTIONS (notify / ask)
                            array of custom {id,label} objects). Composes on ANY type.
   --custom-action SPEC     "id:label[:destructive][:confirm][:biometric][:terminal]" (repeatable)
   --wait                   RESPONSE axis — block until the human answers (any type),
-                           then print chosen_action JSON. Without it: fire-and-forget
-                           (the answer arrives later in \`pidge listen --all\`). ask/approval imply it.
+                           then print chosen_action JSON. 0.32+: if the human TYPES in
+                           the channel composer meanwhile, the wait returns that instead
+                           (kind:"human_message" — handle, \`pidge ack\`, re-wait).
+                           Without it: fire-and-forget (the answer arrives later in
+                           \`pidge listen --all\`). ask/approval imply it.
   --deliver-at ISO8601     schedule for later
   --reply-to URL           also POST the answer to your webhook (HMAC-signed)
   --correlation-id ID      idempotency + routing key (auto-generated if omitted)
@@ -655,7 +658,7 @@ const OPTION_DOCS = {
   copy: '--copy TEXT              tap-to-copy value on the detail screen',
   actions: '--actions LIST|JSON      RESPONSE axis: comma list from the catalog (e.g. yes,no · or reply ALONE — never mix a decision with reply) OR a JSON array of {"id","label"} custom actions — composes on ANY type',
   'custom-action': '--custom-action SPEC     "id:label[:destructive][:confirm][:biometric][:terminal]" (repeatable)',
-  wait: '--wait                  RESPONSE axis: block until the human answers (any type), then print chosen_action JSON (ask/approval imply it)',
+  wait: '--wait                  RESPONSE axis: block until the human answers (any type), then print chosen_action JSON (ask/approval imply it). 0.32+: a composer message typed meanwhile returns as kind:"human_message"',
   'deliver-at': '--deliver-at ISO8601     schedule the send for later',
   'reply-to': '--reply-to URL           also POST the answer to your webhook (HMAC-signed)',
   'correlation-id': '--correlation-id ID      idempotency + routing key (auto-generated if omitted)',
@@ -2526,9 +2529,56 @@ function warnDeprecatedSend(name) {
   console.error(`pidge: \`pidge ${name}\` is deprecated — use a TYPE instead: message · important · urgent · event · live (or the ask/approval shortcuts; see \`pidge help\`). It still sends (no template_kind ⇒ the server picks the channel default).`);
 }
 
+// --- Composer-wake (0.32, server manifest v91) ------------------------------
+// The blindspot this kills: a blocking wait used to watch ONE notification
+// while the human's composer messages piled up unread on the /messages queue —
+// to the human it's ONE conversation (they type in the same chat where they
+// tap your buttons), and the answer they typed was silently diverted to a
+// queue nobody was reading. Now every default wait ALSO asks the server to
+// wake on a deliverable composer message (?wake_on_message=true) and, when the
+// response says messages_pending, DRAINS the queue through the one consume
+// path (GET /messages — the delivered-lease/ack contract stays intact) and
+// returns it as a TYPED result (kind:"human_message"). Skipped when a running
+// `pidge bridge` owns this channel's queue (the bridge wakes your handler
+// itself) and on onAnswer flows (`approve` keeps its exit-code contract — a
+// free-text composer line can never approve).
+async function drainComposerQueue() {
+  try {
+    const res = await fetchT(`${BASE}/api/v1/messages?continuity=true`, { headers });
+    if (res.status !== 200) return null;
+    const data = await res.json().catch(() => ({}));
+    warnStalePriorClaim(data);
+    warnConsumerConflict(data);
+    const raw = data.messages || [];
+    if (!raw.length) return null; // raced — another consumer took them; keep waiting
+    const msgs = await Promise.all(raw.map((m) => e2eOpenMessageRow(m)));
+    const contexts = await e2eOpenContinuityContexts(data && data.continuity_contexts);
+    return { msgs, contexts };
+  } catch { return null; }
+}
+
+// Print the drained composer messages as the wait's typed result and exit 0.
+// kind:"human_message" is the discriminator — a chosen_action parser switching
+// on kind sees a NEW kind, never a mis-shaped answer. The notification stays
+// unanswered: the note says so, and says how to resume.
+function exitWithComposerMessages(cid, { msgs, contexts }) {
+  for (const ctx of contexts || []) console.log(JSON.stringify({ type: 'continuity_context', ...ctx }));
+  const upTo = Math.max(...msgs.map((m) => m.id));
+  console.log(JSON.stringify({
+    kind: 'human_message',
+    note: `the human wrote in the channel composer while you waited — handle it FIRST. Your notification ${cid} is STILL unanswered: resume with \`pidge wait ${cid}\` afterwards (or answer the human with a new send, reusing thread_id).`,
+    pending_notification: cid,
+    messages: msgs,
+  }, null, 2));
+  console.error(`pidge: ${msgs.length} composer message(s) DELIVERED (gray ✓✓), NOT done — ACK AFTER you handle them: \`pidge ack --up-to ${upTo}\` (the ~10-min lease re-serves un-acked rows).`);
+  process.exit(0);
+}
+
 // Poll GET /notifications/:cid until a TERMINAL answer, print chosen_action JSON to
 // stdout, exit 0. A snooze (snooze / reschedule-to-a-time) is non-terminal — it
 // re-fires — so keep waiting through it. Exits 3 on timeout.
+// 0.32: the same wait also hears the composer plane (see drainComposerQueue
+// above) — a composer message arriving mid-wait returns kind:"human_message".
 // Long-poll: each GET carries ?wait=N (≤55 s) and the SERVER holds it until
 // the user acts — answer latency ~instant, ~1 request/min. --interval is only the
 // fallback pace against an old server that ignores `wait` (returns immediately).
@@ -2538,11 +2588,20 @@ function warnDeprecatedSend(name) {
 async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
   const deadline = Date.now() + timeout * 1000;
   let firedNotice = false;
+  // Composer-wake (0.32): only the default print-and-exit contract returns
+  // typed human messages; an onAnswer flow (approve) stays notification-only.
+  // A live bridge owns the queue — a wait must never double-consume it.
+  const wakeQueue = !onAnswer && !bridgeLockHolder();
   for (;;) {
     // Degraded: a held poll keeps dying behind some edge — switch to
     // PLAIN GETs (the requests that kept working in the wild) on a slow pace.
     const waitS = health.degraded ? 0 : Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
-    const url = `${BASE}/api/v1/notifications/${encodeURIComponent(cid)}${waitS > 0 ? `?wait=${waitS}` : ''}`;
+    // wake_on_message rides even the degraded plain GETs — the flag is
+    // computed on any read; only the HOLD needs ?wait=.
+    const qs = new URLSearchParams();
+    if (waitS > 0) qs.set('wait', String(waitS));
+    if (wakeQueue) qs.set('wake_on_message', 'true');
+    const url = `${BASE}/api/v1/notifications/${encodeURIComponent(cid)}${qs.size ? `?${qs}` : ''}`;
     const askedAt = Date.now();
     try {
       const res = await fetchT(url, { headers }, (waitS + 10) * 1000);
@@ -2553,6 +2612,11 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
         if (data.responded) {
           await e2eOpenChosen(data); // sealed answer → plaintext (gated on data.enc)
           const chosen = data.chosen_action || {};
+          // The answer never masks the backlog: say the queue is non-empty
+          // BEFORE exiting (deliberately not drained here — draining would
+          // lease the rows and make the suggested `pidge listen` read empty).
+          if (data.messages_pending)
+            console.error('pidge: your queue ALSO holds composer message(s) from the human — read them before moving on: `pidge listen` (or `pidge catchup`, read-only).');
           if (chosen.kind === 'snoozed') {
             console.error(`pidge: snoozed until ${chosen.snooze_until || chosen.at} — re-fires then, still waiting`);
           } else if (onAnswer) {
@@ -2561,6 +2625,10 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
             console.log(JSON.stringify(chosen, null, 2));
             process.exit(0);
           }
+        } else if (wakeQueue && data.messages_pending) {
+          const drained = await drainComposerQueue();
+          if (drained) exitWithComposerMessages(cid, drained);
+          // raced empty (another consumer took the rows) — keep waiting
         } else if (!firedNotice && data.escalation && data.escalation.state === 'fired') {
           firedNotice = true;
           // stopping the ring on-device now reports `seen` (seen_at flips);
@@ -2598,27 +2666,38 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
 // for OUR cid as a wake-up; the durable answer is always re-read over HTTP
 // (doWait prints + exits). A safety re-check every 60 s covers a frame lost in
 // a reconnect gap. Returns only when WS can't carry us — caller falls back.
+// 0.32: the same hold also hears the composer plane — a ConversationChannel
+// subscription (plus the safety probe's messages_pending) wakes the drain.
 async function realtimeWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
   const deadline = Date.now() + timeout * 1000;
-  const answered = async () => {
+  // Same gate as doWait: default contract only, never over a running bridge.
+  const wakeQueue = !onAnswer && !bridgeLockHolder();
+  // 'answered' | 'composer' | false — one authoritative HTTP read for both planes.
+  const probe = async () => {
     try {
-      const res = await fetchT(`${BASE}/api/v1/notifications/${encodeURIComponent(cid)}`, { headers });
+      const res = await fetchT(`${BASE}/api/v1/notifications/${encodeURIComponent(cid)}${wakeQueue ? '?wake_on_message=true' : ''}`, { headers });
       if (res.status !== 200) return false;
       const data = await res.json().catch(() => ({}));
-      return !!(data.responded && data.chosen_action && data.chosen_action.kind !== 'snoozed');
+      if (data.responded && data.chosen_action && data.chosen_action.kind !== 'snoozed') return 'answered';
+      if (wakeQueue && data.messages_pending) return 'composer';
+      return false;
     } catch { return false; }
   };
   let safety = null;
-  const outcome = await cableSession({
+  let finishInbox = null;
+  const check = () => probe().then((r) => r && finishInbox && finishInbox(r));
+  const sessions = [cableSession({
     channel: 'InboxChannel',
     params: wsIdentityParams(),
     deadline,
     onUp: (finish) => {
       health.ok();
-      // catch an answer that landed while we were connecting/offline
-      answered().then((done) => done && finish('answered'));
+      finishInbox = finish;
+      // catch an answer (or a queued composer message) that landed while we
+      // were connecting/offline
+      check();
       clearInterval(safety);
-      safety = setInterval(() => answered().then((done) => done && finish('answered')), 60000);
+      safety = setInterval(check, 60000);
     },
     onFrame: (m, finish) => {
       if (m.type !== 'event' || m.correlation_id !== cid) return;
@@ -2627,8 +2706,29 @@ async function realtimeWait(cid, { timeout, interval, onAnswer, onTimeout } = {}
       else if (m.kind === 'snoozed') console.error(`pidge: snoozed until ${m.snooze_until || m.at} — re-fires then, still waiting`);
       else if (m.responded) finish('answered');
     },
-  });
+  })];
+  // Composer plane: messages broadcast on ConversationChannel, not Inbox — a
+  // second subscription wakes the same typed-result path (the queue is the
+  // ledger; the loser session leaks until exit, harmless in a one-shot process).
+  if (wakeQueue) {
+    sessions.push(cableSession({
+      channel: 'ConversationChannel',
+      params: wsIdentityParams(),
+      deadline,
+      onUp: () => {},
+      onFrame: (m, finish) => { if (m.type === 'message') finish('composer'); },
+    }));
+  }
+  const outcome = await Promise.race(sessions);
   clearInterval(safety);
+  if (outcome === 'composer') {
+    const drained = await drainComposerQueue();
+    if (drained) exitWithComposerMessages(cid, drained);
+    // raced empty (another consumer took the rows) — hand the remaining budget
+    // to the poller, which re-holds with the wake armed. Not a WS failure, so
+    // no "realtime unavailable" line.
+    return Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
+  }
   if (outcome === 'answered') {
     // fetch + resolve (print+exit, or the caller's onAnswer/onTimeout mapping) via
     // the poller (one quick authoritative read)
@@ -4177,6 +4277,25 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   // an older server that omits it can't confirm either way, so stay silent then.
   if (data.stale_from_prior_claim === false)
     console.error('pidge doctor: prior-claim backlog: none ✓ (no un-acked messages predate your ownership claim)');
+  // Composer-backlog honesty (0.32): the /messages queue is the OTHER input
+  // plane — the human typing in the app's composer. Count unprocessed rows
+  // with a READ-ONLY history probe (never consumes, never leases) and shout
+  // when they're piling up with nobody reading: waiting on one notification
+  // is NOT being online (a pre-0.32 wait never read this queue at all).
+  try {
+    const hres = await fetchT(`${BASE}/api/v1/messages?history=true`, { headers });
+    if (hres.status === 200) {
+      const hdata = await hres.json().catch(() => ({}));
+      const pending = (hdata.messages || []).filter((mm) => !mm.processed_at && !mm.consumed_at).length;
+      if (pending > 0) {
+        const anyLive = Array.isArray(data.consumers) && data.consumers.some((c) => c && c.live);
+        const noEar = ' Nobody is consuming this queue — a `--wait` on one notification does NOT read it (CLI ≥0.32 waits DO wake on it): run `pidge listen`/`pidge online`, or `pidge catchup` first (read-only).';
+        console.error(`pidge doctor: ⚠️ ${pending} composer message(s) un-acked on this channel's queue — the human wrote and no ack marked them handled.${anyLive ? ' A live consumer exists; make sure it acks after the work.' : noEar}`);
+      } else {
+        console.error('pidge doctor: composer queue: no un-acked messages ✓');
+      }
+    }
+  } catch { /* advisory probe — never fails the doctor */ }
   // An UNMARKED home skill is one the self-heal (correctly) won't touch
   // (requireMarker) — so a PRE-MARKER pidge copy silently stays on old doctrine
   // with no signal (a real incident: an install ran months-stale doctrine
@@ -4642,11 +4761,13 @@ ${notes.map((n) => `- ${n}`).join('\n')}
 ## Getting answers
 
 - \`pidge ask …\` blocks and prints \`chosen_action\` JSON; \`pidge wait <cid>\` blocks on an existing send.
+- **A wait hears BOTH planes (0.32+).** While you block on a notification, the human may TYPE in the channel composer instead of tapping a button — to them it is ONE conversation. The wait wakes on that too and prints \`kind:"human_message"\` with the message rows: handle them FIRST, \`pidge ack --up-to <id>\` after the work, then resume \`pidge wait <cid>\` (your notification is still unanswered). Parsing: switch on \`kind\` — \`human_message\` = the human spoke on the side; anything else = the answer to your question.
 - \`pidge listen\` blocks until the human MESSAGES you from the app (composer) — run it when idle.
 - **A pending notification's answer does NOT surface in plain \`pidge listen\`** (messages only).
   To collect the answer to a question you already sent: \`pidge wait <cid>\` (you printed the cid
   on stderr at send time) or \`pidge listen --all\` (replies + messages). Park the cid, never re-send.
-- ${exits}
+- **\`--wait\` is still NOT "being online."** It hears the composer only WHILE it blocks; between waits nothing reads the queue. Guiding a human step-by-step? Run \`pidge listen --all\` (or \`pidge online\`) as the primary loop, or \`pidge catchup --since <cursor>\` between steps. \`pidge doctor\` counts composer messages piling up un-acked.
+- ${exits} (a \`human_message\` return is also exit 0)
 
 ## Waking up in an interactive session (multi-runtime channels)
 

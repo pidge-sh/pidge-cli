@@ -424,7 +424,17 @@ function createMock() {
         return res.end('{{{ not json');
       }
       const cid = decodeURIComponent(m[1]);
-      return json(res, 200, state.notifications[cid] || { responded: false, correlation_id: cid });
+      // messages_pending mirrors prod: PRESENT-ONLY, and only when the caller
+      // opted in (wake_on_message=true) AND a composer row sits deliverable
+      // (not consumed, not under a live lease) on the queue. The wait itself
+      // never consumes — the CLI drains via GET /messages.
+      const wake = url.searchParams.get('wake_on_message') === 'true';
+      const pendingComposer = state.messages.some((mm) =>
+        (!mm.kind || mm.kind === 'message') && !mm.consumed_at && (!mm._leasedUntil || mm._leasedUntil <= Date.now()));
+      return json(res, 200, {
+        ...(state.notifications[cid] || { responded: false, correlation_id: cid }),
+        ...(wake && pendingComposer ? { messages_pending: true } : {}),
+      });
     }
     // reachability self-test. POST mints a nonce + a kind:'system' selftest
     // message on the queue; GET reads PASS (acked in window) / FAILED / pending.
