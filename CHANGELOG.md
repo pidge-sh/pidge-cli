@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.32.0 — 2026-07-22
+
+The composer blindspot is dead: **a blocking wait now hears BOTH input planes.**
+
+The failure mode this kills, seen in real use: an agent drives a whole session on
+`--wait` (blocking on one notification at a time) while the human — for whom the
+notification buttons and the channel composer are ONE conversation — types answers
+into the composer. Those messages queued durably on `/messages`… which nothing was
+reading. The human says "you're online, you should have seen it"; the agent never
+wakes.
+
+- **`--wait`/`pidge wait` wake on composer messages** (server manifest ≥ v91). Every
+  default wait sends `wake_on_message=true`; when the held poll reports a deliverable
+  composer message, the CLI drains the queue through the normal consume path and
+  returns it as a TYPED stdout result — `kind:"human_message"` with the message rows,
+  `pending_notification` (your still-unanswered cid) and a note saying how to resume.
+  Exit `0`. Parsers switch on `kind`: `human_message` = the human spoke on the side;
+  anything else = the usual `chosen_action`. Rows are DELIVERED, not consumed —
+  `pidge ack --up-to <id>` after the work, exactly like `listen` (the ~10-min lease
+  re-serves on a crash).
+- **The realtime wait hears it too:** the WS path now also subscribes the
+  conversation stream, and the 60 s safety probe carries the wake flag — a composer
+  message wakes a socket-held wait as fast as a button tap.
+- **An ANSWERED wait names the backlog:** when the answer arrives while composer
+  messages sit queued, `chosen_action` prints unchanged and stderr says the queue is
+  non-empty (deliberately NOT drained there — a drain would lease the rows the
+  suggested `pidge listen` should read).
+- **Never over a bridge, never on `approve`:** a live `pidge bridge` lock suppresses
+  the wake entirely (the bridge is the queue's one consumer and wakes your handler
+  itself), and `approve` keeps its strict exit-code contract (free text can never
+  approve) — it waits exactly as before.
+- **`pidge doctor` counts the pile-up:** a read-only history probe reports composer
+  messages nobody acked ("⚠️ N composer message(s) un-acked…"), loudly noting when NO
+  consumer is reading the queue — plus an explicit "composer queue: no un-acked
+  messages ✓" on the healthy path. Waiting on one notification is not being online;
+  now the doctor says so with numbers.
+- **Presence got honest** (server ≥ v91): a wake-armed wait counts as "listening now"
+  in the app — it genuinely can receive a composer message — while a plain wait no
+  longer implies it.
+- Skill/help updated: the wait-vs-listen section now teaches both planes and the
+  `human_message` return.
+
+Older servers ignore the flag — behavior is byte-identical to 0.31 there.
+
 ## 0.31.0 — 2026-07-17
 
 Two launch-hardening fixes so a bridge never haunts the app and a claim can't be

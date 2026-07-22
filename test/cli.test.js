@@ -3679,3 +3679,100 @@ test('ack — a v88 `skipped` count is narrated honestly (present-only; old serv
   assert.match(r.stderr, /skipped 2 message\(s\) below the cursor/, 'the refusal is surfaced, not silent');
   assert.match(r.stderr, /stay queued and re-serve/, 'and explained as safe');
 });
+
+// --- composer-wake on wait (0.32) -------------------------------------------
+// A blocking wait watches ONE notification while the human may TYPE in the
+// channel composer — one conversation to them, two planes on the wire. The
+// wait now sends wake_on_message=true, and a deliverable composer row returns
+// as a TYPED result (kind:"human_message") drained through the one consume
+// path (lease semantics intact, ack-after-work).
+
+test('wait wakes on a composer message and returns it typed (kind human_message), un-acked', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 41, channel_id: 1, body: 'na verdade, faz outra coisa antes', created_at: 'x', consumed_at: null }];
+
+  const { result } = runCli(['wait', 'cid-1', '--no-realtime', '--timeout', '10', '--interval', '1'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr:\n${stderr}`);
+  assert.match(stdout, /"kind": "human_message"/);
+  assert.match(stdout, /na verdade, faz outra coisa antes/);
+  assert.match(stdout, /"pending_notification": "cid-1"/, 'says which notification is still unanswered');
+  assert.match(stderr, /ACK AFTER you handle them/, 'read-receipt contract: delivered, not done');
+  assert.equal(mock.state.acks.length, 0, 'the wake never acks — the agent acks after the work');
+  const drainReads = mock.state.messageReads.filter((u) => !/history=true/.test(u));
+  assert.equal(drainReads.length, 1, 'exactly one drain through the consume path');
+  assert.match(drainReads[0], /continuity=true/, 'the drain asks for the thread context packet');
+});
+
+test('an answered wait with queued composer messages prints chosen_action and POINTS at the queue (no drain)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.notifications['cid-2'] = {
+    responded: true,
+    chosen_action: { kind: 'acted', action_id: 'yes', label: 'Sim', text: null },
+  };
+  mock.state.messages = [{ id: 42, channel_id: 1, body: 'e mais uma coisa', created_at: 'x', consumed_at: null }];
+
+  const { result } = runCli(['wait', 'cid-2', '--no-realtime', '--timeout', '10', '--interval', '1'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr:\n${stderr}`);
+  assert.match(stdout, /"action_id": "yes"/, 'the answer is the primary result — shape untouched');
+  assert.match(stderr, /ALSO holds composer message/, 'the backlog is named before exiting');
+  assert.equal(mock.state.messageReads.length, 0, 'not drained here — a drain would lease the rows the suggested listen should read');
+});
+
+test('a running bridge suppresses the composer wake — the wait never double-consumes the queue', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 43, channel_id: 1, body: 'do bridge, não sua', created_at: 'x', consumed_at: null }];
+
+  // A live bridge lock for THIS token (hash mirrors the CLI's per-channel key),
+  // held by our own pid — alive by construction.
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-lock-'));
+  const h = crypto.createHash('sha256').update('hld_test').digest('hex').slice(0, 16);
+  fs.mkdirSync(path.join(xdg, 'pidge'), { recursive: true });
+  fs.writeFileSync(path.join(xdg, 'pidge', `bridge-${h}.lock`),
+    JSON.stringify({ pid: process.pid, started_at: 'x', label: 'test-bridge' }) + '\n');
+
+  const { result } = runCli(['wait', 'cid-3', '--no-realtime', '--timeout', '2', '--interval', '1'], port,
+    { XDG_CONFIG_HOME: xdg });
+  const { code } = await result;
+  await mock.stop();
+
+  assert.equal(code, 3, 'no wake — the wait rides to its timeout');
+  assert.equal(mock.state.messageReads.length, 0, 'the queue was never touched');
+});
+
+test('doctor counts un-acked composer messages and says nobody is consuming', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 44, channel_id: 1, body: 'quero parar isso tudo', created_at: 'x', consumed_at: null }];
+
+  const { result } = runCli(['doctor', '--no-realtime'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr:\n${stderr}`);
+  assert.match(stderr, /1 composer message\(s\) un-acked/);
+  assert.match(stderr, /Nobody is consuming this queue/);
+  const historyReads = mock.state.messageReads.filter((u) => /history=true/.test(u));
+  assert.equal(historyReads.length, 1, 'the probe is the read-only history read');
+  assert.equal(mock.state.acks.length, 0, 'the probe never consumes or acks');
+});
+
+test('doctor confirms a clean composer queue explicitly', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  const { result } = runCli(['doctor', '--no-realtime'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr:\n${stderr}`);
+  assert.match(stderr, /composer queue: no un-acked messages ✓/);
+});
