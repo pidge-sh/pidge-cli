@@ -22,7 +22,7 @@ const { spawn: rawSpawn } = require('node:child_process');
 const WebSocketClient = require('ws');
 const { track } = require('./spawn-tracker');
 const { createMock } = require('./mock-server');
-const { e2eAad, e2eEncryptField, e2eDecryptField } = require('../bin/pidge.js');
+const { e2eAad, e2eEncryptBlob, e2eDecryptBlob } = require('../bin/pidge.js');
 const { parseProfiles } = require('../src/terminal/profiles');
 const { deriveSessionName } = require('../src/terminal/host');
 
@@ -35,9 +35,12 @@ const HAS_WS = typeof WebSocket === 'function';
 
 const KEY = Buffer.alloc(32, 5);
 const SECRET = KEY.toString('base64url');
-const sealCtrlViewer = (pid, frame) => e2eEncryptField(KEY, e2eAad(1, pid, 'terminal_ctrl_viewer'), JSON.stringify(frame));
-const openCtrlHost = (pid, data) => JSON.parse(e2eDecryptField(KEY, e2eAad(1, pid, 'terminal_ctrl_host'), data));
-const openOutput = (pid, data) => JSON.parse(e2eDecryptField(KEY, e2eAad(1, pid, 'terminal_output'), data));
+const VG = 'hostvgen1'; // a valid vgen ([a-z0-9]{8,}) for the test viewer's control frames
+// The iOS wire form: blob framing → STANDARD base64.
+const sealBlob = (pid, field, frame) => e2eEncryptBlob(KEY, e2eAad(1, pid, field), Buffer.from(JSON.stringify(frame), 'utf8')).toString('base64');
+const sealCtrlViewer = (pid, frame) => sealBlob(pid, 'terminal_ctrl_viewer', frame);
+const openCtrlHost = (pid, data) => JSON.parse(e2eDecryptBlob(KEY, e2eAad(1, pid, 'terminal_ctrl_host'), Buffer.from(data, 'base64')).toString('utf8'));
+const openOutput = (pid, data) => JSON.parse(e2eDecryptBlob(KEY, e2eAad(1, pid, 'terminal_output'), Buffer.from(data, 'base64')).toString('utf8'));
 
 function runHost(port, env = {}) {
   const fakeDir = env.FAKE_TMUX_DIR || tmpDir('pidge-hosttmux-');
@@ -196,7 +199,7 @@ test('terminal host: control lane + inventory + spawn-by-whitelist + lazy attach
 
   // spawn BY NAME from the whitelist → tmux session created with the
   // profile's cmd, registered, and a fresh sessions frame published
-  ctrlViewer.sendFrame(sealCtrlViewer(head.control_public_id, { t: 'spawn', seq: 1, profile: 'Shell' }));
+  ctrlViewer.sendFrame(sealCtrlViewer(head.control_public_id, { t: 'spawn', vgen: VG, seq: 1, profile: 'Shell' }));
   assert.ok(await waitFor(() => {
     const s = JSON.parse(fs.readFileSync(path.join(fakeDir, 'sessions.json'), 'utf8'));
     return s.Shell && s.Shell.cmd === 'bash';
@@ -209,7 +212,7 @@ test('terminal host: control lane + inventory + spawn-by-whitelist + lazy attach
 
   // an unknown profile is REFUSED — a viewer can never originate a command
   const sessionsBefore = Object.keys(JSON.parse(fs.readFileSync(path.join(fakeDir, 'sessions.json'), 'utf8'))).length;
-  ctrlViewer.sendFrame(sealCtrlViewer(head.control_public_id, { t: 'spawn', seq: 2, profile: 'Evil; rm -rf /' }));
+  ctrlViewer.sendFrame(sealCtrlViewer(head.control_public_id, { t: 'spawn', vgen: VG, seq: 2, profile: 'Evil; rm -rf /' }));
   await sleep(400);
   assert.strictEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(fakeDir, 'sessions.json'), 'utf8'))).length, sessionsBefore);
   assert.match(out.stderr, /spawn REFUSED/);
@@ -272,7 +275,7 @@ test('terminal host: a vanished tmux session gets its row ended on the next inve
   await mock.stop();
 });
 
-test('terminal host: a replayed control spawn frame is DROPPED — a forged join cannot reset the seq guard', { skip: !HAS_WS }, async () => {
+test('terminal host: a replayed control spawn frame (same vgen) is DROPPED; a genuine reconnect (new vgen, seq 1) still spawns', { skip: !HAS_WS }, async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.e2eEnabled = true;
@@ -282,23 +285,29 @@ test('terminal host: a replayed control spawn frame is DROPPED — a forged join
   assert.ok(await waitFor(() => out.stdout.includes('"control_public_id"')), `stderr: ${out.stderr}`);
   const ctrlPid = JSON.parse(out.stdout.trim().split('\n')[0]).control_public_id;
 
-  // a legit spawn at seq 1 lands one 'Shell' session
+  // a legit spawn at (vgen VG, seq 1) lands one 'Shell' session
   const v1 = connectViewer(port, ctrlPid);
   assert.ok(await waitFor(() => v1.confirmed));
-  const spawnFrame = { t: 'spawn', seq: 1, profile: 'Shell' };
-  v1.sendFrame(sealCtrlViewer(ctrlPid, spawnFrame));
-  assert.ok(await waitFor(() => (mock.state.terminalPosts.filter((p) => /^Shell/.test(p.name || '')).length) >= 1), `spawn never landed; stderr: ${out.stderr}`);
+  const capturedSpawn = { t: 'spawn', vgen: VG, seq: 1, profile: 'Shell' };
+  v1.sendFrame(sealCtrlViewer(ctrlPid, capturedSpawn));
+  assert.ok(await waitFor(() => mock.state.terminalPosts.some((p) => p.name === 'Shell')), `spawn never landed; stderr: ${out.stderr}`);
 
-  // A hostile relay reconnects a viewer (fresh, forgeable join) and replays the
-  // SAME sealed spawn frame (seq 1). The join must NOT reset the guard, so the
-  // replay is dropped and NO second 'Shell-2' session is ever spawned.
+  // A hostile relay reconnects a viewer (fresh, forgeable join) and REPLAYS the
+  // captured sealed frame — it carries its ORIGINAL vgen (VG) + seq 1, which
+  // lands in VG's ledger (1 ≤ 1) and is dropped. The relay cannot mint a new
+  // vgen (it's inside the seal), so no 'Shell-2' is ever spawned by replay.
   v1.close();
   const v2 = connectViewer(port, ctrlPid);
   assert.ok(await waitFor(() => v2.confirmed));
-  v2.sendFrame(sealCtrlViewer(ctrlPid, spawnFrame)); // replay
-  v2.sendFrame(sealCtrlViewer(ctrlPid, { t: 'spawn', seq: 1, profile: 'Shell' })); // and again
+  v2.sendFrame(sealCtrlViewer(ctrlPid, capturedSpawn));                              // replay (same vgen, seq 1)
+  v2.sendFrame(sealCtrlViewer(ctrlPid, { t: 'spawn', vgen: VG, seq: 1, profile: 'Shell' })); // and again
   await sleep(500);
   assert.ok(!mock.state.terminalPosts.some((p) => p.name === 'Shell-2'), `a replayed spawn created a second session; posts: ${JSON.stringify(mock.state.terminalPosts.map((p) => p.name))}`);
+
+  // BUT a genuine reconnect — a NEW vgen at seq 1 — MUST spawn again (the old
+  // lifetime-high-water design wrongly dropped a reconnected viewer forever).
+  v2.sendFrame(sealCtrlViewer(ctrlPid, { t: 'spawn', vgen: 'freshvgen9', seq: 1, profile: 'Shell' }));
+  assert.ok(await waitFor(() => mock.state.terminalPosts.some((p) => p.name === 'Shell-2')), `a reconnected viewer (new vgen, seq 1) could not spawn; stderr: ${out.stderr}`);
 
   child.kill('SIGTERM');
   await result;

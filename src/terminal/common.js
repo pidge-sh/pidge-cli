@@ -107,7 +107,7 @@ async function registerSession(ctx, { publicId, name, kind = 'term' }, { fatal =
   await ctx.checkManifestNews(res);
   if (res.status === 201) return { ok: true, status: 201, data };
   // Any non-201. A daemon inventory row (fatal:false) must NEVER tear down the
-  // whole process on ONE bad row — including a 402/402 that only means a race
+  // whole process on ONE bad row — including a 402/422 that only means a race
   // (the control-lane register, which is fatal:true, already relayed the plan
   // gate / e2e refusal): return and leave the row unlisted for a later pass.
   if (!fatal) return { ok: false, status: res.status, data };

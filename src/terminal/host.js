@@ -148,8 +148,8 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
 
   // ---- control lane ---------------------------------------------------------
   let ctrlSeq = 0;
-  let ctrlInSeq = 0;
   let ctrlRejects = 0;
+  const ctrlLedger = wire.createLedger(); // per-vgen replay guard (viewer→host ctrl frames)
   const sealCtrl = (frame) => wire.sealFrame(mat.key, info.id, ctrl.pid, wire.AAD_CTRL_HOST, frame);
   const openCtrl = (data) => wire.openFrame(mat.key, info.id, ctrl.pid, wire.AAD_CTRL_VIEWER, data);
 
@@ -162,11 +162,14 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
   }
 
   async function handleCtrlFrame(frame) {
-    if (!Number.isInteger(frame.seq) || frame.seq <= ctrlInSeq) {
-      noteOnce('pidge terminal host: dropped non-monotonic control seq (replay guard)');
+    // Per-(field, vgen) monotonic-seq replay guard: a reconnecting viewer mints
+    // a fresh vgen and restarts at 1, while a replayed frame lands in its
+    // ORIGINAL vgen's ledger and is a no-op — the forgeable join never resets
+    // it, so a hostile relay can't re-open a window to replay a `spawn`.
+    if (!ctrlLedger.accept(wire.AAD_CTRL_VIEWER, frame.vgen, frame.seq)) {
+      noteOnce('pidge terminal host: dropped a control frame (missing vgen or non-monotonic seq — replay guard)');
       return;
     }
-    ctrlInSeq = frame.seq;
     if (frame.t === 'spawn') return spawn(String(frame.profile || ''));
     if (frame.t === 'reseed') {
       // Repaint a session the viewer is ALREADY watching (attached). A
@@ -194,16 +197,11 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
     onFrame: (msg) => {
       if (!msg || typeof msg !== 'object') return;
       if (msg.sys === 'viewer') {
-        // Republish state so a fresh viewer sees the current sessions/profiles.
-        // We do NOT reset ctrlInSeq here: the join ping is the one UNSEALED,
-        // relay-forgeable message, and the control lane carries `spawn` — a
-        // reset would let a hostile relay forge a join and then replay a
-        // captured sealed spawn frame (seq > 0 again) to launch whitelisted
-        // profiles at will. The control seq is a high-water mark for the life
-        // of the control session; the viewer sends strictly increasing seq
-        // (never resets it on reconnect). This is stricter than the session
-        // lane's documented input-replay residual precisely because spawn
-        // starts processes, not just re-types keys.
+        // Flow control ONLY — republish state so a fresh viewer sees the
+        // current sessions/profiles. The join ping is unsealed and
+        // relay-forgeable, so it never touches the replay ledger (spec §4):
+        // the per-vgen seq guard is what stops a captured `spawn` from being
+        // replayed, and a reconnecting viewer's new vgen restarts cleanly.
         if (msg.ev === 'join') publishState();
         return;
       }
@@ -278,10 +276,13 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
       const mirror = createMirror({
         control, target: rec.name, epoch: rec.entry.epoch,
         seal: (frame) => wire.sealFrame(mat.key, info.id, rec.entry.pid, wire.AAD_OUTPUT, frame),
-        open: (data) => wire.openFrame(mat.key, info.id, rec.entry.pid, wire.AAD_INPUT, data),
+        // The session :in carries keystrokes (terminal_input) AND roaming
+        // reseed/resize (terminal_ctrl_viewer, anchored on this session's id).
+        openViewer: (data) => wire.openViewerFrame(mat.key, info.id, rec.entry.pid, data),
         sendFrame: (data) => rec.sub.send('frame', { data }),
         narrate: note,
         dataMax: limits.dataMax,
+        frameCap: limits.frameCap,
         flushMs: limits.flushMs,
       });
       rec.attached = { control, mirror };
