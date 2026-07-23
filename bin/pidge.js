@@ -338,6 +338,8 @@ module.exports = {
   E2E_NEVER_SEAL_LABEL_IDS, e2ePinKeyFor,
   // sealed media — the pure halves (gate decision + filename hygiene).
   e2eMediaSealDecision, sanitizeAttachmentName,
+  // service-template quoting (bridge install + terminal host install share it).
+  xmlEscape, systemdQuote,
 };
 if (require.main !== module) return;
 
@@ -444,6 +446,7 @@ const OPTIONS = {
   'no-defer': { type: 'boolean' },             // bridge: turn OFF the polite poller (never defer to an interactive run)
   // terminal: the tmux session name the wrapper creates (default pidge-<hex>)
   name: { type: 'string' },
+  install: { type: 'boolean' },                // terminal host: write the launchd/systemd template
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -538,6 +541,12 @@ USAGE
                                           clear-text path). Pro feature — the server says so on a 402.
                                           Ctrl-C stops the MIRROR only; the tmux session keeps running.
   pidge terminal attach <tmux-name>       mirror an EXISTING tmux session (the agent inside never knows)
+  pidge terminal host [--install]         the ALWAYS-ON daemon: registers a control lane, keeps the
+                                          tmux inventory listed, attaches a session only WHILE someone
+                                          watches, and spawns new sessions strictly from the profile
+                                          whitelist in ~/.config/pidge/terminal.toml (a viewer can only
+                                          NAME a profile — command lines live on this Mac). --install
+                                          writes the launchd/systemd template (key never embedded).
   pidge skill install [--target T]        write the generated Pidge skill from the live manifest
                                           (persistent knowledge for an AI agent). --target claude
                                           (default) → .claude/skills/pidge/SKILL.md · agents → AGENTS.md ·
@@ -738,6 +747,7 @@ const OPTION_DOCS = {
   json: '--json                   run start: print the raw server body instead of the two export lines',
   'no-defer': '--no-defer               bridge: never hold back for a live interactive run (turn OFF the polite poller)',
   name: '--name NAME              terminal: the tmux session name to create (default pidge-<hex>; 1-64 of letters/digits/_ @ -)',
+  install: '--install                terminal host: write the launchd (Mac) / systemd user (Linux) template instead of running (review, then enable with the printed command; the key is never embedded)',
 };
 // Content flags shared by every send.
 // `template` is intentionally OFF the menu (content_template is
@@ -941,19 +951,21 @@ const HELP = {
   },
   terminal: {
     summary: 'mirror a LIVE tmux session to the human\'s phone/Mac (Terminals tab) — sealed frames out, keystrokes back.',
-    usage: 'pidge terminal [--name NAME] [-- CMD…]  ·  pidge terminal attach <tmux-session>',
+    usage: 'pidge terminal [--name NAME] [-- CMD…]  ·  pidge terminal attach <tmux-session>  ·  pidge terminal host [--install]',
     body: [
       'The RAW surface next to notifications (which stay the curated channel): the human watches the real terminal live and can type back — the agent running INSIDE tmux needs no integration and never knows. Pure tmux control mode: no PTY, no native deps; tmux is required (macOS: brew install tmux).',
       '',
-      'Two forms. `pidge terminal [-- CMD…]` CREATES a detached tmux session (running CMD, else the default shell), registers it and mirrors — your human can also `tmux attach -t <name>` locally, both at once. `pidge terminal attach <name>` mirrors a session that ALREADY exists. Either way this process is only the MIRROR: Ctrl-C stops mirroring, the tmux session keeps running (resume with `attach`). When the tmux session itself dies, the mirror marks it ended and exits 0.',
+      'Three forms. `pidge terminal [-- CMD…]` CREATES a detached tmux session (running CMD, else the default shell), registers it and mirrors — your human can also `tmux attach -t <name>` locally, both at once. `pidge terminal attach <name>` mirrors a session that ALREADY exists. Either way this process is only the MIRROR: Ctrl-C stops mirroring, the tmux session keeps running (resume with `attach`). When the tmux session itself dies, the mirror marks it ended and exits 0.',
       '',
-      'SEALED-ONLY, no escape hatch: every frame (output, keystrokes) is end-to-end encrypted with the channel key — the server relays ciphertext it cannot read. Needs an E2E channel AND PIDGE_SECRET in this install; missing either ⇒ refuse to start (exit 2) with the fix instructions. Session name/status are the only CLEAR metadata (keep secrets out of --name).',
+      '`pidge terminal host` is the ALWAYS-ON daemon (one per channel, PID-checked lock): it registers a CONTROL LANE session (where the app asks for the sessions list and the spawn profiles), keeps every `tmux ls` session registered as it appears/disappears, attaches the tap only WHILE someone is watching (viewer joins → attach + repaint; last leave → stand down after a grace period), and spawns new sessions STRICTLY from the whitelist in ~/.config/pidge/terminal.toml — a viewer can only NAME a profile; the command line, cwd and everything executable exist only in that file, owned by the human. `--install` writes the launchd (Mac) / systemd user (Linux) template with restart-on-failure semantics — a TEMPLATE to review then enable; the channel key is NEVER embedded.',
+      '',
+      'SEALED-ONLY, no escape hatch: every frame (output, keystrokes, control) is end-to-end encrypted with the channel key — the server relays ciphertext it cannot read. Needs an E2E channel AND PIDGE_SECRET in this install; missing either ⇒ refuse to start (exit 2) with the fix instructions. Session name/status are the only CLEAR metadata (keep secrets out of --name and profile names).',
       '',
       'PRO: terminal mirroring is a Pro feature — a non-Pro account gets a typed 402 with a message to relay to your human (do not retry; everything else on the key keeps working).',
       '',
-      'stdout prints ONE machine-readable line ({ok, public_id, name, epoch}); everything human goes to stderr. Exit: 0 mirror stopped / session ended · 1 usage · 2 refused (E2E, plan, tmux missing, server).',
+      'stdout prints ONE machine-readable line ({ok, public_id, name, epoch} — the host prints {ok, control_public_id, host, profiles, sessions}); everything human goes to stderr. Exit: 0 mirror stopped / session ended · 1 usage · 2 refused (E2E, plan, tmux missing, another host live, server).',
     ].join('\n'),
-    opts: ['name'],
+    opts: ['name', 'install'],
   },
   skill: {
     summary: 'write the generated Pidge skill from the live manifest (persistent Pidge knowledge for an AI agent).',
@@ -5214,6 +5226,8 @@ ${SKILL_END_MARKER}
         cableSubscribe, checkManifestNews,
         e2eKeyMaterial, e2eChannelInfo, channelKeyFor,
         readState, writeState,
+        baseDir: pidgeBaseDir(), configDir: CONFIG_DIR,
+        tokenFromFile: !!FILE_ENV.PIDGE_TOKEN,
         rawArgv: RAW_ARGV, positionals: parsed.positionals, values: v,
       });
       break;

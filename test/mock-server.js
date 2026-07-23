@@ -604,6 +604,18 @@ function createMock() {
           sock.send(JSON.stringify({ type: 'confirm_subscription', identifier: f.identifier }));
           if (state.onSubscribe) state.onSubscribe(channel, sock);
         }
+        if (f.command === 'unsubscribe') {
+          for (const s of [...state.terminalSubs]) {
+            if (s.sock !== sock || s.identifier !== f.identifier) continue;
+            state.terminalSubs.delete(s);
+            if (s.role === 'viewer') {
+              for (const h of termPeers(s.session, 'host')) {
+                h.sock.send(JSON.stringify({ identifier: h.identifier, message: { sys: 'viewer', ev: 'leave' } }));
+              }
+            }
+          }
+          return;
+        }
         if (f.command === 'message') {
           let ident; let action;
           try { ident = JSON.parse(f.identifier); action = JSON.parse(f.data); } catch { return; }

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.34.0 — 2026-07-22
+
+**Pidge Terminal (part 2): `pidge terminal host` — the always-on daemon.** One
+process per channel that makes the Terminals tab self-service: the phone lists this
+Mac's tmux sessions, opens any of them, and starts new ones — without an agent (or a
+human at the keyboard) running anything first.
+
+- **Control lane.** The daemon registers a `kind: control` session and publishes,
+  sealed like everything else, the live sessions list and the spawn profile names;
+  viewers send `spawn`/`reseed`/`resize` back on the same lane (its own AAD pair,
+  anchored on the control session's id; monotonic-seq replay guard).
+- **Inventory.** `tmux ls` is polled and kept registered server-side — a session
+  appearing anywhere on the Mac shows up in the tab; one that dies gets its row
+  marked ended. Session identity (`public_id`) is stable across daemon restarts.
+- **Lazy attach.** The tmux tap for a session starts only when someone is actually
+  watching (viewer join → attach + seed repaint; a fresh tap bumps the `epoch`) and
+  stands down after the last viewer leaves (30 s grace). Zero viewers = zero frames
+  sealed, zero relay traffic.
+- **Spawn = a profile NAME against a Mac-local whitelist**
+  (`~/.config/pidge/terminal.toml`: `[[profile]]` with `name`/`cwd`/`cmd`). The
+  server and the viewer can never originate a command line — an unknown name is
+  refused loudly. The file is a deliberate TOML subset (strings + comments), parsed
+  warn-don't-crash; unknown keys are ignored.
+- **One socket, N subscriptions.** The daemon multiplexes every session over a
+  single WebSocket (control lane included) — it never eats a connection slot per
+  terminal — and reconnects with backoff, reseeding watchers on every reconnect.
+- **One host per channel** (PID-checked lock, crashed-host recovery), clean
+  SIGTERM/SIGINT shutdown: taps detached, the control row ended, session rows left
+  alone (tmux keeps running; they read offline once the heartbeat lapses).
+- **`--install`** writes the launchd (Mac) / systemd user (Linux) template with
+  restart-on-failure semantics — a TEMPLATE to review then enable with the printed
+  command; the channel key is NEVER embedded (it stays in the config file).
+
 ## 0.33.0 — 2026-07-22
 
 **Pidge Terminal (part 1): `pidge terminal` + `pidge terminal attach` — mirror a live

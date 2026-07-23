@@ -15,115 +15,16 @@
 // refuse to start, loudly, with the enable instructions. There is no
 // clear-text terminal path — a terminal leaks env vars, tokens and code.
 
-const { execFile } = require('node:child_process');
 const crypto = require('node:crypto');
 const { createControl } = require('./control');
 const { createMirror } = require('./mirror');
 const wire = require('./wire');
+const {
+  SESSION_NAME, execFileP, fetchLimits, bumpSessionEntry,
+  preflightSealed, registerSession, endSession,
+} = require('./common');
 
-const USAGE = 'pidge: usage: pidge terminal [--name NAME] [-- CMD…]  ·  pidge terminal attach <tmux-session>';
-
-// tmux forbids ':' and '.' in session names; the mirror stays stricter (the
-// name is also CLEAR server-side metadata and rides tmux command lines).
-const SESSION_NAME = /^[A-Za-z0-9_@-]{1,64}$/;
-
-const execFileP = (bin, args) => new Promise((resolve, reject) => {
-  execFile(bin, args, { timeout: 10000 }, (err, stdout, stderr) => {
-    if (err) reject(new Error((stderr || err.message || '').trim() || 'command failed'));
-    else resolve(stdout);
-  });
-});
-
-// Wire limits come from the served manifest (generated from the server's live
-// constants — hardcoding them WILL drift). The section narrates them in prose,
-// so the numbers are extracted tolerantly; the protocol's shipped values are
-// the fallback when the section (or the fetch) is missing.
-async function fetchLimits(ctx) {
-  const limits = { frameCap: 64 * 1024, fps: 30 };
-  try {
-    const res = await ctx.fetchT(`${ctx.BASE}/api/v1/manifest`, { headers: ctx.headers });
-    const m = await res.json();
-    const relay = (m && m.terminal && m.terminal.relay) || '';
-    const cap = /\(>\s*(\d+)\s*KB\)/.exec(relay);
-    const fps = /~?(\d+)\s*frames\/s/.exec(relay);
-    if (cap) limits.frameCap = parseInt(cap[1], 10) * 1024;
-    if (fps) limits.fps = parseInt(fps[1], 10);
-  } catch { /* served defaults double as the offline fallback */ }
-  // Raw bytes per output frame: base64 + JSON + envelope ≈ 16/9 blow-up, so
-  // stay at 9/16 of the cap with headroom — and never above the protocol's
-  // own 16 KB chunk.
-  limits.dataMax = Math.min(wire.DATA_MAX_BYTES, Math.floor((limits.frameCap * 9) / 16) - 512);
-  // Flush at half the allowed rate at most (coalescing is the contract).
-  limits.flushMs = Math.max(parseInt(process.env.PIDGE_TERMINAL_FLUSH_MS || '80', 10) || 80,
-    Math.ceil(2000 / Math.max(1, limits.fps)));
-  return limits;
-}
-
-// The per-(channel, tmux-name) identity: public_id anchors every seal (minted
-// BEFORE anything is sealed, reused across host restarts so the Terminals tab
-// keeps ONE row per session), epoch bumps per host process so viewers reset
-// their gap detector.
-function bumpSessionEntry(ctx, name) {
-  const key = ctx.channelKeyFor(ctx.TOKEN) || 'default';
-  const all = ctx.readState().terminalSessions || {};
-  const chan = all[key] || {};
-  const entry = chan[name] || { pid: `term_${crypto.randomUUID()}`, epoch: 0 };
-  entry.epoch += 1;
-  ctx.writeState({ terminalSessions: { ...all, [key]: { ...chan, [name]: entry } } });
-  return entry;
-}
-
-async function preflightSealed(ctx) {
-  let info;
-  try {
-    info = await ctx.e2eChannelInfo();
-  } catch (e) {
-    ctx.die(`pidge terminal: cannot reach the server to verify the channel's E2E state (${e.message}) — the mirror is sealed-only and never starts unverified`, 2);
-  }
-  if (!info.e2eEnabled) {
-    ctx.die([
-      'pidge terminal: REFUSING to start — terminal mirroring is SEALED-ONLY and this channel is not end-to-end encrypted.',
-      'A terminal leaks env vars, tokens and code, so there is no clear-text path (no flag overrides this).',
-      'Fix: ask your human to turn ON end-to-end encryption for this channel in the Pidge app, run the Connect screen\'s',
-      'TERMINAL step (it writes PIDGE_SECRET into this install\'s env file — never paste the secret in chat), then retry.',
-      '`pidge doctor` confirms the E2E state.',
-    ].join('\n'), 2);
-  }
-  const mat = ctx.e2eKeyMaterial();
-  if (!mat) {
-    ctx.die([
-      'pidge terminal: REFUSING to start — the channel is E2E but this install has no (valid) PIDGE_SECRET, so frames could not be sealed.',
-      'Fix: the Pidge app\'s Connect screen shows a TERMINAL step that writes PIDGE_SECRET next to the token (never paste the secret',
-      'in chat). Run that, confirm with `pidge doctor`, then retry.',
-    ].join('\n'), 2);
-  }
-  return { info, mat };
-}
-
-async function registerSession(ctx, publicId, name) {
-  let res, data;
-  try {
-    res = await ctx.fetchT(`${ctx.BASE}/api/v1/terminal_sessions`, {
-      method: 'POST', headers: ctx.headers,
-      body: JSON.stringify({ public_id: publicId, name, kind: 'term' }),
-    });
-    data = await res.json().catch(() => ({}));
-  } catch (e) {
-    ctx.die(`pidge terminal: registering the session failed (network): ${e.message}`, 2);
-  }
-  await ctx.checkManifestNews(res);
-  if (res.status === 402) {
-    // Typed plan gate — the message is written by the server to be RELAYED.
-    // Never retried: only the human upgrading changes the answer.
-    ctx.die(`pidge: ${data.message || 'terminal mirroring is a Pro feature and this account is not on Pro'}\npidge: (plan gate — do not retry; everything else on this key keeps working)`, 2);
-  }
-  if (res.status === 422 && data.code === 'e2e_required') {
-    ctx.die('pidge terminal: the server refused the register — this channel is not E2E (sealed-only is enforced server-side too). Ask your human to enable E2E in the app, then retry.', 2);
-  }
-  if (res.status !== 201) {
-    ctx.die(`pidge terminal: register failed (${res.status}): ${JSON.stringify(data)}`, 2);
-  }
-}
+const USAGE = 'pidge: usage: pidge terminal [--name NAME] [-- CMD…]  ·  pidge terminal attach <tmux-session>  ·  pidge terminal host [--install]';
 
 // Quote one argv word for the single shell-command string tmux new-session
 // takes (wrapped commands run under the user's shell inside the pane).
@@ -143,6 +44,17 @@ module.exports = async function runTerminal(ctx) {
   const ddi = ctx.rawArgv.indexOf('--');
   const wrapped = ddi === -1 ? [] : ctx.rawArgv.slice(ddi + 1);
   const sub = ctx.positionals.slice(1, ctx.positionals.length - wrapped.length);
+
+  if (sub[0] === 'host') {
+    if (sub.length > 1) die(USAGE, 1);
+    const host = require('./host');
+    if (ctx.values.install) return host.installHost(ctx);
+    return host.runHost(ctx, { tmuxBin, socketArgs });
+  }
+
+  if (typeof WebSocket !== 'function') {
+    die('pidge terminal: needs a native WebSocket (Node ≥22) — frames ride the realtime socket, there is no polling floor for a terminal', 2);
+  }
 
   let name;
   let creating = false;
@@ -187,8 +99,8 @@ module.exports = async function runTerminal(ctx) {
     die(`pidge terminal: no tmux session named '${name}' (tmux ls shows what exists)`, 2);
   }
 
-  const entry = bumpSessionEntry(ctx, name);
-  await registerSession(ctx, entry.pid, name);
+  const entry = bumpSessionEntry(ctx, 'term', name);
+  await registerSession(ctx, { publicId: entry.pid, name, kind: 'term' });
   const limits = await fetchLimits(ctx);
 
   let stopping = false;
@@ -203,12 +115,8 @@ module.exports = async function runTerminal(ctx) {
       stopping = true;
       if (mirror) mirror.stop();
       note(`pidge terminal: ${reason} — marking the session ended`);
-      // The tmux session died under us ⇒ the row is history now. Best-effort:
-      // an unreachable server just leaves a stale row the heartbeat TTL
-      // already reports offline.
-      try {
-        await ctx.fetchT(`${ctx.BASE}/api/v1/terminal_sessions/${encodeURIComponent(entry.pid)}`, { method: 'DELETE', headers: ctx.headers });
-      } catch { /* best-effort cleanup */ }
+      // The tmux session died under us ⇒ the row is history now.
+      await endSession(ctx, entry.pid);
       if (cableHandle) cableHandle.close();
       process.exit(0);
     },
