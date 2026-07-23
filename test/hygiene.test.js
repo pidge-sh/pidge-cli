@@ -16,8 +16,26 @@ const ROOT = path.join(__dirname, '..');
 const SELF = path.basename(__filename);
 const PRIVATE_PATTERNS = '.hygiene-private-patterns.json'; // untracked, never published
 
+// Recurse a directory returning repo-relative .js/.json paths. Hand-rolled
+// (not readdirSync's `recursive` option) because that option only exists on
+// Node ≥18.17 — below it the option is SILENTLY ignored and returns just the
+// top-level entries, so `src/` (whose files are all nested under terminal/)
+// would scan to ZERO files and the guard would pass green checking nothing on
+// a Node the package's `engines: >=18` still promises to support.
+function walkSources(absDir, relDir, out) {
+  for (const ent of fs.readdirSync(absDir, { withFileTypes: true })) {
+    const rel = relDir ? `${relDir}/${ent.name}` : ent.name;
+    if (ent.isDirectory()) walkSources(path.join(absDir, ent.name), rel, out);
+    else if (/\.(js|json)$/.test(ent.name)) out.push(rel);
+  }
+}
+
 function publicFiles() {
   const files = ['bin/pidge.js', 'README.md', 'CHANGELOG.md', 'package.json'];
+  // src/ ships in the npm package too — same public-hygiene bar as bin/.
+  const srcFiles = [];
+  walkSources(path.join(ROOT, 'src'), 'src', srcFiles);
+  files.push(...srcFiles);
   for (const f of fs.readdirSync(path.join(ROOT, 'test'))) {
     if (f === SELF) continue; // this file names the forbidden patterns
     if (f === PRIVATE_PATTERNS) continue; // untracked local-only pattern source

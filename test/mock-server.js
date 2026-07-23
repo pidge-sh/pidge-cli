@@ -73,6 +73,12 @@ function createMock() {
     // the caller asked (continuity=true). null ⇒ omitted, models an OLD server —
     // the CLI's batch/listen output is then byte-identical to before.
     continuityContexts: null,
+    // Pidge Terminal — the lifecycle REST + the relay-blind cable pipe.
+    terminalSessions: {},      // public_id → row (the upsert target)
+    terminalPosts: [],         // every POST body (a 402 must never be retried)
+    terminalDeletes: [],       // every DELETEd public_id
+    terminalRequiresPro: false, // POST answers the typed 402 plan gate
+    terminalSubs: new Set(),   // live cable subs: {sock, role, session, identifier}
   };
   let server = null;
   let wss = null;
@@ -436,6 +442,47 @@ function createMock() {
         ...(wake && pendingComposer ? { messages_pending: true } : {}),
       });
     }
+    // Pidge Terminal lifecycle — mirrors prod: plan gate BEFORE the e2e
+    // contract check; idempotent upsert; DELETE marks ended (uniform 404 on
+    // unknown). Frames never ride HTTP — they go through the ws relay below.
+    if (req.method === 'POST' && url.pathname === '/api/v1/terminal_sessions') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
+        state.terminalPosts.push(p);
+        if (state.terminalRequiresPro) {
+          return json(res, 402, {
+            error: 'terminal_requires_pro', code: 'terminal_requires_pro',
+            message: 'Terminal mirroring is a Pro feature and this account is not on Pro. Relay this to your human.',
+            tier: 'free',
+          });
+        }
+        if (!state.e2eEnabled) {
+          return json(res, 422, { error: 'terminal mirroring requires an end-to-end encrypted channel', code: 'e2e_required' });
+        }
+        const pid = String(p.public_id || '');
+        if (!/^term_[a-z0-9-]{1,64}$/.test(pid)) {
+          return json(res, 422, { error: 'bad public_id', code: 'invalid_public_id' });
+        }
+        const row = state.terminalSessions[pid] || { public_id: pid, kind: 'term', status: 'offline' };
+        if (p.kind !== undefined) row.kind = p.kind;
+        if (p.name !== undefined) row.name = p.name;
+        if (row.status === 'ended') row.status = 'offline';
+        state.terminalSessions[pid] = row;
+        json(res, 201, { terminal_session: row });
+      });
+      return;
+    }
+    const termDel = url.pathname.match(/^\/api\/v1\/terminal_sessions\/([^/]+)$/);
+    if (req.method === 'DELETE' && termDel) {
+      const pid = decodeURIComponent(termDel[1]);
+      state.terminalDeletes.push(pid);
+      const row = state.terminalSessions[pid];
+      if (!row) return json(res, 404, { error: 'not_found' });
+      row.status = 'ended';
+      return json(res, 200, { terminal_session: row });
+    }
     // reachability self-test. POST mints a nonce + a kind:'system' selftest
     // message on the queue; GET reads PASS (acked in window) / FAILED / pending.
     if (req.method === 'POST' && url.pathname === '/api/v1/selftest') {
@@ -506,15 +553,22 @@ function createMock() {
       server,
       handleProtocols: () => 'actioncable-v1-json', // negotiate like ActionCable
     });
-    wss.on('connection', (sock) => {
+    wss.on('connection', (sock, req) => {
       // wsMode '1006': drop EVERY socket abruptly (no close frame) → the client
       // sees close code 1006, an intermittent failure mode seen in production.
       if (state.wsMode === '1006') { try { sock.terminate(); } catch { /* gone */ } return; }
       state.sockets.add(sock);
+      // The bearer rides the second Sec-WebSocket-Protocol entry (the browser
+      // API can't set headers) — the terminal relay derives the ROLE from the
+      // auth track exactly like prod: hld_ ⇒ host, ses_ ⇒ viewer.
+      const proto = String(req.headers['sec-websocket-protocol'] || '');
+      const wsToken = (proto.split(',')[1] || '').trim();
       sock.send(JSON.stringify({ type: 'welcome' }));
       const ping = setInterval(() => {
         if (sock.readyState === 1) sock.send(JSON.stringify({ type: 'ping', message: Date.now() }));
       }, 1000);
+      const termPeers = (session, role) =>
+        [...state.terminalSubs].filter((s) => s.session === session && s.role === role && s.sock.readyState === 1);
       sock.on('message', (raw) => {
         let f; try { f = JSON.parse(raw); } catch { return; }
         if (f.command === 'subscribe') {
@@ -522,6 +576,25 @@ function createMock() {
           const channel = ident.channel;
           state.subscriptions.push(channel);
           state.subscribeIdentifiers.push(ident); // capture fingerprint/label params
+          if (channel === 'TerminalChannel') {
+            const role = wsToken.startsWith('ses_') ? 'viewer' : 'host';
+            const row = state.terminalSessions[String(ident.session || '')];
+            // Mirror prod's reject map: unknown session, or a host on a
+            // non-E2E channel (the sealed-only backstop).
+            if (!row || (role === 'host' && !state.e2eEnabled)) {
+              sock.send(JSON.stringify({ type: 'reject_subscription', identifier: f.identifier }));
+              return;
+            }
+            state.terminalSubs.add({ sock, role, session: ident.session, identifier: f.identifier });
+            sock.send(JSON.stringify({ type: 'confirm_subscription', identifier: f.identifier }));
+            if (role === 'viewer') {
+              for (const h of termPeers(ident.session, 'host')) {
+                h.sock.send(JSON.stringify({ identifier: h.identifier, message: { sys: 'viewer', ev: 'join' } }));
+              }
+            }
+            if (state.onSubscribe) state.onSubscribe(channel, sock);
+            return;
+          }
           // Real ActionCable tags every broadcast frame with the EXACT identifier
           // string the client sent (params included) — the client matches on it.
           // Track it per-socket so broadcast() echoes it faithfully (the
@@ -531,8 +604,38 @@ function createMock() {
           sock.send(JSON.stringify({ type: 'confirm_subscription', identifier: f.identifier }));
           if (state.onSubscribe) state.onSubscribe(channel, sock);
         }
+        if (f.command === 'message') {
+          let ident; let action;
+          try { ident = JSON.parse(f.identifier); action = JSON.parse(f.data); } catch { return; }
+          if (ident.channel !== 'TerminalChannel' || action.action !== 'frame') return;
+          const mine = [...state.terminalSubs].find((s) => s.sock === sock && s.identifier === f.identifier);
+          if (!mine) return;
+          // Relay-blind: shape guards only, then the string verbatim to the
+          // opposite side. Loud drop back to the sender, never buffered.
+          if (typeof action.data !== 'string' || !action.data) {
+            return sock.send(JSON.stringify({ identifier: f.identifier, message: { dropped: true, reason: 'missing_data' } }));
+          }
+          if (Buffer.byteLength(action.data) > 64 * 1024) {
+            return sock.send(JSON.stringify({ identifier: f.identifier, message: { dropped: true, reason: 'frame_too_large' } }));
+          }
+          for (const peer of termPeers(mine.session, mine.role === 'host' ? 'viewer' : 'host')) {
+            peer.sock.send(JSON.stringify({ identifier: peer.identifier, message: { data: action.data } }));
+          }
+        }
       });
-      sock.on('close', () => { clearInterval(ping); state.sockets.delete(sock); });
+      sock.on('close', () => {
+        clearInterval(ping);
+        state.sockets.delete(sock);
+        for (const s of [...state.terminalSubs]) {
+          if (s.sock !== sock) continue;
+          state.terminalSubs.delete(s);
+          if (s.role === 'viewer') {
+            for (const h of termPeers(s.session, 'host')) {
+              h.sock.send(JSON.stringify({ identifier: h.identifier, message: { sys: 'viewer', ev: 'leave' } }));
+            }
+          }
+        }
+      });
     });
     server.listen(atPort, '127.0.0.1', () => { port = server.address().port; resolve(port); });
   });

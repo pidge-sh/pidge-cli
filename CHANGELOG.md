@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.33.0 — 2026-07-22
+
+**Pidge Terminal (part 1): `pidge terminal` + `pidge terminal attach` — mirror a live
+tmux session to the human's phone/Mac, sealed end-to-end, with input coming back.**
+
+The raw surface next to notifications (which stay the curated channel): the human
+watches the real terminal live in the app's Terminals tab and can type back — and the
+agent running INSIDE tmux needs no integration and never knows. The tap is pure tmux
+control mode over stdio: no PTY, no native dependencies.
+
+- **`pidge terminal [--name X] [-- CMD…]`** creates a detached tmux session (running
+  `CMD`, else the default shell), registers it, and mirrors. The local human can
+  `tmux attach -t <name>` the same session at the same time — both views are live.
+- **`pidge terminal attach <tmux-name>`** mirrors a session that ALREADY exists.
+- **The process is only the MIRROR.** Ctrl-C stops mirroring; the tmux session keeps
+  running (resume with `attach`). When the tmux session itself dies, the mirror marks
+  the server row ended and exits `0`. tmux is the durability layer — a dropped phone
+  socket or a killed mirror never touches the running terminal.
+- **Sealed-only, no escape hatch.** Every frame — output, seed repaints, keystrokes —
+  is sealed with the channel key using the CLI's existing envelope machinery, with
+  per-direction AAD names (a relay re-presenting host output as viewer input
+  authenticates in no slot; the anchor is the session's client-minted `public_id`).
+  No E2E channel or no valid `PIDGE_SECRET` ⇒ refuse to start (exit `2`) with the fix
+  instructions. The server enforces the same structurally (`422 e2e_required`).
+- **Drops are safe by design.** Output is coalesced (~80 ms, ≤16 KB per frame) and
+  relayed at-most-once; any gap, reconnect or foreground heals through the seed
+  protocol (a full `capture-pane` repaint on every viewer join, reseed request, or
+  relay reconnect). Nothing is buffered or replayed server-side; wire limits are read
+  from the live manifest's `terminal` section, never hardcoded.
+- **Input is guarded.** Special keys go through a CLOSED whitelist (`Enter Escape Tab
+  BTab` arrows `Home End PageUp PageDown DC BSpace C-c C-d C-u C-r C-z C-l`); literal
+  text rides `send-keys -l` in its own command; a non-monotonic input `seq` is dropped
+  (replay guard). A fresh host process re-registers with a bumped `epoch` and REUSES
+  the session's `public_id`, so the Terminals tab keeps one row per session.
+- **Pro feature.** A non-Pro account gets the server's typed `402` relayed verbatim
+  (exit `2`, never retried); the register/cleanup contract (`POST`/`DELETE
+  /api/v1/terminal_sessions`) is idempotent.
+- Needs `tmux` (macOS: `brew install tmux`) and Node ≥22 (frames ride the realtime
+  socket — there is no polling floor for a terminal). New isolated module under
+  `src/terminal/`; the host daemon (`pidge terminal host`, spawn profiles, launchd
+  install) ships separately.
+
 ## 0.32.0 — 2026-07-22
 
 The composer blindspot is dead: **a blocking wait now hears BOTH input planes.**

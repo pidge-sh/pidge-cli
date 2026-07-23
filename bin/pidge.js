@@ -54,7 +54,10 @@ const crypto = require('node:crypto');
 
 // `pidge --version` / `-v` — handled BEFORE parseArgs (which would otherwise
 // throw "Unknown option" on the undeclared flag). Prints the version, exit 0.
-if (process.argv.includes('--version') || process.argv.includes('-v')) {
+// Gated on require.main so an in-process require of this file (wire.js pulls
+// the pure e2e helpers this way) is side-effect-free — a requirer whose own
+// argv carried -v must never trigger this process.exit(0) at import time.
+if (require.main === module && (process.argv.includes('--version') || process.argv.includes('-v'))) {
   try { console.log(require(path.join(__dirname, '..', 'package.json')).version); }
   catch { console.log('unknown'); }
   process.exit(0);
@@ -320,21 +323,23 @@ const E2E_NEVER_SEAL_LABEL_IDS = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// Test seam: require()ing this file exports the pure e2e helpers and
-// stops HERE — none of the CLI machinery below (parseArgs, the TOKEN check,
-// command dispatch) may run under a test runner's argv. Executed as a binary
-// (require.main === module) it skips the export and runs the CLI unchanged.
+// Test seam: require()ing this file exposes the pure e2e helpers and stops
+// HERE — none of the CLI machinery below (parseArgs, the TOKEN check, command
+// dispatch) runs under a require. The exports are assigned UNCONDITIONALLY,
+// then the early `return` skips the CLI body when not the main module: a
+// CONDITIONAL export would hand an in-process require (src/terminal/ pulls
+// these same helpers while the CLI itself is the main module) an empty object
+// — the circular-dependency trap. Executed as a binary, only the return is
+// skipped, so the CLI still runs unchanged.
 // ---------------------------------------------------------------------------
-if (require.main !== module) {
-  module.exports = {
-    e2eAad, e2eKeyFingerprint, e2eLoadSecret, e2eParseSecret,
-    e2eEncryptField, e2eDecryptField, e2eEncryptBlob, e2eDecryptBlob,
-    E2E_NEVER_SEAL_LABEL_IDS, e2ePinKeyFor,
-    // sealed media — the pure halves (gate decision + filename hygiene).
-    e2eMediaSealDecision, sanitizeAttachmentName,
-  };
-  return;
-}
+module.exports = {
+  e2eAad, e2eKeyFingerprint, e2eLoadSecret, e2eParseSecret,
+  e2eEncryptField, e2eDecryptField, e2eEncryptBlob, e2eDecryptBlob,
+  E2E_NEVER_SEAL_LABEL_IDS, e2ePinKeyFor,
+  // sealed media — the pure halves (gate decision + filename hygiene).
+  e2eMediaSealDecision, sanitizeAttachmentName,
+};
+if (require.main !== module) return;
 
 const OPTIONS = {
   help: { type: 'boolean', short: 'h' },
@@ -437,6 +442,8 @@ const OPTIONS = {
   ttl: { type: 'string' },                     // run start: sliding TTL in seconds → ttl_seconds
   json: { type: 'boolean' },                   // run start: print the raw server body instead of the export lines
   'no-defer': { type: 'boolean' },             // bridge: turn OFF the polite poller (never defer to an interactive run)
+  // terminal: the tmux session name the wrapper creates (default pidge-<hex>)
+  name: { type: 'string' },
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -524,6 +531,13 @@ USAGE
                                           run the listener, confirm it picks it up + acks in time.
                                           PASS exit 0 / FAIL exit 2 (with the likely cause). Run it as the
                                           last onboarding step + whenever sends seem to go unheard.
+  pidge terminal [--name X] [-- CMD…]     mirror a LIVE terminal to the human's phone (Terminals tab):
+                                          create a tmux session (running CMD or the default shell),
+                                          register it, stream SEALED frames; the human's keystrokes come
+                                          back. SEALED-ONLY: needs an E2E channel + PIDGE_SECRET (no
+                                          clear-text path). Pro feature — the server says so on a 402.
+                                          Ctrl-C stops the MIRROR only; the tmux session keeps running.
+  pidge terminal attach <tmux-name>       mirror an EXISTING tmux session (the agent inside never knows)
   pidge skill install [--target T]        write the generated Pidge skill from the live manifest
                                           (persistent knowledge for an AI agent). --target claude
                                           (default) → .claude/skills/pidge/SKILL.md · agents → AGENTS.md ·
@@ -723,6 +737,7 @@ const OPTION_DOCS = {
   ttl: '--ttl N                  run start: sliding TTL in seconds (server clamps; default 24h)',
   json: '--json                   run start: print the raw server body instead of the two export lines',
   'no-defer': '--no-defer               bridge: never hold back for a live interactive run (turn OFF the polite poller)',
+  name: '--name NAME              terminal: the tmux session name to create (default pidge-<hex>; 1-64 of letters/digits/_ @ -)',
 };
 // Content flags shared by every send.
 // `template` is intentionally OFF the menu (content_template is
@@ -923,6 +938,22 @@ const HELP = {
     usage: 'pidge selftest [--window N]',
     body: 'PASS exit 0 / FAIL exit 2 (with the likely cause). Run it as the last onboarding step + whenever sends seem to go unheard.',
     opts: ['window'],
+  },
+  terminal: {
+    summary: 'mirror a LIVE tmux session to the human\'s phone/Mac (Terminals tab) — sealed frames out, keystrokes back.',
+    usage: 'pidge terminal [--name NAME] [-- CMD…]  ·  pidge terminal attach <tmux-session>',
+    body: [
+      'The RAW surface next to notifications (which stay the curated channel): the human watches the real terminal live and can type back — the agent running INSIDE tmux needs no integration and never knows. Pure tmux control mode: no PTY, no native deps; tmux is required (macOS: brew install tmux).',
+      '',
+      'Two forms. `pidge terminal [-- CMD…]` CREATES a detached tmux session (running CMD, else the default shell), registers it and mirrors — your human can also `tmux attach -t <name>` locally, both at once. `pidge terminal attach <name>` mirrors a session that ALREADY exists. Either way this process is only the MIRROR: Ctrl-C stops mirroring, the tmux session keeps running (resume with `attach`). When the tmux session itself dies, the mirror marks it ended and exits 0.',
+      '',
+      'SEALED-ONLY, no escape hatch: every frame (output, keystrokes) is end-to-end encrypted with the channel key — the server relays ciphertext it cannot read. Needs an E2E channel AND PIDGE_SECRET in this install; missing either ⇒ refuse to start (exit 2) with the fix instructions. Session name/status are the only CLEAR metadata (keep secrets out of --name).',
+      '',
+      'PRO: terminal mirroring is a Pro feature — a non-Pro account gets a typed 402 with a message to relay to your human (do not retry; everything else on the key keeps working).',
+      '',
+      'stdout prints ONE machine-readable line ({ok, public_id, name, epoch}); everything human goes to stderr. Exit: 0 mirror stopped / session ended · 1 usage · 2 refused (E2E, plan, tmux missing, server).',
+    ].join('\n'),
+    opts: ['name'],
   },
   skill: {
     summary: 'write the generated Pidge skill from the live manifest (persistent Pidge knowledge for an AI agent).',
@@ -1338,7 +1369,21 @@ function cableSubscribe({ channel, params = {}, onUp, onFrame, onDown, base = BA
   // the reconnect log prefixes "realtime socket …", so the reason must NOT
   // start with "socket" again (was "socket socket closed (1006)").
   ws.onclose = (e) => die(`closed (${e.code})`);
-  return { close: () => { closed = true; clearInterval(beatCheck); try { ws.close(); } catch { /* noop */ } } };
+  return {
+    close: () => { closed = true; clearInterval(beatCheck); try { ws.close(); } catch { /* noop */ } },
+    // Perform ONE cable action on this subscription (ActionCable `message`
+    // command). Only meaningful after onUp (a pre-confirm send would race the
+    // subscribe); returns false when it could not be sent — callers treat
+    // that as a drop, never an error (the terminal relay is drop-safe by
+    // contract, and nothing else performs actions yet).
+    send: (action, payload) => {
+      if (closed) return false;
+      try {
+        ws.send(JSON.stringify({ command: 'message', identifier, data: JSON.stringify({ action, ...payload }) }));
+        return true;
+      } catch { return false; }
+    },
+  };
 }
 
 // Run one WS subscription session until the deadline / an unrecoverable WS
@@ -5156,6 +5201,21 @@ ${SKILL_END_MARKER}
       // prove reachability by round-trip. Fire a nonce, run the listener,
       // confirm it picks it up + acks in time. PASS exit 0 / FAIL exit 2.
       await doSelftest();
+      break;
+    }
+    case 'terminal': {
+      // Pidge Terminal — mirror a tmux session as SEALED frames (Terminals
+      // tab). The feature lives in src/terminal/ as an isolated module: it
+      // imports the pure e2e helpers through this file's test seam and gets
+      // the LIVE pieces (cable client, config, identity headers) injected
+      // here — the one place that knows both worlds.
+      await require('../src/terminal')({
+        BASE, TOKEN, headers, fetchT, die, note, sleep,
+        cableSubscribe, checkManifestNews,
+        e2eKeyMaterial, e2eChannelInfo, channelKeyFor,
+        readState, writeState,
+        rawArgv: RAW_ARGV, positionals: parsed.positionals, values: v,
+      });
       break;
     }
     case 'inbox': {
