@@ -127,7 +127,9 @@ test('terminal: refuses without a PIDGE_SECRET even on an E2E channel (exit 2)',
   await mock.stop();
 });
 
-test('terminal: the typed 402 plan gate is relayed verbatim and NEVER retried', async () => {
+// (needs the CLI's native WebSocket: the register happens after the runtime
+// check — refusal ordering is usage → sealed-only → runtime → side effects)
+test('terminal: the typed 402 plan gate is relayed verbatim and NEVER retried', { skip: !HAS_WS }, async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.e2eEnabled = true;

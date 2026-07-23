@@ -131,9 +131,6 @@ const shellWord = (a) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(a) ? a : `'${a.replace
 
 module.exports = async function runTerminal(ctx) {
   const { die, note } = ctx;
-  if (typeof WebSocket !== 'function') {
-    die('pidge terminal: needs a native WebSocket (Node ≥22) — frames ride the realtime socket, there is no polling floor for a terminal', 2);
-  }
 
   const tmuxBin = process.env.PIDGE_TMUX_BIN || 'tmux';
   // Test/ops hook: an isolated tmux server (-L) so suites never touch the
@@ -168,6 +165,13 @@ module.exports = async function runTerminal(ctx) {
   }
 
   const { info, mat } = await preflightSealed(ctx);
+
+  // Checked AFTER usage + the sealed-only preflight (those errors are the
+  // actionable ones) but BEFORE any tmux session is created or registered —
+  // an old runtime must leave zero side effects behind.
+  if (typeof WebSocket !== 'function') {
+    die('pidge terminal: needs a native WebSocket (Node ≥22) — frames ride the realtime socket, there is no polling floor for a terminal', 2);
+  }
 
   const hasSession = await execFileP(tmuxBin, [...socketArgs, 'has-session', '-t', `=${name}`]).then(() => true, () => false);
   if (creating) {
