@@ -18,6 +18,10 @@ const PRIVATE_PATTERNS = '.hygiene-private-patterns.json'; // untracked, never p
 
 function publicFiles() {
   const files = ['bin/pidge.js', 'README.md', 'CHANGELOG.md', 'package.json'];
+  // src/ ships in the npm package too — same public-hygiene bar as bin/.
+  for (const f of fs.readdirSync(path.join(ROOT, 'src'), { recursive: true })) {
+    if (/\.(js|json)$/.test(f)) files.push(`src/${f}`);
+  }
   for (const f of fs.readdirSync(path.join(ROOT, 'test'))) {
     if (f === SELF) continue; // this file names the forbidden patterns
     if (f === PRIVATE_PATTERNS) continue; // untracked local-only pattern source
