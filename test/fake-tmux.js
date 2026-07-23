@@ -40,13 +40,30 @@ if (args[0] === 'has-session') {
   process.exit(readSessions()[t] ? 0 : 1);
 }
 if (args[0] === 'new-session') {
-  const name = String(flag('-s') || '');
+  let name = null;
+  let cwd = null;
+  const rest = [];
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-d') continue;
+    if (a === '-s') { name = args[++i]; continue; }
+    if (a === '-c') { cwd = args[++i]; continue; }
+    if (a === '-x' || a === '-y') { ++i; continue; }
+    rest.push(a);
+  }
   const sessions = readSessions();
-  sessions[name] = { cmd: args[args.length - 1] === name ? null : args[args.length - 1] };
+  sessions[String(name)] = { cmd: rest.length ? rest.join(' ') : null, ...(cwd ? { cwd } : {}) };
   writeSessions(sessions);
   process.exit(0);
 }
 if (args[0] === 'set-option') process.exit(0);
+if (args[0] === 'list-sessions') {
+  const sessions = readSessions();
+  const names = Object.keys(sessions);
+  if (!names.length) { console.error('no server running'); process.exit(1); }
+  for (const n of names) console.log(`${n}\t80\t24`);
+  process.exit(0);
+}
 
 if (args[0] !== '-C' || args[1] !== 'attach') {
   console.error(`fake-tmux: unhandled args ${JSON.stringify(args)}`);
@@ -125,6 +142,7 @@ function handle(line) {
     return;
   }
   if (line.startsWith('detach-client')) {
+    fs.appendFileSync(keysLog, line + '\n'); // stand-down is observable
     reply([]);
     out('%exit');
     process.exit(0);

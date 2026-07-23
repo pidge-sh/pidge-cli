@@ -1,6 +1,6 @@
 {
   "name": "pidge-cli",
-  "version": "0.33.0",
+  "version": "0.34.0",
   "description": "Send rich, actionable iPhone notifications to a human and block until they answer. Built for AI agents.",
   "keywords": [
     "pidge",
@@ -23,7 +23,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/cli.test.js test/e2e.test.js test/e2e-wire.test.js test/e2e-pin.test.js test/media-e2e.test.js test/bridge.test.js test/runs.test.js test/continuity.test.js test/terminal-wire.test.js test/terminal.test.js test/hygiene.test.js"
+    "test": "node --test test/cli.test.js test/e2e.test.js test/e2e-wire.test.js test/e2e-pin.test.js test/media-e2e.test.js test/bridge.test.js test/runs.test.js test/continuity.test.js test/terminal-wire.test.js test/terminal.test.js test/terminal-host.test.js test/hygiene.test.js"
   },
   "engines": {
     "node": ">=18"

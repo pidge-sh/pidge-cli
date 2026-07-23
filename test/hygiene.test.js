@@ -63,7 +63,9 @@ const FORBIDDEN = [
   ['closed-suite reference', /\bXCTest\b/],
   ['namespaced server class', /\b[A-Z][a-zA-Z]+::[A-Z]/],
   ['server source file', /\b[a-z_]+\.rb\b/],
-  ['memory-link syntax', /\[\[[a-z][a-z-]*\]\]/],
+  // `[[profile]]` is the terminal spawn-whitelist's TOML array table — public
+  // config syntax, not a memory link; everything else in the shape stays banned.
+  ['memory-link syntax', /\[\[(?!profile\]\])[a-z][a-z-]*\]\]/],
   ['dogfooding narration', /\bdogfood/i],
   ['tracker ref in test title', /test\('#\d/],
   ['leading tracker-ref comment', /^\s*\/\/ ?(---+ )?#\d+\b/],
