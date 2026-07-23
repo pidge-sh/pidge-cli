@@ -217,10 +217,14 @@ module.exports = async function runTerminal(ctx) {
   mirror = createMirror({
     control, target: name, epoch: entry.epoch,
     seal: (frame) => wire.sealFrame(mat.key, info.id, entry.pid, wire.AAD_OUTPUT, frame),
-    open: (data) => wire.openFrame(mat.key, info.id, entry.pid, wire.AAD_INPUT, data),
+    // A wrapper/attach host has no control lane, so reseed/resize ROAM onto
+    // this session's own :in (terminal_ctrl_viewer, anchored on entry.pid) —
+    // openViewer tries terminal_input then terminal_ctrl_viewer.
+    openViewer: (data) => wire.openViewerFrame(mat.key, info.id, entry.pid, data),
     sendFrame: (data) => (cableHandle ? cableHandle.send('frame', { data }) : false),
     narrate: (msg) => console.error(msg),
     dataMax: limits.dataMax,
+    frameCap: limits.frameCap,
     flushMs: limits.flushMs,
   });
 

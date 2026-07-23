@@ -3,30 +3,43 @@
 // state): frame builders/parsers, the sealed-envelope glue and the tmux
 // control-mode byte decoding. Everything here is directly unit-testable.
 //
-// FRAME CONTRACT (shared with the server relay and the viewer apps; the live
-// manifest's `terminal` section is the served copy):
-//   Every frame is a JSON object sealed WHOLE into one field envelope
-//   ("v1:" + base64url(nonce||ct||tag)) — the exact machinery notifications
-//   already use — and rides the cable as an opaque `data` string the relay
-//   never reads. Per-DIRECTION AAD field names kill reflection (a relay
-//   re-presenting host output as viewer input authenticates in no slot);
-//   the AAD anchor is the session's public_id, minted by the host BEFORE
-//   anything is sealed.
+// FRAME CONTRACT (the "Wire form" pinned in the terminal spec §4; shared with
+// the server relay and the iOS/Mac viewers):
+//   Every frame is a JSON object sealed WHOLE with the BLOB framing
+//   (`[0x01][nonce12][ct][tag16]`, AES-256-GCM) and rides the cable as
+//   STANDARD base64 (padded, `+/` — NOT base64url). The viewer decodes with a
+//   strict standard-base64 reader; base64url would fail to open and degrade to
+//   a reseed loop. One encoding end to end — the inner `data` payload of
+//   o/seed frames is standard base64 too.
+//   Per-DIRECTION AAD field names kill reflection (a relay re-presenting host
+//   output as viewer input authenticates in no slot); the AAD anchor is the
+//   public_id of the session whose streams carry the frame.
 //   Host → viewer (`terminal_output`):
 //     { t:"o",    epoch, seq, data:<base64 raw bytes> }       live output
 //     { t:"seed", epoch, seq, cols, rows, data:<base64> }     full repaint
 //   Viewer → host (`terminal_input`):
-//     { t:"i",      seq, keys:[ {lit:"ls"}, {key:"Enter"} ] }
-//     { t:"reseed", seq }                                     repaint request
-//     { t:"resize", seq, cols, rows }
+//     { t:"i", vgen, seq, keys:[ {lit:"ls"}, {key:"Enter"} ] }
+//   Viewer → host control (`terminal_ctrl_viewer`) — reseed/resize may ROAM
+//   onto a mirrored session's own :in stream (anchor = that session's
+//   public_id) so a wrapper/attach host with no control lane still heals:
+//     { t:"reseed", vgen, seq, pid }
+//     { t:"resize", vgen, seq, pid, cols, rows }
+//   VGEN: every viewer→host frame carries a viewer-minted `vgen` ([a-z0-9]{8,},
+//   fresh per subscription) inside the ciphertext; the host ledgers `seq` per
+//   (session, AAD field, vgen). A frame without a valid vgen, or one that does
+//   not strictly advance its vgen's ledger, is DROPPED (replay guard). Join
+//   pings never touch the ledger — they are unsealed and server-forgeable.
 //   EVOLUTION IS ADDITIVE: unknown `t` ⇒ ignore the frame; unknown fields
 //   inside a known frame ⇒ ignore the field. A newer peer never breaks an
 //   older one — enforced here by parsing only what we know.
 
 // The e2e crypto is the CLI's existing, test-vectored machinery — the test
 // seam in bin/pidge.js exports the pure helpers when require()d (the CLI
-// itself never runs under require).
-const { e2eAad, e2eEncryptField, e2eDecryptField } = require('../../bin/pidge.js');
+// itself never runs under require). Terminal frames use the BLOB framing
+// (`[0x01][nonce12][ct][tag16]`, standard base64 — see sealFrame), NOT the
+// field-envelope string (`"v1:"` + base64url); that is the wire the iOS/Mac
+// viewers decode with a STRICT standard-base64 reader.
+const { e2eAad, e2eEncryptBlob, e2eDecryptBlob } = require('../../bin/pidge.js');
 
 // Per-direction AAD field names (append-only registry — never rename).
 const AAD_OUTPUT = 'terminal_output';       // host → viewer (output/seed)
@@ -75,22 +88,68 @@ function unescapeOctal(s) {
   return out.subarray(0, n);
 }
 
-// Seal one frame object for the wire. Returns the opaque `data` string.
+// Seal one frame object for the wire: blob framing → STANDARD base64 (padded).
+// `.toString('base64')` is standard (not base64url), matching the viewer's
+// strict `Data(base64Encoded:)` reader byte-for-byte.
 function sealFrame(key, channelId, publicId, aadField, frame) {
-  return e2eEncryptField(key, e2eAad(channelId, publicId, aadField), JSON.stringify(frame));
+  const blob = e2eEncryptBlob(key, e2eAad(channelId, publicId, aadField), Buffer.from(JSON.stringify(frame), 'utf8'));
+  return blob.toString('base64');
 }
 
-// Open one inbound `data` string. Returns the parsed frame object, or null
-// (bad envelope / wrong key / not JSON) — the caller narrates, never throws:
-// a hostile or corrupt frame must never kill the mirror.
+// Open one inbound `data` string (standard base64 of the blob). Returns the
+// parsed frame object, or null (bad base64 / wrong key/AAD / not a JSON object)
+// — the caller narrates, never throws: a hostile or corrupt frame must never
+// kill the mirror.
 function openFrame(key, channelId, publicId, aadField, data) {
   try {
-    const plain = e2eDecryptField(key, e2eAad(channelId, publicId, aadField), data);
-    const frame = JSON.parse(plain);
+    const blob = Buffer.from(String(data), 'base64');
+    const plain = e2eDecryptBlob(key, e2eAad(channelId, publicId, aadField), blob);
+    const frame = JSON.parse(plain.toString('utf8'));
     return frame && typeof frame === 'object' ? frame : null;
   } catch {
     return null;
   }
+}
+
+// Open a viewer→host frame on a mirrored session's :in stream, which carries
+// BOTH keystroke frames (`terminal_input`) and ROAMING control frames
+// (`terminal_ctrl_viewer` — reseed/resize, anchored on THIS session's id).
+// Try input first, then ctrl_viewer; returns { frame, field } or null. The
+// field is what the caller keys its per-vgen seq ledger on.
+function openViewerFrame(key, channelId, publicId, data) {
+  const asInput = openFrame(key, channelId, publicId, AAD_INPUT, data);
+  if (asInput) return { frame: asInput, field: AAD_INPUT };
+  const asCtrl = openFrame(key, channelId, publicId, AAD_CTRL_VIEWER, data);
+  if (asCtrl) return { frame: asCtrl, field: AAD_CTRL_VIEWER };
+  return null;
+}
+
+// A vgen is a viewer-minted random token, [a-z0-9] and ≥8 chars (iOS mints 12).
+const VGEN_RE = /^[a-z0-9]{8,}$/;
+function isValidVgen(v) { return typeof v === 'string' && VGEN_RE.test(v); }
+
+// The viewer→host replay guard (spec §3/§4): a per-(field, vgen) monotonic
+// `seq` ledger with a small LRU of recent vgens. `accept(field, vgen, seq)`
+// returns true exactly once per strictly-increasing seq within a vgen; a frame
+// with no valid vgen, a non-integer/≤0 seq, or a seq that doesn't advance its
+// vgen's ledger is rejected. A reconnecting viewer mints a NEW vgen and
+// restarts at 1 (a fresh ledger entry). The LRU bounds memory; an evicted
+// vgen's very-old replay could re-open, the documented tail risk (≥4 kept).
+function createLedger(cap = 8) {
+  const seqs = new Map(); // `${field}\0${vgen}` → lastSeq, insertion-ordered (LRU)
+  return {
+    accept(field, vgen, seq) {
+      if (!isValidVgen(vgen)) return false;
+      if (!Number.isInteger(seq) || seq < 1) return false;
+      const k = `${field}\0${vgen}`;
+      const last = seqs.get(k);
+      if (last !== undefined && seq <= last) return false;
+      seqs.delete(k);            // refresh LRU recency
+      seqs.set(k, seq);
+      while (seqs.size > cap) seqs.delete(seqs.keys().next().value);
+      return true;
+    },
+  };
 }
 
 // Split a raw output buffer into ≤max-byte chunks (the coalescer flushes one
@@ -160,6 +219,7 @@ function keysToTmuxCommands(target, keys) {
 module.exports = {
   AAD_OUTPUT, AAD_INPUT, AAD_CTRL_HOST, AAD_CTRL_VIEWER,
   ALLOWED_KEYS, DATA_MAX_BYTES,
-  unescapeOctal, sealFrame, openFrame, chunkBytes,
+  unescapeOctal, sealFrame, openFrame, openViewerFrame, chunkBytes,
+  isValidVgen, createLedger,
   normalizeKeyEntry, tmuxQuote, keysToTmuxCommands,
 };

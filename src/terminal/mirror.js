@@ -8,17 +8,22 @@
 //     delivery policy: a drop is always healed by reseed),
 //   · seed/reseed (capture-pane repaint — THE loss-recovery mechanism: any
 //     gap, reconnect or foreground ends in a seed, so drops stay safe),
-//   · inbound input (seq replay guard, key whitelist → send-keys) and the
-//     input-lane resize.
+//   · inbound viewer→host frames: keystrokes on `terminal_input` and ROAMING
+//     reseed/resize on `terminal_ctrl_viewer` (a wrapper/attach host has no
+//     control lane, so gap-healing rides the session's own :in lane).
 //
-// Replay guard: input seq must be strictly increasing. The ledger RESETS on
-// a viewer join ping — a fresh viewer legitimately restarts at 1. Residual:
-// the join ping is the one unsealed relay message, so a hostile relay could
-// forge join+replay to re-run keys it captured THIS epoch, in order, from 1.
-// Same residual class the sealed-text fields accept; documented, not fought
-// in v1 (the fix would need viewer-persistent seq or a handshake).
+// Replay guard (spec §3/§4): every viewer→host frame carries a viewer-minted
+// `vgen`; the host ledgers `seq` per (AAD field, vgen) and drops anything that
+// does not strictly advance its vgen's ledger. A reconnecting viewer mints a
+// NEW vgen and restarts at 1. The unsealed, server-forgeable join ping plays
+// NO role in the ledger — it is host-side flow control only (viewer balance +
+// reseed trigger), so a forged join can never re-open a replay window.
 
-const { chunkBytes, keysToTmuxCommands, tmuxQuote, DATA_MAX_BYTES } = require('./wire');
+const { chunkBytes, keysToTmuxCommands, tmuxQuote, createLedger, AAD_INPUT, AAD_CTRL_VIEWER, DATA_MAX_BYTES } = require('./wire');
+
+// Scrollback ladder for a seed: try the deepest first, shrink until the sealed
+// frame fits the relay's byte cap. `0` (the bare visible screen) always fits.
+const SEED_SCROLLBACK = [200, 100, 50, 0];
 
 // A runaway burst while the cable is down must not grow memory forever: past
 // this, the buffer is dropped WHOLE and a seed repaint is scheduled instead —
@@ -27,15 +32,16 @@ const BUFFER_DROP_BYTES = 256 * 1024;
 
 function createMirror({
   control, target, epoch,
-  seal,        // (frameObj) → opaque data string (terminal_output AAD)
-  open,        // (data)     → frame | null      (terminal_input AAD)
-  sendFrame,   // (data)     → boolean — false = not sent (socket down/closed)
+  seal,        // (frameObj)  → opaque data string (terminal_output AAD)
+  openViewer,  // (data)      → { frame, field } | null  (tries input + ctrl_viewer)
+  sendFrame,   // (data)      → boolean — false = not sent (socket down/closed)
   narrate = () => {},
   dataMax = DATA_MAX_BYTES,
+  frameCap = 64 * 1024,   // relay byte ceiling per frame (from the manifest) — caps the seed
   flushMs = 80,
 }) {
   let outSeq = 0;          // host→viewer, one counter for o+seed frames
-  let lastInSeq = 0;       // the replay-guard ledger (viewer→host)
+  const ledger = createLedger(); // per-(field, vgen) monotonic seq replay guard
   let viewers = 0;         // local running balance of join/leave events
   let pending = [];        // coalesce buffer (Buffer[])
   let pendingBytes = 0;
@@ -71,45 +77,61 @@ function createMirror({
 
   // Full repaint: pane size + screen/scrollback captured INSIDE the control
   // connection, sent as ONE seed frame the viewer resets its emulator on.
+  // THE SEED MUST FIT the relay's frame cap: an oversized seed is the one loss
+  // the reseed protocol can't heal (relay drops it → viewer reseeds → the host
+  // regenerates the SAME oversized dump → loop). So shrink scrollback
+  // (-200→-100→-50→0) until the SEALED+base64 frame is under the cap; the bare
+  // visible screen (0) always fits and is sent unconditionally as the floor.
   async function seed() {
     if (stopped) return;
     const t = tmuxQuote(target);
     const size = await control.command(`display-message -p -t ${t} '#{pane_width} #{pane_height}'`);
     const m = size.ok ? /^(\d+)\s+(\d+)/.exec(size.lines[0] || '') : null;
-    const cap = await control.command(`capture-pane -p -e -J -S -200 -t ${t}`);
-    if (!cap.ok) { noteOnce('pidge terminal: capture-pane failed — seed skipped (will retry on the next reseed)'); return; }
-    // Block body lines are latin1-preserved bytes; \r\n between lines so the
-    // viewer's emulator repaints rows, not one endless line.
-    const data = Buffer.from(cap.lines.join('\r\n') + '\r\n', 'latin1');
-    emit({
-      t: 'seed', epoch, seq: ++outSeq,
-      cols: m ? parseInt(m[1], 10) : 80,
-      rows: m ? parseInt(m[2], 10) : 24,
-      data: data.toString('base64'),
-    });
-  }
-
-  async function handleInput(frame) {
-    if (frame.t === 'i') {
-      const seq = frame.seq;
-      if (!Number.isInteger(seq) || seq <= lastInSeq) {
-        noteOnce('pidge terminal: dropped non-monotonic input seq (replay guard)');
+    const cols = m ? parseInt(m[1], 10) : 80;
+    const rows = m ? parseInt(m[2], 10) : 24;
+    for (let i = 0; i < SEED_SCROLLBACK.length; i++) {
+      const lines = SEED_SCROLLBACK[i];
+      const cap = await control.command(`capture-pane -p -e -J -S -${lines} -t ${t}`);
+      if (!cap.ok) { noteOnce('pidge terminal: capture-pane failed — seed skipped (will retry on the next reseed)'); return; }
+      if (stopped) return;
+      // Block body lines are latin1-preserved bytes; \r\n between lines so the
+      // viewer's emulator repaints rows, not one endless line.
+      const data = Buffer.from(cap.lines.join('\r\n') + '\r\n', 'latin1');
+      const sealed = seal({ t: 'seed', epoch, seq: outSeq + 1, cols, rows, data: data.toString('base64') });
+      const last = i === SEED_SCROLLBACK.length - 1;
+      if (last || Buffer.byteLength(sealed) <= frameCap) {
+        if (!last && i > 0) noteOnce(`pidge terminal: seed shrunk to ${lines} lines of scrollback to fit the relay frame cap`);
+        outSeq += 1;
+        sendFrame(sealed);
         return;
       }
-      lastInSeq = seq;
+    }
+  }
+
+  // Handle one opened viewer→host frame. `field` is the AAD it opened under —
+  // it both gates the valid frame types (keystrokes on terminal_input;
+  // reseed/resize on terminal_ctrl_viewer) and keys the per-vgen replay ledger.
+  async function handleInput(frame, field) {
+    if (!ledger.accept(field, frame.vgen, frame.seq)) {
+      noteOnce('pidge terminal: dropped a viewer frame (missing vgen or non-monotonic seq — replay guard)');
+      return;
+    }
+    if (field === AAD_INPUT) {
+      if (frame.t !== 'i') return; // only keystrokes ride terminal_input
       for (const cmd of keysToTmuxCommands(target, frame.keys)) {
         await control.command(cmd); // in order — keystrokes must not interleave
       }
       return;
     }
+    // field === AAD_CTRL_VIEWER: the roaming control frames.
     if (frame.t === 'reseed') {
       await reseed();
       return;
     }
     if (frame.t === 'resize') {
+      if (!frame.cols || !frame.rows) return;
       const cols = Math.min(500, Math.max(20, parseInt(frame.cols, 10) || 0));
       const rows = Math.min(300, Math.max(5, parseInt(frame.rows, 10) || 0));
-      if (!frame.cols || !frame.rows) return;
       // Resizing OUR control client resizes the window (window-size latest);
       // the reflow arrives as ordinary %output.
       await control.command(`refresh-client -C ${cols}x${rows}`);
@@ -146,9 +168,10 @@ function createMirror({
     handleCable(msg) {
       if (!msg || typeof msg !== 'object' || stopped) return;
       if (msg.sys === 'viewer') {
+        // Flow control ONLY — never a ledger event (join is unsealed and
+        // server-forgeable). A join repaints (the viewer reset its emulator).
         if (msg.ev === 'join') {
           viewers += 1;
-          lastInSeq = 0; // fresh viewer, fresh seq space (see header note)
           seed();
         } else if (msg.ev === 'leave') {
           viewers = Math.max(0, viewers - 1);
@@ -161,8 +184,8 @@ function createMirror({
         return;
       }
       if (typeof msg.data !== 'string') return;
-      const frame = open(msg.data);
-      if (!frame) {
+      const opened = openViewer(msg.data);
+      if (!opened) {
         noteOnce('pidge terminal: an inbound frame failed to open (wrong key or corrupt) — ignored');
         return;
       }
@@ -172,7 +195,7 @@ function createMirror({
       // handleInput would let two frames' send-keys interleave and scramble
       // keystroke order across frames.
       inputChain = inputChain
-        .then(() => handleInput(frame))
+        .then(() => handleInput(opened.frame, opened.field))
         .catch((e) => narrate(`pidge terminal: input relay error: ${e.message}`));
     },
 

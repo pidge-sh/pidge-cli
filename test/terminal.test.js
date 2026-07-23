@@ -21,7 +21,7 @@ const { spawn: rawSpawn } = require('node:child_process');
 const WebSocketClient = require('ws');
 const { track } = require('./spawn-tracker');
 const { createMock } = require('./mock-server');
-const { e2eAad, e2eEncryptField, e2eDecryptField } = require('../bin/pidge.js');
+const { e2eAad, e2eEncryptBlob, e2eDecryptBlob } = require('../bin/pidge.js');
 
 const spawn = (cmd, args, opts = {}) => track(rawSpawn(cmd, args, { ...opts, detached: true }));
 const CLI = path.join(__dirname, '..', 'bin', 'pidge.js');
@@ -35,8 +35,12 @@ const HAS_WS = typeof WebSocket === 'function';
 
 const KEY = Buffer.alloc(32, 5);
 const SECRET = KEY.toString('base64url');
-const sealInput = (pid, frame) => e2eEncryptField(KEY, e2eAad(1, pid, 'terminal_input'), JSON.stringify(frame));
-const openOutput = (pid, data) => JSON.parse(e2eDecryptField(KEY, e2eAad(1, pid, 'terminal_output'), data));
+const VG = 'testvgen1'; // a valid vgen ([a-z0-9]{8,}) — every viewer→host frame carries one
+// The wire form the iOS/Mac viewer speaks: blob framing → STANDARD base64.
+const sealBlob = (pid, field, frame) => e2eEncryptBlob(KEY, e2eAad(1, pid, field), Buffer.from(JSON.stringify(frame), 'utf8')).toString('base64');
+const sealInput = (pid, frame) => sealBlob(pid, 'terminal_input', frame);          // keystrokes {t:i}
+const sealCtrlViewer = (pid, frame) => sealBlob(pid, 'terminal_ctrl_viewer', frame); // roaming reseed/resize
+const openOutput = (pid, data) => JSON.parse(e2eDecryptBlob(KEY, e2eAad(1, pid, 'terminal_output'), Buffer.from(data, 'base64')).toString('utf8'));
 
 function runCli(args, port, env = {}) {
   const fakeDir = env.FAKE_TMUX_DIR || tmpDir('pidge-faketmux-');
@@ -178,8 +182,8 @@ test('terminal attach: full sealed round-trip — seed on join, input→send-key
     return f.t === 'o' && Buffer.from(f.data, 'base64').toString('latin1').includes('NOT_A_REAL_NOTIFICATION');
   }), 'a %-leading seed body line leaked into the live stream');
 
-  // viewer input → send-keys in tmux (literal in its own -l command, special separate)
-  viewer.sendFrame(sealInput(pid, { t: 'i', seq: 1, keys: [{ lit: "echo 'oi'" }, { key: 'Enter' }] }));
+  // viewer input (terminal_input, carries vgen) → send-keys in tmux
+  viewer.sendFrame(sealInput(pid, { t: 'i', vgen: VG, seq: 1, keys: [{ lit: "echo 'oi'" }, { key: 'Enter' }] }));
   const keysLog = path.join(fakeDir, 'keys.log');
   assert.ok(await waitFor(() => fs.existsSync(keysLog) && fs.readFileSync(keysLog, 'utf8').includes('Enter')));
   const log1 = fs.readFileSync(keysLog, 'utf8');
@@ -192,22 +196,31 @@ test('terminal attach: full sealed round-trip — seed on join, input→send-key
     return f.t === 'o' && Buffer.from(f.data, 'base64').toString() === "echo 'oi'";
   })), 'echoed output frame never arrived');
 
-  // replay guard: a reused seq is DROPPED (nothing new reaches tmux)
-  viewer.sendFrame(sealInput(pid, { t: 'i', seq: 1, keys: [{ lit: 'HACK' }] }));
+  // replay guard: a reused (vgen, seq) is DROPPED (nothing new reaches tmux)
+  viewer.sendFrame(sealInput(pid, { t: 'i', vgen: VG, seq: 1, keys: [{ lit: 'HACK' }] }));
+  // a frame WITHOUT a vgen is dropped too (mandatory on viewer→host)
+  viewer.sendFrame(sealInput(pid, { t: 'i', seq: 99, keys: [{ lit: 'NOVGEN' }] }));
   await sleep(400);
-  assert.ok(!fs.readFileSync(keysLog, 'utf8').includes('HACK'));
+  const afterReplay = fs.readFileSync(keysLog, 'utf8');
+  assert.ok(!afterReplay.includes('HACK'), 'a replayed (vgen,seq) reached tmux');
+  assert.ok(!afterReplay.includes('NOVGEN'), 'a vgen-less frame reached tmux');
 
-  // resize rides the input lane → refresh-client -C
-  viewer.sendFrame(sealInput(pid, { t: 'resize', seq: 2, cols: 61, rows: 21 }));
+  // a RECONNECTED viewer mints a NEW vgen and restarts at seq 1 — must be honored
+  // (the old lifetime-high-water design wrongly dropped this)
+  viewer.sendFrame(sealInput(pid, { t: 'i', vgen: 'freshvgen2', seq: 1, keys: [{ lit: 'RECONN' }] }));
+  assert.ok(await waitFor(() => fs.readFileSync(keysLog, 'utf8').includes('RECONN')), 'a reconnected viewer (new vgen, seq 1) was wrongly dropped');
+
+  // resize ROAMS on the session's own :in via terminal_ctrl_viewer → refresh-client -C
+  viewer.sendFrame(sealCtrlViewer(pid, { t: 'resize', vgen: VG, seq: 2, pid, cols: 61, rows: 21 }));
   assert.ok(await waitFor(() => fs.readFileSync(keysLog, 'utf8').includes('refresh-client -C 61x21')));
 
-  // reseed → a second seed frame
+  // reseed (also terminal_ctrl_viewer roaming) → a second seed frame
   const framesBefore = viewer.frames.length;
-  viewer.sendFrame(sealInput(pid, { t: 'reseed', seq: 3 }));
+  viewer.sendFrame(sealCtrlViewer(pid, { t: 'reseed', vgen: VG, seq: 3, pid }));
   assert.ok(await waitFor(() => viewer.frames.slice(framesBefore).some((d) => openOutput(pid, d).t === 'seed')));
 
   // an unknown frame type is IGNORED (additive evolution), not a crash
-  viewer.sendFrame(sealInput(pid, { t: 'brand-new-thing', seq: 4, whatever: true }));
+  viewer.sendFrame(sealInput(pid, { t: 'brand-new-thing', vgen: VG, seq: 5, whatever: true }));
   await sleep(200);
   assert.strictEqual(out.code, null); // still running
 
@@ -221,6 +234,43 @@ test('terminal attach: full sealed round-trip — seed on join, input→send-key
   viewer.close();
   await mock.stop();
   void child;
+});
+
+test('terminal: interop with the iOS wire dialect — an iOS-form reseed opens on the host, the host seed passes the STRICT viewer reader', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const { child, result, out } = runCli(['terminal', 'attach', 'work'], port, { FAKE_TMUX_DIR: makeFakeDir({ work: {} }) });
+  assert.ok(await waitFor(() => out.stdout.includes('"public_id"')), `stderr: ${out.stderr}`);
+  const pid = JSON.parse(out.stdout.trim().split('\n')[0]).public_id;
+  assert.ok(await waitFor(() => [...mock.state.terminalSubs].some((s) => s.role === 'host')));
+
+  const viewer = connectViewer(port, pid);
+  assert.ok(await waitFor(() => viewer.confirmed));
+
+  // EXACTLY what iOS TerminalSessionController sends: a 12-char [a-z0-9] vgen,
+  // {t,vgen,seq,pid} sealed with terminal_ctrl_viewer anchored on the session
+  // id, on the session's own :in stream (roaming — no control lane here).
+  const iosVgen = 'k3v9x2mqab12';
+  const before = viewer.frames.length;
+  viewer.sendFrame(sealCtrlViewer(pid, { t: 'reseed', vgen: iosVgen, seq: 1, pid }));
+
+  // The host answers with a seed on :out. Open it the way the iOS viewer does —
+  // a STRICT standard-base64 reader (rejects base64url), then the [0x01] blob,
+  // then terminal_output. If the host emitted base64url or a field envelope,
+  // this reader gets nothing and the app would loop on reseed.
+  assert.ok(await waitFor(() => viewer.frames.slice(before).some((d) => {
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(d)) return false;       // strict standard base64 only
+    const blob = Buffer.from(d, 'base64');
+    if (blob[0] !== 0x01) return false;                         // blob framing version byte
+    const f = openOutput(pid, d);
+    return f.t === 'seed' && typeof f.data === 'string';
+  })), `the host did not answer the iOS-form reseed with a strict-standard-base64 seed; stderr: ${out.stderr}`);
+
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
 });
 
 test('terminal wrapper: creates the tmux session (wrapped CMD verbatim) and SIGINT stops the mirror WITHOUT deleting it', { skip: !HAS_WS }, async () => {
@@ -304,7 +354,7 @@ test('terminal (REAL tmux): sealed seed + typed command echoes back through the 
 
     // type into the REAL shell through the sealed pipe; the echo (and the
     // command's output) must come back as sealed output frames.
-    viewer.sendFrame(sealInput(pid, { t: 'i', seq: 1, keys: [{ lit: 'echo PIDGE_RT_MARKER' }, { key: 'Enter' }] }));
+    viewer.sendFrame(sealInput(pid, { t: 'i', vgen: VG, seq: 1, keys: [{ lit: 'echo PIDGE_RT_MARKER' }, { key: 'Enter' }] }));
     assert.ok(await waitFor(() => viewer.frames.some((d) => {
       const f = openOutput(pid, d);
       return f.t === 'o' && Buffer.from(f.data, 'base64').toString('latin1').includes('PIDGE_RT_MARKER');
