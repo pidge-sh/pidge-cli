@@ -112,7 +112,10 @@ process.stdin.on('data', (chunk) => {
 
 function handle(line) {
   if (line.startsWith('display-message')) return reply(['80 24']);
-  if (line.startsWith('capture-pane')) return reply(['seed-line-1', 'seed-line-2 \x1b[1mbold\x1b[0m']);
+  // The last line deliberately LOOKS like a %output notification: real pane
+  // content (a log, a paste) can start with `%output`/`%exit`, and the parser
+  // must keep it as verbatim seed body, never dispatch it into the live stream.
+  if (line.startsWith('capture-pane')) return reply(['seed-line-1', 'seed-line-2 \x1b[1mbold\x1b[0m', '%output %9 NOT_A_REAL_NOTIFICATION']);
   if (line.startsWith('send-keys') || line.startsWith('refresh-client')) {
     fs.appendFileSync(keysLog, line + '\n');
     reply([]);

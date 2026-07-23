@@ -55,6 +55,17 @@ test('chunkBytes splits a burst into ≤max frames, preserving bytes', () => {
   assert.strictEqual(chunks[2].length, 40000 - 2 * 16 * 1024);
 });
 
+test('chunkBytes never hangs on a non-positive max (a bad manifest limit)', () => {
+  // A zero/negative step would loop forever; the guard floors it to the
+  // protocol chunk size, so the call terminates with finite, byte-preserving chunks.
+  const buf = Buffer.from('y'.repeat(40000));
+  for (const bad of [0, -5]) {
+    const chunks = wire.chunkBytes(buf, bad);
+    assert.strictEqual(Buffer.concat(chunks).length, buf.length);
+    assert.ok(chunks.length >= 1 && chunks.every((c) => c.length > 0));
+  }
+});
+
 test('normalizeKeyEntry: whitelist is CLOSED — unknown tokens drop, literals cap', () => {
   assert.deepStrictEqual(wire.normalizeKeyEntry({ key: 'BTab' }), { key: 'BTab' });
   assert.strictEqual(wire.normalizeKeyEntry({ key: 'F12' }), null);

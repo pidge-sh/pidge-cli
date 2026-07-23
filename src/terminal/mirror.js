@@ -43,6 +43,7 @@ function createMirror({
   let stopped = false;
   let penaltyUntil = 0;    // rate-limited by the relay → flush slower briefly
   let seedWanted = false;  // a dropped buffer heals via seed on next flush
+  let inputChain = Promise.resolve(); // serializes inbound frames (see handleCable)
   const notedOnce = new Set();
   const noteOnce = (msg) => { if (!notedOnce.has(msg)) { notedOnce.add(msg); narrate(msg); } };
 
@@ -102,9 +103,7 @@ function createMirror({
       return;
     }
     if (frame.t === 'reseed') {
-      // A reseed proves someone is watching even if we missed their join.
-      if (viewers < 1) viewers = 1;
-      await seed();
+      await reseed();
       return;
     }
     if (frame.t === 'resize') {
@@ -117,6 +116,16 @@ function createMirror({
       return;
     }
     // Unknown t ⇒ a newer viewer — ignore by contract.
+  }
+
+  // A reseed proves someone is watching even if we missed their join, so it
+  // makes output flow again (viewers ≥ 1) and repaints. Shared by the input
+  // lane (a viewer's reseed frame) AND the control lane (reseed-by-pid) so
+  // both paths self-heal identically — a control-lane reseed must NOT leave a
+  // tap attached with viewers stuck at 0 (output would be silently dropped).
+  function reseed() {
+    if (viewers < 1) viewers = 1;
+    return seed();
   }
 
   return {
@@ -157,7 +166,14 @@ function createMirror({
         noteOnce('pidge terminal: an inbound frame failed to open (wrong key or corrupt) — ignored');
         return;
       }
-      handleInput(frame).catch((e) => narrate(`pidge terminal: input relay error: ${e.message}`));
+      // SERIALIZE: chain onto the previous frame so a multi-command frame
+      // (e.g. a literal + Enter) fully drains to tmux before the next frame's
+      // keys start — handleCable fires without await, so an unchained
+      // handleInput would let two frames' send-keys interleave and scramble
+      // keystroke order across frames.
+      inputChain = inputChain
+        .then(() => handleInput(frame))
+        .catch((e) => narrate(`pidge terminal: input relay error: ${e.message}`));
     },
 
     // The cable reconnected: repaint anyone still watching (their gap
@@ -167,6 +183,7 @@ function createMirror({
     },
 
     seed,
+    reseed,
     get viewers() { return viewers; },
     stop() {
       stopped = true;

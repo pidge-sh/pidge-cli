@@ -95,9 +95,12 @@ function openFrame(key, channelId, publicId, aadField, data) {
 
 // Split a raw output buffer into ≤max-byte chunks (the coalescer flushes one
 // frame per chunk — a burst bigger than one frame becomes N well-formed frames).
+// A non-positive `max` (a bad manifest-derived limit) must never make the loop
+// stall forever — floor the step at the protocol chunk size.
 function chunkBytes(buf, max = DATA_MAX_BYTES) {
+  const step = max > 0 ? max : DATA_MAX_BYTES;
   const chunks = [];
-  for (let off = 0; off < buf.length; off += max) chunks.push(buf.subarray(off, off + max));
+  for (let off = 0; off < buf.length; off += step) chunks.push(buf.subarray(off, off + step));
   return chunks;
 }
 

@@ -169,6 +169,14 @@ test('terminal attach: full sealed round-trip — seed on join, input→send-key
   assert.strictEqual(seed.rows, 24);
   const seedText = Buffer.from(seed.data, 'base64').toString('latin1');
   assert.match(seedText, /seed-line-1\r\nseed-line-2/);
+  // a capture-pane body line that LOOKS like a %output notification stays
+  // verbatim in the seed and is NOT dispatched into the live stream (control
+  // block bodies are contiguous — a `%…` pane line is content, not a tag).
+  assert.match(seedText, /%output %9 NOT_A_REAL_NOTIFICATION/);
+  assert.ok(!viewer.frames.slice(1).some((d) => {
+    const f = openOutput(pid, d);
+    return f.t === 'o' && Buffer.from(f.data, 'base64').toString('latin1').includes('NOT_A_REAL_NOTIFICATION');
+  }), 'a %-leading seed body line leaked into the live stream');
 
   // viewer input → send-keys in tmux (literal in its own -l command, special separate)
   viewer.sendFrame(sealInput(pid, { t: 'i', seq: 1, keys: [{ lit: "echo 'oi'" }, { key: 'Enter' }] }));

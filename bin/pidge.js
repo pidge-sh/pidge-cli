@@ -54,7 +54,10 @@ const crypto = require('node:crypto');
 
 // `pidge --version` / `-v` — handled BEFORE parseArgs (which would otherwise
 // throw "Unknown option" on the undeclared flag). Prints the version, exit 0.
-if (process.argv.includes('--version') || process.argv.includes('-v')) {
+// Gated on require.main so an in-process require of this file (wire.js pulls
+// the pure e2e helpers this way) is side-effect-free — a requirer whose own
+// argv carried -v must never trigger this process.exit(0) at import time.
+if (require.main === module && (process.argv.includes('--version') || process.argv.includes('-v'))) {
   try { console.log(require(path.join(__dirname, '..', 'package.json')).version); }
   catch { console.log('unknown'); }
   process.exit(0);
@@ -320,16 +323,15 @@ const E2E_NEVER_SEAL_LABEL_IDS = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// Test seam: require()ing this file exports the pure e2e helpers and
-// stops HERE — none of the CLI machinery below (parseArgs, the TOKEN check,
-// command dispatch) may run under a test runner's argv. Executed as a binary
-// (require.main === module) it skips the export and runs the CLI unchanged.
+// Test seam: require()ing this file exposes the pure e2e helpers and stops
+// HERE — none of the CLI machinery below (parseArgs, the TOKEN check, command
+// dispatch) runs under a require. The exports are assigned UNCONDITIONALLY,
+// then the early `return` skips the CLI body when not the main module: a
+// CONDITIONAL export would hand an in-process require (src/terminal/ pulls
+// these same helpers while the CLI itself is the main module) an empty object
+// — the circular-dependency trap. Executed as a binary, only the return is
+// skipped, so the CLI still runs unchanged.
 // ---------------------------------------------------------------------------
-// The exports are assigned UNCONDITIONALLY: src/terminal/ requires this file
-// for the same pure helpers while the CLI itself is the main module (a
-// conditional assignment would hand that in-process require an empty object —
-// the circular-dependency trap). Executed as a binary, the early return below
-// is what's skipped, so the CLI machinery still runs unchanged.
 module.exports = {
   e2eAad, e2eKeyFingerprint, e2eLoadSecret, e2eParseSecret,
   e2eEncryptField, e2eDecryptField, e2eEncryptBlob, e2eDecryptBlob,

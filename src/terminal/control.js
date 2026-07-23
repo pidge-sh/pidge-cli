@@ -13,9 +13,12 @@
 //     tmux emits on attach carries flags 0, so it can never be mistaken for
 //     the first command's reply.
 //   · Command-output blocks (capture-pane -p, display-message -p) carry the
-//     output lines VERBATIM between %begin/%end — including raw ESC bytes.
-//     Only the block's own terminator ends it; a known notification tag
-//     inside is dispatched as the async event it is.
+//     output lines VERBATIM between %begin/%end — including raw ESC bytes AND
+//     pane text that itself starts with `%output`/`%exit`. tmux holds real
+//     notifications until a command's block completes, so INSIDE a block every
+//     line up to the terminator is body — we must NOT re-interpret a `%…`
+//     body line as a notification (that would steal captured pane content out
+//     of a seed and inject it into the live stream).
 //   · %exit means THIS client is done (detach, session killed, server gone) —
 //     stdout EOF follows.
 
@@ -62,11 +65,19 @@ function createControl({ tmuxBin = 'tmux', socketArgs = [], target, onOutput, on
   child.stderr.on('data', () => { /* tmux -C narrates nothing useful here */ });
   child.on('error', (e) => finish(`tmux failed to start: ${e.message}`));
   child.on('exit', (code, signal) => finish(closeReason || `tmux exited (${signal || code})`));
+  // A write to a dying tmux surfaces EPIPE / ERR_STREAM_DESTROYED as an ASYNC
+  // 'error' on the stdin stream. Without a listener that is an unhandled
+  // exception — in the host daemon it would take down the control lane and
+  // EVERY other session's mirror, not just the one dead tmux. Treat it as the
+  // tap closing (the child 'exit' usually follows and is idempotent here).
+  child.stdin.on('error', (e) => finish(`tmux stdin error: ${e.message}`));
 
   function handleLine(line) {
     if (block) {
-      // Inside a block: only its own terminator ends it; async notifications
-      // may interleave and are dispatched; everything else is body.
+      // Inside a block ONLY its own terminator ends it. Everything else is
+      // VERBATIM body — a body line that happens to start with `%output`/
+      // `%exit` is captured pane content, not a notification (tmux holds real
+      // notifications until the block closes), so it must never be dispatched.
       if (line.startsWith('%end ') || line.startsWith('%error ')) {
         const done = block;
         done.error = line.startsWith('%error ');
@@ -76,7 +87,6 @@ function createControl({ tmuxBin = 'tmux', socketArgs = [], target, onOutput, on
         }
         return;
       }
-      if (NOTIFICATION.test(line)) { dispatch(line); return; }
       block.lines.push(line);
       return;
     }
@@ -119,8 +129,17 @@ function createControl({ tmuxBin = 'tmux', socketArgs = [], target, onOutput, on
       if (closed) return Promise.resolve({ ok: false, lines: [], error: 'control client closed' });
       if (/[\r\n]/.test(line)) return Promise.resolve({ ok: false, lines: [], error: 'newline in tmux command' });
       return new Promise((resolve) => {
-        pending.push({ resolve });
-        child.stdin.write(line + '\n');
+        const entry = { resolve };
+        pending.push(entry);
+        try {
+          child.stdin.write(line + '\n');
+        } catch (e) {
+          // Synchronous throw on a destroyed pipe (a raced tmux death): fail
+          // THIS command now; the 'exit'/stdin-'error' handler fails the rest.
+          const idx = pending.indexOf(entry);
+          if (idx !== -1) pending.splice(idx, 1);
+          resolve({ ok: false, lines: [], error: `tmux stdin write failed: ${e.message}` });
+        }
       });
     },
     kill() {
