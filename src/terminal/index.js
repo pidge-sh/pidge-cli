@@ -52,10 +52,6 @@ module.exports = async function runTerminal(ctx) {
     return host.runHost(ctx, { tmuxBin, socketArgs });
   }
 
-  if (typeof WebSocket !== 'function') {
-    die('pidge terminal: needs a native WebSocket (Node ≥22) — frames ride the realtime socket, there is no polling floor for a terminal', 2);
-  }
-
   let name;
   let creating = false;
   if (sub[0] === 'attach') {
