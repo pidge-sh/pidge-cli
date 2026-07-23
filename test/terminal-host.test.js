@@ -272,6 +272,62 @@ test('terminal host: a vanished tmux session gets its row ended on the next inve
   await mock.stop();
 });
 
+test('terminal host: a replayed control spawn frame is DROPPED — a forged join cannot reset the seq guard', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const xdg = tmpDir('pidge-host-xdg-');
+  writeProfiles(xdg, '[[profile]]\nname = "Shell"\ncmd = "bash"\n');
+  const { child, result, out } = runHost(port, { FAKE_TMUX_DIR: makeFakeDir({}), XDG_CONFIG_HOME: xdg });
+  assert.ok(await waitFor(() => out.stdout.includes('"control_public_id"')), `stderr: ${out.stderr}`);
+  const ctrlPid = JSON.parse(out.stdout.trim().split('\n')[0]).control_public_id;
+
+  // a legit spawn at seq 1 lands one 'Shell' session
+  const v1 = connectViewer(port, ctrlPid);
+  assert.ok(await waitFor(() => v1.confirmed));
+  const spawnFrame = { t: 'spawn', seq: 1, profile: 'Shell' };
+  v1.sendFrame(sealCtrlViewer(ctrlPid, spawnFrame));
+  assert.ok(await waitFor(() => (mock.state.terminalPosts.filter((p) => /^Shell/.test(p.name || '')).length) >= 1), `spawn never landed; stderr: ${out.stderr}`);
+
+  // A hostile relay reconnects a viewer (fresh, forgeable join) and replays the
+  // SAME sealed spawn frame (seq 1). The join must NOT reset the guard, so the
+  // replay is dropped and NO second 'Shell-2' session is ever spawned.
+  v1.close();
+  const v2 = connectViewer(port, ctrlPid);
+  assert.ok(await waitFor(() => v2.confirmed));
+  v2.sendFrame(sealCtrlViewer(ctrlPid, spawnFrame)); // replay
+  v2.sendFrame(sealCtrlViewer(ctrlPid, { t: 'spawn', seq: 1, profile: 'Shell' })); // and again
+  await sleep(500);
+  assert.ok(!mock.state.terminalPosts.some((p) => p.name === 'Shell-2'), `a replayed spawn created a second session; posts: ${JSON.stringify(mock.state.terminalPosts.map((p) => p.name))}`);
+
+  child.kill('SIGTERM');
+  await result;
+  v2.close();
+  await mock.stop();
+});
+
+test('terminal host: a transient register failure is RETRIED on a later inventory pass (not hidden forever)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  // Fail the FIRST registration of the 'alpha' inventory row (the control lane
+  // registers under the hostname and is unaffected); the daemon must retry.
+  mock.state.terminalRegisterFailName = 'alpha';
+  mock.state.terminalRegisterFailTimes = 1;
+  const { child, result, out } = runHost(port, { FAKE_TMUX_DIR: makeFakeDir({ alpha: {} }) });
+  assert.ok(await waitFor(() => out.stdout.includes('"control_public_id"')), `stderr: ${out.stderr}`);
+
+  // first attempt 500s; a later pass re-POSTs and succeeds → alpha becomes a row
+  assert.ok(await waitFor(() => Object.values(mock.state.terminalSessions).some((r) => r.name === 'alpha'), 5000),
+    `alpha never registered after the transient failure; stderr: ${out.stderr}`);
+  const alphaPosts = mock.state.terminalPosts.filter((p) => p.name === 'alpha').length;
+  assert.ok(alphaPosts >= 2, `expected a retry (≥2 POSTs for alpha), saw ${alphaPosts}`);
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
+});
+
 test('terminal host: ONE per channel — a second host is refused (exit 2) while the first is live', { skip: !HAS_WS }, async () => {
   const mock = createMock();
   const port = await mock.start();

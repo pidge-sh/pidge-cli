@@ -52,15 +52,30 @@ function pidAlive(pid) {
 }
 function acquireLock(ctx) {
   const file = lockFile(ctx);
-  try {
-    const cur = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (cur && cur.pid && cur.pid !== process.pid && pidAlive(cur.pid)) {
-      ctx.die(`pidge terminal host: another host daemon is live for this channel (pid ${cur.pid}, since ${cur.at}) — one per channel. Stop it first, or check: ps -p ${cur.pid}`, 2);
-    }
-  } catch { /* absent or unreadable — claimable */ }
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }) + '\n', { mode: 0o600 });
-  return () => { try { fs.unlinkSync(file); } catch { /* already gone */ } };
+  const body = JSON.stringify({ pid: process.pid, at: new Date().toISOString() }) + '\n';
+  // ATOMIC claim ('wx' = O_CREAT|O_EXCL): the create itself is the lock, so
+  // two daemons starting at once cannot both win (a read-then-write would let
+  // both read "absent" and both proceed — double control lane, double attach).
+  // On EEXIST, adopt the file ONLY if its holder is dead (a crashed host).
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(file, 'wx', 0o600);
+      fs.writeSync(fd, body);
+      fs.closeSync(fd);
+      return () => { try { fs.unlinkSync(file); } catch { /* already gone */ } };
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let cur = null;
+      try { cur = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* unreadable ⇒ treat as stale */ }
+      if (cur && cur.pid && cur.pid !== process.pid && pidAlive(cur.pid)) {
+        ctx.die(`pidge terminal host: another host daemon is live for this channel (pid ${cur.pid}, since ${cur.at}) — one per channel. Stop it first, or check: ps -p ${cur.pid}`, 2);
+      }
+      // Stale/unreadable corpse — remove and retry the atomic create ONCE.
+      try { fs.unlinkSync(file); } catch { /* someone else took it — the retry's create will EEXIST again */ }
+    }
+  }
+  ctx.die('pidge terminal host: could not acquire the channel lock (a race with another starting host?) — retry in a moment', 2);
 }
 
 // A profile name becomes a tmux session name: whitelist charset, bounded,
@@ -138,6 +153,8 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
   const sealCtrl = (frame) => wire.sealFrame(mat.key, info.id, ctrl.pid, wire.AAD_CTRL_HOST, frame);
   const openCtrl = (data) => wire.openFrame(mat.key, info.id, ctrl.pid, wire.AAD_CTRL_VIEWER, data);
 
+  const recByPid = (pid) => [...records.values()].find((r) => r.entry.pid === pid);
+
   function publishState() {
     const list = [...records.values()].map((r) => ({ pid: r.entry.pid, name: r.name, cols: r.cols, rows: r.rows }));
     ctrlSub.send('frame', { data: sealCtrl({ t: 'sessions', seq: ++ctrlSeq, list }) });
@@ -152,12 +169,17 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
     ctrlInSeq = frame.seq;
     if (frame.t === 'spawn') return spawn(String(frame.profile || ''));
     if (frame.t === 'reseed') {
-      const rec = [...records.values()].find((r) => r.entry.pid === frame.pid);
-      if (rec) (await ensureAttached(rec)).seed();
+      // Repaint a session the viewer is ALREADY watching (attached). A
+      // reseed-by-pid for a session with no live tap is a no-op: the seed
+      // frames ride that session's own :out stream, which the viewer only
+      // consumes once it has subscribed (a subscribe sends the join that
+      // attaches). reseed() (not seed()) keeps viewers ≥ 1 so output flows.
+      const rec = recByPid(frame.pid);
+      if (rec && rec.attached) rec.attached.mirror.reseed();
       return;
     }
     if (frame.t === 'resize') {
-      const rec = [...records.values()].find((r) => r.entry.pid === frame.pid);
+      const rec = recByPid(frame.pid);
       if (!rec || !rec.attached) return; // resizing an unwatched session is a no-op
       const cols = Math.min(500, Math.max(20, parseInt(frame.cols, 10) || 0));
       const rows = Math.min(300, Math.max(5, parseInt(frame.rows, 10) || 0));
@@ -172,7 +194,17 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
     onFrame: (msg) => {
       if (!msg || typeof msg !== 'object') return;
       if (msg.sys === 'viewer') {
-        if (msg.ev === 'join') { ctrlInSeq = 0; publishState(); }
+        // Republish state so a fresh viewer sees the current sessions/profiles.
+        // We do NOT reset ctrlInSeq here: the join ping is the one UNSEALED,
+        // relay-forgeable message, and the control lane carries `spawn` — a
+        // reset would let a hostile relay forge a join and then replay a
+        // captured sealed spawn frame (seq > 0 again) to launch whitelisted
+        // profiles at will. The control seq is a high-water mark for the life
+        // of the control session; the viewer sends strictly increasing seq
+        // (never resets it on reconnect). This is stricter than the session
+        // lane's documented input-replay residual precisely because spawn
+        // starts processes, not just re-types keys.
+        if (msg.ev === 'join') publishState();
         return;
       }
       if (msg.dropped) { noteOnce(`pidge terminal host: relay dropped a control frame (${msg.reason})`); return; }
@@ -204,7 +236,10 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
       await execFileP(tmuxBin, args);
       await execFileP(tmuxBin, [...socketArgs, 'set-option', '-g', 'focus-events', 'on']).catch(() => {});
       note(`pidge terminal host: spawned '${name}' from profile ${JSON.stringify(p.name)}`);
-      await inventory(); // register + publish without waiting a tick
+      // Register + publish the new session promptly. If a periodic pass is
+      // already running, this coalesces into a follow-up run (inventoryPending)
+      // rather than no-op'ing until the next tick.
+      await inventory();
     } catch (e) {
       note(`pidge terminal host: spawn of ${JSON.stringify(p.name)} failed: ${e.message}`);
     }
@@ -214,7 +249,14 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
   async function ensureAttached(rec) {
     if (rec.attached) return rec.attached.mirror;
     if (rec.attaching) return rec.attaching;
-    rec.attaching = (async () => {
+    // The IIFE body is synchronous (createControl/createMirror are sync), so a
+    // `rec.attaching = null` INSIDE it would be clobbered by the outer
+    // assignment of the (already-resolved) promise, leaving attaching stuck
+    // non-null until onClose — a re-join in the detach→onClose window would
+    // then get the stale, stopped mirror and the session would stay dark.
+    // Clear it in .finally instead, which runs as a microtask AFTER the outer
+    // assignment lands.
+    const p = (async () => {
       // A fresh tap = a fresh epoch (output seq restarts; viewers reset).
       rec.entry = bumpSessionEntry(ctx, 'term', rec.name);
       const control = createControl({
@@ -223,7 +265,6 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
         onClose: async (reason) => {
           const wasDeliberate = rec.detaching || stopping;
           rec.attached = null;
-          rec.attaching = null;
           rec.detaching = false;
           if (wasDeliberate) return;
           // The tmux session died under the tap.
@@ -244,10 +285,10 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
         flushMs: limits.flushMs,
       });
       rec.attached = { control, mirror };
-      rec.attaching = null;
       note(`pidge terminal host: attached '${rec.name}' (epoch ${rec.entry.epoch}) — someone is watching`);
       return mirror;
     })();
+    rec.attaching = p.finally(() => { rec.attaching = null; });
     return rec.attaching;
   }
 
@@ -257,6 +298,10 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
     rec.attached.mirror.stop();
     rec.attached.control.kill();
     rec.attached = null;
+    // Clear any in-flight attach handle too, so a re-join in the same tick
+    // (before the control's onClose fires) starts a FRESH tap instead of
+    // returning this now-stopped one.
+    rec.attaching = null;
     note(`pidge terminal host: stood down from '${rec.name}' (${why}) — reattaches on the next viewer`);
   }
 
@@ -284,8 +329,15 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
 
   // ---- inventory -------------------------------------------------------------
   let inventoryRunning = false;
+  let inventoryPending = false;
   async function inventory() {
-    if (inventoryRunning || stopping) return;
+    if (stopping) return;
+    // A call that lands mid-pass does NOT no-op: it coalesces into a single
+    // follow-up run when the in-flight pass finishes. Without this, spawn()'s
+    // `await inventory()` (fired right after new-session) silently returned
+    // during a periodic pass, so the new session stayed unlisted until the
+    // next 5 s tick.
+    if (inventoryRunning) { inventoryPending = true; return; }
     inventoryRunning = true;
     try {
       let changed = reloadProfilesIfChanged();
@@ -299,14 +351,22 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
       for (const [name, size] of seen) {
         let rec = records.get(name);
         if (!rec) {
+          // Register BEFORE inserting into `records`: a failed (transient)
+          // registration must NOT leave a rec behind, or the next pass would
+          // take the cols/rows-only branch and never retry — the session would
+          // stay hidden for the daemon's whole life. bumpSessionEntry persists
+          // the public_id, so the retry re-registers the SAME id (idempotent).
+          const entry = bumpSessionEntry(ctx, 'term', name, { bump: false });
+          const reg = await registerSession(ctx, { publicId: entry.pid, name, kind: 'term' }, { fatal: false });
+          if (!reg.ok) {
+            noteOnce(`pidge terminal host: registering '${name}' failed (${reg.status}) — retrying on the next inventory pass`);
+            continue;
+          }
           rec = {
-            name, cols: size.cols, rows: size.rows,
-            entry: bumpSessionEntry(ctx, 'term', name, { bump: false }),
+            name, cols: size.cols, rows: size.rows, entry,
             attached: null, attaching: null, standTimer: null, detaching: false,
           };
           records.set(name, rec);
-          const reg = await registerSession(ctx, { publicId: rec.entry.pid, name, kind: 'term' }, { fatal: false });
-          if (!reg.ok) noteOnce(`pidge terminal host: registering '${name}' failed (${reg.status}) — it stays unlisted until the next inventory pass`);
           rec.sub = cable.subscribe({ session: rec.entry.pid }, {
             onUp: () => { if (rec.attached) rec.attached.mirror.onRelayUp(); },
             onFrame: (msg) => onSessionFrame(rec, msg),
@@ -333,6 +393,9 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
       if (changed) publishState();
     } finally {
       inventoryRunning = false;
+      // Drain a coalesced request (e.g. a spawn that landed mid-pass) so the
+      // new session appears within one pass, not a full inventory tick.
+      if (inventoryPending && !stopping) { inventoryPending = false; await inventory(); }
     }
   }
 

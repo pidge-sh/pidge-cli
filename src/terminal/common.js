@@ -35,8 +35,9 @@ async function fetchLimits(ctx) {
   } catch { /* shipped defaults double as the offline fallback */ }
   // Raw bytes per output frame: base64 + JSON + envelope ≈ 16/9 blow-up, so
   // stay at 9/16 of the cap with headroom — and never above the protocol's
-  // own 16 KB chunk.
-  limits.dataMax = Math.min(wire.DATA_MAX_BYTES, Math.floor((limits.frameCap * 9) / 16) - 512);
+  // own 16 KB chunk. Floored at 1 KB so a malformed/tiny manifest cap can
+  // never yield a non-positive chunk step (which would loop the flusher forever).
+  limits.dataMax = Math.max(1024, Math.min(wire.DATA_MAX_BYTES, Math.floor((limits.frameCap * 9) / 16) - 512));
   // Flush at half the allowed rate at most (coalescing is the contract).
   limits.flushMs = Math.max(parseInt(process.env.PIDGE_TERMINAL_FLUSH_MS || '80', 10) || 80,
     Math.ceil(2000 / Math.max(1, limits.fps)));
@@ -104,20 +105,22 @@ async function registerSession(ctx, { publicId, name, kind = 'term' }, { fatal =
     ctx.die(`pidge terminal: registering the session failed (network): ${e.message}`, 2);
   }
   await ctx.checkManifestNews(res);
+  if (res.status === 201) return { ok: true, status: 201, data };
+  // Any non-201. A daemon inventory row (fatal:false) must NEVER tear down the
+  // whole process on ONE bad row — including a 402/402 that only means a race
+  // (the control-lane register, which is fatal:true, already relayed the plan
+  // gate / e2e refusal): return and leave the row unlisted for a later pass.
+  if (!fatal) return { ok: false, status: res.status, data };
   if (res.status === 402) {
     // Typed plan gate — the message is written by the server to be RELAYED.
-    // Never retried: only the human upgrading changes the answer. Fatal even
-    // for the daemon: the whole feature is closed, not one row.
+    // Never retried: only the human upgrading changes the answer.
     ctx.die(`pidge: ${data.message || 'terminal mirroring is a Pro feature and this account is not on Pro'}\npidge: (plan gate — do not retry; everything else on this key keeps working)`, 2);
   }
   if (res.status === 422 && data.code === 'e2e_required') {
     ctx.die('pidge terminal: the server refused the register — this channel is not E2E (sealed-only is enforced server-side too). Ask your human to enable E2E in the app, then retry.', 2);
   }
-  if (res.status !== 201) {
-    if (!fatal) return { ok: false, status: res.status, data };
-    ctx.die(`pidge terminal: register failed (${res.status}): ${JSON.stringify(data)}`, 2);
-  }
-  return { ok: true, status: res.status, data };
+  ctx.die(`pidge terminal: register failed (${res.status}): ${JSON.stringify(data)}`, 2);
+  return { ok: false, status: res.status, data }; // unreachable (die exits) — keeps the shape honest
 }
 
 // Mark a session row ended. Best-effort by design: an unreachable server just

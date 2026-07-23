@@ -78,6 +78,10 @@ function createMock() {
     terminalPosts: [],         // every POST body (a 402 must never be retried)
     terminalDeletes: [],       // every DELETEd public_id
     terminalRequiresPro: false, // POST answers the typed 402 plan gate
+    // Fail the register POST for a specific session NAME N times (then succeed)
+    // — models a transient 5xx so a test can prove the daemon RETRIES the row.
+    terminalRegisterFailName: null,
+    terminalRegisterFailTimes: 0,
     terminalSubs: new Set(),   // live cable subs: {sock, role, session, identifier}
   };
   let server = null;
@@ -461,6 +465,10 @@ function createMock() {
         if (!state.e2eEnabled) {
           return json(res, 422, { error: 'terminal mirroring requires an end-to-end encrypted channel', code: 'e2e_required' });
         }
+        if (state.terminalRegisterFailTimes > 0 && p.name === state.terminalRegisterFailName) {
+          state.terminalRegisterFailTimes -= 1;
+          return json(res, 500, { error: 'transient' });
+        }
         const pid = String(p.public_id || '');
         if (!/^term_[a-z0-9-]{1,64}$/.test(pid)) {
           return json(res, 422, { error: 'bad public_id', code: 'invalid_public_id' });
@@ -574,17 +582,19 @@ function createMock() {
         if (f.command === 'subscribe') {
           const ident = JSON.parse(f.identifier);
           const channel = ident.channel;
-          state.subscriptions.push(channel);
-          state.subscribeIdentifiers.push(ident); // capture fingerprint/label params
           if (channel === 'TerminalChannel') {
             const role = wsToken.startsWith('ses_') ? 'viewer' : 'host';
             const row = state.terminalSessions[String(ident.session || '')];
             // Mirror prod's reject map: unknown session, or a host on a
-            // non-E2E channel (the sealed-only backstop).
+            // non-E2E channel (the sealed-only backstop). A REJECTED subscribe
+            // must NOT be recorded as confirmed — else a test asserting a
+            // successful subscribe via state.subscriptions would false-pass.
             if (!row || (role === 'host' && !state.e2eEnabled)) {
               sock.send(JSON.stringify({ type: 'reject_subscription', identifier: f.identifier }));
               return;
             }
+            state.subscriptions.push(channel);
+            state.subscribeIdentifiers.push(ident);
             state.terminalSubs.add({ sock, role, session: ident.session, identifier: f.identifier });
             sock.send(JSON.stringify({ type: 'confirm_subscription', identifier: f.identifier }));
             if (role === 'viewer') {
@@ -595,6 +605,8 @@ function createMock() {
             if (state.onSubscribe) state.onSubscribe(channel, sock);
             return;
           }
+          state.subscriptions.push(channel);
+          state.subscribeIdentifiers.push(ident); // capture fingerprint/label params
           // Real ActionCable tags every broadcast frame with the EXACT identifier
           // string the client sent (params included) — the client matches on it.
           // Track it per-socket so broadcast() echoes it faithfully (the
