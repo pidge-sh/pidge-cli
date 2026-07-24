@@ -5,6 +5,9 @@
 
 const { execFile } = require('node:child_process');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const wire = require('./wire');
 
 // tmux forbids ':' and '.' in session names; the mirror stays stricter (the
@@ -88,24 +91,63 @@ async function preflightSealed(ctx) {
   return { info, mat };
 }
 
+// The advisory channel link landed with server manifest v94 — prod stamps
+// X-Pidge-Manifest-Version on every response, so an older server is
+// detectable. On one, an unknown `linked_channel_id` param is SILENTLY dropped
+// by the permit — say so loudly instead of pretending the link stuck (the
+// echoed row is the belt when the header is missing).
+function warnLinkIgnoredByOldServer(res, data, link) {
+  const ver = parseInt(res.headers.get('x-pidge-manifest-version') || '0', 10) || 0;
+  const echoed = !!(data && data.terminal_session && ('linked_channel_id' in data.terminal_session));
+  if ((ver && ver < 94) || (!ver && !echoed)) {
+    console.error(`pidge terminal: this server (manifest v${ver || '?'}) predates linked_channel_id (v94) — the ${link.id === null ? 'link CLEAR' : `link to channel id ${link.id}`} was IGNORED (nothing stored or cleared). The session mirrors normally; re-run against an updated server to link it.`);
+  }
+}
+
 // POST the lifecycle row. `fatal` (the default) dies on failure — right for
 // the one session a mirror IS; the host daemon passes fatal:false for
 // inventory rows (one bad row must not kill the whole daemon) and gets
 // {ok, status, data} back instead.
-async function registerSession(ctx, { publicId, name, kind = 'term' }, { fatal = true } = {}) {
-  let res, data;
-  try {
-    res = await ctx.fetchT(`${ctx.BASE}/api/v1/terminal_sessions`, {
-      method: 'POST', headers: ctx.headers,
-      body: JSON.stringify({ public_id: publicId, name, kind }),
+// `link` (optional): { id: <integer|null>, source: 'flag'|'inferred' }.
+// Partial-upsert semantics ride through untouched: an OMITTED link keeps the
+// stored value server-side, an explicit null clears it — so the key is only
+// ever sent when the caller actually decided something.
+async function registerSession(ctx, { publicId, name, kind = 'term', link }, { fatal = true } = {}) {
+  const post = async (withLink) => {
+    const body = { public_id: publicId, name, kind };
+    if (withLink && link !== undefined) body.linked_channel_id = link.id;
+    const res = await ctx.fetchT(`${ctx.BASE}/api/v1/terminal_sessions`, {
+      method: 'POST', headers: ctx.headers, body: JSON.stringify(body),
     });
-    data = await res.json().catch(() => ({}));
+    const data = await res.json().catch(() => ({}));
+    return { res, data };
+  };
+  let res, data;
+  let sentLink = link !== undefined;
+  try {
+    ({ res, data } = await post(true));
   } catch (e) {
     if (!fatal) return { ok: false, status: 0, data: { error: e.message } };
     ctx.die(`pidge terminal: registering the session failed (network): ${e.message}`, 2);
   }
   await ctx.checkManifestNews(res);
-  if (res.status === 201) return { ok: true, status: 201, data };
+  // An INFERRED link the server refuses must never kill the mirror it was
+  // only meant to garnish: drop it, say so, register plain. An EXPLICIT
+  // --link is the user's ask — that refusal stays the loud exit below.
+  if (res.status === 422 && data.code === 'invalid_linked_channel' && link && link.source === 'inferred') {
+    console.error(`pidge terminal: the server refused the inferred channel link (id ${link.id}: ${data.error || 'invalid_linked_channel'}) — registering WITHOUT it. Pass --link <id> to set one explicitly.`);
+    sentLink = false;
+    try {
+      ({ res, data } = await post(false));
+    } catch (e) {
+      if (!fatal) return { ok: false, status: 0, data: { error: e.message } };
+      ctx.die(`pidge terminal: registering the session failed (network): ${e.message}`, 2);
+    }
+  }
+  if (res.status === 201) {
+    if (sentLink) warnLinkIgnoredByOldServer(res, data, link);
+    return { ok: true, status: 201, data };
+  }
   // Any non-201. A daemon inventory row (fatal:false) must NEVER tear down the
   // whole process on ONE bad row — including a 402/422 that only means a race
   // (the control-lane register, which is fatal:true, already relayed the plan
@@ -119,8 +161,70 @@ async function registerSession(ctx, { publicId, name, kind = 'term' }, { fatal =
   if (res.status === 422 && data.code === 'e2e_required') {
     ctx.die('pidge terminal: the server refused the register — this channel is not E2E (sealed-only is enforced server-side too). Ask your human to enable E2E in the app, then retry.', 2);
   }
+  if (res.status === 422 && data.code === 'invalid_linked_channel') {
+    // Loud by server design: a typo'd link must be visible, never degrade
+    // into "no chip". The id must name a channel of the SAME account.
+    ctx.die(`pidge terminal: the server REFUSED the channel link (--link ${link && link.id}): ${data.error || 'invalid_linked_channel'} — the id must be a channel of the same account (\`pidge whoami\` on that channel's key prints its id). Re-run with the right --link, or without it.`, 2);
+  }
   ctx.die(`pidge terminal: register failed (${res.status}): ${JSON.stringify(data)}`, 2);
   return { ok: false, status: res.status, data }; // unreachable (die exits) — keeps the shape honest
+}
+
+// The git-project toplevel for a directory: walk up to the first `.git` entry
+// (a dir in a checkout, a file in a linked worktree). $HOME is never a project
+// and outside any project is null — byte-for-byte the rule the CLI's
+// project-scoped identity uses, because the hash below must land on the SAME
+// ~/.config/pidge/projects/<hash> directory `setup` wrote.
+function projectRootFor(startDir) {
+  try {
+    let dir = startDir;
+    for (;;) {
+      try {
+        fs.statSync(path.join(dir, '.git'));
+        return dir === os.homedir() ? null : dir;
+      } catch { /* keep walking */ }
+      const up = path.dirname(dir);
+      if (up === dir) return null;
+      dir = up;
+    }
+  } catch { return null; }
+}
+
+// Advisory link inference: when the mirrored session's cwd lives inside a git
+// project that holds a project-scoped pidge env (~/.config/pidge/projects/
+// <hash>/env — the identity mechanism `setup` writes), the agent running
+// INSIDE this terminal is almost certainly that project's channel — link the
+// session to it so the Terminals tab shows provenance. CONSERVATIVE and LOUD:
+// any doubt (no project, no env, a different server, the mirror's own
+// channel, an unresolvable whoami) ⇒ no link with at most one note, never
+// fatal, never a retry loop. Explicit --link always wins and --no-link
+// disables — both are handled by the caller before this ever runs. The
+// project token is read only to ask whoami for its channel id; it is never
+// printed, stored or sent anywhere else.
+async function inferLinkedChannel(ctx, cwd) {
+  const root = projectRootFor(cwd);
+  if (!root) return undefined;
+  const hash = crypto.createHash('sha256').update(root).digest('hex').slice(0, 16);
+  const envFile = path.join(ctx.baseDir, 'projects', hash, 'env');
+  const env = ctx.readEnvFile(envFile);
+  if (!env.PIDGE_TOKEN) return undefined;                 // no project identity — the common case, no noise
+  if (env.PIDGE_TOKEN === ctx.TOKEN) return undefined;    // the mirror's own channel — a self-link adds nothing
+  const projBase = (env.PIDGE_URL || '').replace(/\/+$/, '');
+  if (projBase && projBase !== ctx.BASE.replace(/\/+$/, '')) {
+    ctx.note(`pidge terminal: this project's pidge env speaks to a different server (${projBase}) — session not linked`);
+    return undefined;
+  }
+  try {
+    const { res, data } = await ctx.fetchWhoami(ctx.BASE, env.PIDGE_TOKEN);
+    if (res.status === 200 && data.channel && data.channel.id != null) {
+      ctx.note(`pidge terminal: linking this session to channel ${JSON.stringify(data.channel.name || String(data.channel.id))} (id ${data.channel.id}) — inferred from this project's pidge env. --no-link disables; --link <id> overrides.`);
+      return { id: data.channel.id, source: 'inferred' };
+    }
+    ctx.note(`pidge terminal: this project has a pidge env but its channel could not be resolved (whoami ${res.status}) — session not linked`);
+  } catch (e) {
+    ctx.note(`pidge terminal: channel-link inference skipped (whoami failed: ${e.message}) — session not linked`);
+  }
+  return undefined;
 }
 
 // Mark a session row ended. Best-effort by design: an unreachable server just
@@ -136,5 +240,5 @@ async function endSession(ctx, publicId) {
 
 module.exports = {
   SESSION_NAME, execFileP, fetchLimits, bumpSessionEntry,
-  preflightSealed, registerSession, endSession,
+  preflightSealed, registerSession, endSession, inferLinkedChannel,
 };

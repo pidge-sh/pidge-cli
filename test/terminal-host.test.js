@@ -379,6 +379,152 @@ test('terminal host --install: launchd template on darwin — daemon args, NO ke
   assert.match(plist, /SuccessfulExit/);
 });
 
+// ---------------------------------------------------------------------------
+// --install --machine-channel: auto-create (or reuse) the HIDDEN machine
+// channel, key stored in the daemon's OWN scope — never the shared env.
+// ---------------------------------------------------------------------------
+
+function runInstall(port, env = {}) {
+  const child = spawn(process.execPath, [CLI, 'terminal', 'host', '--install', '--machine-channel'], {
+    env: {
+      ...process.env,
+      PIDGE_URL: `http://127.0.0.1:${port}`,
+      PIDGE_TOKEN: 'hld_test',
+      PIDGE_AGENT: '',
+      PIDGE_TERMINAL_PLATFORM: 'darwin',
+      PIDGE_QUIET_NAG: '1',
+      ...env,
+    },
+  });
+  const out = { code: null, stdout: '', stderr: '' };
+  child.stdout.on('data', (c) => { out.stdout += c; });
+  child.stderr.on('data', (c) => { out.stderr += c; });
+  const result = new Promise((resolve) => { child.on('exit', (code) => { out.code = code; resolve(out); }); });
+  return { result, out };
+}
+
+test('terminal host --install --machine-channel: mints the hidden channel, stores the key in the daemon scope, NEVER clobbers the shared env', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.manifestVersion = 94;
+  const home = tmpDir('pidge-mc-home-');
+  const xdg = tmpDir('pidge-mc-xdg-');
+  // a pre-existing SHARED env (another channel's key) that must stay untouched
+  const sharedEnv = path.join(xdg, 'pidge', 'env');
+  fs.mkdirSync(path.dirname(sharedEnv), { recursive: true });
+  fs.writeFileSync(sharedEnv, 'PIDGE_TOKEN=hld_someone_else\n');
+
+  const { result } = runInstall(port, { HOME: home, XDG_CONFIG_HOME: xdg });
+  const r = await result;
+  assert.strictEqual(r.code, 0, r.stderr);
+
+  // the create: hidden:true, named after the host
+  assert.strictEqual(mock.state.channelPosts.length, 1);
+  assert.strictEqual(mock.state.channelPosts[0].hidden, true);
+  assert.ok(String(mock.state.channelPosts[0].name).startsWith('🖥️ '), mock.state.channelPosts[0].name);
+
+  // the minted key lands in the DAEMON scope only — the shared env is untouched
+  const daemonEnv = path.join(xdg, 'pidge', 'agents', 'terminal-host', 'env');
+  const stored = fs.readFileSync(daemonEnv, 'utf8');
+  assert.match(stored, /PIDGE_TOKEN=hld_minted_/);
+  assert.match(stored, new RegExp(`PIDGE_URL=http://127\\.0\\.0\\.1:${port}`));
+  assert.strictEqual(fs.readFileSync(sharedEnv, 'utf8'), 'PIDGE_TOKEN=hld_someone_else\n');
+
+  // stdout JSON names the machine channel + its env file
+  const res = JSON.parse(r.stdout);
+  assert.strictEqual(res.machine_channel.hidden, true);
+  assert.strictEqual(res.machine_channel.reused, false);
+  assert.strictEqual(res.machine_channel.env_file, daemonEnv);
+
+  // the template pins the daemon to the machine scope and embeds NO key
+  const plist = fs.readFileSync(res.file, 'utf8');
+  assert.match(plist, /<key>PIDGE_AGENT<\/key><string>terminal-host<\/string>/);
+  assert.ok(!plist.includes('hld_minted'), 'the minted key must NEVER be embedded');
+  assert.ok(!plist.includes('hld_test'), 'the creator key must NEVER be embedded');
+
+  // sealed-only next steps are narrated (the fresh channel is not E2E yet)
+  assert.match(r.stderr, /sealed-only/);
+  assert.match(r.stderr, /PIDGE_SECRET/);
+  assert.match(r.stderr, /PIDGE_AGENT=terminal-host pidge doctor/);
+  await mock.stop();
+});
+
+test('terminal host --install --machine-channel: a re-install REUSES the stored machine channel — no duplicate mint', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.manifestVersion = 94;
+  const home = tmpDir('pidge-mc-home-');
+  const xdg = tmpDir('pidge-mc-xdg-');
+
+  const first = runInstall(port, { HOME: home, XDG_CONFIG_HOME: xdg });
+  assert.strictEqual((await first.result).code, 0, first.out.stderr);
+  assert.strictEqual(mock.state.channelPosts.length, 1);
+
+  const second = runInstall(port, { HOME: home, XDG_CONFIG_HOME: xdg });
+  const r2 = await second.result;
+  assert.strictEqual(r2.code, 0, r2.stderr);
+  assert.strictEqual(mock.state.channelPosts.length, 1, 'a re-install must never mint a second machine channel');
+  assert.match(r2.stderr, /reusing the machine channel/);
+  assert.strictEqual(JSON.parse(r2.stdout).machine_channel.reused, true);
+  await mock.stop();
+});
+
+test('terminal host: the installed machine scope WORKS — the daemon resolves key+URL from agents/terminal-host/env via PIDGE_AGENT, no ambient token', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.manifestVersion = 94;
+  mock.state.e2eEnabled = true;
+  const home = tmpDir('pidge-mc-home-');
+  const xdg = tmpDir('pidge-mc-xdg-');
+  const inst = runInstall(port, { HOME: home, XDG_CONFIG_HOME: xdg });
+  assert.strictEqual((await inst.result).code, 0, inst.out.stderr);
+  const envFile = path.join(xdg, 'pidge', 'agents', 'terminal-host', 'env');
+  // what the app's terminal step writes next to the token
+  fs.appendFileSync(envFile, `PIDGE_SECRET=${SECRET}\n`);
+
+  // The daemon exactly as launchd would run it: PIDGE_AGENT pins the scope,
+  // NO token/URL/secret in the environment — everything comes from the file.
+  const { child, result, out } = runHost(port, {
+    HOME: home, XDG_CONFIG_HOME: xdg, PIDGE_AGENT: 'terminal-host',
+    PIDGE_URL: '', PIDGE_TOKEN: '', PIDGE_SECRET: '', HERALD_URL: '', HERALD_TOKEN: '',
+    FAKE_TMUX_DIR: makeFakeDir({ alpha: {} }),
+  });
+  assert.ok(await waitFor(() => out.stdout.includes('"control_public_id"')), `daemon never came up from the machine scope; stderr: ${out.stderr}`);
+  assert.ok(mock.state.terminalPosts.some((p) => p.kind === 'control'));
+  child.kill('SIGTERM');
+  assert.strictEqual((await result).code, 0);
+  await mock.stop();
+});
+
+test('terminal host --install --machine-channel: a pre-v94 server is refused LOUDLY before anything is created', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.manifestVersion = 93; // today's prod: hidden:true would silently mint a VISIBLE channel
+  const xdg = tmpDir('pidge-mc-xdg-');
+  const { result } = runInstall(port, { HOME: tmpDir('pidge-mc-home-'), XDG_CONFIG_HOME: xdg });
+  const r = await result;
+  assert.strictEqual(r.code, 2);
+  assert.match(r.stderr, /VISIBLE/);
+  assert.match(r.stderr, /Nothing was created/);
+  assert.strictEqual(mock.state.channelPosts.length, 0);
+  assert.ok(!fs.existsSync(path.join(xdg, 'pidge', 'agents', 'terminal-host', 'env')));
+  await mock.stop();
+});
+
+test('terminal host --install --machine-channel: a foreign PIDGE_AGENT scope is refused (they would fight over the daemon env)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.manifestVersion = 94;
+  const { result } = runInstall(port, {
+    HOME: tmpDir('pidge-mc-home-'), XDG_CONFIG_HOME: tmpDir('pidge-mc-xdg-'), PIDGE_AGENT: 'myagent',
+  });
+  const r = await result;
+  assert.strictEqual(r.code, 1);
+  assert.match(r.stderr, /PIDGE_AGENT/);
+  assert.strictEqual(mock.state.channelPosts.length, 0);
+  await mock.stop();
+});
+
 test('terminal host --install: systemd template on linux — unit shape, NO key embedded', async () => {
   const xdg = tmpDir('pidge-install-xdg-');
   const install = spawn(process.execPath, [CLI, 'terminal', 'host', '--install'], {

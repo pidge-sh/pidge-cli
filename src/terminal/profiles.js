@@ -1,5 +1,5 @@
 'use strict';
-// Spawn profiles — the whitelist that lives ON THE MAC, never server-side.
+// Spawn profiles — the whitelist that lives ON THE MACHINE, never server-side.
 // A viewer can only ever NAME a profile; the command line, cwd and everything
 // executable exist only in this file, owned by the human:
 //
@@ -69,7 +69,7 @@ function parseProfiles(text) {
 }
 
 // The whitelist path is MACHINE-level on purpose (the base pidge dir, never
-// the per-agent scope): what may be spawned on this Mac is one human
+// the per-agent scope): what may be spawned on this machine is one human
 // decision, not a per-agent one.
 function profilesPath(baseDir) {
   return path.join(baseDir, 'terminal.toml');

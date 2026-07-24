@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.35.0 — 2026-07-24
+
+**Pidge Terminal: the machine channel + advisory session links** (server ≥ manifest
+v94 — the CLI detects an older server and degrades LOUDLY, never silently).
+
+- **`pidge terminal host --install --machine-channel`** — the daemon no longer needs
+  a pre-existing channel. The installer creates a **hidden** machine channel
+  (`🖥️ <hostname>`) with your existing key — hidden channels stay off the human's
+  Channels tab but are fully functional; the app's Terminals tab is their home — or
+  **reuses** the one a previous install minted (a re-install never creates a
+  duplicate; only a dead 401 key is replaced). The minted key is stored in the
+  daemon's **own identity scope** (`~/.config/pidge/agents/terminal-host/env`, chmod
+  600): the shared machine env and every project env are **never touched**, and the
+  generated launchd/systemd template pins `PIDGE_AGENT=terminal-host` so the running
+  daemon (and `PIDGE_AGENT=terminal-host pidge doctor`) resolves the same scope with
+  zero new machinery. Sealed-only is unchanged: the fresh channel is born non-E2E,
+  so the installer prints the exact next steps (enable E2E in the app;
+  `PIDGE_SECRET` lands next to the token) instead of pretending. On a pre-v94
+  server the create is refused **before** anything happens — `hidden:true` would be
+  silently dropped there and mint a channel visible in the human's app.
+- **`--link <channel-id>` / `--no-link`** on `pidge terminal` and
+  `pidge terminal attach` — the session upsert carries `linked_channel_id`:
+  ADVISORY provenance ("this terminal runs channel X's agent") the Terminals tab
+  can chip; it never changes delivery, auth or relay behavior. Partial-upsert
+  semantics ride through honestly: omitted keeps the stored link, `--no-link` sends
+  an **explicit null** that clears it. A bad or foreign id is the server's loud
+  `422 invalid_linked_channel` — surfaced as exit `2`, never silently dropped.
+- **Link inference** (wrapper + attach, when neither flag is passed): if the
+  session's cwd lives in a git project holding a project-scoped pidge env
+  (`~/.config/pidge/projects/<hash>/env`), that project's channel is linked
+  automatically — loudly (the note names the channel), conservatively (no project,
+  no env, a different server, the mirror's own channel, an unresolvable whoami ⇒ no
+  link), and never fatally: a refused **inferred** link re-registers without it.
+- On a pre-v94 server, a requested link is registered fine but IGNORED by the
+  server's permit — the CLI says so on stderr instead of pretending it stuck.
+- Docs: host/daemon wording says **machine** (Linux/systemd is first-class; WSL
+  works) — "Mac" now only where it means the Pidge Mac viewer app.
+
 ## 0.34.0 — 2026-07-22
 
 **Pidge Terminal (part 2): `pidge terminal host` — the always-on daemon.** One

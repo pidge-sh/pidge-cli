@@ -10,7 +10,7 @@
 //     grace period) — flow control, not delivery policy,
 //   · executes `spawn` STRICTLY from the profile whitelist in
 //     ~/.config/pidge/terminal.toml (a viewer names a profile; the command
-//     line only ever exists on this Mac),
+//     line only ever exists on this machine),
 //   · installs itself under launchd/systemd with `--install` (a template —
 //     the channel key is NEVER embedded).
 //
@@ -223,7 +223,7 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
   async function spawn(profileName) {
     const p = prof.profiles.find((x) => x.name === profileName);
     if (!p) {
-      note(`pidge terminal host: spawn REFUSED — ${JSON.stringify(profileName)} is not in the whitelist (${profilesPath(ctx.baseDir)}). A viewer can only name a profile; commands live on this Mac.`);
+      note(`pidge terminal host: spawn REFUSED — ${JSON.stringify(profileName)} is not in the whitelist (${profilesPath(ctx.baseDir)}). A viewer can only name a profile; commands live on this machine.`);
       return;
     }
     const name = deriveSessionName(p.name, new Set(records.keys()));
@@ -433,28 +433,156 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
 }
 
 // ---------------------------------------------------------------------------
-// `pidge terminal host --install` — write the launchd (Mac) / systemd user
+// The MACHINE CHANNEL — a hidden sibling channel dedicated to the daemon
+// (server ≥ manifest v94), minted with the ambient channel key (the sibling
+// inherits the creator's urgency ceiling) so `--install --machine-channel`
+// needs no pre-existing dedicated channel. Its key lives in the daemon's OWN
+// identity scope — the PIDGE_AGENT mechanism, under a reserved id — so the
+// shared machine env and every project env stay untouched (a global one-liner
+// once overwrote another channel's secret; never again). The generated
+// template pins PIDGE_AGENT to that id, so the running daemon (and a
+// `PIDGE_AGENT=terminal-host pidge doctor`) resolves the same scope with the
+// CLI's existing machinery: env file, state, E2E pin, fingerprint — all
+// isolated for free.
+// ---------------------------------------------------------------------------
+const MACHINE_AGENT_ID = 'terminal-host';
+
+function machineEnvFile(ctx) {
+  return path.join(ctx.baseDir, 'agents', MACHINE_AGENT_ID, 'env');
+}
+
+// Returns { id, name, hidden, reused, envFile, e2eEnabled, hasSecret }.
+// Idempotent by construction: a stored daemon env that still authenticates is
+// REUSED (never a duplicate on re-install); only a missing env or a dead key
+// (401 — rotated/revoked) mints a fresh hidden channel.
+async function ensureMachineChannel(ctx) {
+  const envFile = machineEnvFile(ctx);
+  const stored = ctx.readEnvFile(envFile);
+  if (stored.PIDGE_TOKEN) {
+    let who;
+    try {
+      who = await ctx.fetchWhoami((stored.PIDGE_URL || ctx.BASE).replace(/\/+$/, ''), stored.PIDGE_TOKEN);
+    } catch (e) {
+      ctx.die(`pidge: terminal host install — cannot verify the stored machine channel (${envFile}): ${e.message}. Refusing to mint a duplicate blind; retry when the server is reachable.`, 2);
+    }
+    if (who.res.status === 200 && who.data.channel) {
+      const ch = who.data.channel;
+      if (ch.hidden !== true) {
+        console.error(`pidge: terminal host install — note: the machine channel ${JSON.stringify(ch.name)} is VISIBLE in the app's Channels tab (created before the server knew hidden channels, or un-hidden by your human). It still works; hiding is human-only, from the app.`);
+      }
+      console.error(`pidge: terminal host install — reusing the machine channel ${JSON.stringify(ch.name)} (key already at ${envFile})`);
+      return {
+        id: ch.id, name: ch.name, hidden: ch.hidden === true, reused: true, envFile,
+        e2eEnabled: !!ch.e2e_enabled, hasSecret: !!stored.PIDGE_SECRET,
+      };
+    }
+    if (who.res.status !== 401) {
+      ctx.die(`pidge: terminal host install — the stored machine-channel key could not be verified (whoami ${who.res.status}). Refusing to mint a duplicate; fix the server side first (\`PIDGE_AGENT=${MACHINE_AGENT_ID} pidge doctor\`).`, 2);
+    }
+    // 401 = a corpse (rotated/revoked) — overwriting it needs no ceremony.
+    console.error(`pidge: terminal host install — the stored machine-channel key (${envFile}) is DEAD (401: rotated or revoked); minting a fresh hidden channel.`);
+  }
+
+  // Version gate BEFORE creating anything: a pre-v94 server ignores the
+  // unknown `hidden` param and would mint the channel VISIBLE in the human's
+  // Channels tab — degrade loudly instead of pretending (the header rides
+  // every authenticated response, so the whoami below is also the key check).
+  let who;
+  try {
+    who = await ctx.fetchWhoami(ctx.BASE, ctx.TOKEN);
+  } catch (e) {
+    ctx.die(`pidge: terminal host install — cannot reach the server to create the machine channel: ${e.message}`, 2);
+  }
+  if (who.res.status !== 200 || !who.data.channel) {
+    ctx.die(`pidge: terminal host install — this install's channel key did not verify (whoami ${who.res.status}) — the machine channel is minted WITH it (the new channel inherits its urgency ceiling). Fix the key (\`pidge doctor\`), then retry.`, 2);
+  }
+  const ver = parseInt(who.res.headers.get('x-pidge-manifest-version') || '0', 10) || 0;
+  if (ver < 94) {
+    ctx.die([
+      `pidge: terminal host install — this server (manifest v${ver || '?'}) predates hidden channels (v94): creating now would mint a channel VISIBLE in your human's Channels tab instead of a quiet machine channel. Nothing was created.`,
+      'Either update the server and re-run, or skip --machine-channel and point the daemon at a channel you created normally.',
+    ].join('\n'), 2);
+  }
+
+  const hostLabel = `🖥️ ${os.hostname().split('.')[0] || 'host'}`;
+  let res, data;
+  try {
+    res = await ctx.fetchT(`${ctx.BASE}/api/v1/channels`, {
+      method: 'POST', headers: ctx.headers,
+      body: JSON.stringify({ name: hostLabel, hidden: true }),
+    });
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    ctx.die(`pidge: terminal host install — creating the machine channel failed (network): ${e.message}`, 2);
+  }
+  await ctx.checkManifestNews(res);
+  if (!(res.status >= 200 && res.status < 300)) {
+    ctx.die(`pidge: terminal host install — creating the machine channel failed (${res.status}): ${JSON.stringify(data)}`, 2);
+  }
+  const ch = (data && data.channel) || data || {};
+  if (!ch.key) {
+    ctx.die('pidge: terminal host install — the server answered 201 without the new channel key; cannot store the machine identity (nothing written).', 2);
+  }
+  if (ch.hidden !== true) {
+    // Belt over the version gate: never PRETEND the channel is hidden.
+    console.error(`pidge: terminal host install — WARNING: the server did not confirm hidden:true — ${JSON.stringify(ch.name || hostLabel)} may be VISIBLE in the app's Channels tab. It works either way; your human can delete it if unwanted.`);
+  }
+  const dir = path.dirname(envFile);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // A fresh channel gets a FRESH file on purpose: a corpse's PIDGE_SECRET
+  // belonged to the dead channel's E2E and must never bleed into this one.
+  fs.writeFileSync(envFile, `PIDGE_URL=${ctx.BASE.replace(/\/+$/, '')}\nPIDGE_TOKEN=${ch.key}\n`, { mode: 0o600 });
+  try { fs.chmodSync(envFile, 0o600); } catch { /* mode set on create */ }
+  console.error(`pidge: terminal host install — machine channel ${JSON.stringify(ch.name || hostLabel)} created${ch.hidden === true ? ' HIDDEN (it never appears in the Channels tab; the Terminals tab is its home)' : ''} — key written to ${envFile} (chmod 600, never displayed; no other pidge env was touched).`);
+  return {
+    id: ch.id, name: ch.name || hostLabel, hidden: ch.hidden === true, reused: false, envFile,
+    e2eEnabled: false, hasSecret: false,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// `pidge terminal host --install` — write the launchd (macOS) / systemd user
 // (Linux) TEMPLATE that keeps the daemon running. Same contract as the
 // bridge's installer: review-then-enable, Restart=on-failure semantics, the
-// channel key NEVER embedded (it stays in the config file).
+// channel key NEVER embedded (it stays in the config file). With
+// --machine-channel, the daemon gets its own hidden channel + identity scope
+// first (above), and the template pins PIDGE_AGENT to that scope.
 // ---------------------------------------------------------------------------
-function installHost(ctx) {
+async function installHost(ctx) {
   const platform = process.env.PIDGE_TERMINAL_PLATFORM || process.platform;
   const nodeBin = process.execPath;
   const cli = require.resolve('../../bin/pidge.js');
-  const agentId = (process.env.PIDGE_AGENT || '').trim().replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 64);
+  const machine = !!ctx.values['machine-channel'];
+  const ambientAgent = (process.env.PIDGE_AGENT || '').trim();
+  let mc = null;
+  if (machine) {
+    if (ambientAgent && ambientAgent !== MACHINE_AGENT_ID) {
+      ctx.die(`pidge: terminal host install — --machine-channel manages its own identity scope (PIDGE_AGENT=${MACHINE_AGENT_ID}); unset PIDGE_AGENT=${ambientAgent} first, or install without --machine-channel to keep that scope.`, 1);
+    }
+    mc = await ensureMachineChannel(ctx);
+  }
+  const agentId = machine
+    ? MACHINE_AGENT_ID
+    : ambientAgent.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 64);
   const nameSuffix = agentId ? `.${agentId}` : '';
   const envPairs = {};
   for (const k of ['PIDGE_URL', 'PIDGE_AGENT', 'XDG_CONFIG_HOME', 'PIDGE_TMUX_BIN', 'PIDGE_TMUX_SOCKET', 'PATH']) {
     if (process.env[k]) envPairs[k] = process.env[k];
   }
-  if (!ctx.tokenFromFile) {
+  if (machine) {
+    // The daemon's whole identity (key, URL, secret, pins) lives in the
+    // machine scope — pin it in the template; the URL rides the env file.
+    envPairs.PIDGE_AGENT = MACHINE_AGENT_ID;
+    delete envPairs.PIDGE_URL;
+  }
+  if (!machine && !ctx.tokenFromFile) {
     console.error(`pidge: terminal host install — WARNING: your key lives ONLY in this shell's env; the daemon won't inherit it (the template NEVER embeds secrets). Put it in the config file first — re-run \`pidge setup --claim <code>\`, or write PIDGE_TOKEN=… to the env file yourself (chmod 600).`);
   }
   if (/[\\/]_npx[\\/]/.test(cli)) {
     console.error('pidge: terminal host install — WARNING: this CLI is running from the npx CACHE — the generated template points into it and BREAKS when npx prunes. Install it durably first (npm i -g pidge-cli) and re-run.');
   }
 
+  const keyHome = mc ? mc.envFile : '~/.config/pidge/env';
   let file, enable;
   if (platform === 'darwin') {
     const label = `sh.pidge.terminal-host${nameSuffix}`;
@@ -466,7 +594,7 @@ function installHost(ctx) {
 <plist version="1.0">
 <!-- generated by \`pidge terminal host --install\`. A TEMPLATE: review, then
      launchctl load -w <this file>
-     The channel key stays in ~/.config/pidge/env — NEVER embedded here. -->
+     The channel key stays in ${xmlEscape(keyHome)} — NEVER embedded here. -->
 <dict>
   <key>Label</key><string>${xmlEscape(label)}</string>
   <key>ProgramArguments</key>
@@ -498,7 +626,7 @@ ${envBlock}  <key>StandardOutPath</key><string>${xmlEscape(path.join(ctx.configD
     const envLines = Object.entries(envPairs).map(([k, val]) => `Environment=${systemdQuote(`${k}=${val}`)}`).join('\n');
     const unit = `# generated by \`pidge terminal host --install\`. A TEMPLATE: review, then
 #   systemctl --user daemon-reload && systemctl --user enable --now ${name}
-# The channel key stays in ~/.config/pidge/env — NEVER embedded here.
+# The channel key stays in ${keyHome} — NEVER embedded here.
 [Unit]
 Description=pidge terminal host — sealed tmux mirror daemon (Terminals tab)
 Wants=network-online.target
@@ -523,8 +651,22 @@ WantedBy=default.target
   console.error(`pidge: terminal host install — template written to ${file} (Restart=on-failure semantics; logs → ${path.join(ctx.configDir, 'terminal-host.log')})`);
   console.error(`pidge: enable it with:  ${enable}`);
   console.error(`pidge: spawn profiles live in ${profilesPath(ctx.baseDir)} — entries like:\n${PROFILE_EXAMPLE}`);
-  console.log(JSON.stringify({ ok: true, file, platform: platform === 'darwin' ? 'launchd' : 'systemd' }, null, 2));
+  if (mc && (!mc.e2eEnabled || !mc.hasSecret)) {
+    // Sealed-only posture: the daemon will refuse to register sessions until
+    // the machine channel is E2E and its secret sits next to the token. Both
+    // steps are human-only by design — narrate them instead of pretending.
+    console.error([
+      `pidge: machine channel — NOT end-to-end encrypted yet, and terminal mirroring is sealed-only, so the daemon will refuse until that flips:`,
+      `  1. your human turns ON E2E for ${JSON.stringify(mc.name)} in the Pidge app (the Terminals onboarding handles the hidden channel),`,
+      `  2. the app's TERMINAL step writes PIDGE_SECRET next to the token — run that command prefixed with PIDGE_AGENT=${MACHINE_AGENT_ID} so it lands in ${mc.envFile} (never paste the secret in chat),`,
+      `  3. verify with: PIDGE_AGENT=${MACHINE_AGENT_ID} pidge doctor`,
+    ].join('\n'));
+  }
+  console.log(JSON.stringify({
+    ok: true, file, platform: platform === 'darwin' ? 'launchd' : 'systemd',
+    ...(mc ? { machine_channel: { id: mc.id, name: mc.name, hidden: mc.hidden, reused: mc.reused, env_file: mc.envFile } } : {}),
+  }, null, 2));
   process.exit(0);
 }
 
-module.exports = { runHost, installHost, deriveSessionName };
+module.exports = { runHost, installHost, deriveSessionName, MACHINE_AGENT_ID };
