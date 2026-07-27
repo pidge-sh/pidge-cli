@@ -42,9 +42,10 @@ const sealInput = (pid, frame) => sealBlob(pid, 'terminal_input', frame);       
 const sealCtrlViewer = (pid, frame) => sealBlob(pid, 'terminal_ctrl_viewer', frame); // roaming reseed/resize
 const openOutput = (pid, data) => JSON.parse(e2eDecryptBlob(KEY, e2eAad(1, pid, 'terminal_output'), Buffer.from(data, 'base64')).toString('utf8'));
 
-function runCli(args, port, env = {}) {
+function runCli(args, port, env = {}, opts = {}) {
   const fakeDir = env.FAKE_TMUX_DIR || tmpDir('pidge-faketmux-');
   const child = spawn(process.execPath, [CLI, ...args], {
+    ...(opts.cwd ? { cwd: opts.cwd } : {}),
     env: {
       ...process.env,
       PIDGE_URL: `http://127.0.0.1:${port}`,
@@ -370,7 +371,7 @@ test('terminal (REAL tmux): sealed seed + typed command echoes back through the 
   }
 });
 
-test('terminal: usage errors are exit 1 (bad subcommand, bad --name)', async () => {
+test('terminal: usage errors are exit 1 (bad subcommand, bad --name, bad --link, misplaced flags)', async () => {
   const mock = createMock();
   const port = await mock.start();
   const bad = runCli(['terminal', 'bogus'], port, {});
@@ -379,5 +380,173 @@ test('terminal: usage errors are exit 1 (bad subcommand, bad --name)', async () 
   const r = await badName.result;
   assert.strictEqual(r.code, 1);
   assert.match(r.stderr, /session name/);
+  // --link takes the channel's NUMERIC id — anything else refuses before side effects
+  const badLink = runCli(['terminal', 'attach', 'work', '--link', 'abc'], port, {});
+  const rl = await badLink.result;
+  assert.strictEqual(rl.code, 1);
+  assert.match(rl.stderr, /numeric id/);
+  assert.strictEqual(mock.state.terminalPosts.length, 0);
+  // --link and --no-link conflict
+  const both = runCli(['terminal', 'attach', 'work', '--link', '7', '--no-link'], port, {});
+  assert.strictEqual((await both.result).code, 1);
+  // link flags don't apply to the daemon; --machine-channel only to host --install
+  const hostLink = runCli(['terminal', 'host', '--link', '3'], port, {});
+  const rh = await hostLink.result;
+  assert.strictEqual(rh.code, 1);
+  assert.match(rh.stderr, /wrapper\/attach/);
+  const wrapMachine = runCli(['terminal', '--machine-channel'], port, {});
+  const rw = await wrapMachine.result;
+  assert.strictEqual(rw.code, 1);
+  assert.match(rw.stderr, /host --install/);
+  await mock.stop();
+});
+
+// ---------------------------------------------------------------------------
+// Advisory channel link (server ≥ manifest v94): --link / --no-link on the
+// wrapper+attach upsert, project-env inference, the loud 422, and the
+// old-server degrade. All ADVISORY — nothing here touches frames or sealing.
+// ---------------------------------------------------------------------------
+
+test('terminal --link: linked_channel_id rides the register upsert (integer, echoed, no warning)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.manifestVersion = 94;
+  const { child, result, out } = runCli(['terminal', 'attach', 'work', '--link', '7'], port, { FAKE_TMUX_DIR: makeFakeDir({ work: {} }) });
+  assert.ok(await waitFor(() => mock.state.terminalPosts.length >= 1), `stderr: ${out.stderr}`);
+  assert.strictEqual(mock.state.terminalPosts[0].linked_channel_id, 7);
+  assert.ok(await waitFor(() => out.stdout.includes('"public_id"')), `stderr: ${out.stderr}`);
+  assert.match(out.stderr, /linking this session to channel id 7/);
+  assert.doesNotMatch(out.stderr, /IGNORED/);
+  child.kill('SIGINT');
+  await result;
+  await mock.stop();
+});
+
+test('terminal --no-link: an EXPLICIT null clears the stored link (partial upsert: omitted keeps, null clears)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.manifestVersion = 94;
+  const { child, result, out } = runCli(['terminal', 'attach', 'work', '--no-link'], port, { FAKE_TMUX_DIR: makeFakeDir({ work: {} }) });
+  assert.ok(await waitFor(() => mock.state.terminalPosts.length >= 1), `stderr: ${out.stderr}`);
+  const post = mock.state.terminalPosts[0];
+  assert.ok('linked_channel_id' in post, 'the clear must be an EXPLICIT null, not an omission');
+  assert.strictEqual(post.linked_channel_id, null);
+  assert.ok(await waitFor(() => out.stdout.includes('"public_id"')), `stderr: ${out.stderr}`);
+  child.kill('SIGINT');
+  await result;
+  await mock.stop();
+});
+
+test('terminal --link: a plain register (no flags, no project env) sends NO linked_channel_id — omission keeps the stored value', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.manifestVersion = 94;
+  const { child, result, out } = runCli(['terminal', 'attach', 'work'], port, { FAKE_TMUX_DIR: makeFakeDir({ work: {} }) });
+  assert.ok(await waitFor(() => mock.state.terminalPosts.length >= 1), `stderr: ${out.stderr}`);
+  assert.ok(!('linked_channel_id' in mock.state.terminalPosts[0]), 'no decision ⇒ the key must be omitted entirely');
+  child.kill('SIGINT');
+  await result;
+  await mock.stop();
+});
+
+test('terminal --link: the server\'s 422 invalid_linked_channel is surfaced LOUDLY (exit 2, no retry, no silent drop)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.manifestVersion = 94;
+  mock.state.rejectLink = true;
+  const { result } = runCli(['terminal', 'attach', 'work', '--link', '999'], port, { FAKE_TMUX_DIR: makeFakeDir({ work: {} }) });
+  const r = await result;
+  assert.strictEqual(r.code, 2);
+  assert.match(r.stderr, /REFUSED the channel link/);
+  assert.match(r.stderr, /--link 999/);
+  await sleep(200);
+  assert.strictEqual(mock.state.terminalPosts.length, 1, 'an explicit refused link must never be retried');
+  await mock.stop();
+});
+
+test('terminal --link on a pre-v94 server: register succeeds but the CLI says LOUDLY the link was ignored', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.manifestVersion = 93; // today's prod — the param is silently dropped by the permit
+  const { child, result, out } = runCli(['terminal', 'attach', 'work', '--link', '7'], port, { FAKE_TMUX_DIR: makeFakeDir({ work: {} }) });
+  assert.ok(await waitFor(() => out.stdout.includes('"public_id"')), `stderr: ${out.stderr}`);
+  assert.ok(await waitFor(() => /predates linked_channel_id/.test(out.stderr)), `no old-server warning; stderr: ${out.stderr}`);
+  assert.match(out.stderr, /IGNORED/);
+  child.kill('SIGINT');
+  await result;
+  await mock.stop();
+});
+
+// The inference setup: a git project whose toplevel hashes to a project-scoped
+// pidge env (~/.config/pidge/projects/<hash>/env) holding ANOTHER channel's
+// token — the wrapper started inside it must link that channel automatically.
+function makeLinkedProject(xdg, port, token = 'hld_project') {
+  const projDir = fs.realpathSync(tmpDir('pidge-proj-')); // realpath: the child's process.cwd() is kernel-resolved
+  fs.mkdirSync(path.join(projDir, '.git'));
+  const crypto = require('node:crypto');
+  const hash = crypto.createHash('sha256').update(projDir).digest('hex').slice(0, 16);
+  const envDir = path.join(xdg, 'pidge', 'projects', hash);
+  fs.mkdirSync(envDir, { recursive: true });
+  fs.writeFileSync(path.join(envDir, 'env'), `PIDGE_URL=http://127.0.0.1:${port}\nPIDGE_TOKEN=${token}\n`);
+  return projDir;
+}
+
+test('terminal wrapper: the project-env inference links the project\'s channel — loudly, resolved via whoami', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.manifestVersion = 94;
+  mock.state.whoamiChannels.hld_project = { id: 9, name: 'proj-agent' };
+  const xdg = tmpDir('pidge-term-xdg-');
+  const projDir = makeLinkedProject(xdg, port);
+  const { child, result, out } = runCli(['terminal', '--name', 'job'], port, { XDG_CONFIG_HOME: xdg }, { cwd: projDir });
+  assert.ok(await waitFor(() => mock.state.terminalPosts.length >= 1), `stderr: ${out.stderr}`);
+  assert.strictEqual(mock.state.terminalPosts[0].linked_channel_id, 9);
+  assert.match(out.stderr, /linking this session to channel "proj-agent" \(id 9\)/);
+  assert.match(out.stderr, /inferred from this project/);
+  child.kill('SIGINT');
+  await result;
+  await mock.stop();
+});
+
+test('terminal wrapper: --no-link DISABLES the inference (explicit beats inferred)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.manifestVersion = 94;
+  mock.state.whoamiChannels.hld_project = { id: 9, name: 'proj-agent' };
+  const xdg = tmpDir('pidge-term-xdg-');
+  const projDir = makeLinkedProject(xdg, port);
+  const { child, result, out } = runCli(['terminal', '--name', 'job', '--no-link'], port, { XDG_CONFIG_HOME: xdg }, { cwd: projDir });
+  assert.ok(await waitFor(() => mock.state.terminalPosts.length >= 1), `stderr: ${out.stderr}`);
+  assert.strictEqual(mock.state.terminalPosts[0].linked_channel_id, null);
+  assert.doesNotMatch(out.stderr, /inferred/);
+  child.kill('SIGINT');
+  await result;
+  await mock.stop();
+});
+
+test('terminal wrapper: a REFUSED inferred link never kills the mirror — it re-registers without it, loudly', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  mock.state.manifestVersion = 94;
+  mock.state.rejectLink = true; // models an unknown/foreign id refusal
+  mock.state.whoamiChannels.hld_project = { id: 9, name: 'proj-agent' };
+  const xdg = tmpDir('pidge-term-xdg-');
+  const projDir = makeLinkedProject(xdg, port);
+  const { child, result, out } = runCli(['terminal', '--name', 'job'], port, { XDG_CONFIG_HOME: xdg }, { cwd: projDir });
+  assert.ok(await waitFor(() => out.stdout.includes('"public_id"')), `mirror never started; stderr: ${out.stderr}`);
+  assert.match(out.stderr, /refused the inferred channel link/);
+  assert.strictEqual(mock.state.terminalPosts.length, 2);
+  assert.strictEqual(mock.state.terminalPosts[0].linked_channel_id, 9);
+  assert.ok(!('linked_channel_id' in mock.state.terminalPosts[1]), 'the retry must register WITHOUT the link');
+  child.kill('SIGINT');
+  await result;
   await mock.stop();
 });

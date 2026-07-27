@@ -1,5 +1,5 @@
 'use strict';
-// `pidge terminal` — mirror a real tmux session to the human's phone/Mac,
+// `pidge terminal` — mirror a real tmux session to the human's phone/Mac app,
 // live, with input coming back. The agent running INSIDE tmux needs no
 // integration: this process is a transparent tap (tmux control mode) that
 // seals every frame with the channel key and relays through the server,
@@ -21,10 +21,10 @@ const { createMirror } = require('./mirror');
 const wire = require('./wire');
 const {
   SESSION_NAME, execFileP, fetchLimits, bumpSessionEntry,
-  preflightSealed, registerSession, endSession,
+  preflightSealed, registerSession, endSession, inferLinkedChannel,
 } = require('./common');
 
-const USAGE = 'pidge: usage: pidge terminal [--name NAME] [-- CMD…]  ·  pidge terminal attach <tmux-session>  ·  pidge terminal host [--install]';
+const USAGE = 'pidge: usage: pidge terminal [--name NAME] [--link ID | --no-link] [-- CMD…]  ·  pidge terminal attach <tmux-session> [--link ID | --no-link]  ·  pidge terminal host [--install [--machine-channel]]';
 
 // Quote one argv word for the single shell-command string tmux new-session
 // takes (wrapped commands run under the user's shell inside the pane).
@@ -47,9 +47,30 @@ module.exports = async function runTerminal(ctx) {
 
   if (sub[0] === 'host') {
     if (sub.length > 1) die(USAGE, 1);
+    if (ctx.values.link !== undefined || ctx.values['no-link']) {
+      die('pidge terminal host: --link/--no-link apply to the wrapper/attach forms — the daemon inventories MANY sessions; link a specific one from its own mirror', 1);
+    }
     const host = require('./host');
     if (ctx.values.install) return host.installHost(ctx);
+    if (ctx.values['machine-channel']) die('pidge terminal host: --machine-channel only applies together with --install (it provisions the daemon before the template is written)', 1);
     return host.runHost(ctx, { tmuxBin, socketArgs });
+  }
+  if (ctx.values['machine-channel']) die('pidge terminal: --machine-channel only applies to `pidge terminal host --install`', 1);
+
+  // The advisory channel link — validated BEFORE any side effect (usage
+  // errors must leave nothing behind). undefined = omit (the server keeps a
+  // stored link, partial upsert); {id:null} = explicit clear.
+  let link;
+  if (ctx.values.link !== undefined && ctx.values['no-link']) {
+    die('pidge terminal: --link and --no-link conflict — pass one', 1);
+  }
+  if (ctx.values.link !== undefined) {
+    if (!/^\d+$/.test(ctx.values.link)) {
+      die(`pidge terminal: --link takes the channel's numeric id (got ${JSON.stringify(ctx.values.link)}) — \`pidge whoami\` with that channel's key prints it`, 1);
+    }
+    link = { id: Number(ctx.values.link), source: 'flag' };
+  } else if (ctx.values['no-link']) {
+    link = { id: null, source: 'flag' };
   }
 
   let name;
@@ -95,8 +116,26 @@ module.exports = async function runTerminal(ctx) {
     die(`pidge terminal: no tmux session named '${name}' (tmux ls shows what exists)`, 2);
   }
 
+  // No explicit --link/--no-link ⇒ try the conservative inference: the
+  // session's cwd (the wrapper starts in OURS; an attached session answers
+  // for its own) mapping to a project-scoped pidge env names the channel
+  // whose agent runs inside. Loud on success, one note on a near-miss,
+  // never fatal — and an old tmux that can't answer the cwd query simply
+  // skips it.
+  if (link === undefined) {
+    const cwd = creating
+      ? process.cwd()
+      : await execFileP(tmuxBin, [...socketArgs, 'display-message', '-p', '-t', `=${name}`, '-F', '#{pane_current_path}'])
+        .then((s) => s.trim(), () => '');
+    if (cwd) link = await inferLinkedChannel(ctx, cwd);
+  } else if (link.id !== null) {
+    note(`pidge terminal: linking this session to channel id ${link.id} (--link) — advisory provenance for the Terminals tab`);
+  } else {
+    note('pidge terminal: clearing any stored channel link (--no-link)');
+  }
+
   const entry = bumpSessionEntry(ctx, 'term', name);
-  await registerSession(ctx, { publicId: entry.pid, name, kind: 'term' });
+  await registerSession(ctx, { publicId: entry.pid, name, kind: 'term', link });
   const limits = await fetchLimits(ctx);
 
   let stopping = false;

@@ -78,6 +78,16 @@ function createMock() {
     terminalPosts: [],         // every POST body (a 402 must never be retried)
     terminalDeletes: [],       // every DELETEd public_id
     terminalRequiresPro: false, // POST answers the typed 402 plan gate
+    // advisory channel link on the session upsert: rejectLink forces the loud
+    // 422 (unknown/foreign id); the echo/validation model follows
+    // manifestVersion (< 94 = an old server that silently drops the param).
+    rejectLink: false,
+    // POST /api/v1/channels (machine-channel mint). manifestVersion >= 94
+    // honors + echoes `hidden`; below it the param is silently ignored and the
+    // echo omits the field — exactly the old-server shape the CLI must detect.
+    channelPosts: [],          // every POST body
+    channelSeq: 41,            // minted channel ids (42, 43, …)
+    whoamiChannels: {},        // raw bearer token → channel-block overrides
     // Fail the register POST for a specific session NAME N times (then succeed)
     // — models a transient 5xx so a test can prove the daemon RETRIES the row.
     terminalRegisterFailName: null,
@@ -146,7 +156,10 @@ function createMock() {
         // CLI's send-side sealing on (a test flips state.e2eEnabled).
         channel: { id: 1, name: 'mock', icon: 'bot', color: 'violet', e2e_enabled: !!state.e2eEnabled,
                    // media gate: a test flips state.e2eMediaReady.
-                   e2e_media_ready: !!state.e2eMediaReady },
+                   e2e_media_ready: !!state.e2eMediaReady,
+                   // per-token channel identity (machine channel / link
+                   // inference): a test parks overrides keyed by raw token.
+                   ...(state.whoamiChannels[auth.replace(/^Bearer /, '')] || {}) },
         operating_contract: state.operatingContract,
         user: { name: 'Ana', timezone: 'America/Sao_Paulo' },
         claim: state.claim,
@@ -183,6 +196,29 @@ function createMock() {
           claimed_at: new Date().toISOString(), claim_generation: gen,
         };
         json(res, 200, { channel: { id: 1, name: 'mock' }, claim: state.claim, generation: gen });
+      });
+      return;
+    }
+    // POST /channels — mint a sibling channel (the machine-channel path).
+    // Mirrors prod: 201 echoes the new channel INCLUDING its key; `hidden` is
+    // honored + echoed only from manifest v94 (older permits silently drop it
+    // and mint VISIBLE — the exact degrade the CLI must catch BEFORE posting).
+    if (req.method === 'POST' && url.pathname === '/api/v1/channels') {
+      const auth = req.headers.authorization || '';
+      if (!/^Bearer (hld_|ses_)/.test(auth) || auth === 'Bearer hld_revoked') return json(res, 401, { error: 'unauthorized' });
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
+        state.channelPosts.push(p);
+        const id = ++state.channelSeq;
+        const key = `hld_minted_${id}`;
+        const supportsHidden = state.manifestVersion >= 94;
+        const hidden = supportsHidden && p.hidden === true;
+        const ch = { id, name: p.name || 'unnamed', key, ...(supportsHidden ? { hidden } : {}) };
+        // future whoami on the minted key answers as THIS channel
+        state.whoamiChannels[key] = { id, name: ch.name, ...(supportsHidden ? { hidden } : {}) };
+        json(res, 201, ch);
       });
       return;
     }
@@ -476,6 +512,18 @@ function createMock() {
         const row = state.terminalSessions[pid] || { public_id: pid, kind: 'term', status: 'offline' };
         if (p.kind !== undefined) row.kind = p.kind;
         if (p.name !== undefined) row.name = p.name;
+        // linked_channel_id: only a v94+ server knows the param (an older
+        // permit drops it silently — no 422, no echo). The accepted shape is
+        // CLOSED (null, integer, digit-string); rejectLink models the loud
+        // unknown/foreign-id refusal.
+        if (state.manifestVersion >= 94 && 'linked_channel_id' in p) {
+          const val = p.linked_channel_id;
+          const okShape = val === null || Number.isInteger(val) || (typeof val === 'string' && /^\d+$/.test(val));
+          if (!okShape || state.rejectLink) {
+            return json(res, 422, { error: 'linked_channel_id must name a channel of this account', code: 'invalid_linked_channel' });
+          }
+          row.linked_channel_id = val === null ? null : Number(val);
+        }
         if (row.status === 'ended') row.status = 'offline';
         state.terminalSessions[pid] = row;
         json(res, 201, { terminal_session: row });
