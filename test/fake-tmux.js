@@ -11,6 +11,11 @@
 //   sessions.json   — {name: {cmd}} the fake's session table
 //   keys.log        — every send-keys/refresh-client line received (append)
 //   emit.txt        — drop bytes here → emitted as %output, file unlinked
+//   alt.txt         — scripted #{alternate_on} answers, one per line: each
+//                     display-message read consumes a line, the LAST line
+//                     sticks (missing file = 0). "1" = stable alt screen;
+//                     "1\n0" = the two seed reads DISAGREE (TUI exited
+//                     mid-seed — the fail-closed case)
 //   die             — create it → the fake emits %exit and quits (session died)
 // Echo behavior: a literal send-keys is echoed back as %output (like a shell
 // would), so input→output round-trips are testable without a real shell.
@@ -127,8 +132,27 @@ process.stdin.on('data', (chunk) => {
   }
 });
 
+// One scripted #{alternate_on} answer per read: alt.txt holds a line per read,
+// consumed in order, last line sticky — lets a test flip the value BETWEEN the
+// seed's two reads (the mid-seed TUI exit) without racing the mirror.
+function readAlt() {
+  const altFile = path.join(dir, 'alt.txt');
+  let lines;
+  try { lines = fs.readFileSync(altFile, 'utf8').split('\n').filter((l) => l.trim() !== ''); } catch { return '0'; }
+  if (!lines.length) return '0';
+  if (lines.length > 1) fs.writeFileSync(altFile, lines.slice(1).join('\n'));
+  return lines[0].trim();
+}
+
 function handle(line) {
-  if (line.startsWith('display-message')) return reply(['80 24']);
+  if (line.startsWith('display-message')) {
+    // Expand the two format shapes the mirror sends (geometry+alt for the
+    // seed's first read, bare alternate_on for the confirm read).
+    if (line.includes('#{alternate_on}')) {
+      return reply([line.includes('#{pane_width}') ? `80 24 ${readAlt()}` : readAlt()]);
+    }
+    return reply(['80 24']);
+  }
   // The last line deliberately LOOKS like a %output notification: real pane
   // content (a log, a paste) can start with `%output`/`%exit`, and the parser
   // must keep it as verbatim seed body, never dispatch it into the live stream.

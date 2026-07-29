@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.37.0 — 2026-07-29
+
+- **Terminal: the seed carries alternate-screen state** — when the pane is on the
+  alternate screen the host prefixes the seed's data with `ESC[?1049h`, gated on a
+  fail-closed double read of `#{alternate_on}` around the capture, so the alt-drag
+  scroll gate on iOS opens for pre-existing TUIs (gotcha #64; cures already-shipped
+  viewers via the CLI alone).
+
 ## 0.36.0 — 2026-07-29
 
 **Pidge Terminal: a TUI that stays readable** — the two host-side fixes the on-device
