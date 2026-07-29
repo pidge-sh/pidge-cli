@@ -30,6 +30,8 @@ const SEED_SCROLLBACK = [200, 100, 50, 0];
 // strictly better than a partial stream (the viewer would keep a gap anyway).
 const BUFFER_DROP_BYTES = 256 * 1024;
 
+const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
+
 function createMirror({
   control, target, epoch,
   seal,        // (frameObj)  → opaque data string (terminal_output AAD)
@@ -39,6 +41,8 @@ function createMirror({
   dataMax = DATA_MAX_BYTES,
   frameCap = 64 * 1024,   // relay byte ceiling per frame (from the manifest) — caps the seed
   flushMs = 80,
+  nudgeMs = 500,          // debounce after the LAST resize before the repaint nudge fires
+  nudgePauseMs = 60,      // pause between the two jiggle steps (one real SIGWINCH each)
 }) {
   let outSeq = 0;          // host→viewer, one counter for o+seed frames
   const ledger = createLedger(); // per-(field, vgen) monotonic seq replay guard
@@ -50,6 +54,9 @@ function createMirror({
   let penaltyUntil = 0;    // rate-limited by the relay → flush slower briefly
   let seedWanted = false;  // a dropped buffer heals via seed on next flush
   let inputChain = Promise.resolve(); // serializes inbound frames (see handleCable)
+  let nudgeTimer = null;   // debounce timer for the post-resize repaint nudge
+  let titleSwallow = false; // live-stream title stripper: inside `ESC k …`, discarding up to ST/BEL
+  let heldEsc = false;      // live-stream title stripper: last byte was a bare ESC — classify on the NEXT byte
   const notedOnce = new Set();
   const noteOnce = (msg) => { if (!notedOnce.has(msg)) { notedOnce.add(msg); narrate(msg); } };
 
@@ -135,9 +142,111 @@ function createMirror({
       // Resizing OUR control client resizes the window (window-size latest);
       // the reflow arrives as ordinary %output.
       await control.command(`refresh-client -C ${cols}x${rows}`);
+      // …but a no-op resize (same size) yields NO SIGWINCH, so a torn TUI stays
+      // torn — schedule the debounced repaint nudge behind the immediate call.
+      scheduleRepaintNudge(cols, rows);
       return;
     }
     // Unknown t ⇒ a newer viewer — ignore by contract.
+  }
+
+  // Post-resize repaint nudge (QA r4 T0-a). A TUI (Claude Code, vim, htop)
+  // already painted at width W is left TORN when the tmux grid changes AFTER
+  // it drew — nothing redraws it on its own. Our attached client is the tmux
+  // CONTROL client: it renders no screen, so `refresh-client` on it only
+  // re-emits the ALREADY-torn grid as %output. The one universal repaint
+  // trigger is SIGWINCH, which tmux delivers to the pane ONLY when the window
+  // size actually CHANGES — so a resize to the size the window already has
+  // (e.g. re-opening the session) produces NO SIGWINCH and the tear persists.
+  // Cure: once a burst of resizes has SETTLED (debounced ~nudgeMs after the
+  // last one — rotation fires a burst, only the final size gets nudged),
+  // reapply the size with a 1-row jiggle so tmux sees two real changes and
+  // hands the pane two SIGWINCHes, repainting it at the FINAL size even when
+  // the requested resize was a no-op. (`C-l` was rejected: in Claude Code it
+  // clears the transcript the human is supervising — never send keys.)
+  //
+  // Accepted tradeoffs, on purpose:
+  // - window-size latest: the immediate resize already makes the PHONE the
+  //   "latest" client the moment it gestures; the nudge repeats that up to
+  //   ~nudgeMs later, so a Mac-side resize landing inside the debounce window
+  //   gets snapped back once. One-shot by construction (the nudge never
+  //   re-arms itself), and the Mac wins again by simply acting again.
+  // - stop() in the ~pauseMs between the two jiggle steps can leave the tmux
+  //   window at rows-1 (the session keeps running — the next attach/resize
+  //   heals it).
+  // - a resize arriving DURING the pause briefly re-applies the older size;
+  //   its own nudge converges within ~nudgeMs.
+  // Set PIDGE_TERMINAL_NUDGE_MS=0 to disable the nudge entirely (ops knob).
+  function scheduleRepaintNudge(cols, rows) {
+    if (stopped || nudgeMs <= 0) return;
+    if (nudgeTimer) clearTimeout(nudgeTimer);
+    nudgeTimer = setTimeout(() => { nudgeTimer = null; runRepaintNudge(cols, rows); }, nudgeMs);
+    if (nudgeTimer.unref) nudgeTimer.unref();
+  }
+  async function runRepaintNudge(cols, rows) {
+    if (stopped) return;
+    // Jiggle by one row so the size genuinely changes (rows-1, respecting the
+    // ≥5 clamp — if the floor makes rows-1 land back on rows, jiggle UP under
+    // the 300 ceiling). The pair still ends at the requested `rows`.
+    let jiggle = Math.max(5, rows - 1);
+    if (jiggle === rows) jiggle = Math.min(300, rows + 1);
+    if (jiggle === rows) return; // degenerate (unreachable for valid rows) — nothing to jiggle
+    try {
+      const a = await control.command(`refresh-client -C ${cols}x${jiggle}`);
+      if (stopped || !a.ok) return; // control detached/died mid-nudge — drop silently
+      await sleep(nudgePauseMs);
+      if (stopped) return;
+      const b = await control.command(`refresh-client -C ${cols}x${rows}`);
+      if (b.ok) noteOnce('pidge terminal: post-resize repaint nudge (1-row jiggle) — forcing a SIGWINCH so a torn TUI repaints at the final size');
+    } catch { /* raced control teardown — no unhandled rejection */ }
+  }
+
+  // Live-stream stripper for the screen title sequence (QA T1 ghost). Inside
+  // tmux, TERM=screen* makes the shell (zsh precmd/preexec) emit the screen
+  // title sequence `ESC k <title> ST` around every command, and tmux forwards
+  // those bytes VERBATIM in %output. SwiftTerm (the iOS viewer) does not treat
+  // `ESC k` as a string introducer — it dispatches `k` as a 2-byte escape and
+  // paints the TITLE as literal text. That is exactly the live-only ghost
+  // ("echor2" where the pane shows "r2", the stray `%` line): capture-pane
+  // renders grid cells and never contains the sequence, so it only bites on
+  // the live path and every reseed heals it. The mirror has no window-title
+  // UI, so removing `ESC k … ST` (BEL accepted defensively) is LOSSLESS here.
+  // ONLY `ESC k` is filtered: OSC/APC/PM/SOS are already handled as strings by
+  // SwiftTerm — minimalism is the contract, don't grow this into a sanitizer.
+  // The two state flags above live on the mirror instance and MUST survive
+  // chunk boundaries: the sequence can arrive split at ANY byte (ESC ending
+  // one %output, `k` opening the next; a title spanning chunks), so a
+  // per-buffer regex could never be correct. A bare ESC held at a chunk edge
+  // that turns out NOT to start a title (e.g. `ESC [`) is re-emitted intact,
+  // in order, at the head of the next chunk — no byte is ever lost.
+  function stripScreenTitle(bytes) {
+    const out = Buffer.allocUnsafe(bytes.length + 1); // +1: a held ESC from the PREVIOUS chunk may re-emit here
+    let n = 0;
+    for (let i = 0; i < bytes.length; i++) {
+      const b = bytes[i];
+      if (titleSwallow) {
+        if (heldEsc) { // an ESC inside the title — `ESC \` (ST) ends it
+          heldEsc = false;
+          if (b === 0x5c) { titleSwallow = false; continue; }
+          if (b === 0x1b) { heldEsc = true; continue; } // ESC ESC — the new one may still open ST
+          continue; // anything else is still title bytes — keep swallowing
+        }
+        if (b === 0x1b) { heldEsc = true; continue; }
+        if (b === 0x07) { titleSwallow = false; continue; } // BEL terminator (defensive)
+        continue;
+      }
+      if (heldEsc) {
+        heldEsc = false;
+        if (b === 0x6b) { titleSwallow = true; continue; } // `ESC k` — the introducer SwiftTerm can't parse
+        out[n++] = 0x1b; // not a title: the retained ESC re-enters the stream intact, in order
+        if (b === 0x1b) { heldEsc = true; continue; } // ESC ESC — hold the fresh one instead
+        out[n++] = b;
+        continue;
+      }
+      if (b === 0x1b) { heldEsc = true; continue; } // may be `ESC k` split across chunks — hold and classify next
+      out[n++] = b;
+    }
+    return out.subarray(0, n);
   }
 
   // A reseed proves someone is watching even if we missed their join, so it
@@ -153,9 +262,15 @@ function createMirror({
   return {
     // Raw pane bytes from the control client (%output, already unescaped).
     onOutput(bytes) {
-      if (stopped || viewers < 1) return; // nobody watching — drop at zero cost
-      pending.push(bytes);
-      pendingBytes += bytes.length;
+      if (stopped) return;
+      // The stripper sees EVERY live byte, even while nobody watches: a title
+      // sequence can straddle a join, and stale state would either leak title
+      // text as ghost cells or eat real output right after the join's seed.
+      // Seeds (capture-pane) never pass through here — live path ONLY.
+      const cleaned = stripScreenTitle(bytes);
+      if (viewers < 1 || !cleaned.length) return; // nobody watching / nothing left — drop at zero cost
+      pending.push(cleaned);
+      pendingBytes += cleaned.length;
       if (pendingBytes > BUFFER_DROP_BYTES) {
         pending = [];
         pendingBytes = 0;
@@ -207,10 +322,12 @@ function createMirror({
 
     seed,
     reseed,
+    scheduleRepaintNudge, // the control lane (host.js) drives this for its own resize path
     get viewers() { return viewers; },
     stop() {
       stopped = true;
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      if (nudgeTimer) { clearTimeout(nudgeTimer); nudgeTimer = null; }
     },
   };
 }
