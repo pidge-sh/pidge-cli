@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.36.0 — 2026-07-29
+
+**Pidge Terminal: a TUI that stays readable** — the two host-side fixes the on-device
+QA (r4 verify) pinned as entry gates before the iPhone's Terminals tab can be lit.
+
+- **Post-resize repaint nudge.** A TUI (Claude Code, vim, htop) already painted at
+  width W was left **torn** when the tmux grid changed after it drew — opening a
+  session, rotating the phone. Nothing redraws it on its own: the mirror attaches as
+  tmux's **control** client, which renders no screen, so `refresh-client` only re-emits
+  the already-torn grid. The one universal repaint trigger is **SIGWINCH**, and tmux
+  delivers it only when the size actually *changes* — so re-opening a session (a resize
+  to the size the window already has) produced no SIGWINCH at all and the tear stayed.
+  Now, once a burst of resizes has **settled** (debounced ~500 ms after the last one, so
+  a rotation's burst only nudges the final size), the size is reapplied with a **1-row
+  jiggle** (`rows-1` → `rows`): tmux sees two real changes, the pane gets two
+  SIGWINCHes, and it repaints at the **final** size — including the no-op case. The
+  pair always ends at the size you asked for. Both lanes drive it: the wrapper's own
+  resize and the daemon's control lane (per-session timer, cancelled on detach).
+  `C-l` was **rejected** as the mechanism: in Claude Code it clears the transcript the
+  human is supervising — the mirror never sends keys.
+  New knobs: **`PIDGE_TERMINAL_NUDGE_MS`** (default `500`; **`0` disables the nudge
+  entirely** — ops escape hatch) and **`PIDGE_TERMINAL_NUDGE_PAUSE_MS`** (default `60`).
+- **The live "echor2" ghost is gone.** Inside tmux, `TERM=screen*` makes zsh emit the
+  **screen title sequence** `ESC k <title> ST` around every command, and tmux forwards
+  those bytes verbatim in `%output`. The viewer's terminal doesn't treat `ESC k` as a
+  string introducer — it dispatches `k` as a 2-byte escape and **paints the title as
+  literal text** (`echo r2` showing up as `echor2`, the stray `%` line). That's why it
+  was live-only and why a reseed always healed it: `capture-pane` renders grid cells and
+  never contains the sequence. The host now strips `ESC k … ST` from the **live stream
+  only** — the seed path is untouched, and since the mirror has no window-title UI the
+  removal is **lossless**. The stripper is stateful across chunk boundaries (the
+  sequence can split at any byte); a held `ESC` that turns out not to open a title is
+  re-emitted intact, in order. Only `ESC k` is filtered — this is deliberately not a
+  sanitizer.
+
 ## 0.35.0 — 2026-07-24
 
 **Pidge Terminal: the machine channel + advisory session links** (server ≥ manifest
