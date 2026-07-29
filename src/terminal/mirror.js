@@ -25,6 +25,14 @@ const { chunkBytes, keysToTmuxCommands, tmuxQuote, createLedger, AAD_INPUT, AAD_
 // frame fits the relay's byte cap. `0` (the bare visible screen) always fits.
 const SEED_SCROLLBACK = [200, 100, 50, 0];
 
+// Seed state prefix (spec §4 "Seed state prefix" / gotcha #64 / QA 2026-07-29).
+// DECSET 1049 — "switch to the alternate screen". Prefixed to the seed's data
+// bytes when the pane is on the alternate screen, so the viewer's RIS→feed
+// order lands its emulator in the host's buffer state and the alt-drag gate
+// (`isCurrentBufferAlternate`) opens for a pre-existing TUI. `1049h` ONLY —
+// the seed is not a general state carrier.
+const ALT_SCREEN_PREFIX = '\x1b[?1049h';
+
 // A runaway burst while the cable is down must not grow memory forever: past
 // this, the buffer is dropped WHOLE and a seed repaint is scheduled instead —
 // strictly better than a partial stream (the viewer would keep a gap anyway).
@@ -92,18 +100,38 @@ function createMirror({
   async function seed() {
     if (stopped) return;
     const t = tmuxQuote(target);
-    const size = await control.command(`display-message -p -t ${t} '#{pane_width} #{pane_height}'`);
-    const m = size.ok ? /^(\d+)\s+(\d+)/.exec(size.lines[0] || '') : null;
+    // #{alternate_on} rides the SAME display-message as the geometry — the
+    // FIRST of the two reads the seed state prefix is gated on (spec §4 "Seed
+    // state prefix" / gotcha #64 / QA 2026-07-29): capture-pane renders CELLS,
+    // so alternate-screen STATE never crosses the mirror on its own, and the
+    // viewer's RIS actively wipes whatever state it had — a viewer joining a
+    // pre-existing full-screen TUI never opened the alt-drag gate.
+    const size = await control.command(`display-message -p -t ${t} '#{pane_width} #{pane_height} #{alternate_on}'`);
+    const m = size.ok ? /^(\d+)\s+(\d+)(?:\s+(\d+))?/.exec(size.lines[0] || '') : null;
     const cols = m ? parseInt(m[1], 10) : 80;
     const rows = m ? parseInt(m[2], 10) : 24;
+    const altBefore = !!m && m[3] === '1';
     for (let i = 0; i < SEED_SCROLLBACK.length; i++) {
       const lines = SEED_SCROLLBACK[i];
       const cap = await control.command(`capture-pane -p -e -J -S -${lines} -t ${t}`);
       if (!cap.ok) { noteOnce('pidge terminal: capture-pane failed — seed skipped (will retry on the next reseed)'); return; }
       if (stopped) return;
+      // SECOND #{alternate_on} read, immediately after the capture: the prefix
+      // is emitted only if BOTH reads agree on `1` — a TUI exiting mid-seed
+      // must fail CLOSED (arrows leaking into a normal shell drive the zsh
+      // history; a shut gate merely loses a scroll). Skipped entirely when the
+      // first read already said no (no prefix either way). Mid-session flips
+      // need nothing: DECSET/DECRST 1049 cross on the LIVE path.
+      let prefix = '';
+      if (altBefore) {
+        const again = await control.command(`display-message -p -t ${t} '#{alternate_on}'`);
+        if (stopped) return;
+        if (again.ok && (again.lines[0] || '').trim() === '1') prefix = ALT_SCREEN_PREFIX;
+      }
       // Block body lines are latin1-preserved bytes; \r\n between lines so the
-      // viewer's emulator repaints rows, not one endless line.
-      const data = Buffer.from(cap.lines.join('\r\n') + '\r\n', 'latin1');
+      // viewer's emulator repaints rows, not one endless line. The state
+      // prefix rides INSIDE data, so it counts toward the frame cap honestly.
+      const data = Buffer.from(prefix + cap.lines.join('\r\n') + '\r\n', 'latin1');
       const sealed = seal({ t: 'seed', epoch, seq: outSeq + 1, cols, rows, data: data.toString('base64') });
       const last = i === SEED_SCROLLBACK.length - 1;
       if (last || Buffer.byteLength(sealed) <= frameCap) {

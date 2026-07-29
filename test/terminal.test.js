@@ -453,6 +453,105 @@ test('terminal live stripper: BEL also terminates the title (`ESC k title BEL ou
   await mock.stop();
 });
 
+// ---------------------------------------------------------------------------
+// Seed alternate-screen prefix (spec §4 "Seed state prefix" / gotcha #64 /
+// QA 2026-07-29). capture-pane renders CELLS, so a pane's alternate-screen
+// STATE never crosses the mirror — and the viewer's RIS wipes whatever state
+// it had, so a viewer joining a pre-existing full-screen TUI never opened the
+// iOS alt-drag gate. Cure: when the pane is on the alt screen the host
+// prefixes the seed's data with ESC[?1049h, gated on a DOUBLE read of
+// #{alternate_on} around the capture — both must agree or the prefix is
+// withheld (fail closed). alt.txt scripts the fake's answers, one per read.
+// ---------------------------------------------------------------------------
+
+const ALT_PREFIX = '\x1b[?1049h';
+// The fake's capture-pane body, exactly as the clean (no-prefix) seed carries it.
+const FAKE_SEED_BODY = 'seed-line-1\r\nseed-line-2 \x1b[1mbold\x1b[0m\r\n%output %9 NOT_A_REAL_NOTIFICATION\r\n';
+// Every seed the viewer received, decoded to latin1 bytes, in arrival order.
+const seedTexts = (viewer, pid) => viewer.frames
+  .map((d) => openOutput(pid, d))
+  .filter((f) => f.t === 'seed')
+  .map((f) => Buffer.from(f.data, 'base64').toString('latin1'));
+
+test('terminal seed: a pane on the ALTERNATE screen prefixes the seed data with ESC[?1049h — the dump follows intact (gotcha #64)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  fs.writeFileSync(path.join(fakeDir, 'alt.txt'), '1'); // stable: both reads agree
+  const { child, result, viewer, pid } = await startLiveMirror(mock, port, fakeDir);
+
+  const seeds = seedTexts(viewer, pid);
+  assert.strictEqual(seeds[0], ALT_PREFIX + FAKE_SEED_BODY,
+    `expected the 1049h prefix then the untouched dump; got: ${JSON.stringify(seeds[0])}`);
+
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
+test('terminal seed: a NORMAL-screen pane seeds byte-identical to before — no prefix, no state carrier (gotcha #64)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} }); // no alt.txt ⇒ alternate_on = 0
+  const { child, result, viewer, pid } = await startLiveMirror(mock, port, fakeDir);
+
+  const seeds = seedTexts(viewer, pid);
+  assert.strictEqual(seeds[0], FAKE_SEED_BODY, `a normal-screen seed grew a prefix: ${JSON.stringify(seeds[0])}`);
+
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
+test('terminal seed: the two #{alternate_on} reads DISAGREE (TUI exited mid-seed) ⇒ NO prefix — fail closed (gotcha #64)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  // First read (geometry line) answers 1, the post-capture confirm answers 0:
+  // arrows leaking into a normal shell would drive the zsh history — the gate
+  // must stay shut.
+  fs.writeFileSync(path.join(fakeDir, 'alt.txt'), '1\n0');
+  const { child, result, viewer, pid } = await startLiveMirror(mock, port, fakeDir);
+
+  const seeds = seedTexts(viewer, pid);
+  assert.strictEqual(seeds[0], FAKE_SEED_BODY,
+    `a disagreeing double-read must fail CLOSED (no prefix); got: ${JSON.stringify(seeds[0])}`);
+
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
+test('terminal seed: a RESEED also carries the prefix once the pane is on the alt screen (every seed path shares seed()) (gotcha #64)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} }); // boots on the normal screen
+  const { child, result, viewer, pid } = await startLiveMirror(mock, port, fakeDir);
+  assert.strictEqual(seedTexts(viewer, pid)[0], FAKE_SEED_BODY); // join seed: clean
+
+  // The TUI enters the alternate screen AFTER the first seed; the viewer's
+  // reseed (foreground / gap heal) must now carry the state.
+  fs.writeFileSync(path.join(fakeDir, 'alt.txt'), '1');
+  const before = seedTexts(viewer, pid).length;
+  viewer.sendFrame(sealCtrlViewer(pid, { t: 'reseed', vgen: VG, seq: 1, pid }));
+  assert.ok(await waitFor(() => seedTexts(viewer, pid).length > before), 'reseed never produced a second seed');
+  const reseeded = seedTexts(viewer, pid)[before];
+  assert.strictEqual(reseeded, ALT_PREFIX + FAKE_SEED_BODY,
+    `the reseed path lost the alt-screen prefix: ${JSON.stringify(reseeded)}`);
+
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
 test('terminal: interop with the iOS wire dialect — an iOS-form reseed opens on the host, the host seed passes the STRICT viewer reader', { skip: !HAS_WS }, async () => {
   const mock = createMock();
   const port = await mock.start();
@@ -576,6 +675,50 @@ test('terminal (REAL tmux): sealed seed + typed command echoes back through the 
       const f = openOutput(pid, d);
       return f.t === 'o' && Buffer.from(f.data, 'base64').toString('latin1').includes('PIDGE_RT_MARKER');
     }), 10000), 'real-shell echo never arrived through the relay');
+
+    child.kill('SIGINT');
+    const r = await result;
+    assert.strictEqual(r.code, 0);
+    viewer.close();
+  } finally {
+    try { tmuxCtl(['kill-server']); } catch { /* already gone */ }
+    await mock.stop();
+  }
+});
+
+test('terminal (REAL tmux): a pre-existing alt-screen TUI (less) seeds with the ESC[?1049h prefix (gotcha #64)', { skip: !REAL_TMUX || !HAS_WS }, async () => {
+  const sockName = `pidge-test-alt-${process.pid}`;
+  const tmuxCtl = (args) => execFileSync('tmux', ['-L', sockName, ...args], { stdio: 'pipe' });
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  try {
+    tmuxCtl(['new-session', '-d', '-s', 'realalt', '-x', '80', '-y', '24']);
+    // Put a REAL full-screen TUI on the pane BEFORE any viewer exists — the
+    // exact on-device scenario the gate never opened for. `less` of this test
+    // file uses smcup/rmcup; poll #{alternate_on} so the shell's startup and
+    // less's screen switch never race the assertion.
+    tmuxCtl(['send-keys', '-t', 'realalt', '-l', `less ${__filename}`]);
+    tmuxCtl(['send-keys', '-t', 'realalt', 'Enter']);
+    assert.ok(await waitFor(() => {
+      try { return tmuxCtl(['display-message', '-p', '-t', 'realalt', '#{alternate_on}']).toString().trim() === '1'; } catch { return false; }
+    }, 10000), 'less never reached the alternate screen');
+
+    const { child, result, out } = runCli(['terminal', 'attach', 'realalt'], port, {
+      PIDGE_TMUX_BIN: 'tmux',
+      PIDGE_TMUX_SOCKET: sockName,
+    });
+    assert.ok(await waitFor(() => out.stdout.includes('"public_id"')), `stderr: ${out.stderr}`);
+    const pid = JSON.parse(out.stdout.trim().split('\n')[0]).public_id;
+    assert.ok(await waitFor(() => [...mock.state.terminalSubs].some((s) => s.role === 'host')));
+
+    const viewer = connectViewer(port, pid);
+    assert.ok(await waitFor(() => viewer.frames.length >= 1, 10000), 'no seed from real tmux');
+    const seed = openOutput(pid, viewer.frames[0]);
+    assert.strictEqual(seed.t, 'seed');
+    const data = Buffer.from(seed.data, 'base64').toString('latin1');
+    assert.ok(data.startsWith(ALT_PREFIX),
+      `real alt-screen seed did not start with ESC[?1049h; first bytes: ${JSON.stringify(data.slice(0, 24))}`);
 
     child.kill('SIGINT');
     const r = await result;
