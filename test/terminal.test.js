@@ -237,6 +237,222 @@ test('terminal attach: full sealed round-trip — seed on join, input→send-key
   void child;
 });
 
+// ---------------------------------------------------------------------------
+// Post-resize repaint nudge (QA r4 T0-a). After the immediate refresh-client, a
+// debounced 1-row jiggle forces two real SIGWINCHes so a TUI that already
+// painted at the old width repaints at the FINAL size — the cure for the
+// on-device tear, and the ONLY thing that fixes a no-op resize (which yields no
+// SIGWINCH on its own). Delays are shrunk via PIDGE_TERMINAL_NUDGE_MS/_PAUSE_MS.
+// ---------------------------------------------------------------------------
+
+// The nudge is the ordered pair `refresh-client -C {cols}x{rows-1}` then
+// `refresh-client -C {cols}x{rows}` — the immediate refresh already wrote the
+// requested size once, so we look for the DOWN step and a later UP step.
+function nudgeLanded(keysLog, cols, rows) {
+  if (!fs.existsSync(keysLog)) return false;
+  const lines = fs.readFileSync(keysLog, 'utf8').split('\n');
+  const down = lines.indexOf(`refresh-client -C ${cols}x${rows - 1}`);
+  if (down === -1) return false;
+  return lines.indexOf(`refresh-client -C ${cols}x${rows}`, down + 1) !== -1;
+}
+
+test('terminal: a resize schedules a debounced repaint nudge — a rows-jiggle (rows-1 then rows) behind the immediate refresh (QA r4 T0-a)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  const { child, result, out } = runCli(['terminal', 'attach', 'work'], port, {
+    FAKE_TMUX_DIR: fakeDir, PIDGE_TERMINAL_NUDGE_MS: '150', PIDGE_TERMINAL_NUDGE_PAUSE_MS: '20',
+  });
+  assert.ok(await waitFor(() => out.stdout.includes('"public_id"')), `stderr: ${out.stderr}`);
+  const pid = JSON.parse(out.stdout.trim().split('\n')[0]).public_id;
+  const viewer = connectViewer(port, pid);
+  assert.ok(await waitFor(() => viewer.confirmed));
+
+  viewer.sendFrame(sealCtrlViewer(pid, { t: 'resize', vgen: VG, seq: 1, pid, cols: 61, rows: 21 }));
+  const keysLog = path.join(fakeDir, 'keys.log');
+  assert.ok(await waitFor(() => nudgeLanded(keysLog, 61, 21)),
+    `nudge sequence never appeared; log: ${fs.existsSync(keysLog) ? fs.readFileSync(keysLog, 'utf8') : '(none)'}`);
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
+test('terminal: a BURST of resizes nudges only the FINAL size once (debounce re-arms per resize) (QA r4 T0-a)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  const { child, result, out } = runCli(['terminal', 'attach', 'work'], port, {
+    FAKE_TMUX_DIR: fakeDir, PIDGE_TERMINAL_NUDGE_MS: '400', PIDGE_TERMINAL_NUDGE_PAUSE_MS: '20',
+  });
+  assert.ok(await waitFor(() => out.stdout.includes('"public_id"')), `stderr: ${out.stderr}`);
+  const pid = JSON.parse(out.stdout.trim().split('\n')[0]).public_id;
+  const viewer = connectViewer(port, pid);
+  assert.ok(await waitFor(() => viewer.confirmed));
+
+  // two resizes back-to-back, both well inside the 400ms debounce window
+  viewer.sendFrame(sealCtrlViewer(pid, { t: 'resize', vgen: VG, seq: 1, pid, cols: 61, rows: 21 }));
+  viewer.sendFrame(sealCtrlViewer(pid, { t: 'resize', vgen: VG, seq: 2, pid, cols: 62, rows: 21 }));
+  const keysLog = path.join(fakeDir, 'keys.log');
+  assert.ok(await waitFor(() => nudgeLanded(keysLog, 62, 21)),
+    `final-size nudge never landed; log: ${fs.existsSync(keysLog) ? fs.readFileSync(keysLog, 'utf8') : '(none)'}`);
+  await sleep(200); // let a stray first-size nudge fire if it were ever going to
+  const log = fs.readFileSync(keysLog, 'utf8');
+  assert.ok(!log.includes('refresh-client -C 61x20'), `the superseded first resize must NOT have nudged; log: ${log}`);
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
+test('terminal: a resize to the CURRENT size STILL nudges — the no-op resize (no SIGWINCH) is the motivating case (QA r4 T0-a)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  const { child, result, out } = runCli(['terminal', 'attach', 'work'], port, {
+    FAKE_TMUX_DIR: fakeDir, PIDGE_TERMINAL_NUDGE_MS: '150', PIDGE_TERMINAL_NUDGE_PAUSE_MS: '20',
+  });
+  assert.ok(await waitFor(() => out.stdout.includes('"public_id"')), `stderr: ${out.stderr}`);
+  const pid = JSON.parse(out.stdout.trim().split('\n')[0]).public_id;
+  const viewer = connectViewer(port, pid);
+  assert.ok(await waitFor(() => viewer.confirmed));
+
+  // 80x24 is exactly what the fake reports — the nudge must fire even though
+  // "nothing changed" (the whole point: a no-op resize gives no SIGWINCH).
+  viewer.sendFrame(sealCtrlViewer(pid, { t: 'resize', vgen: VG, seq: 1, pid, cols: 80, rows: 24 }));
+  const keysLog = path.join(fakeDir, 'keys.log');
+  assert.ok(await waitFor(() => nudgeLanded(keysLog, 80, 24)),
+    `no-op resize did not nudge; log: ${fs.existsSync(keysLog) ? fs.readFileSync(keysLog, 'utf8') : '(none)'}`);
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
+// ---------------------------------------------------------------------------
+// Live ghost-cell stripper (QA T1 ghost). TERM=screen* shells emit the screen
+// title sequence `ESC k <title> ST` around every command; tmux forwards it
+// verbatim in %output and SwiftTerm paints the title as LITERAL text (it does
+// not treat `ESC k` as a string introducer) — the live-only ghost that heals
+// on reseed, because capture-pane never contains the sequence. The host strips
+// exactly that sequence from the live path, statefully across chunk
+// boundaries. Each emit.txt drop below is ONE %output line ⇒ ONE onOutput
+// chunk, so the splits are real chunk splits, not string theater.
+// ---------------------------------------------------------------------------
+
+// Everything the viewer received on the LIVE lane (t:"o" frames only, seeds
+// excluded), concatenated in arrival order.
+const liveText = (viewer, pid) => viewer.frames
+  .map((d) => openOutput(pid, d))
+  .filter((f) => f.t === 'o')
+  .map((f) => Buffer.from(f.data, 'base64').toString('latin1'))
+  .join('');
+
+// Boot an attached mirror with a joined viewer, plus an emit(bytes) that lands
+// the bytes as ONE %output chunk (waits for the fake to consume the file, so
+// two calls are GUARANTEED to be two separate chunks).
+async function startLiveMirror(mock, port, fakeDir) {
+  const { child, result, out } = runCli(['terminal', 'attach', 'work'], port, { FAKE_TMUX_DIR: fakeDir });
+  assert.ok(await waitFor(() => out.stdout.includes('"public_id"')), `stderr: ${out.stderr}`);
+  const pid = JSON.parse(out.stdout.trim().split('\n')[0]).public_id;
+  // The CLI prints public_id BEFORE it subscribes the cable; a viewer that
+  // joins in that window is a lost join (the mock only delivers to hosts
+  // already subscribed) and the seed never comes — the same guard every
+  // pre-existing live test uses.
+  assert.ok(await waitFor(() => [...mock.state.terminalSubs].some((s) => s.role === 'host')), 'host never subscribed');
+  const viewer = connectViewer(port, pid);
+  assert.ok(await waitFor(() => viewer.frames.length >= 1), `no seed frame; stderr: ${out.stderr}`); // joined ⇒ output flows
+  const emitFile = path.join(fakeDir, 'emit.txt');
+  const emit = async (bytes) => {
+    fs.writeFileSync(emitFile, Buffer.from(bytes, 'latin1'));
+    assert.ok(await waitFor(() => !fs.existsSync(emitFile)), 'the fake never consumed emit.txt');
+  };
+  return { child, result, out, pid, viewer, emit };
+}
+
+test('terminal live stripper: `ESC k title ST` in one chunk — the title never reaches the viewer, the output does (QA T1 ghost)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  const { child, result, viewer, pid, emit } = await startLiveMirror(mock, port, fakeDir);
+
+  await emit('\x1bkecho\x1b\\r2\r\n'); // exactly the on-device ghost: title "echo" glued to output "r2"
+  assert.ok(await waitFor(() => liveText(viewer, pid).includes('r2')), 'live output never arrived');
+  const text = liveText(viewer, pid);
+  assert.ok(!text.includes('echo'), `the screen title leaked as ghost cells: ${JSON.stringify(text)}`);
+  assert.strictEqual(text, 'r2\r\n');
+
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
+test('terminal live stripper: the sequence split across chunks — mid-title AND mid-`ESC k` — still stripped (state survives frames) (QA T1 ghost)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  const { child, result, viewer, pid, emit } = await startLiveMirror(mock, port, fakeDir);
+
+  // Cut INSIDE the title: `…ESC k ec` | `ho ESC \ r2…`
+  await emit('before \x1bkec');
+  await emit('ho\x1b\\r2\r\n');
+  // Cut INSIDE the introducer: a chunk ending on the bare ESC, `k…` opening the next.
+  await emit('\x1b');
+  await emit('kfoo\x1b\\ok\r\n');
+  assert.ok(await waitFor(() => liveText(viewer, pid).includes('ok')), 'live output never arrived');
+  const text = liveText(viewer, pid);
+  assert.ok(!text.includes('echo') && !text.includes('foo'), `a split title leaked: ${JSON.stringify(text)}`);
+  assert.strictEqual(text, 'before r2\r\nok\r\n');
+
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
+test('terminal live stripper: a bare ESC at a chunk edge that is NOT a title (`ESC [`) passes intact — no byte lost, order kept (QA T1 ghost)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  const { child, result, viewer, pid, emit } = await startLiveMirror(mock, port, fakeDir);
+
+  await emit('\x1b');       // held: could still become `ESC k`…
+  await emit('[31mred\r\n'); // …but it's SGR — the ESC must re-emit at the head of this chunk
+  assert.ok(await waitFor(() => liveText(viewer, pid).includes('red')), 'live output never arrived');
+  assert.strictEqual(liveText(viewer, pid), '\x1b[31mred\r\n');
+
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
+test('terminal live stripper: BEL also terminates the title (`ESC k title BEL out`) (QA T1 ghost)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  const { child, result, viewer, pid, emit } = await startLiveMirror(mock, port, fakeDir);
+
+  await emit('\x1bktitle\x07out\r\n');
+  assert.ok(await waitFor(() => liveText(viewer, pid).includes('out')), 'live output never arrived');
+  const text = liveText(viewer, pid);
+  assert.ok(!text.includes('title'), `a BEL-terminated title leaked: ${JSON.stringify(text)}`);
+  assert.strictEqual(text, 'out\r\n');
+
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
 test('terminal: interop with the iOS wire dialect — an iOS-form reseed opens on the host, the host seed passes the STRICT viewer reader', { skip: !HAS_WS }, async () => {
   const mock = createMock();
   const port = await mock.start();

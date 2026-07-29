@@ -44,6 +44,14 @@ async function fetchLimits(ctx) {
   // Flush at half the allowed rate at most (coalescing is the contract).
   limits.flushMs = Math.max(parseInt(process.env.PIDGE_TERMINAL_FLUSH_MS || '80', 10) || 80,
     Math.ceil(2000 / Math.max(1, limits.fps)));
+  // Post-resize repaint nudge timing (QA r4 T0-a — see mirror.js). Debounce
+  // after the LAST resize, and the pause between the two jiggle steps. Sourced
+  // from env here like flushMs so the child-process acceptance tests can shrink
+  // them (PIDGE_TERMINAL_NUDGE_MS / _PAUSE_MS) exactly as they do flushMs.
+  // '0' is a real value here — it disables the nudge (ops knob), so no `|| 500`.
+  const nudgeRaw = parseInt(process.env.PIDGE_TERMINAL_NUDGE_MS || '500', 10);
+  limits.nudgeMs = Number.isFinite(nudgeRaw) && nudgeRaw >= 0 ? nudgeRaw : 500;
+  limits.nudgePauseMs = parseInt(process.env.PIDGE_TERMINAL_NUDGE_PAUSE_MS || '60', 10) || 60;
   return limits;
 }
 

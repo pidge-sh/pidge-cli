@@ -254,6 +254,47 @@ test('terminal host: control lane + inventory + spawn-by-whitelist + lazy attach
   await mock.stop();
 });
 
+test('terminal host: a control-lane resize schedules the repaint nudge on the attached session (QA r4 T0-a)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ alpha: {} });
+  const { child, result, out } = runHost(port, {
+    FAKE_TMUX_DIR: fakeDir, PIDGE_TERMINAL_NUDGE_MS: '150', PIDGE_TERMINAL_NUDGE_PAUSE_MS: '20',
+  });
+  assert.ok(await waitFor(() => out.stdout.includes('"control_public_id"')), `stderr: ${out.stderr}`);
+  const ctrlPid = JSON.parse(out.stdout.trim().split('\n')[0]).control_public_id;
+
+  // learn alpha's pid from a sessions frame on the control lane
+  const ctrlViewer = connectViewer(port, ctrlPid);
+  assert.ok(await waitFor(() => ctrlViewer.frames.some((d) => {
+    const f = openCtrlHost(ctrlPid, d);
+    return f.t === 'sessions' && f.list.some((s) => s.name === 'alpha');
+  })), `no sessions frame; stderr: ${out.stderr}`);
+  const alphaPid = ctrlViewer.frames.map((d) => openCtrlHost(ctrlPid, d))
+    .reverse().find((f) => f.t === 'sessions').list.find((s) => s.name === 'alpha').pid;
+
+  // the control-lane resize is a no-op unless the session has a live tap:
+  // a viewer joins alpha (lazy attach), then the resize rides the CONTROL lane.
+  const alphaViewer = connectViewer(port, alphaPid);
+  assert.ok(await waitFor(() => alphaViewer.frames.length >= 1), `no seed; stderr: ${out.stderr}`);
+
+  ctrlViewer.sendFrame(sealCtrlViewer(ctrlPid, { t: 'resize', vgen: VG, seq: 1, pid: alphaPid, cols: 71, rows: 25 }));
+  const keysLog = path.join(fakeDir, 'keys.log');
+  assert.ok(await waitFor(() => {
+    if (!fs.existsSync(keysLog)) return false;
+    const lines = fs.readFileSync(keysLog, 'utf8').split('\n');
+    const down = lines.indexOf('refresh-client -C 71x24');
+    return down !== -1 && lines.indexOf('refresh-client -C 71x25', down + 1) !== -1;
+  }), `control-lane nudge never appeared; log: ${fs.existsSync(keysLog) ? fs.readFileSync(keysLog, 'utf8') : '(none)'}`);
+
+  child.kill('SIGTERM');
+  await result;
+  ctrlViewer.close();
+  alphaViewer.close();
+  await mock.stop();
+});
+
 test('terminal host: a vanished tmux session gets its row ended on the next inventory pass', { skip: !HAS_WS }, async () => {
   const mock = createMock();
   const port = await mock.start();

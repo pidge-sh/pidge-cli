@@ -169,6 +169,8 @@ module.exports = async function runTerminal(ctx) {
     dataMax: limits.dataMax,
     frameCap: limits.frameCap,
     flushMs: limits.flushMs,
+    nudgeMs: limits.nudgeMs,
+    nudgePauseMs: limits.nudgePauseMs,
   });
 
   const stop = () => {

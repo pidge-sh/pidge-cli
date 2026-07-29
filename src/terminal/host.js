@@ -186,7 +186,14 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
       if (!rec || !rec.attached) return; // resizing an unwatched session is a no-op
       const cols = Math.min(500, Math.max(20, parseInt(frame.cols, 10) || 0));
       const rows = Math.min(300, Math.max(5, parseInt(frame.rows, 10) || 0));
-      if (frame.cols && frame.rows) await rec.attached.control.command(`refresh-client -C ${cols}x${rows}`);
+      if (frame.cols && frame.rows) {
+        await rec.attached.control.command(`refresh-client -C ${cols}x${rows}`);
+        // Behind the immediate resize: the debounced repaint nudge (QA r4 T0-a)
+        // so a torn TUI redraws at the final size even on a no-op resize. The
+        // nudge lives on the mirror (per-session timer, cancelled in its stop()
+        // on detach) — see mirror.js scheduleRepaintNudge.
+        if (rec.attached) rec.attached.mirror.scheduleRepaintNudge(cols, rows);
+      }
       return;
     }
     // unknown t — a newer viewer; ignore by contract.
@@ -284,6 +291,8 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
         dataMax: limits.dataMax,
         frameCap: limits.frameCap,
         flushMs: limits.flushMs,
+        nudgeMs: limits.nudgeMs,
+        nudgePauseMs: limits.nudgePauseMs,
       });
       rec.attached = { control, mirror };
       note(`pidge terminal host: attached '${rec.name}' (epoch ${rec.entry.epoch}) — someone is watching`);
