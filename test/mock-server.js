@@ -73,26 +73,6 @@ function createMock() {
     // the caller asked (continuity=true). null ⇒ omitted, models an OLD server —
     // the CLI's batch/listen output is then byte-identical to before.
     continuityContexts: null,
-    // Pidge Terminal — the lifecycle REST + the relay-blind cable pipe.
-    terminalSessions: {},      // public_id → row (the upsert target)
-    terminalPosts: [],         // every POST body (a 402 must never be retried)
-    terminalDeletes: [],       // every DELETEd public_id
-    terminalRequiresPro: false, // POST answers the typed 402 plan gate
-    // advisory channel link on the session upsert: rejectLink forces the loud
-    // 422 (unknown/foreign id); the echo/validation model follows
-    // manifestVersion (< 94 = an old server that silently drops the param).
-    rejectLink: false,
-    // POST /api/v1/channels (machine-channel mint). manifestVersion >= 94
-    // honors + echoes `hidden`; below it the param is silently ignored and the
-    // echo omits the field — exactly the old-server shape the CLI must detect.
-    channelPosts: [],          // every POST body
-    channelSeq: 41,            // minted channel ids (42, 43, …)
-    whoamiChannels: {},        // raw bearer token → channel-block overrides
-    // Fail the register POST for a specific session NAME N times (then succeed)
-    // — models a transient 5xx so a test can prove the daemon RETRIES the row.
-    terminalRegisterFailName: null,
-    terminalRegisterFailTimes: 0,
-    terminalSubs: new Set(),   // live cable subs: {sock, role, session, identifier}
   };
   let server = null;
   let wss = null;
@@ -156,10 +136,7 @@ function createMock() {
         // CLI's send-side sealing on (a test flips state.e2eEnabled).
         channel: { id: 1, name: 'mock', icon: 'bot', color: 'violet', e2e_enabled: !!state.e2eEnabled,
                    // media gate: a test flips state.e2eMediaReady.
-                   e2e_media_ready: !!state.e2eMediaReady,
-                   // per-token channel identity (machine channel / link
-                   // inference): a test parks overrides keyed by raw token.
-                   ...(state.whoamiChannels[auth.replace(/^Bearer /, '')] || {}) },
+                   e2e_media_ready: !!state.e2eMediaReady },
         operating_contract: state.operatingContract,
         user: { name: 'Ana', timezone: 'America/Sao_Paulo' },
         claim: state.claim,
@@ -196,29 +173,6 @@ function createMock() {
           claimed_at: new Date().toISOString(), claim_generation: gen,
         };
         json(res, 200, { channel: { id: 1, name: 'mock' }, claim: state.claim, generation: gen });
-      });
-      return;
-    }
-    // POST /channels — mint a sibling channel (the machine-channel path).
-    // Mirrors prod: 201 echoes the new channel INCLUDING its key; `hidden` is
-    // honored + echoed only from manifest v94 (older permits silently drop it
-    // and mint VISIBLE — the exact degrade the CLI must catch BEFORE posting).
-    if (req.method === 'POST' && url.pathname === '/api/v1/channels') {
-      const auth = req.headers.authorization || '';
-      if (!/^Bearer (hld_|ses_)/.test(auth) || auth === 'Bearer hld_revoked') return json(res, 401, { error: 'unauthorized' });
-      let body = '';
-      req.on('data', (c) => { body += c; });
-      req.on('end', () => {
-        let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
-        state.channelPosts.push(p);
-        const id = ++state.channelSeq;
-        const key = `hld_minted_${id}`;
-        const supportsHidden = state.manifestVersion >= 94;
-        const hidden = supportsHidden && p.hidden === true;
-        const ch = { id, name: p.name || 'unnamed', key, ...(supportsHidden ? { hidden } : {}) };
-        // future whoami on the minted key answers as THIS channel
-        state.whoamiChannels[key] = { id, name: ch.name, ...(supportsHidden ? { hidden } : {}) };
-        json(res, 201, ch);
       });
       return;
     }
@@ -482,63 +436,6 @@ function createMock() {
         ...(wake && pendingComposer ? { messages_pending: true } : {}),
       });
     }
-    // Pidge Terminal lifecycle — mirrors prod: plan gate BEFORE the e2e
-    // contract check; idempotent upsert; DELETE marks ended (uniform 404 on
-    // unknown). Frames never ride HTTP — they go through the ws relay below.
-    if (req.method === 'POST' && url.pathname === '/api/v1/terminal_sessions') {
-      let body = '';
-      req.on('data', (c) => { body += c; });
-      req.on('end', () => {
-        let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
-        state.terminalPosts.push(p);
-        if (state.terminalRequiresPro) {
-          return json(res, 402, {
-            error: 'terminal_requires_pro', code: 'terminal_requires_pro',
-            message: 'Terminal mirroring is a Pro feature and this account is not on Pro. Relay this to your human.',
-            tier: 'free',
-          });
-        }
-        if (!state.e2eEnabled) {
-          return json(res, 422, { error: 'terminal mirroring requires an end-to-end encrypted channel', code: 'e2e_required' });
-        }
-        if (state.terminalRegisterFailTimes > 0 && p.name === state.terminalRegisterFailName) {
-          state.terminalRegisterFailTimes -= 1;
-          return json(res, 500, { error: 'transient' });
-        }
-        const pid = String(p.public_id || '');
-        if (!/^term_[a-z0-9-]{1,64}$/.test(pid)) {
-          return json(res, 422, { error: 'bad public_id', code: 'invalid_public_id' });
-        }
-        const row = state.terminalSessions[pid] || { public_id: pid, kind: 'term', status: 'offline' };
-        if (p.kind !== undefined) row.kind = p.kind;
-        if (p.name !== undefined) row.name = p.name;
-        // linked_channel_id: only a v94+ server knows the param (an older
-        // permit drops it silently — no 422, no echo). The accepted shape is
-        // CLOSED (null, integer, digit-string); rejectLink models the loud
-        // unknown/foreign-id refusal.
-        if (state.manifestVersion >= 94 && 'linked_channel_id' in p) {
-          const val = p.linked_channel_id;
-          const okShape = val === null || Number.isInteger(val) || (typeof val === 'string' && /^\d+$/.test(val));
-          if (!okShape || state.rejectLink) {
-            return json(res, 422, { error: 'linked_channel_id must name a channel of this account', code: 'invalid_linked_channel' });
-          }
-          row.linked_channel_id = val === null ? null : Number(val);
-        }
-        if (row.status === 'ended') row.status = 'offline';
-        state.terminalSessions[pid] = row;
-        json(res, 201, { terminal_session: row });
-      });
-      return;
-    }
-    const termDel = url.pathname.match(/^\/api\/v1\/terminal_sessions\/([^/]+)$/);
-    if (req.method === 'DELETE' && termDel) {
-      const pid = decodeURIComponent(termDel[1]);
-      state.terminalDeletes.push(pid);
-      const row = state.terminalSessions[pid];
-      if (!row) return json(res, 404, { error: 'not_found' });
-      row.status = 'ended';
-      return json(res, 200, { terminal_session: row });
-    }
     // reachability self-test. POST mints a nonce + a kind:'system' selftest
     // message on the queue; GET reads PASS (acked in window) / FAILED / pending.
     if (req.method === 'POST' && url.pathname === '/api/v1/selftest') {
@@ -609,50 +506,20 @@ function createMock() {
       server,
       handleProtocols: () => 'actioncable-v1-json', // negotiate like ActionCable
     });
-    wss.on('connection', (sock, req) => {
+    wss.on('connection', (sock) => {
       // wsMode '1006': drop EVERY socket abruptly (no close frame) → the client
       // sees close code 1006, an intermittent failure mode seen in production.
       if (state.wsMode === '1006') { try { sock.terminate(); } catch { /* gone */ } return; }
       state.sockets.add(sock);
-      // The bearer rides the second Sec-WebSocket-Protocol entry (the browser
-      // API can't set headers) — the terminal relay derives the ROLE from the
-      // auth track exactly like prod: hld_ ⇒ host, ses_ ⇒ viewer.
-      const proto = String(req.headers['sec-websocket-protocol'] || '');
-      const wsToken = (proto.split(',')[1] || '').trim();
       sock.send(JSON.stringify({ type: 'welcome' }));
       const ping = setInterval(() => {
         if (sock.readyState === 1) sock.send(JSON.stringify({ type: 'ping', message: Date.now() }));
       }, 1000);
-      const termPeers = (session, role) =>
-        [...state.terminalSubs].filter((s) => s.session === session && s.role === role && s.sock.readyState === 1);
       sock.on('message', (raw) => {
         let f; try { f = JSON.parse(raw); } catch { return; }
         if (f.command === 'subscribe') {
           const ident = JSON.parse(f.identifier);
           const channel = ident.channel;
-          if (channel === 'TerminalChannel') {
-            const role = wsToken.startsWith('ses_') ? 'viewer' : 'host';
-            const row = state.terminalSessions[String(ident.session || '')];
-            // Mirror prod's reject map: unknown session, or a host on a
-            // non-E2E channel (the sealed-only backstop). A REJECTED subscribe
-            // must NOT be recorded as confirmed — else a test asserting a
-            // successful subscribe via state.subscriptions would false-pass.
-            if (!row || (role === 'host' && !state.e2eEnabled)) {
-              sock.send(JSON.stringify({ type: 'reject_subscription', identifier: f.identifier }));
-              return;
-            }
-            state.subscriptions.push(channel);
-            state.subscribeIdentifiers.push(ident);
-            state.terminalSubs.add({ sock, role, session: ident.session, identifier: f.identifier });
-            sock.send(JSON.stringify({ type: 'confirm_subscription', identifier: f.identifier }));
-            if (role === 'viewer') {
-              for (const h of termPeers(ident.session, 'host')) {
-                h.sock.send(JSON.stringify({ identifier: h.identifier, message: { sys: 'viewer', ev: 'join' } }));
-              }
-            }
-            if (state.onSubscribe) state.onSubscribe(channel, sock);
-            return;
-          }
           state.subscriptions.push(channel);
           state.subscribeIdentifiers.push(ident); // capture fingerprint/label params
           // Real ActionCable tags every broadcast frame with the EXACT identifier
@@ -664,49 +531,10 @@ function createMock() {
           sock.send(JSON.stringify({ type: 'confirm_subscription', identifier: f.identifier }));
           if (state.onSubscribe) state.onSubscribe(channel, sock);
         }
-        if (f.command === 'unsubscribe') {
-          for (const s of [...state.terminalSubs]) {
-            if (s.sock !== sock || s.identifier !== f.identifier) continue;
-            state.terminalSubs.delete(s);
-            if (s.role === 'viewer') {
-              for (const h of termPeers(s.session, 'host')) {
-                h.sock.send(JSON.stringify({ identifier: h.identifier, message: { sys: 'viewer', ev: 'leave' } }));
-              }
-            }
-          }
-          return;
-        }
-        if (f.command === 'message') {
-          let ident; let action;
-          try { ident = JSON.parse(f.identifier); action = JSON.parse(f.data); } catch { return; }
-          if (ident.channel !== 'TerminalChannel' || action.action !== 'frame') return;
-          const mine = [...state.terminalSubs].find((s) => s.sock === sock && s.identifier === f.identifier);
-          if (!mine) return;
-          // Relay-blind: shape guards only, then the string verbatim to the
-          // opposite side. Loud drop back to the sender, never buffered.
-          if (typeof action.data !== 'string' || !action.data) {
-            return sock.send(JSON.stringify({ identifier: f.identifier, message: { dropped: true, reason: 'missing_data' } }));
-          }
-          if (Buffer.byteLength(action.data) > 64 * 1024) {
-            return sock.send(JSON.stringify({ identifier: f.identifier, message: { dropped: true, reason: 'frame_too_large' } }));
-          }
-          for (const peer of termPeers(mine.session, mine.role === 'host' ? 'viewer' : 'host')) {
-            peer.sock.send(JSON.stringify({ identifier: peer.identifier, message: { data: action.data } }));
-          }
-        }
       });
       sock.on('close', () => {
         clearInterval(ping);
         state.sockets.delete(sock);
-        for (const s of [...state.terminalSubs]) {
-          if (s.sock !== sock) continue;
-          state.terminalSubs.delete(s);
-          if (s.role === 'viewer') {
-            for (const h of termPeers(s.session, 'host')) {
-              h.sock.send(JSON.stringify({ identifier: h.identifier, message: { sys: 'viewer', ev: 'leave' } }));
-            }
-          }
-        }
       });
     });
     server.listen(atPort, '127.0.0.1', () => { port = server.address().port; resolve(port); });
