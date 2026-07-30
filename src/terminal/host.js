@@ -32,6 +32,14 @@ const {
 const { loadProfiles, profilesPath, expandTilde } = require('./profiles');
 const { xmlEscape, systemdQuote } = require('../../bin/pidge.js');
 
+// Spawn cooldown AT THE AUTHORITY (finding #11): the 12 s window used to live
+// only inside one iOS process — two devices (or an app relaunch inside the
+// window) each carried an empty cooldown and double-spawned heavy agents. The
+// host is what executes profiles, so the host owns the window: ONE global
+// timestamp per daemon (not per profile — bounding the spawn RATE is the
+// point). MUST match the iOS client's TerminalSpawnController cooldown (12 s).
+const SPAWN_COOLDOWN_MS = 12 * 1000;
+
 const PROFILE_EXAMPLE = [
   '  [[profile]]',
   '  name = "Claude @ my-project"',
@@ -226,13 +234,24 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
     },
   });
 
-  // ---- spawn (whitelist only) ----------------------------------------------
+  // ---- spawn (whitelist only, host-side cooldown) --------------------------
+  // The env knob exists for the test suite only (the replay-guard test targets
+  // the vgen ledger, not the cooldown); production runs the named constant.
+  const spawnCooldownEnv = process.env.PIDGE_TERMINAL_SPAWN_COOLDOWN_MS;
+  const spawnCooldownMs = spawnCooldownEnv ? Math.max(0, parseInt(spawnCooldownEnv, 10) || 0) : SPAWN_COOLDOWN_MS;
+  let lastSpawnAt = 0; // global to the daemon on purpose (finding #11)
   async function spawn(profileName) {
     const p = prof.profiles.find((x) => x.name === profileName);
     if (!p) {
       note(`pidge terminal host: spawn REFUSED — ${JSON.stringify(profileName)} is not in the whitelist (${profilesPath(ctx.baseDir)}). A viewer can only name a profile; commands live on this machine.`);
       return;
     }
+    const now = Date.now();
+    if (now - lastSpawnAt < spawnCooldownMs) {
+      note(`pidge terminal host: spawn of ${JSON.stringify(p.name)} ignored — cooldown (one spawn per ${Math.round(spawnCooldownMs / 1000)}s, enforced at the host; the app mirrors the same window)`);
+      return;
+    }
+    lastSpawnAt = now;
     const name = deriveSessionName(p.name, new Set(records.keys()));
     const args = [...socketArgs, 'new-session', '-d', '-s', name];
     if (p.cwd) args.push('-c', expandTilde(p.cwd));
@@ -251,6 +270,14 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
   }
 
   // ---- per-session mirrors (lazy) ------------------------------------------
+  // Controls being shut down ON PURPOSE (detach / stand-down / shutdown).
+  // Deliberateness is pinned to the INSTANCE, not the record: `rec.detaching`
+  // was shared record state, so an OLD control's async onClose could read a
+  // flag describing the record and clobber a FRESH reattachment installed in
+  // the detach→onClose window (finding #7). Entries are removed in onClose;
+  // the control's SIGKILL backstop guarantees onClose eventually fires.
+  const deliberateKills = new Set();
+
   async function ensureAttached(rec) {
     if (rec.attached) return rec.attached.mirror;
     if (rec.attaching) return rec.attaching;
@@ -266,13 +293,21 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
       rec.entry = bumpSessionEntry(ctx, 'term', rec.name);
       const control = createControl({
         tmuxBin, socketArgs, target: rec.name,
-        onOutput: (bytes) => { if (rec.attached) rec.attached.mirror.onOutput(bytes); },
+        // Identity-guarded (finding #7): these closures belong to ONE control
+        // instance — after a detach→reattach, `rec.attached` may hold a FRESH
+        // pair, and a replaced client's late output/close must never touch it.
+        onOutput: (bytes) => {
+          if (rec.attached && rec.attached.control === control) rec.attached.mirror.onOutput(bytes);
+        },
         onClose: async (reason) => {
-          const wasDeliberate = rec.detaching || stopping;
-          rec.attached = null;
-          rec.detaching = false;
-          if (wasDeliberate) return;
-          // The tmux session died under the tap.
+          const deliberate = deliberateKills.delete(control) || stopping;
+          const current = rec.attached && rec.attached.control === control;
+          if (current) rec.attached = null;
+          // Deliberate teardown, or an OLD control dying after being replaced
+          // (the record — and any fresh attachment — belongs to the current
+          // instance; a stale death proves nothing about the tmux session).
+          if (deliberate || !current) return;
+          // The tmux session died under the CURRENT tap.
           note(`pidge terminal host: '${rec.name}' — ${reason}`);
           records.delete(rec.name);
           await endSession(ctx, rec.entry.pid);
@@ -304,9 +339,12 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
 
   function detach(rec, why) {
     if (!rec.attached) return;
-    rec.detaching = true;
-    rec.attached.mirror.stop();
-    rec.attached.control.kill();
+    const { control, mirror } = rec.attached;
+    // Mark THIS instance's kill as deliberate BEFORE killing it — its async
+    // onClose must not read the death as "session died" (finding #7).
+    deliberateKills.add(control);
+    mirror.stop();
+    control.kill();
     rec.attached = null;
     // Clear any in-flight attach handle too, so a re-join in the same tick
     // (before the control's onClose fires) starts a FRESH tap instead of
@@ -374,7 +412,7 @@ async function runHost(ctx, { tmuxBin, socketArgs }) {
           }
           rec = {
             name, cols: size.cols, rows: size.rows, entry,
-            attached: null, attaching: null, standTimer: null, detaching: false,
+            attached: null, attaching: null, standTimer: null,
           };
           records.set(name, rec);
           rec.sub = cable.subscribe({ session: rec.entry.pid }, {
@@ -678,4 +716,4 @@ WantedBy=default.target
   process.exit(0);
 }
 
-module.exports = { runHost, installHost, deriveSessionName, MACHINE_AGENT_ID };
+module.exports = { runHost, installHost, deriveSessionName, MACHINE_AGENT_ID, SPAWN_COOLDOWN_MS };

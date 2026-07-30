@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.37.1 — 2026-07-30
+
+Terminal hardening — four fixes from the external adversarial review
+(2026-07-29 findings #6/#7/#10/#11). No wire/contract changes.
+
+- **Seed ladder no longer bypasses the frame cap (finding #6, HIGH).** The last
+  scrollback rung (`-S 0`) used to send unconditionally; an SGR-heavy visible screen
+  over the relay's ~64 KB cap entered the exact infinite loop the cap exists to
+  prevent (relay drops the seed → viewer reseeds → the host regenerates the same
+  dump — the one loss reseed can't heal). The floor now **degrades** instead: the
+  screen is re-captured **without `-e`** (colors lost, content kept); if still over
+  the cap, lines are **truncated from the top** (the bottom of the screen is the live
+  part); every degrade is narrated loudly. An over-cap frame is never sent.
+- **An old control client's close can no longer clobber a fresh reattachment
+  (finding #7, HIGH).** `detach → new viewer attaches → old client's async onClose`
+  used to null `rec.attached` unconditionally (via the shared `rec.detaching` flag),
+  leaving the new viewer dark and the new control leaked. The close/output callbacks
+  are now **identity-guarded** to their own control instance, and deliberate teardown
+  is pinned to the instance being killed — a replaced client's late death touches
+  nothing, including the "session died" cleanup.
+- **`tmux rename-session` ends the wrapper loudly instead of silently breaking it
+  (finding #10, MED).** After a rename, live output kept flowing but every
+  `send-keys`/`capture-pane` targeted the frozen old name — input and reseed failed
+  silently forever. The wrapper/attach form now exits 2 on `%session-renamed` with
+  the re-attach instruction (`pidge terminal attach <new-name>`). The host daemon is
+  untouched — its 5 s inventory already self-corrects. Following the rename (pane-id
+  pinning) stays Tranche B work.
+- **The 12 s spawn cooldown now lives at the host (finding #11, MED).** It existed
+  only inside one iOS process, so two devices (or an app relaunch inside the window)
+  each carried an empty cooldown and double-spawned heavy agents. The daemon — the
+  authority that executes profiles — now enforces one global 12 s window
+  (`SPAWN_COOLDOWN_MS`, matching the iOS client's `TerminalSpawnController`); a
+  spawn inside the window is ignored with a note.
+
 ## 0.37.0 — 2026-07-29
 
 - **Terminal: the seed carries alternate-screen state** — when the pane is on the

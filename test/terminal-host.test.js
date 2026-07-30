@@ -24,7 +24,7 @@ const { track } = require('./spawn-tracker');
 const { createMock } = require('./mock-server');
 const { e2eAad, e2eEncryptBlob, e2eDecryptBlob } = require('../bin/pidge.js');
 const { parseProfiles } = require('../src/terminal/profiles');
-const { deriveSessionName } = require('../src/terminal/host');
+const { deriveSessionName, SPAWN_COOLDOWN_MS } = require('../src/terminal/host');
 
 const spawn = (cmd, args, opts = {}) => track(rawSpawn(cmd, args, { ...opts, detached: true }));
 const CLI = path.join(__dirname, '..', 'bin', 'pidge.js');
@@ -157,6 +157,10 @@ test('deriveSessionName: whitelist charset, bounded, collision-suffixed', () => 
   assert.strictEqual(deriveSessionName('Shell', new Set(['Shell'])), 'Shell-2');
   assert.strictEqual(deriveSessionName('Shell', new Set(['Shell', 'Shell-2'])), 'Shell-3');
   assert.strictEqual(deriveSessionName('!!!', new Set()), 'job');
+});
+
+test('SPAWN_COOLDOWN_MS: the host-side spawn window matches the iOS client (12 s, TerminalSpawnController) (finding #11)', () => {
+  assert.strictEqual(SPAWN_COOLDOWN_MS, 12 * 1000);
 });
 
 // ---- the daemon ---------------------------------------------------------------
@@ -322,7 +326,12 @@ test('terminal host: a replayed control spawn frame (same vgen) is DROPPED; a ge
   mock.state.e2eEnabled = true;
   const xdg = tmpDir('pidge-host-xdg-');
   writeProfiles(xdg, '[[profile]]\nname = "Shell"\ncmd = "bash"\n');
-  const { child, result, out } = runHost(port, { FAKE_TMUX_DIR: makeFakeDir({}), XDG_CONFIG_HOME: xdg });
+  // This test targets the vgen REPLAY ledger — the host-side spawn cooldown
+  // (finding #11, its own test below) would otherwise eat the legit reconnect
+  // spawn that must succeed here.
+  const { child, result, out } = runHost(port, {
+    FAKE_TMUX_DIR: makeFakeDir({}), XDG_CONFIG_HOME: xdg, PIDGE_TERMINAL_SPAWN_COOLDOWN_MS: '0',
+  });
   assert.ok(await waitFor(() => out.stdout.includes('"control_public_id"')), `stderr: ${out.stderr}`);
   const ctrlPid = JSON.parse(out.stdout.trim().split('\n')[0]).control_public_id;
 
@@ -349,6 +358,83 @@ test('terminal host: a replayed control spawn frame (same vgen) is DROPPED; a ge
   // lifetime-high-water design wrongly dropped a reconnected viewer forever).
   v2.sendFrame(sealCtrlViewer(ctrlPid, { t: 'spawn', vgen: 'freshvgen9', seq: 1, profile: 'Shell' }));
   assert.ok(await waitFor(() => mock.state.terminalPosts.some((p) => p.name === 'Shell-2')), `a reconnected viewer (new vgen, seq 1) could not spawn; stderr: ${out.stderr}`);
+
+  child.kill('SIGTERM');
+  await result;
+  v2.close();
+  await mock.stop();
+});
+
+test('terminal host: a second spawn inside the cooldown window is IGNORED at the host — the executing authority owns the window (finding #11)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const xdg = tmpDir('pidge-host-xdg-');
+  writeProfiles(xdg, '[[profile]]\nname = "Shell"\ncmd = "bash"\n');
+  const fakeDir = makeFakeDir({});
+  // NO cooldown knob: the daemon runs the real 12 s SPAWN_COOLDOWN_MS.
+  const { child, result, out } = runHost(port, { FAKE_TMUX_DIR: fakeDir, XDG_CONFIG_HOME: xdg });
+  assert.ok(await waitFor(() => out.stdout.includes('"control_public_id"')), `stderr: ${out.stderr}`);
+  const ctrlPid = JSON.parse(out.stdout.trim().split('\n')[0]).control_public_id;
+
+  const v = connectViewer(port, ctrlPid);
+  assert.ok(await waitFor(() => v.confirmed));
+  // Two DISTINCT frames (seq 1 and 2 — both pass the replay ledger), the way
+  // two devices' pickers or an app relaunch inside the window would send them.
+  v.sendFrame(sealCtrlViewer(ctrlPid, { t: 'spawn', vgen: VG, seq: 1, profile: 'Shell' }));
+  v.sendFrame(sealCtrlViewer(ctrlPid, { t: 'spawn', vgen: VG, seq: 2, profile: 'Shell' }));
+  assert.ok(await waitFor(() => mock.state.terminalPosts.some((p) => p.name === 'Shell')), `first spawn never landed; stderr: ${out.stderr}`);
+  assert.ok(await waitFor(() => /ignored — cooldown/.test(out.stderr)), `no cooldown note; stderr: ${out.stderr}`);
+  await sleep(400);
+
+  // ONE new-session executed, no 'Shell-2' anywhere.
+  const keysLog = path.join(fakeDir, 'keys.log');
+  const spawns = fs.readFileSync(keysLog, 'utf8').split('\n').filter((l) => l.startsWith('new-session'));
+  assert.deepStrictEqual(spawns, ['new-session -s Shell'], `expected exactly one new-session; keys.log spawns: ${JSON.stringify(spawns)}`);
+  assert.ok(!mock.state.terminalPosts.some((p) => p.name === 'Shell-2'),
+    `the cooldown let a second spawn through; posts: ${JSON.stringify(mock.state.terminalPosts.map((p) => p.name))}`);
+
+  child.kill('SIGTERM');
+  await result;
+  v.close();
+  await mock.stop();
+});
+
+test('terminal host: an OLD control client\'s late close never clobbers a FRESH reattachment (finding #7)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ alpha: {} });
+  // Control A lingers 1 s after its deliberate detach before its close lands —
+  // the real-world async teardown window the race lives in.
+  fs.writeFileSync(path.join(fakeDir, 'detach-delay'), '1000');
+  const { child, result, out } = runHost(port, { FAKE_TMUX_DIR: fakeDir });
+  assert.ok(await waitFor(() => out.stdout.includes('"control_public_id"')), `stderr: ${out.stderr}`);
+  assert.ok(await waitFor(() => mock.state.terminalPosts.some((p) => p.name === 'alpha')));
+  const alphaPid = mock.state.terminalPosts.find((p) => p.name === 'alpha').public_id;
+
+  // viewer 1 attaches control A, then leaves → stand-down detaches A (which
+  // now LINGERS for 1 s before dying).
+  const v1 = connectViewer(port, alphaPid);
+  assert.ok(await waitFor(() => v1.frames.length >= 1), `no seed from A; stderr: ${out.stderr}`);
+  v1.close();
+  assert.ok(await waitFor(() => /stood down from 'alpha'/.test(out.stderr)), `no stand-down; stderr: ${out.stderr}`);
+
+  // viewer 2 joins INSIDE A's teardown window → fresh control B attaches.
+  const v2 = connectViewer(port, alphaPid);
+  assert.ok(await waitFor(() => v2.frames.length >= 1), `no seed from B; stderr: ${out.stderr}`);
+  assert.ok(await waitFor(() => /attached 'alpha' \(epoch 2\)/.test(out.stderr)), `B never attached; stderr: ${out.stderr}`);
+
+  // let A's delayed close land — the shared `rec.detaching` flag used to make
+  // it clear rec.attached here, silencing B forever.
+  await sleep(1400);
+  fs.writeFileSync(path.join(fakeDir, 'emit.txt'), 'still-alive-after-old-close');
+  assert.ok(await waitFor(() => v2.frames.some((d) => {
+    const f = openOutput(alphaPid, d);
+    return f.t === 'o' && Buffer.from(f.data, 'base64').toString('latin1').includes('still-alive-after-old-close');
+  })), `bytes stopped flowing after the OLD control's close — the fresh attachment was clobbered; stderr: ${out.stderr}`);
+  // and A's stale death was not read as "session died": the row survives.
+  assert.ok(!mock.state.terminalDeletes.includes(alphaPid), 'an old control\'s close ended a live session row');
 
   child.kill('SIGTERM');
   await result;

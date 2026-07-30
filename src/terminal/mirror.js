@@ -22,7 +22,10 @@
 const { chunkBytes, keysToTmuxCommands, tmuxQuote, createLedger, AAD_INPUT, AAD_CTRL_VIEWER, DATA_MAX_BYTES } = require('./wire');
 
 // Scrollback ladder for a seed: try the deepest first, shrink until the sealed
-// frame fits the relay's byte cap. `0` (the bare visible screen) always fits.
+// frame fits the relay's byte cap. `0` (the bare visible screen) does NOT
+// always fit (finding #6: a nonblank 500x300 SGR screen is several times the
+// cap) — past the floor, seed() degrades (no-SGR recapture, then top-truncate)
+// instead of ever sending an over-cap frame.
 const SEED_SCROLLBACK = [200, 100, 50, 0];
 
 // Seed state prefix (spec §4 "Seed state prefix" / gotcha #64 / QA 2026-07-29).
@@ -95,8 +98,16 @@ function createMirror({
   // THE SEED MUST FIT the relay's frame cap: an oversized seed is the one loss
   // the reseed protocol can't heal (relay drops it → viewer reseeds → the host
   // regenerates the SAME oversized dump → loop). So shrink scrollback
-  // (-200→-100→-50→0) until the SEALED+base64 frame is under the cap; the bare
-  // visible screen (0) always fits and is sent unconditionally as the floor.
+  // (-200→-100→-50→0) until the SEALED+base64 frame is under the cap. The bare
+  // visible screen (0) does NOT always fit — a nonblank SGR-heavy screen at
+  // the allowed 500x300 grid is already several times the cap (finding #6) —
+  // so past the ladder's floor the seed DEGRADES instead of bypassing the cap:
+  //   (a) re-capture without -e (no SGR — plain text shrinks massively; color
+  //       is lost, content is not),
+  //   (b) still over: truncate lines from the TOP of the dump (the bottom of
+  //       the screen is the live part),
+  //   and every degrade is narrated loudly. A frame over the cap is NEVER
+  //   sent — degrade loudly, never loop (and degrade beats a dark screen).
   async function seed() {
     if (stopped) return;
     const t = tmuxQuote(target);
@@ -111,36 +122,91 @@ function createMirror({
     const cols = m ? parseInt(m[1], 10) : 80;
     const rows = m ? parseInt(m[2], 10) : 24;
     const altBefore = !!m && m[3] === '1';
-    for (let i = 0; i < SEED_SCROLLBACK.length; i++) {
-      const lines = SEED_SCROLLBACK[i];
-      const cap = await control.command(`capture-pane -p -e -J -S -${lines} -t ${t}`);
-      if (!cap.ok) { noteOnce('pidge terminal: capture-pane failed — seed skipped (will retry on the next reseed)'); return; }
-      if (stopped) return;
-      // SECOND #{alternate_on} read, immediately after the capture: the prefix
-      // is emitted only if BOTH reads agree on `1` — a TUI exiting mid-seed
-      // must fail CLOSED (arrows leaking into a normal shell drive the zsh
-      // history; a shut gate merely loses a scroll). Skipped entirely when the
-      // first read already said no (no prefix either way). Mid-session flips
-      // need nothing: DECSET/DECRST 1049 cross on the LIVE path.
+
+    // One capture (with or without SGR) at one scrollback depth, plus the
+    // SECOND #{alternate_on} read immediately after it: the prefix is emitted
+    // only if BOTH reads agree on `1` — a TUI exiting mid-seed must fail
+    // CLOSED (arrows leaking into a normal shell drive the zsh history; a
+    // shut gate merely loses a scroll). Skipped entirely when the first read
+    // already said no (no prefix either way). Mid-session flips need nothing:
+    // DECSET/DECRST 1049 cross on the LIVE path. Returns null on failure —
+    // the caller distinguishes `stopped` (silent) from a real capture error.
+    async function capture(sgr, lines) {
+      const cap = await control.command(`capture-pane -p${sgr ? ' -e' : ''} -J -S -${lines} -t ${t}`);
+      if (!cap.ok || stopped) return null;
       let prefix = '';
       if (altBefore) {
         const again = await control.command(`display-message -p -t ${t} '#{alternate_on}'`);
-        if (stopped) return;
+        if (stopped) return null;
         if (again.ok && (again.lines[0] || '').trim() === '1') prefix = ALT_SCREEN_PREFIX;
       }
-      // Block body lines are latin1-preserved bytes; \r\n between lines so the
-      // viewer's emulator repaints rows, not one endless line. The state
-      // prefix rides INSIDE data, so it counts toward the frame cap honestly.
-      const data = Buffer.from(prefix + cap.lines.join('\r\n') + '\r\n', 'latin1');
-      const sealed = seal({ t: 'seed', epoch, seq: outSeq + 1, cols, rows, data: data.toString('base64') });
-      const last = i === SEED_SCROLLBACK.length - 1;
-      if (last || Buffer.byteLength(sealed) <= frameCap) {
-        if (!last && i > 0) noteOnce(`pidge terminal: seed shrunk to ${lines} lines of scrollback to fit the relay frame cap`);
-        outSeq += 1;
-        sendFrame(sealed);
+      return { lines: cap.lines, prefix };
+    }
+    // Block body lines are latin1-preserved bytes; \r\n between lines so the
+    // viewer's emulator repaints rows, not one endless line. The state prefix
+    // rides INSIDE data, so it counts toward the frame cap honestly. `seq` is
+    // outSeq+1 on every attempt — it only advances when a frame is SENT.
+    const sealData = (dataBuf) => seal({ t: 'seed', epoch, seq: outSeq + 1, cols, rows, data: dataBuf.toString('base64') });
+    const sealLines = (prefix, bodyLines) => sealData(Buffer.from(prefix + bodyLines.join('\r\n') + '\r\n', 'latin1'));
+    const send = (sealed) => { outSeq += 1; sendFrame(sealed); };
+    const fits = (sealed) => Buffer.byteLength(sealed) <= frameCap;
+
+    for (let i = 0; i < SEED_SCROLLBACK.length; i++) {
+      const got = await capture(true, SEED_SCROLLBACK[i]);
+      if (!got) {
+        if (!stopped) noteOnce('pidge terminal: capture-pane failed — seed skipped (will retry on the next reseed)');
+        return;
+      }
+      const sealed = sealLines(got.prefix, got.lines);
+      if (fits(sealed)) {
+        if (i > 0) noteOnce(`pidge terminal: seed shrunk to ${SEED_SCROLLBACK[i]} lines of scrollback to fit the relay frame cap`);
+        send(sealed);
         return;
       }
     }
+
+    // Ladder exhausted: the bare visible screen WITH SGR is over the cap.
+    // (a) re-capture the visible screen without -e — colors lost, not content.
+    const plain = await capture(false, 0);
+    if (!plain) {
+      if (!stopped) noteOnce('pidge terminal: capture-pane failed — seed skipped (will retry on the next reseed)');
+      return;
+    }
+    let sealed = sealLines(plain.prefix, plain.lines);
+    if (fits(sealed)) {
+      noteOnce('pidge terminal: seed exceeded the relay frame cap — resent WITHOUT COLORS (SGR stripped, content intact; degrade loudly, never loop)');
+      send(sealed);
+      return;
+    }
+    // (b) even the plain screen is over the cap: keep the LARGEST bottom slice
+    // of lines that fits (binary search — sealing is cheap, the dump is not).
+    let best = null;
+    for (let lo = 1, hi = plain.lines.length; lo <= hi;) {
+      const mid = (lo + hi) >> 1;
+      const s = sealLines(plain.prefix, plain.lines.slice(plain.lines.length - mid));
+      if (fits(s)) { best = s; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    if (best) {
+      noteOnce('pidge terminal: seed exceeded the relay frame cap even without colors — TOP lines truncated to fit (the bottom of the screen is the live part; degrade loudly, never loop)');
+      send(best);
+      return;
+    }
+    // Floor of the floor: even ONE line over the cap (a pathological single
+    // giant line). Keep the TAIL bytes — the freshest — halving until the
+    // sealed frame fits. A partial screen still beats a dark viewer, and a
+    // dark viewer beats the reseed loop.
+    let bytes = Buffer.from(plain.prefix + plain.lines.join('\r\n') + '\r\n', 'latin1');
+    while (bytes.length > 1 && !fits(sealData(bytes))) bytes = bytes.subarray(bytes.length >> 1);
+    sealed = sealData(bytes);
+    if (!fits(sealed)) {
+      // The cap is smaller than the seal envelope itself — NOTHING can ever
+      // fit. Sending anyway would feed the loop; skip loudly instead (the
+      // viewer keeps its last paint).
+      noteOnce('pidge terminal: the relay frame cap is too small for ANY seed — seed skipped (check the server manifest terminal limits)');
+      return;
+    }
+    noteOnce('pidge terminal: seed exceeded the relay frame cap even without colors — TOP bytes truncated to fit (degrade loudly, never loop)');
+    send(sealed);
   }
 
   // Handle one opened viewer→host frame. `field` is the AAD it opened under —
