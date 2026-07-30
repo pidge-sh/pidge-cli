@@ -552,6 +552,115 @@ test('terminal seed: a RESEED also carries the prefix once the pane is on the al
   await mock.stop();
 });
 
+// ---------------------------------------------------------------------------
+// Seed degrade past the ladder floor (finding #6). The last rung used to send
+// the `-S 0` capture UNCONDITIONALLY — an SGR-heavy visible screen over the
+// relay cap entered the exact loop the cap exists to prevent (relay drops it →
+// viewer reseeds → the host regenerates the same dump, forever: the one loss
+// reseed can't heal). Now the floor degrades INSTEAD of bypassing the cap:
+// (a) recapture without -e (colors lost, content kept), (b) truncate lines
+// from the TOP, always loudly — and an over-cap frame is NEVER sent.
+// capture.txt / capture-plain.txt script the fake's two capture modes.
+// ---------------------------------------------------------------------------
+
+// The mock manifest serves no terminal section → the CLI runs its shipped
+// default cap, which is also what the mock relay enforces with frame_too_large.
+const FRAME_CAP = 64 * 1024;
+// ~128 KB of SGR-heavy screen — sealed+base64 lands far over the cap, at every
+// scrollback rung (the fake serves the same body regardless of -S depth).
+const GIANT_SGR = Array.from({ length: 2000 }, (_, i) => `\x1b[31m${'x'.repeat(50)}\x1b[0m ${i}`).join('\n');
+
+test('terminal seed degrade (finding #6): an over-cap SGR screen is resent WITHOUT COLORS — under the cap, loudly, and the reseed loop is dead', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  fs.writeFileSync(path.join(fakeDir, 'capture.txt'), GIANT_SGR, 'latin1');
+  const plainLines = Array.from({ length: 24 }, (_, i) => `plain-${i}`);
+  fs.writeFileSync(path.join(fakeDir, 'capture-plain.txt'), plainLines.join('\n'), 'latin1');
+  const { child, result, out, viewer, pid } = await startLiveMirror(mock, port, fakeDir);
+
+  // The join seed ARRIVED (the old code's oversize frame was dropped by the
+  // relay and never reached a viewer), fits the cap, and is the COLORLESS body.
+  const seed = openOutput(pid, viewer.frames[0]);
+  assert.strictEqual(seed.t, 'seed');
+  assert.ok(Buffer.byteLength(viewer.frames[0]) <= FRAME_CAP,
+    `the sent seed frame is over the relay cap (${Buffer.byteLength(viewer.frames[0])} > ${FRAME_CAP})`);
+  assert.strictEqual(Buffer.from(seed.data, 'base64').toString('latin1'), plainLines.join('\r\n') + '\r\n');
+  assert.match(out.stderr, /WITHOUT COLORS/);
+  assert.doesNotMatch(out.stderr, /frame_too_large/); // nothing over-cap ever hit the relay
+
+  // Loop provado morto: a reseed regenerates the SAME degraded (fitting) seed
+  // once — no storm, and still nothing over the cap.
+  const before = viewer.frames.length;
+  viewer.sendFrame(sealCtrlViewer(pid, { t: 'reseed', vgen: VG, seq: 1, pid }));
+  assert.ok(await waitFor(() => viewer.frames.slice(before).some((d) => openOutput(pid, d).t === 'seed')), 'the degraded reseed never arrived');
+  await sleep(500);
+  assert.ok(viewer.frames.length <= before + 2, `reseed storm: ${viewer.frames.length - before} frames after one reseed`);
+  assert.ok(viewer.frames.every((d) => Buffer.byteLength(d) <= FRAME_CAP), 'an over-cap frame was sent');
+  assert.doesNotMatch(out.stderr, /frame_too_large/);
+
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
+test('terminal seed degrade (finding #6): a screen over the cap even WITHOUT colors is truncated from the TOP — the bottom (live) part survives', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  fs.writeFileSync(path.join(fakeDir, 'capture.txt'), GIANT_SGR, 'latin1');
+  // ~140 KB of PLAIN lines: the colorless recapture is still over the cap.
+  const plainGiant = Array.from({ length: 3000 }, (_, i) => `plainline-${i} ${'p'.repeat(30)}`);
+  fs.writeFileSync(path.join(fakeDir, 'capture-plain.txt'), plainGiant.join('\n'), 'latin1');
+  const { child, result, out, viewer, pid } = await startLiveMirror(mock, port, fakeDir);
+
+  const seed = openOutput(pid, viewer.frames[0]);
+  assert.strictEqual(seed.t, 'seed');
+  assert.ok(Buffer.byteLength(viewer.frames[0]) <= FRAME_CAP,
+    `the sent seed frame is over the relay cap (${Buffer.byteLength(viewer.frames[0])} > ${FRAME_CAP})`);
+  const data = Buffer.from(seed.data, 'base64').toString('latin1');
+  // truncated from the TOP: the LAST line is intact at the tail, the first is gone
+  assert.ok(data.endsWith(`plainline-2999 ${'p'.repeat(30)}\r\n`), `the bottom of the screen was lost; tail: ${JSON.stringify(data.slice(-60))}`);
+  assert.ok(!data.includes('plainline-0 '), 'the top of the dump should have been truncated first');
+  assert.match(out.stderr, /TOP lines truncated/);
+  assert.doesNotMatch(out.stderr, /frame_too_large/);
+
+  child.kill('SIGINT');
+  await result;
+  viewer.close();
+  await mock.stop();
+});
+
+// ---------------------------------------------------------------------------
+// Rename guard (finding #10). While attached, `tmux rename-session` leaves the
+// control client alive (output keeps flowing) but every send-keys/capture
+// targets the frozen old name — input and reseed die silently, forever. The
+// wrapper/attach form has no inventory to self-correct (the daemon does), so
+// the honest cure is to END the mirror loudly with the re-attach instruction.
+// ---------------------------------------------------------------------------
+
+test('terminal attach: a tmux rename-session ENDS the wrapper loudly with the re-attach instruction (finding #10)', { skip: !HAS_WS }, async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.e2eEnabled = true;
+  const fakeDir = makeFakeDir({ work: {} });
+  const { result, out } = runCli(['terminal', 'attach', 'work'], port, { FAKE_TMUX_DIR: fakeDir });
+  assert.ok(await waitFor(() => out.stdout.includes('"public_id"')), `stderr: ${out.stderr}`);
+
+  // The Mac user renames the session under the live mirror.
+  fs.writeFileSync(path.join(fakeDir, 'rename.txt'), 'newwork');
+  const r = await result;
+  assert.strictEqual(r.code, 2);
+  assert.match(r.stderr, /RENAMED/);
+  assert.match(r.stderr, /pidge terminal attach newwork/);
+  // NOT marked ended — the tmux session keeps running under its new name.
+  assert.strictEqual(mock.state.terminalDeletes.length, 0);
+  await mock.stop();
+});
+
 test('terminal: interop with the iOS wire dialect — an iOS-form reseed opens on the host, the host seed passes the STRICT viewer reader', { skip: !HAS_WS }, async () => {
   const mock = createMock();
   const port = await mock.start();

@@ -9,13 +9,24 @@
 //
 // Coordination happens through FAKE_TMUX_DIR:
 //   sessions.json   — {name: {cmd}} the fake's session table
-//   keys.log        — every send-keys/refresh-client line received (append)
+//   keys.log        — every send-keys/refresh-client line received (append);
+//                     new-session invocations land here too (spawn cooldown
+//                     tests count them)
 //   emit.txt        — drop bytes here → emitted as %output, file unlinked
 //   alt.txt         — scripted #{alternate_on} answers, one per line: each
 //                     display-message read consumes a line, the LAST line
 //                     sticks (missing file = 0). "1" = stable alt screen;
 //                     "1\n0" = the two seed reads DISAGREE (TUI exited
 //                     mid-seed — the fail-closed case)
+//   capture.txt     — scripted capture-pane body for `-e` (SGR) captures;
+//   capture-plain.txt — …and for captures WITHOUT `-e` (the seed degrade
+//                     path re-captures colorless). Missing file = the default
+//                     3-line body below.
+//   rename.txt      — drop the new name here → `%session-renamed $0 <name>`
+//                     is emitted, file unlinked (finding #10 tests)
+//   detach-delay    — ms to LINGER after detach-client before %exit+quit; the
+//                     dying client stops consuming emit.txt/die/rename.txt so
+//                     a successor client owns them (finding #7 race tests)
 //   die             — create it → the fake emits %exit and quits (session died)
 // Echo behavior: a literal send-keys is echoed back as %output (like a shell
 // would), so input→output round-trips are testable without a real shell.
@@ -59,6 +70,7 @@ if (args[0] === 'new-session') {
   const sessions = readSessions();
   sessions[String(name)] = { cmd: rest.length ? rest.join(' ') : null, ...(cwd ? { cwd } : {}) };
   writeSessions(sessions);
+  fs.appendFileSync(keysLog, `new-session -s ${name}\n`); // spawn-cooldown tests count these
   process.exit(0);
 }
 if (args[0] === 'set-option') process.exit(0);
@@ -156,7 +168,13 @@ function handle(line) {
   // The last line deliberately LOOKS like a %output notification: real pane
   // content (a log, a paste) can start with `%output`/`%exit`, and the parser
   // must keep it as verbatim seed body, never dispatch it into the live stream.
-  if (line.startsWith('capture-pane')) return reply(['seed-line-1', 'seed-line-2 \x1b[1mbold\x1b[0m', '%output %9 NOT_A_REAL_NOTIFICATION']);
+  // capture.txt / capture-plain.txt script the body per capture MODE (with /
+  // without -e) so the seed-degrade ladder (finding #6) is testable.
+  if (line.startsWith('capture-pane')) {
+    const scripted = path.join(dir, line.includes(' -e ') ? 'capture.txt' : 'capture-plain.txt');
+    if (fs.existsSync(scripted)) return reply(fs.readFileSync(scripted, 'latin1').split('\n'));
+    return reply(['seed-line-1', 'seed-line-2 \x1b[1mbold\x1b[0m', '%output %9 NOT_A_REAL_NOTIFICATION']);
+  }
   if (line.startsWith('send-keys') || line.startsWith('refresh-client')) {
     fs.appendFileSync(keysLog, line + '\n');
     reply([]);
@@ -168,6 +186,15 @@ function handle(line) {
   if (line.startsWith('detach-client')) {
     fs.appendFileSync(keysLog, line + '\n'); // stand-down is observable
     reply([]);
+    // detach-delay: linger before dying, like a real client whose async
+    // teardown lands AFTER a successor already attached (the finding #7 race).
+    let delay = 0;
+    try { delay = parseInt(fs.readFileSync(path.join(dir, 'detach-delay'), 'utf8'), 10) || 0; } catch { /* no knob */ }
+    if (delay > 0) {
+      dying = true; // the successor client owns emit.txt/die/rename.txt now
+      setTimeout(() => { out('%exit'); process.exit(0); }, delay);
+      return;
+    }
     out('%exit');
     process.exit(0);
   }
@@ -176,7 +203,9 @@ function handle(line) {
 
 // Session death is signalled by the `die` file (the watcher below), matching
 // how a killed tmux session surfaces to a control client: %exit, then EOF.
+let dying = false; // a detach-delay client stops consuming the shared knobs
 setInterval(() => {
+  if (dying) return;
   if (fs.existsSync(path.join(dir, 'die'))) {
     out('%exit');
     process.exit(0);
@@ -186,5 +215,11 @@ setInterval(() => {
     const bytes = fs.readFileSync(emitFile);
     fs.unlinkSync(emitFile);
     emitOutput(bytes);
+  }
+  const renameFile = path.join(dir, 'rename.txt');
+  if (fs.existsSync(renameFile)) {
+    const newName = fs.readFileSync(renameFile, 'utf8').trim();
+    fs.unlinkSync(renameFile);
+    out(`%session-renamed $0 ${newName}`);
   }
 }, 50);

@@ -145,6 +145,23 @@ module.exports = async function runTerminal(ctx) {
   const control = createControl({
     tmuxBin, socketArgs, target: name,
     onOutput: (bytes) => { if (mirror) mirror.onOutput(bytes); },
+    // `tmux rename-session` leaves this mirror pointing at a STALE name: live
+    // %output keeps flowing (the control client follows the session), but
+    // every later send-keys/capture-pane/display-message targets the frozen
+    // string — input and reseed fail silently, forever (finding #10). Degrade
+    // loudly: end the wrapper with the re-attach instruction. Following the
+    // rename (pinning the pane id) is Tranche B work, not this guard's. The
+    // host daemon needs none of this — its 5 s inventory self-corrects.
+    onEvent: (tag, rest) => {
+      if (tag !== 'session-renamed' || stopping) return;
+      stopping = true;
+      // "%session-renamed $id name" → rest is "$id name".
+      const newName = rest.split(' ').slice(1).join(' ').trim();
+      if (mirror) mirror.stop();
+      if (cableHandle) cableHandle.close();
+      control.kill();
+      die(`pidge terminal: the tmux session '${name}' was RENAMED — the mirror's target is stale, so input and reseed would fail silently from here on. Mirror stopped (the session keeps running); re-run: pidge terminal attach ${newName || '<new-name>'}`, 2);
+    },
     onClose: async (reason) => {
       if (stopping) return;
       stopping = true;
