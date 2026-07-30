@@ -326,11 +326,9 @@ const E2E_NEVER_SEAL_LABEL_IDS = new Set([
 // Test seam: require()ing this file exposes the pure e2e helpers and stops
 // HERE — none of the CLI machinery below (parseArgs, the TOKEN check, command
 // dispatch) runs under a require. The exports are assigned UNCONDITIONALLY,
-// then the early `return` skips the CLI body when not the main module: a
-// CONDITIONAL export would hand an in-process require (src/terminal/ pulls
-// these same helpers while the CLI itself is the main module) an empty object
-// — the circular-dependency trap. Executed as a binary, only the return is
-// skipped, so the CLI still runs unchanged.
+// then the early `return` skips the CLI body when not the main module.
+// Executed as a binary, only the return is skipped, so the CLI still runs
+// unchanged.
 // ---------------------------------------------------------------------------
 module.exports = {
   e2eAad, e2eKeyFingerprint, e2eLoadSecret, e2eParseSecret,
@@ -338,8 +336,6 @@ module.exports = {
   E2E_NEVER_SEAL_LABEL_IDS, e2ePinKeyFor,
   // sealed media — the pure halves (gate decision + filename hygiene).
   e2eMediaSealDecision, sanitizeAttachmentName,
-  // service-template quoting (bridge install + terminal host install share it).
-  xmlEscape, systemdQuote,
 };
 if (require.main !== module) return;
 
@@ -444,12 +440,6 @@ const OPTIONS = {
   ttl: { type: 'string' },                     // run start: sliding TTL in seconds → ttl_seconds
   json: { type: 'boolean' },                   // run start: print the raw server body instead of the export lines
   'no-defer': { type: 'boolean' },             // bridge: turn OFF the polite poller (never defer to an interactive run)
-  // terminal: the tmux session name the wrapper creates (default pidge-<hex>)
-  name: { type: 'string' },
-  install: { type: 'boolean' },                // terminal host: write the launchd/systemd template
-  link: { type: 'string' },                    // terminal: advisory channel link on the session row (server ≥ v94)
-  'no-link': { type: 'boolean' },              // terminal: clear a stored link + disable the project-env inference
-  'machine-channel': { type: 'boolean' },      // terminal host --install: auto-create/reuse the hidden machine channel
 };
 
 const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
@@ -537,25 +527,6 @@ USAGE
                                           run the listener, confirm it picks it up + acks in time.
                                           PASS exit 0 / FAIL exit 2 (with the likely cause). Run it as the
                                           last onboarding step + whenever sends seem to go unheard.
-  pidge terminal [--name X] [-- CMD…]     mirror a LIVE terminal to the human's phone (Terminals tab):
-                                          create a tmux session (running CMD or the default shell),
-                                          register it, stream SEALED frames; the human's keystrokes come
-                                          back. SEALED-ONLY: needs an E2E channel + PIDGE_SECRET (no
-                                          clear-text path). Pro feature — the server says so on a 402.
-                                          Ctrl-C stops the MIRROR only; the tmux session keeps running.
-                                          --link ID tags the session with the channel whose agent runs
-                                          inside (advisory provenance; inferred from the project's pidge
-                                          env when omitted; --no-link clears).
-  pidge terminal attach <tmux-name>       mirror an EXISTING tmux session (the agent inside never knows)
-  pidge terminal host [--install]         the ALWAYS-ON daemon: registers a control lane, keeps the
-                                          tmux inventory listed, attaches a session only WHILE someone
-                                          watches, and spawns new sessions strictly from the profile
-                                          whitelist in ~/.config/pidge/terminal.toml (a viewer can only
-                                          NAME a profile — command lines live on this machine). --install
-                                          writes the launchd/systemd template (key never embedded);
-                                          --install --machine-channel also creates (or reuses) a HIDDEN
-                                          "🖥️ <hostname>" channel just for the daemon, key stored in its
-                                          own scope — your other pidge envs are never touched.
   pidge skill install [--target T]        write the generated Pidge skill from the live manifest
                                           (persistent knowledge for an AI agent). --target claude
                                           (default) → .claude/skills/pidge/SKILL.md · agents → AGENTS.md ·
@@ -755,11 +726,6 @@ const OPTION_DOCS = {
   ttl: '--ttl N                  run start: sliding TTL in seconds (server clamps; default 24h)',
   json: '--json                   run start: print the raw server body instead of the two export lines',
   'no-defer': '--no-defer               bridge: never hold back for a live interactive run (turn OFF the polite poller)',
-  name: '--name NAME              terminal: the tmux session name to create (default pidge-<hex>; 1-64 of letters/digits/_ @ -)',
-  install: '--install                terminal host: write the launchd (macOS) / systemd user (Linux) template instead of running (review, then enable with the printed command; the key is never embedded)',
-  link: '--link ID                terminal: link this session to channel ID — ADVISORY provenance ("this terminal runs channel ID\'s agent"; the Terminals tab shows the chip). Server ≥ manifest v94; a bad/foreign id is refused loudly (422), never silently dropped',
-  'no-link': '--no-link                terminal: send an explicit null link — clears a stored link AND disables the project-env inference for this run',
-  'machine-channel': '--machine-channel        terminal host --install: auto-create (or reuse) a HIDDEN machine channel ("🖥️ <hostname>") for the daemon; its key is stored in the daemon\'s own scope (~/.config/pidge/agents/terminal-host/env) — the shared/project envs are never touched',
 };
 // Content flags shared by every send.
 // `template` is intentionally OFF the menu (content_template is
@@ -960,26 +926,6 @@ const HELP = {
     usage: 'pidge selftest [--window N]',
     body: 'PASS exit 0 / FAIL exit 2 (with the likely cause). Run it as the last onboarding step + whenever sends seem to go unheard.',
     opts: ['window'],
-  },
-  terminal: {
-    summary: 'mirror a LIVE tmux session to the human\'s phone/Mac (Terminals tab) — sealed frames out, keystrokes back.',
-    usage: 'pidge terminal [--name NAME] [--link ID | --no-link] [-- CMD…]  ·  pidge terminal attach <tmux-session> [--link ID | --no-link]  ·  pidge terminal host [--install [--machine-channel]]',
-    body: [
-      'The RAW surface next to notifications (which stay the curated channel): the human watches the real terminal live and can type back — the agent running INSIDE tmux needs no integration and never knows. Pure tmux control mode: no PTY, no native deps; tmux is required (macOS: brew install tmux).',
-      '',
-      'Three forms. `pidge terminal [-- CMD…]` CREATES a detached tmux session (running CMD, else the default shell), registers it and mirrors — your human can also `tmux attach -t <name>` locally, both at once. `pidge terminal attach <name>` mirrors a session that ALREADY exists. Either way this process is only the MIRROR: Ctrl-C stops mirroring, the tmux session keeps running (resume with `attach`). When the tmux session itself dies, the mirror marks it ended and exits 0.',
-      '',
-      '`pidge terminal host` is the ALWAYS-ON daemon (one per channel, PID-checked lock): it registers a CONTROL LANE session (where the app asks for the sessions list and the spawn profiles), keeps every `tmux ls` session registered as it appears/disappears, attaches the tap only WHILE someone is watching (viewer joins → attach + repaint; last leave → stand down after a grace period), and spawns new sessions STRICTLY from the whitelist in ~/.config/pidge/terminal.toml — a viewer can only NAME a profile; the command line, cwd and everything executable exist only in that file, owned by the human. `--install` writes the launchd (macOS) / systemd user (Linux) template with restart-on-failure semantics — a TEMPLATE to review then enable; the channel key is NEVER embedded. Add `--machine-channel` to auto-create (or reuse on a re-install) a HIDDEN machine channel ("🖥️ <hostname>", server ≥ v94) dedicated to the daemon: its key lands in the daemon\'s own scope (~/.config/pidge/agents/terminal-host/env), never in the shared or project env, and the template points the daemon there via PIDGE_AGENT.',
-      '',
-      'LINKING (advisory, server ≥ v94): a mirrored session can carry `linked_channel_id` — "this terminal runs channel X\'s agent" — so the Terminals tab shows provenance. `--link ID` sets it, `--no-link` clears it (explicit null; an OMITTED link keeps whatever is stored). With neither flag the wrapper/attach forms INFER it: when the session\'s cwd lives in a git project holding a project-scoped pidge env (~/.config/pidge/projects/<hash>/env), that env\'s channel is linked automatically — loudly (the note names the channel), conservatively (any doubt ⇒ no link), and never fatally (a refused INFERRED link registers without it; a refused EXPLICIT --link exits 2). Advisory only: the link never changes delivery, auth or relay behavior.',
-      '',
-      'SEALED-ONLY, no escape hatch: every frame (output, keystrokes, control) is end-to-end encrypted with the channel key — the server relays ciphertext it cannot read. Needs an E2E channel AND PIDGE_SECRET in this install; missing either ⇒ refuse to start (exit 2) with the fix instructions. Session name/status are the only CLEAR metadata (keep secrets out of --name and profile names).',
-      '',
-      'PRO: terminal mirroring is a Pro feature — a non-Pro account gets a typed 402 with a message to relay to your human (do not retry; everything else on the key keeps working).',
-      '',
-      'stdout prints ONE machine-readable line ({ok, public_id, name, epoch} — the host prints {ok, control_public_id, host, profiles, sessions}); everything human goes to stderr. Exit: 0 mirror stopped / session ended · 1 usage · 2 refused (E2E, plan, tmux missing, another host live, server).',
-    ].join('\n'),
-    opts: ['name', 'link', 'no-link', 'install', 'machine-channel'],
   },
   skill: {
     summary: 'write the generated Pidge skill from the live manifest (persistent Pidge knowledge for an AI agent).',
@@ -1397,18 +1343,6 @@ function cableSubscribe({ channel, params = {}, onUp, onFrame, onDown, base = BA
   ws.onclose = (e) => die(`closed (${e.code})`);
   return {
     close: () => { closed = true; clearInterval(beatCheck); try { ws.close(); } catch { /* noop */ } },
-    // Perform ONE cable action on this subscription (ActionCable `message`
-    // command). Only meaningful after onUp (a pre-confirm send would race the
-    // subscribe); returns false when it could not be sent — callers treat
-    // that as a drop, never an error (the terminal relay is drop-safe by
-    // contract, and nothing else performs actions yet).
-    send: (action, payload) => {
-      if (closed) return false;
-      try {
-        ws.send(JSON.stringify({ command: 'message', identifier, data: JSON.stringify({ action, ...payload }) }));
-        return true;
-      } catch { return false; }
-    },
   };
 }
 
@@ -5227,23 +5161,6 @@ ${SKILL_END_MARKER}
       // prove reachability by round-trip. Fire a nonce, run the listener,
       // confirm it picks it up + acks in time. PASS exit 0 / FAIL exit 2.
       await doSelftest();
-      break;
-    }
-    case 'terminal': {
-      // Pidge Terminal — mirror a tmux session as SEALED frames (Terminals
-      // tab). The feature lives in src/terminal/ as an isolated module: it
-      // imports the pure e2e helpers through this file's test seam and gets
-      // the LIVE pieces (cable client, config, identity headers) injected
-      // here — the one place that knows both worlds.
-      await require('../src/terminal')({
-        BASE, TOKEN, headers, fetchT, die, note, sleep,
-        cableSubscribe, checkManifestNews,
-        e2eKeyMaterial, e2eChannelInfo, channelKeyFor,
-        readState, writeState, readEnvFile, fetchWhoami,
-        baseDir: pidgeBaseDir(), configDir: CONFIG_DIR,
-        tokenFromFile: !!FILE_ENV.PIDGE_TOKEN,
-        rawArgv: RAW_ARGV, positionals: parsed.positionals, values: v,
-      });
       break;
     }
     case 'inbox': {

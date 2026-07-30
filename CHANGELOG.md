@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.38.0 — 2026-07-30
+
+**Pidge Terminal removed** — the whole `pidge terminal …` surface (the tmux mirror
+wrapper, `terminal attach`, and the `terminal host` daemon) is gone, a product
+decision rather than a technical one. Two findings drove it: a terminal-on-your-phone
+is already served well by dedicated SSH clients (Termius, Blink — use those for raw
+terminal access), and the thing we actually wanted to mirror — a Claude Code
+conversation — cannot be faithfully reconstructed from the terminal byte stream, so
+the mirror could never become the transcript view it was reaching for. Pidge stays
+focused on what it is: the **notify → reply loop** between an agent and its human
+(`ask` / `approval` / `approve`, `listen` / `bridge`, `live`).
+
+- Removed: the `terminal` subcommand (all three forms), its flags (`--name`,
+  `--install`, `--link`, `--no-link`, `--machine-channel`), the `src/` terminal
+  module, and its help/README sections. `pidge terminal` now fails as an unknown
+  subcommand.
+- No other command changes: notifications, waits, E2E sealing, media, bridge, runs
+  and Live Activities are untouched.
+
 ## 0.37.1 — 2026-07-30
 
 Terminal hardening — four fixes from the external adversarial review
