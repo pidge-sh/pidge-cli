@@ -65,8 +65,27 @@ class Daemon {
     this.key = core.e2eParseSecret(this.env.secret);
     this.caps = core.loadCaps();
     this.state = core.readJson(core.STATE_FILE(), { epoch: 0, sessions: {} });
+    // Tunnel scoping (QA finding #13): state.json used to persist sessions
+    // with no channel stamp, so reconnecting this computer to a DIFFERENT
+    // tunnel re-published the old tunnel's sessions there — re-sealing their
+    // title+cwd metadata under the NEW key (a cross-owner metadata leak; the
+    // item crypto held, the sessions rendered empty). Every persisted session
+    // now carries the channelId that owns it (persistSession); on load,
+    // anything that does not belong to the CURRENT tunnel is dropped before it
+    // can register, publish, or re-seal a byte. A missing stamp (a pre-fix
+    // state file) is foreign too: ownership it cannot prove, it does not get.
+    const foreign = [];
+    for (const [sid, p] of Object.entries(this.state.sessions || {})) {
+      if (!p || p.channelId !== this.env.channelId) {
+        foreign.push({ sid, channelId: (p && p.channelId) || null });
+        delete this.state.sessions[sid];
+      }
+    }
     this.state.epoch = (this.state.epoch || 0) + 1; // new epoch per process (B4)
     this.saveState();
+    for (const f of foreign) {
+      this.log(`session ${String(f.sid).slice(0, 8)} belongs to ${f.channelId ? `channel ${f.channelId}` : 'an UNKNOWN channel (pre-scoping state)'}, not the connected channel ${this.env.channelId} — DROPPED from state (a connect that switches tunnels inherits no sessions; metadata never re-seals under another owner's key)`);
+    }
     this.announces = new Map();  // sid → {tty, cwd, transcriptPath, at}
     this.sessions = new Map();   // sid → live session record (see enable)
     this.ws = null;              // one cable socket, N subscriptions
@@ -532,6 +551,9 @@ class Daemon {
   persistSession(s) {
     this.state.sessions[s.sid] = {
       publicId: s.publicId, paneId: s.paneId, tty: s.tty, cwd: s.cwd,
+      // The tunnel that owns this session (finding #13): the load-time scope
+      // check keys on it, so a reconnect to another tunnel cannot inherit it.
+      channelId: this.env.channelId,
       file: s.file, offset: s.offset, nextSeq: s.nextSeq, approvals: s.approvals,
       seen: s.seenRing, // restart dedup (§6) — see seedSeenFromFile
       // The pending sealed items, with the uuid that produced each. Riding in

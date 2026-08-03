@@ -1066,6 +1066,7 @@ function daemonWithPersisted({ sid = 'sess-k', ...overrides } = {}) {
   const st = core.readJson(core.STATE_FILE(), { epoch: 1, sessions: {} });
   st.sessions[sid] = {
     publicId: `ases_${sid}`, paneId: '%1', tty: null, cwd: '/tmp/proj',
+    channelId: 1, // the tunnel this slot is connected to (finding #13 scoping)
     file: path.join(tmp('pidge-term-jsonl-'), 'absent.jsonl'),
     offset: 0, nextSeq: 1, approvals: [], seen: [], outbox: [], ...overrides,
   };
@@ -1983,6 +1984,71 @@ test('re-arm KEEPS the share when the server is unavailable at boot, and retries
   assert.equal(registers, 2, 'the flush tick owns the re-register retry');
   assert.equal(s.registered, true);
   assert.equal(s.nextSeq, 8, 'numbering continues from the server high-water');
+});
+
+// --- state.json is TUNNEL-SCOPED (QA finding #13) ---------------------------
+//
+// Reconnecting this computer from one tunnel to another used to re-publish the
+// old tunnel's sessions on the new one — re-sealing their title+cwd metadata
+// under the NEW key. The crypto held for items (they rendered empty), but the
+// metadata (project paths!) leaked across owners, and a ghost session sat
+// `idle` forever in the app.
+
+test('sessions from ANOTHER tunnel (or with no stamp) are dropped at load, never republished', () => {
+  makeDaemon(); // channel 1 identity + a first epoch in a fresh slot
+  const st = core.readJson(core.STATE_FILE(), { epoch: 1, sessions: {} });
+  const row = (publicId, extra = {}) => ({
+    publicId, paneId: '%1', tty: null, cwd: '/private/tmp/pidge-qa-proj',
+    file: '/tmp/absent.jsonl', offset: 0, nextSeq: 1, approvals: [], seen: [], outbox: [], ...extra,
+  });
+  st.sessions['sess-mine'] = row('ases_mine', { channelId: 1, cwd: '/tmp/mine' });
+  // The QA reproduction: a session enabled against the LOCAL test server
+  // (channel 103) still in state when the computer reconnects to prod.
+  st.sessions['sess-theirs'] = row('ases_theirs', { channelId: 103 });
+  // A pre-scoping state file (0.41.0) has no stamp at all — ownership it
+  // cannot prove, it does not get.
+  st.sessions['sess-legacy'] = row('ases_legacy');
+  core.writeJson(core.STATE_FILE(), st);
+
+  const { value: d, lines } = captureSay(() => new Daemon());
+  assert.deepEqual(Object.keys(d.state.sessions), ['sess-mine'],
+    'only the CURRENT tunnel\'s sessions may survive the load');
+  assert.deepEqual(Object.keys(core.readJson(core.STATE_FILE(), {}).sessions), ['sess-mine'],
+    'the purge is persisted — a crash must not resurrect the foreign rows');
+  const out = lines.join('\n');
+  assert.match(out, /sess-the.*channel 103.*DROPPED/s, 'the foreign drop is loud and names the owner');
+  assert.match(out, /sess-leg.*UNKNOWN channel.*DROPPED/s);
+});
+
+test('after a tunnel switch, re-arm registers NOTHING from the old tunnel', async () => {
+  makeDaemon();
+  const st = core.readJson(core.STATE_FILE(), { epoch: 1, sessions: {} });
+  st.sessions['sess-old-tunnel'] = {
+    publicId: 'ases_old', channelId: 103, paneId: '%1', tty: null,
+    cwd: '/private/tmp/pidge-qa-proj', file: '/tmp/absent.jsonl',
+    offset: 0, nextSeq: 1, approvals: [], seen: [], outbox: [],
+  };
+  core.writeJson(core.STATE_FILE(), st);
+
+  const { value: d } = captureSay(() => new Daemon());
+  d.logLines = [];
+  d.log = (...a) => { d.logLines.push(a.join(' ')); };
+  d.subscribeInput = () => {};
+  const registered = [];
+  d.api = async (method, p, body) => {
+    if (method === 'POST' && p === '/agent_sessions') registered.push(body.public_id);
+    return { res: { status: 201 }, data: { session: { last_seq: 0 } } };
+  };
+  await d.rearmPersisted();
+  assert.deepEqual(registered, [], 'a connect that switches tunnels inherits NO sessions');
+  assert.equal(d.sessions.size, 0);
+});
+
+test('persistSession stamps the owning channelId on every write', () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { sid: 'sess-stamp' });
+  d.persistSession(s);
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-stamp'].channelId, 1);
 });
 
 test('re-arm DROPS a session only when the server refuses it definitively', async () => {
