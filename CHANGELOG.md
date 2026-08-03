@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.39.0 — 2026-08-02
+
+**Agent Sessions — `pidge terminal` reborn as transcript-as-data** (pidge repo
+`docs/agent-sessions-spec.md`; pairs with server manifest v98). Not the old byte
+mirror: the daemon tails Claude Code's own session transcript (JSONL), normalizes
+it into structured items and publishes them **E2E-sealed** to a tunnel channel;
+the phone renders a native conversation and typed replies land in the session's
+real input box via tmux `send-keys`. Pidge never spawns or wraps the agent.
+
+- `pidge terminal connect --code <code>` — once per Mac: exchanges the app's
+  Link-a-Mac claim code (Settings → Tunnels), stores the tunnel identity in its
+  own machine slot (`~/.config/pidge/terminal/env`, 0600 — independent of every
+  project/agent identity), asks consent, installs Claude Code hooks (tagged
+  `# pidge-hook`, cleanly removable) and a launchd daemon. E2E is mandatory —
+  there is no clear mode.
+- `pidge terminal enable` — per session, opt-in (consent boundary = capability
+  boundary): run from INSIDE claude ("enable yourself on Pidge" — the skill
+  teaches it), it walks the process tree to the claude ancestor, binds its exact
+  tmux pane + transcript, seeds the last ~100 items and live-tails. `ls` is the
+  picker door; sessions outside tmux are not shareable in v1.
+- Status via hooks (PreToolUse→running, Notification→waiting→a REAL
+  notification, Stop→idle) + 30 s heartbeats; `--approvals Bash,Write` gates
+  those tools behind an Approve/Deny push (off by default; timeout falls open
+  to the local prompt).
+- Input lane hardening inherited from the old feature's paid-for lessons: pane
+  binding, single-writer lock, viewer-generation replay ledger + daemon epoch
+  echo, a deliberately tiny key allowlist, and items degrade INSIDE the 16 KB
+  sealed cap before sending.
+- Skill rev 17: the "Enable yourself on Pidge" instruction.
+
 ## 0.38.0 — 2026-07-30
 
 **Pidge Terminal removed** — the whole `pidge terminal …` surface (the tmux mirror
