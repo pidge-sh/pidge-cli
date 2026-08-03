@@ -166,6 +166,10 @@ class Daemon {
       harness_version: session.hv || null,
       tmux: { pane_id: session.paneId },
       epoch: this.state.epoch,
+      // The harness's permission mode as last seen by the hooks (Claude:
+      // default | plan | acceptEdits | bypassPermissions). OMITTED when
+      // unknown — viewers must tolerate absence (spec §4, added 2026-08-03).
+      ...(session.mode ? { mode: session.mode } : {}),
     };
     return core.e2eEncryptBlob(this.key,
       core.e2eAad(this.env.channelId, session.publicId, 'agent_meta'),
@@ -272,7 +276,11 @@ class Daemon {
           return send(200, { decision: await this.enableFromSentinel(sid, body, sentinel) });
         }
         const s = sid && this.sessions.get(sid);
-        if (s) { s.lastAliveAt = Date.now(); this.setStatus(s, 'running'); }
+        if (s) {
+          s.lastAliveAt = Date.now();
+          this.setStatus(s, 'running');
+          this.notePermissionMode(s, body.permission_mode);
+        }
         if (s && s.approvals && s.approvals.length && this.toolGated(s, body.tool_name)) {
           const decision = await this.approvalGate(s, body);
           return send(200, decision ? { decision } : {});
@@ -364,6 +372,9 @@ class Daemon {
     try {
       const s = await this.enableSession({
         sid, paneId: pane.paneId, tty, cwd, file,
+        // The enable ride IS a PreToolUse payload — its permission_mode (read
+        // defensively; older harnesses omit it) seeds the very first meta.
+        mode: typeof body.permission_mode === 'string' && body.permission_mode ? body.permission_mode : null,
         approvals: (sentinel && sentinel.approvals) || [],
       });
       this.log(`enable ${sid.slice(0, 8)} via the PreToolUse sentinel → ${s.publicId} (pane ${pane.paneId}${pane.loc ? ` ${pane.loc}` : ''}, bound by ${pane.by})`);
@@ -523,10 +534,10 @@ class Daemon {
     }
   }
 
-  async enableSession({ sid, paneId, tty, cwd, file, approvals }) {
+  async enableSession({ sid, paneId, tty, cwd, file, mode, approvals }) {
     this.acquireWriterLock(sid); // B3 — refuse loudly on conflict
     try {
-      return await this.enableSessionLocked({ sid, paneId, tty, cwd, file, approvals });
+      return await this.enableSessionLocked({ sid, paneId, tty, cwd, file, mode, approvals });
     } catch (e) {
       // A failed enable must not strand the lock — NOR leave the half-enabled
       // record live: enableSessionLocked inserts into this.sessions and persists
@@ -542,12 +553,13 @@ class Daemon {
     }
   }
 
-  async enableSessionLocked({ sid, paneId, tty, cwd, file, approvals }) {
+  async enableSessionLocked({ sid, paneId, tty, cwd, file, mode, approvals }) {
     const session = {
       sid,
       publicId: `ases_${sid}`,
       paneId, tty, cwd, file,
       title: path.basename(cwd || 'session'),
+      mode: mode || null, // harness permission mode — sealed meta only (§4)
       hv: null,
       offset: 0,
       seenUuids: new Set(), seenRing: [],
@@ -1097,6 +1109,21 @@ class Daemon {
   }
 
   // --- status + waiting notification (spec §9) ------------------------------
+
+  // The harness's permission mode rides every PreToolUse payload (Claude:
+  // default | plan | acceptEdits | bypassPermissions) — read DEFENSIVELY, the
+  // field can be absent on older harnesses, and absence is never a change.
+  // A change refreshes meta_sealed so viewers see the current mode; the mode
+  // lives only inside the sealed blob (the server never reads it).
+  notePermissionMode(s, mode) {
+    if (typeof mode !== 'string' || !mode || mode === s.mode) return;
+    const had = s.mode || null;
+    s.mode = mode;
+    this.persistSession(s);
+    this.api('PATCH', `/agent_sessions/${s.publicId}`, { status: s.status, meta_sealed: this.sealMeta(s) })
+      .catch((e) => this.log(`${s.publicId}: meta refresh on mode change failed (${e.message}) — the next change retries`));
+    this.log(`${s.sid.slice(0, 8)}: permission mode ${had ? `${had} → ` : ''}${mode}`);
+  }
 
   // s.status IS the desired status: the transition PATCH is best-effort, and
   // the heartbeat re-asserts whatever this last set.

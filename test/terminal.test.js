@@ -1743,6 +1743,59 @@ test('the cold end happens even when the final notice cannot be delivered', asyn
     `an undelivered notice must be narrated, got ${JSON.stringify(d.logLines)}`);
 });
 
+// --- permission_mode rides the SEALED meta (spec §4, added 2026-08-03) ------
+
+test('permission_mode: captured at enable into the sealed meta; OMITTED when the harness does not send it', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-mode', 'pidge terminal enable', { permission_mode: 'plan' })));
+  const s = d.sessions.get('sess-mode');
+  assert.equal(s.mode, 'plan');
+  const meta = JSON.parse(core.e2eDecryptBlob(d.key, core.e2eAad(1, 'ases_sess-mode', 'agent_meta'),
+    Buffer.from(d.sealMeta(s), 'base64url')).toString('utf8'));
+  assert.equal(meta.mode, 'plan');
+
+  // An older harness without the field: the key is OMITTED, never null-filled.
+  const bare = readyDaemon();
+  bare.hookToken = 'local-test-token';
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(bare, 'pre-tool-use', preToolUse('sess-nomode', 'pidge terminal enable')));
+  const s2 = bare.sessions.get('sess-nomode');
+  const meta2 = JSON.parse(core.e2eDecryptBlob(bare.key, core.e2eAad(1, 'ases_sess-nomode', 'agent_meta'),
+    Buffer.from(bare.sealMeta(s2), 'base64url')).toString('utf8'));
+  assert.ok(!('mode' in meta2), 'absence must stay absent — viewers tolerate a missing mode, not a fake one');
+});
+
+test('a mode CHANGE refreshes meta_sealed; a mode-less payload changes nothing', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const apiLog = [];
+  d.api = async (method, p, body) => { apiLog.push({ method, p, body }); return { res: { status: 200 }, data: {} }; };
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-flip', 'pidge terminal enable', { permission_mode: 'default' })));
+  apiLog.length = 0;
+
+  // The human flips shift+tab → acceptEdits; the next PreToolUse carries it.
+  await hookPost(d, 'pre-tool-use', preToolUse('sess-flip', 'npm test', { permission_mode: 'acceptEdits' }));
+  const s = d.sessions.get('sess-flip');
+  assert.equal(s.mode, 'acceptEdits');
+  const patch = apiLog.find((c) => c.method === 'PATCH' && c.body && c.body.meta_sealed);
+  assert.ok(patch, 'a mode change must refresh the sealed meta');
+  const meta = JSON.parse(core.e2eDecryptBlob(d.key, core.e2eAad(1, 'ases_sess-flip', 'agent_meta'),
+    Buffer.from(patch.body.meta_sealed, 'base64url')).toString('utf8'));
+  assert.equal(meta.mode, 'acceptEdits');
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-flip'].mode, 'acceptEdits',
+    'the mode survives a daemon restart');
+  assert.ok(d.logLines.some((l) => /permission mode default → acceptEdits/.test(l)));
+
+  // No field ⇒ no change, no spurious meta traffic (defensive read).
+  apiLog.length = 0;
+  await hookPost(d, 'pre-tool-use', preToolUse('sess-flip', 'ls'));
+  assert.equal(d.sessions.get('sess-flip').mode, 'acceptEdits', 'absence is not a change');
+  assert.ok(!apiLog.some((c) => c.method === 'PATCH' && c.body && c.body.meta_sealed));
+});
+
 // --- the tailer: backfill, restart dedup, rescan bounds ---------------------
 
 function rec(i) {
