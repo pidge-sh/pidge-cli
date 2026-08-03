@@ -9,11 +9,12 @@ it into structured items and publishes them **E2E-sealed** to a tunnel channel;
 the phone renders a native conversation and typed replies land in the session's
 real input box via tmux `send-keys`. Pidge never spawns or wraps the agent.
 
-- `pidge terminal connect --code <code>` — once per Mac: exchanges the app's
-  Link-a-Mac claim code (Settings → Tunnels), stores the tunnel identity in its
-  own machine slot (`~/.config/pidge/terminal/env`, 0600 — independent of every
-  project/agent identity), asks consent, installs Claude Code hooks (tagged
-  `# pidge-hook`, cleanly removable) and a launchd daemon. E2E is mandatory —
+- `pidge terminal connect --code <code>` — once per computer: exchanges the
+  app's claim code (Settings → Computers → Connect a computer), stores the
+  tunnel identity in its own machine slot (`~/.config/pidge/terminal/env`,
+  0600 — independent of every project/agent identity), asks consent, installs
+  Claude Code hooks (tagged `# pidge-hook`, cleanly removable) and a background
+  daemon (launchd on macOS, `systemd --user` on Linux/WSL). E2E is mandatory —
   there is no clear mode.
 - `pidge terminal enable` — per session, opt-in (consent boundary = capability
   boundary): run from INSIDE claude ("enable yourself on Pidge" — the skill

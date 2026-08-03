@@ -10,6 +10,37 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+
+// --- the ONE enable door ----------------------------------------------------
+
+// There is exactly one way to share a session: run `pidge terminal enable` from
+// INSIDE the claude you want to share (the "enable yourself on Pidge" prompt),
+// so the ancestor walk can bind its tmux pane. No picker, no explicit session
+// id, no pane-less "read-only" share — shared means fully interactive, and a
+// share the human types into for nothing is worse than a refusal. Every refusal
+// on that path says this ONE sentence, from the CLI and from the daemon alike.
+const ENABLE_REFUSAL = 'Run this from inside the Claude session you want to share — it must be in a tmux.';
+
+// --- tmux ------------------------------------------------------------------
+
+// Resolve the tmux pane that owns a controlling tty. Used by the CLI's ancestor
+// walk (commands.runEnable) and, as a belt, by the daemon when it resolves the
+// announced tty of the session being enabled. No pane ⇒ no share (spec §8:
+// enable pins ONE pane_id).
+function tmuxPaneForTty(tty) {
+  if (!tty) return null;
+  try {
+    const out = execFileSync('tmux',
+      ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}'],
+      { encoding: 'utf8' });
+    for (const line of out.trim().split('\n')) {
+      const [paneId, paneTty, loc] = line.split('\t');
+      if (paneTty === tty) return { paneId, loc };
+    }
+  } catch {}
+  return null;
+}
 
 // --- config slot -----------------------------------------------------------
 
@@ -163,6 +194,7 @@ function saveCaps(caps) {
 
 module.exports = {
   baseDir, terminalDir, ENV_FILE, DAEMON_FILE, STATE_FILE, LOG_FILE, HOOK_SHIM, LOCKS_DIR,
+  tmuxPaneForTty, ENABLE_REFUSAL,
   readEnvFile, writeFileAtomic, readJson, writeJson,
   loadTerminalEnv, saveTerminalEnv,
   e2eAad, e2eParseSecret, e2eKeyFingerprint, e2eEncryptField, e2eEncryptBlob, e2eDecryptBlob,

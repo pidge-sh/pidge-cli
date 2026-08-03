@@ -1,13 +1,14 @@
 'use strict';
 // The pidge terminal daemon (agent-sessions-spec §1/§2/§8/§9/§11).
 //
-// One per Mac (launchd), owns: the loopback hook endpoint (SessionStart/
-// PreToolUse/Notification/Stop announce to it — LOCAL ONLY, publishing is
-// gated per-session by the explicit enable), the JSONL tailers for ENABLED
+// One per computer (launchd on macOS, `systemd --user` on Linux/WSL), owns:
+// the loopback hook endpoint (SessionStart/PreToolUse/Notification/Stop
+// announce to it — LOCAL ONLY, publishing is gated per-session by the
+// explicit enable), the JSONL tailers for ENABLED
 // sessions, the sealed publisher, status heartbeats, the waiting→notification
 // edge, and the cable input lane (sealed frames → tmux send-keys into the
 // BOUND pane). Consent boundary = capability boundary: nothing about a
-// session leaves this Mac before `pidge terminal enable`, and everything
+// session leaves this computer before `pidge terminal enable`, and everything
 // enabled is fully interactive.
 //
 // Inherited scars (see the spec §15): #65 — items degrade INSIDE the cap
@@ -32,7 +33,26 @@ const HEARTBEAT_MS = 30_000;
 const WATCHDOG_MS = 15_000;
 const BACKFILL_ITEMS = 100;             // spec §6
 const BACKFILL_SEALED_BYTES = 512 * 1024;
+// How many recently-published uuids ride in state.json per session. The uuid
+// set is what stops a rescan/rotation from re-publishing a whole transcript,
+// and an in-memory-only set is empty after a restart — see seedSeenFromFile.
+const SEEN_RING = 500;
+// The DURABLE OUTBOX (see persistSession): sealed items awaiting their 201,
+// persisted with the offset that produced them. Bounded, because state.json is
+// not a queue server — at the cap the TAILER STOPS ADVANCING (tailOne), so the
+// un-enqueued tail stays exactly where it is durable: in the transcript file.
+const OUTBOX_MAX_ITEMS = 2000;
+const OUTBOX_MAX_BYTES = 4 * 1024 * 1024;
+// Read windows. A transcript can be multi-GB; nothing here may slurp one.
+const LIVE_READ_MAX_BYTES = 4 * 1024 * 1024;   // per live tick (the next tick continues)
+const TAIL_WINDOW_BYTES = 8 * 1024 * 1024;     // enable backfill + restart dedup reseed
+const RESCAN_MAX_BYTES = 64 * 1024 * 1024;     // a whole-file bulk re-read, hard-clamped
 const INPUT_KEYS = new Set(['Enter', 'Escape', 'Up', 'Down', 'Tab', 'BTab', 'C-c']);
+// A register the server refused for a reason RETRYING cannot fix (the session
+// is gone, the key was rotated, the tunnel is not ours). Everything else — a
+// network error, a 5xx, a 402 while a subscription lapses — is transient and
+// must NOT cost the human the share they opted into.
+const DEFINITIVE_REGISTER_STATUSES = new Set([401, 403, 404, 410]);
 
 function nowIso() { return new Date().toISOString(); }
 
@@ -52,7 +72,17 @@ class Daemon {
     this.ws = null;              // one cable socket, N subscriptions
     this.wsGen = 0;              // identity guard for reconnects (#66)
     this.wsLastBeat = 0;
-    this.replay = new Map();     // `${publicId}|${vgen}` → last seq
+    this.replay = new Map();     // `${publicId}|${vgen}` → last seq (never pruned:
+                                 // a viewer generation must stay monotonic for the
+                                 // life of the process, including across a
+                                 // disable/re-enable of the same sid)
+    // RESERVED, deliberately empty in v1: there is no wire signal that retires a
+    // viewer generation (the spec's grow-only retired set needs one). Replay
+    // defense in v1 rests on the mandatory `he` epoch echo — which kills every
+    // pre-restart ciphertext — plus the per-vgen monotonic seq ledger above.
+    // Populating this on disable was considered and REJECTED: the app can reuse
+    // a vgen across a re-enable, and dropping a live viewer's input silently is
+    // worse than the replay window the epoch echo already closes.
     this.retiredVgens = new Set();
     this.logStream = null;
   }
@@ -127,9 +157,13 @@ class Daemon {
       public_id: session.publicId, status, meta_sealed: this.sealMeta(session),
     });
     if (res.status !== 201) {
-      throw new Error(`register ${session.publicId} → ${res.status} ${JSON.stringify(data)}`);
+      // The status rides the error: the caller must tell "the session is gone"
+      // (drop it) from "the server is having a bad minute" (keep and retry).
+      const err = new Error(`register ${session.publicId} → ${res.status} ${JSON.stringify(data)}`);
+      err.status = res.status;
+      throw err;
     }
-    return data.session; // {last_seq, …} — the continue-point
+    return (data && data.session) || {}; // {last_seq, …} — the continue-point
   }
 
   // --- hooks endpoint (loopback) -------------------------------------------
@@ -178,7 +212,7 @@ class Daemon {
         if (s && tp && tp !== s.file) {
           // /clear+resume rotation: same sid, new file — SAME AgentSession (spec §6).
           this.log(`session ${sid.slice(0, 8)}: transcript rotated → ${path.basename(tp)}`);
-          s.file = tp; s.offset = 0; s.partial = ''; // uuid dedup absorbs the re-read
+          s.file = tp; s.offset = 0; s.bulk = true; // uuid dedup absorbs the re-read; bulk caps it (§6)
           this.persistSession(s);
         }
         return send(200, {});
@@ -222,8 +256,11 @@ class Daemon {
         return this.enableFromRequest(body, send);
       case 'POST /disable': {
         const targets = body.all ? [...this.sessions.keys()] : [body.sid].filter(Boolean);
-        for (const sid of targets) await this.disableSession(sid, 'requested');
-        return send(200, { disabled: targets });
+        // The results carry whether the server was actually told — the CLI
+        // reports that honestly instead of a blanket "✓ stopped sharing".
+        const results = [];
+        for (const sid of targets) results.push(await this.disableSession(sid, 'requested'));
+        return send(200, { disabled: targets, results });
       }
       default:
         return send(404, {});
@@ -232,34 +269,49 @@ class Daemon {
 
   // --- enable / disable -----------------------------------------------------
 
+  // The ONE enable door. The CLI has already walked its ancestors to the claude
+  // process, so it arrives with that claude's tty (which announce to pick) and
+  // its pane. No explicit sid is accepted — "which session did you mean?" is
+  // exactly the guess this feature refuses to make — and a session with NO
+  // bound pane is a hard error, never a read-only share: shared ⇔ interactive.
   async enableFromRequest(body, send) {
-    const { tty, cwd, pane_id: paneId, sid: explicitSid, approvals } = body;
-    let sid = explicitSid || null;
-    if (!sid && tty) {
-      const now = Date.now();
-      const hits = [...this.announces.entries()]
-        .filter(([, a]) => now - a.at < HOOK_TTL_MS && a.tty === tty)
-        .sort((a, b) => b[1].at - a[1].at);
-      if (hits.length === 0) {
-        return send(422, { error: 'no announced session on this tty — restart claude inside the tmux pane (the SessionStart hook announces it), then retry' });
-      }
-      sid = hits[0][0]; // newest announce on the tty — a new claude re-announces
+    const { tty, cwd, pane_id: paneId, approvals } = body;
+    if (!tty) return send(422, { error: core.ENABLE_REFUSAL });
+    const now = Date.now();
+    const hits = [...this.announces.entries()]
+      .filter(([, a]) => now - a.at < HOOK_TTL_MS && a.tty === tty)
+      .sort((a, b) => b[1].at - a[1].at);
+    if (hits.length === 0) {
+      return send(422, { error: 'no announced session on this tty — restart claude inside the tmux pane (the SessionStart hook announces it), then retry' });
     }
-    if (!sid) return send(422, { error: 'need sid or tty' });
+    const sid = hits[0][0]; // newest announce on the tty — a new claude re-announces
     const ann = this.announces.get(sid);
     if (!ann || !ann.transcriptPath) {
       return send(422, { error: `session ${sid.slice(0, 8)} has no announced transcript path — restart claude and retry` });
     }
     if (this.sessions.has(sid)) {
-      const s = this.sessions.get(sid);
-      return send(200, { already: true, public_id: s.publicId });
+      return send(200, { already: true, public_id: this.sessions.get(sid).publicId });
+    }
+    // The CLI's pane wins; the announced tty is the belt (a pane the CLI could
+    // not name is still a pane). Neither ⇒ refuse, with the one instruction.
+    let bound = paneId || null;
+    if (!bound) {
+      const hit = core.tmuxPaneForTty(ann.tty || tty);
+      if (hit) {
+        bound = hit.paneId;
+        this.log(`enable ${sid.slice(0, 8)}: pane ${hit.paneId} (${hit.loc}) resolved from tty ${ann.tty || tty}`);
+      }
+    }
+    if (!bound) {
+      this.log(`enable ${sid.slice(0, 8)} REFUSED: no tmux pane owns tty ${ann.tty || tty} — a pane-less share would drop every keystroke`);
+      return send(422, { error: core.ENABLE_REFUSAL });
     }
     try {
       const s = await this.enableSession({
-        sid, paneId: paneId || null, tty: ann.tty, cwd: cwd || ann.cwd,
+        sid, paneId: bound, tty: ann.tty, cwd: cwd || ann.cwd,
         file: ann.transcriptPath, approvals: Array.isArray(approvals) ? approvals : [],
       });
-      return send(200, { public_id: s.publicId, backfilled: s.backfilled });
+      return send(200, { public_id: s.publicId, backfilled: s.backfilled, pane_bound: true });
     } catch (e) {
       this.log('enable failed:', e.message);
       return send(502, { error: e.message });
@@ -271,7 +323,16 @@ class Daemon {
     try {
       return await this.enableSessionLocked({ sid, paneId, tty, cwd, file, approvals });
     } catch (e) {
-      this.releaseWriterLock(sid); // a failed enable must not strand the lock
+      // A failed enable must not strand the lock — NOR leave the half-enabled
+      // record live: enableSessionLocked inserts into this.sessions and persists
+      // before the first backfill flush, so a throw after that point would leave
+      // a session publishing without the single-writer guarantee and reviving
+      // from state.json on the next boot.
+      const s = this.sessions.get(sid);
+      if (s) { s.gen += 1; this.sessions.delete(sid); }
+      delete this.state.sessions[sid];
+      this.saveState();
+      this.releaseWriterLock(sid);
       throw e;
     }
   }
@@ -283,12 +344,14 @@ class Daemon {
       paneId, tty, cwd, file,
       title: path.basename(cwd || 'session'),
       hv: null,
-      offset: 0, partial: '',
-      seenUuids: new Set(),
-      queue: [], nextSeq: 1,
+      offset: 0,
+      seenUuids: new Set(), seenRing: [],
+      queue: [], outboxBytes: 0, nextSeq: 1,
       status: 'idle', waitingArmed: true,
       approvals: approvals || [],
       flushing: false, backfilled: 0,
+      registered: true, registering: false, // the server knows this session
+      backoff: 0, nextFlushAt: 0, // publish backoff window (flushTick honors it)
       gen: 0, // teardown identity (#66)
     };
     const echo = await this.registerSession(session, 'idle');
@@ -297,28 +360,103 @@ class Daemon {
     this.persistSession(session);
     await this.backfill(session);
     this.subscribeInput(session);
-    this.log(`enabled ${sid.slice(0, 8)} → ${session.publicId} (pane ${paneId || 'NONE — read-only'}, seq from ${session.nextSeq})`);
+    this.log(`enabled ${sid.slice(0, 8)} → ${session.publicId} (pane ${paneId}, seq from ${session.nextSeq})`);
     return session;
+  }
+
+  // Record a uuid as published. Returns false when it was already known — the
+  // ONE dedup gate for the tailer, the backfill and every rescan. `seenRing` is
+  // the bounded, persistable tail of the same knowledge (see persistSession).
+  markSeen(s, uuid) {
+    if (s.seenUuids.has(uuid)) return false;
+    s.seenUuids.add(uuid);
+    s.seenRing.push(uuid);
+    if (s.seenRing.length > SEEN_RING) s.seenRing.splice(0, s.seenRing.length - SEEN_RING);
+    return true;
+  }
+
+  // --- the durable outbox ---------------------------------------------------
+  //
+  // An item is enqueued the moment it is sealed and removed ONLY when the
+  // server has acked it (201). Because the queue used to live in memory only
+  // while the read offset and the uuid ring were persisted immediately, a
+  // server outage plus a restart was silent DATA LOSS: the offset sat at EOF,
+  // the uuids were deduped, and the queued items were simply gone — the phone
+  // never saw them and the next item took their seq (an invisible splice).
+  // Now the offset, the uuid ring and the pending items are written in ONE
+  // atomic state.json write, so they can never disagree about what was read
+  // but not yet delivered.
+
+  queuePush(s, uuid, sealed) {
+    s.queue.push({ uuid, sealed });
+    s.outboxBytes = (s.outboxBytes || 0) + sealed.length;
+  }
+
+  // Drop the first n entries — ONLY ever called for items the server has
+  // confirmed it stored (a 201, or a seq re-sync that proved they landed).
+  queueDrop(s, n) {
+    const gone = s.queue.splice(0, n);
+    let freed = 0;
+    for (const e of gone) freed += (e.sealed || '').length;
+    s.outboxBytes = Math.max(0, (s.outboxBytes || 0) - freed);
+    if (!s.queue.length) s.outboxBytes = 0;
+    return gone.length;
+  }
+
+  outboxFull(s) {
+    return s.queue.length >= OUTBOX_MAX_ITEMS || (s.outboxBytes || 0) >= OUTBOX_MAX_BYTES;
   }
 
   persistSession(s) {
     this.state.sessions[s.sid] = {
       publicId: s.publicId, paneId: s.paneId, tty: s.tty, cwd: s.cwd,
       file: s.file, offset: s.offset, nextSeq: s.nextSeq, approvals: s.approvals,
+      seen: s.seenRing, // restart dedup (§6) — see seedSeenFromFile
+      // The pending sealed items, with the uuid that produced each. Riding in
+      // the SAME write as `offset`/`seen` is the point: a uuid may be marked
+      // seen before its 201 precisely because the item itself survives here and
+      // is replayed on the next boot (rearmPersisted).
+      outbox: s.queue,
     };
     this.saveState();
   }
 
+  // Local teardown only — no server call. Used when the server has told us the
+  // session is gone (a re-register it refused definitively).
+  dropSession(session, why) {
+    session.gen += 1; // invalidate every outstanding async callback (#66)
+    if (this.sessions.get(session.sid) === session) this.sessions.delete(session.sid);
+    delete this.state.sessions[session.sid];
+    this.saveState();
+    this.releaseWriterLock(session.sid);
+    this.log(`dropped ${session.sid.slice(0, 8)} (${why})`);
+  }
+
+  // Returns {sid, server_ok, detail}: the LOCAL stop always happens, but a
+  // DELETE that never reached the server must be reported as such — telling
+  // the human "✓ stopped sharing" while the row is still live on the server is
+  // the kind of quiet lie this feature does not get to tell.
   async disableSession(sid, why) {
     const s = this.sessions.get(sid);
-    if (!s) { delete this.state.sessions[sid]; this.saveState(); return; }
+    if (!s) { delete this.state.sessions[sid]; this.saveState(); return { sid, server_ok: true, detail: null }; }
     s.gen += 1; // invalidate every outstanding async callback (#66)
     this.sessions.delete(sid);
     delete this.state.sessions[sid];
     this.saveState();
     this.releaseWriterLock(sid);
-    try { await this.api('DELETE', `/agent_sessions/${s.publicId}`); } catch {}
-    this.log(`disabled ${sid.slice(0, 8)} (${why})`);
+    let serverOk = false;
+    let detail = null;
+    try {
+      const { res } = await this.api('DELETE', `/agent_sessions/${s.publicId}`);
+      // 404 = already gone (the DELETE is idempotent by contract) — that IS a
+      // clean stop, not a failure.
+      serverOk = (res.status >= 200 && res.status < 300) || res.status === 404;
+      if (!serverOk) detail = `server answered ${res.status}`;
+    } catch (e) {
+      detail = e.message;
+    }
+    this.log(`disabled ${sid.slice(0, 8)} (${why})${serverOk ? '' : ` — the server was NOT told (${detail}); it reaps the session on staleness`}`);
+    return { sid, server_ok: serverOk, detail };
   }
 
   // On boot: re-arm persisted sessions (daemon restart must not silently
@@ -328,24 +466,74 @@ class Daemon {
     for (const [sid, p] of Object.entries(this.state.sessions || {})) {
       try {
         this.acquireWriterLock(sid);
-        const session = {
-          sid, publicId: p.publicId, paneId: p.paneId, tty: p.tty, cwd: p.cwd,
-          file: p.file, offset: p.offset || 0, partial: '',
-          title: path.basename(p.cwd || 'session'), hv: null,
-          seenUuids: new Set(), queue: [], nextSeq: p.nextSeq || 1,
-          status: 'idle', waitingArmed: true, approvals: p.approvals || [],
-          flushing: false, backfilled: 0, gen: 0,
-        };
-        const echo = await this.registerSession(session, 'idle');
-        session.nextSeq = Math.max(session.nextSeq, (echo.last_seq || 0) + 1);
-        this.sessions.set(sid, session);
-        this.subscribeInput(session);
-        this.log(`re-armed ${sid.slice(0, 8)} after restart (epoch ${this.state.epoch})`);
       } catch (e) {
-        this.log(`re-arm ${sid.slice(0, 8)} failed: ${e.message} — dropped from state`);
-        delete this.state.sessions[sid];
-        this.saveState();
+        // Another live daemon owns this session. Leaving it in state is the
+        // whole point — it is not ours to un-share.
+        this.log(`re-arm ${sid.slice(0, 8)} skipped: ${e.message}`);
+        continue;
       }
+      // The un-acked items from the previous process, replayed before a single
+      // new byte is tailed (their seqs are re-assigned from the server's
+      // high-water at register, so ordering and monotonicity hold).
+      const outbox = (p.outbox || []).filter((e) => e && typeof e.sealed === 'string');
+      const session = {
+        sid, publicId: p.publicId, paneId: p.paneId, tty: p.tty, cwd: p.cwd,
+        file: p.file, offset: p.offset || 0,
+        title: path.basename(p.cwd || 'session'), hv: null,
+        // Restart dedup: start from the persisted ring, then rebuild the rest
+        // from the bytes we already published (below) BEFORE any tick can emit.
+        seenUuids: new Set(p.seen || []), seenRing: [...(p.seen || [])],
+        queue: outbox, outboxBytes: outbox.reduce((n, e) => n + e.sealed.length, 0),
+        nextSeq: p.nextSeq || 1,
+        status: 'idle', waitingArmed: true, approvals: p.approvals || [],
+        flushing: false, backfilled: 0, registered: false, registering: false,
+        backoff: 0, nextFlushAt: 0, gen: 0,
+      };
+      this.seedSeenFromFile(session);
+      // A pending item's uuid counts as seen: it is not published yet, but it
+      // IS captured — re-reading it from the transcript would queue it twice.
+      for (const e of session.queue) if (e.uuid) this.markSeen(session, e.uuid);
+      this.sessions.set(sid, session);
+      this.subscribeInput(session);
+      if (outbox.length) this.log(`${sid.slice(0, 8)}: ${outbox.length} un-acked item(s) recovered from the outbox — they publish before any new bytes`);
+      await this.registerOrKeep(session);
+      if (this.sessions.get(sid) === session) {
+        this.log(`re-armed ${sid.slice(0, 8)} after restart (epoch ${this.state.epoch})`);
+      }
+    }
+  }
+
+  // Register (or re-register) a session with the server. A failure the server
+  // owns definitively drops the share; ANY transient failure keeps it — the
+  // offsets, the dedup ring and the pending outbox all live on this computer,
+  // so publishing simply resumes when the server comes back. A Mac that reboots
+  // during a deploy used to lose every share here.
+  async registerOrKeep(session) {
+    if (session.registering) return false;
+    session.registering = true;
+    const gen = session.gen;
+    try {
+      const echo = await this.registerSession(session, session.status || 'idle');
+      if (!this.stillOwns(session, gen)) return false; // torn down mid-flight (#66)
+      session.nextSeq = Math.max(session.nextSeq || 1, (echo.last_seq || 0) + 1);
+      session.registered = true;
+      session.backoff = 0;
+      session.nextFlushAt = 0;
+      this.persistSession(session);
+      return true;
+    } catch (e) {
+      if (!this.stillOwns(session, gen)) return false;
+      if (DEFINITIVE_REGISTER_STATUSES.has(e.status)) {
+        this.log(`${session.sid.slice(0, 8)}: the server refused this session for good (${e.message}) — un-sharing it locally`);
+        this.dropSession(session, 'server refused the session');
+        return false;
+      }
+      session.registered = false;
+      this.backOff(session, `register failed (${e.message})`);
+      this.log(`${session.sid.slice(0, 8)}: keeping the share — offsets and ${session.queue.length} pending item(s) stay on this computer; publishing resumes on reconnect`);
+      return false;
+    } finally {
+      session.registering = false;
     }
   }
 
@@ -377,18 +565,106 @@ class Daemon {
 
   // --- tailer + publisher ---------------------------------------------------
 
+  // Read [from, to) of the session file and return its COMPLETE lines as parsed
+  // JSONL records (the trailing fragment, if any, is left for the tailer).
+  // `ends[i]` is the absolute offset just past record i — what lets the tailer
+  // stop MID-CHUNK (outbox at cap) without losing the records it did not take.
+  readRecords(file, from, to) {
+    const fd = fs.openSync(file, 'r');
+    let buf;
+    try {
+      buf = Buffer.alloc(Math.max(0, to - from));
+      if (buf.length) fs.readSync(fd, buf, 0, buf.length, from);
+    } finally { fs.closeSync(fd); }
+    const objs = [];
+    const ends = [];
+    let start = 0;
+    for (;;) {
+      const nl = buf.indexOf(0x0a, start);
+      if (nl < 0) break;
+      const line = buf.subarray(start, nl).toString('utf8');
+      start = nl + 1;
+      if (!line.trim()) continue;
+      let obj; try { obj = JSON.parse(line); } catch { continue; }
+      objs.push(obj);
+      ends.push(from + start);
+    }
+    // consumed = how far the caller may advance its offset: never past a record
+    // still being written (a half-flushed line would otherwise be skipped forever).
+    return { objs, ends, consumed: from + start };
+  }
+
+  // Rebuild the dedup set after a daemon restart.
+  //
+  // seenUuids is what keeps a rescan (`size < offset`, the probe-proven
+  // in-place rewrite) or a /clear rotation from re-publishing an entire
+  // transcript under fresh seqs. It lives in memory, so a restart used to empty
+  // it: the very next rescan re-emitted every record the phone already had.
+  // Two guards, cheapest first: the ring persisted in state.json, plus a
+  // no-emit re-read of the prefix we already published ([0, offset)). This runs
+  // BEFORE the session joins this.sessions, so no tick can emit in between.
+  seedSeenFromFile(s) {
+    if (!s.offset) return;
+    let objs;
+    try {
+      const st = fs.statSync(s.file);
+      const to = Math.min(s.offset, st.size);
+      // Bounded: a multi-GB transcript must not be slurped to rebuild a dedup
+      // set. What the window can miss is old records a LATER rescan might
+      // re-publish — and a rescan is itself capped at the newest 100 items
+      // (enqueueBounded), all of which live inside this window.
+      const from = Math.max(0, to - TAIL_WINDOW_BYTES);
+      if (from > 0) this.log(`${s.sid.slice(0, 8)}: reseeding the dedup set from the last ${TAIL_WINDOW_BYTES}B of a ${to}B prefix`);
+      ({ objs } = this.readRecords(s.file, from, to));
+    } catch (e) {
+      this.log(`${s.sid.slice(0, 8)}: dedup set could not be reseeded (${e.message}) — the ${s.seenUuids.size} persisted uuid(s) are the only guard`);
+      return;
+    }
+    for (const obj of objs) for (const item of adapter.normalize(obj)) this.markSeen(s, item.uuid);
+    this.log(`${s.sid.slice(0, 8)}: dedup set reseeded with ${s.seenUuids.size} published uuid(s)`);
+  }
+
+  // Seal + enqueue a BULK emission (the enable backfill, a rescan, a /clear
+  // rotation), bounded to the LAST 100 items / 512 KB sealed (spec §6). Live
+  // tailing goes through the unbounded path — this cap exists so a 5k-item
+  // transcript can never flood the lane in one go.
+  enqueueBounded(s, items, why) {
+    let total = 0;
+    const sealed = [];
+    for (const item of items.slice(-BACKFILL_ITEMS).reverse()) { // newest first for the budget…
+      item._publicId = s.publicId;
+      let b64 = null;
+      try { b64 = this.sealItem(item); } catch (e) { this.log(`item ${item.uuid}: seal failed (${e.message}) — skipped`); }
+      if (b64 === null) continue;
+      const bytes = Buffer.byteLength(b64, 'utf8');
+      if (total + bytes > BACKFILL_SEALED_BYTES) break;
+      total += bytes;
+      sealed.push({ uuid: item.uuid, b64 });
+    }
+    sealed.reverse(); // …back to oldest-first for seq order
+    for (const e of sealed) this.queuePush(s, e.uuid, e.b64);
+    if (items.length > sealed.length) {
+      this.log(`${why}: seeded ${sealed.length}/${items.length} items (bounded window — earlier history stays on this computer)`);
+    }
+    return sealed.length;
+  }
+
   async backfill(session) {
     // Seed = the LAST 100 items / 512 KB sealed, oldest-first (spec §6).
     const items = [];
     try {
-      const raw = fs.readFileSync(session.file, 'utf8');
-      session.offset = Buffer.byteLength(raw, 'utf8');
-      for (const line of raw.split('\n')) {
-        if (!line.trim()) continue;
-        let obj; try { obj = JSON.parse(line); } catch { continue; }
+      const st = fs.statSync(session.file);
+      // Read a bounded TAIL, not the whole file: the seed is the newest 100
+      // items, and a long-running session's transcript can be gigabytes. A
+      // partial first line inside the window simply fails to parse and is
+      // skipped — the window boundary is a record boundary from then on.
+      const from = Math.max(0, st.size - TAIL_WINDOW_BYTES);
+      if (from > 0) this.log(`backfill: transcript is ${st.size}B — seeding from its last ${TAIL_WINDOW_BYTES}B (earlier history stays on this computer)`);
+      const { objs, consumed } = this.readRecords(session.file, from, st.size);
+      session.offset = consumed; // NOT st.size: a record mid-write stays unread
+      for (const obj of objs) {
         for (const item of adapter.normalize(obj)) {
-          if (session.seenUuids.has(item.uuid)) continue;
-          session.seenUuids.add(item.uuid);
+          if (!this.markSeen(session, item.uuid)) continue;
           if (item.hv) session.hv = item.hv;
           items.push(item);
         }
@@ -397,27 +673,10 @@ class Daemon {
       this.log(`backfill read failed (${e.message}) — starting live-only`);
       return;
     }
-    let seed = items.slice(-BACKFILL_ITEMS);
-    // Budget by sealed size, dropping OLDEST first.
-    let sealedTotal = 0;
-    const sealedSeed = [];
-    for (const item of seed.reverse()) { // newest first for the budget…
-      item._publicId = session.publicId;
-      const b64 = this.sealItem(item);
-      if (b64 === null) continue;
-      const bytes = Buffer.byteLength(b64, 'utf8');
-      if (sealedTotal + bytes > BACKFILL_SEALED_BYTES) break;
-      sealedTotal += bytes;
-      sealedSeed.push({ item, b64 });
-    }
-    sealedSeed.reverse(); // …back to oldest-first for seq order
-    for (const { b64 } of sealedSeed) {
-      session.queue.push(b64);
-    }
-    session.backfilled = sealedSeed.length;
-    if (items.length > sealedSeed.length) {
-      this.log(`backfill: seeded ${sealedSeed.length}/${items.length} items (bounded window — earlier history stays on this Mac)`);
-    }
+    session.backfilled = this.enqueueBounded(session, items, 'backfill');
+    // Persist offset + the uuid ring BEFORE publishing (same order the tailer
+    // uses): a restart mid-flush must not re-read and re-publish the seed.
+    this.persistSession(session);
     await this.flush(session);
   }
 
@@ -429,48 +688,119 @@ class Daemon {
     let st;
     try { st = fs.statSync(s.file); } catch { return; }
     if (st.size < s.offset) {
-      // Truncated/rewritten in place (probe: RESCAN) — re-read whole, dedup by uuid.
+      // Truncated/rewritten in place (probe: RESCAN) — re-read whole, dedup by
+      // uuid. `bulk` makes this re-read obey the §6 cap: a 5k-item transcript
+      // whose dedup set is somehow cold must not flood the lane in one tick.
       this.log(`${s.sid.slice(0, 8)}: size ${st.size} < offset ${s.offset} — full rescan with uuid dedup`);
-      s.offset = 0; s.partial = '';
+      s.offset = 0; s.bulk = true;
     }
     if (st.size <= s.offset) return;
-    let buf;
-    try {
-      const fd = fs.openSync(s.file, 'r');
-      buf = Buffer.alloc(st.size - s.offset);
-      fs.readSync(fd, buf, 0, buf.length, s.offset);
-      fs.closeSync(fd);
-    } catch { return; }
-    s.offset = st.size;
-    const data = (s.partial || '') + buf.toString('utf8');
-    const lines = data.split('\n');
-    s.partial = lines.pop();
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let obj;
-      try { obj = JSON.parse(line); } catch { continue; }
-      for (const item of adapter.normalize(obj)) {
-        if (s.seenUuids.has(item.uuid)) continue;
-        s.seenUuids.add(item.uuid);
-        if (item.hv && item.hv !== s.hv) {
-          if (s.hv) this.log(`${s.sid.slice(0, 8)}: harness version drift ${s.hv} → ${item.hv}`);
-          s.hv = item.hv;
-        }
-        item._publicId = s.publicId;
-        // A seal failure on ONE item must never take the tailer interval down —
-        // skip it loudly and keep tailing (the JSONL remains durable).
-        let b64 = null;
-        try { b64 = this.sealItem(item); } catch (e) { this.log(`item ${item.uuid}: seal failed (${e.message}) — skipped`); }
-        if (b64 !== null) s.queue.push(b64);
+    // The outbox is at its cap (the server has been unreachable long enough to
+    // fill it): STOP READING. The offset stays where it is, so everything past
+    // it remains exactly where it is already durable — in the transcript file —
+    // instead of piling into a queue we would have to bound by dropping it.
+    if (this.outboxFull(s)) {
+      if (!s.outboxWarned) {
+        s.outboxWarned = true;
+        this.log(`${s.sid.slice(0, 8)}: outbox FULL (${s.queue.length} items / ${s.outboxBytes}B un-acked) — pausing the tail at offset ${s.offset}; nothing is lost, the transcript keeps it until the backlog drains`);
       }
+      return;
+    }
+    s.outboxWarned = false;
+    const bulk = !!s.bulk;
+    s.bulk = false;
+    // Live reads are windowed (the next tick continues where this one stopped);
+    // a bulk re-read wants the whole prefix for dedup, but is still clamped —
+    // a transcript larger than the clamp degrades to windowed live reads, whose
+    // items the dedup set absorbs.
+    const to = Math.min(st.size, s.offset + (bulk ? RESCAN_MAX_BYTES : LIVE_READ_MAX_BYTES));
+    if (bulk && to < st.size) this.log(`${s.sid.slice(0, 8)}: rescan clamped to ${RESCAN_MAX_BYTES}B of a ${st.size}B transcript — the remainder streams on the next ticks`);
+    let objs, ends, consumed;
+    try {
+      ({ objs, ends, consumed } = this.readRecords(s.file, s.offset, to));
+    } catch (e) { this.log(`${s.sid.slice(0, 8)}: tail read failed (${e.message}) — retrying next tick`); return; }
+    // The trailing fragment of a record still being written is left UNREAD
+    // rather than carried in memory: offset only ever advances past COMPLETE
+    // records, so the next tick re-reads it (and a restart resumes at a record
+    // boundary instead of skipping the half-written one forever).
+    if (consumed <= s.offset) return;
+    if (bulk) {
+      const fresh = [];
+      for (const obj of objs) {
+        for (const item of adapter.normalize(obj)) {
+          if (!this.markSeen(s, item.uuid)) continue;
+          this.noteHarnessVersion(s, item);
+          fresh.push(item);
+        }
+      }
+      s.offset = consumed;
+      this.enqueueBounded(s, fresh, `${s.sid.slice(0, 8)}: rescan`);
+    } else {
+      // Record by record, so hitting the cap mid-chunk parks the offset at the
+      // last record we actually enqueued — the rest is re-read, never skipped.
+      let consumedTo = consumed;
+      for (let i = 0; i < objs.length; i++) {
+        for (const item of adapter.normalize(objs[i])) {
+          if (!this.markSeen(s, item.uuid)) continue;
+          this.noteHarnessVersion(s, item);
+          item._publicId = s.publicId;
+          // A seal failure on ONE item must never take the tailer interval down —
+          // skip it loudly and keep tailing (the JSONL remains durable).
+          let b64 = null;
+          try { b64 = this.sealItem(item); } catch (e) { this.log(`item ${item.uuid}: seal failed (${e.message}) — skipped`); }
+          if (b64 !== null) this.queuePush(s, item.uuid, b64);
+        }
+        if (this.outboxFull(s)) {
+          consumedTo = ends[i];
+          this.log(`${s.sid.slice(0, 8)}: outbox hit its cap mid-read — parking the tail at offset ${consumedTo}; the remaining records stay in the transcript`);
+          break;
+        }
+      }
+      s.offset = consumedTo;
     }
     this.persistSession(s);
   }
 
+  noteHarnessVersion(s, item) {
+    if (!item.hv || item.hv === s.hv) return;
+    if (s.hv) this.log(`${s.sid.slice(0, 8)}: harness version drift ${s.hv} → ${item.hv}`);
+    s.hv = item.hv;
+  }
+
+  // Does this record still own its slot? Every await inside flush must ask:
+  // `disable` bumps gen AND removes the session, and a late success that then
+  // persisted the record would REVIVE a share the human just revoked (#66).
+  stillOwns(session, gen) {
+    return session.gen === gen && this.sessions.get(session.sid) === session;
+  }
+
   async flushTick() {
+    const now = Date.now();
     for (const s of this.sessions.values()) {
-      if (s.queue.length && !s.flushing) this.flush(s).catch((e) => this.log('flush error:', e.message));
+      // Honor the backoff window. Without this the tick simply re-fired every
+      // 500 ms after every failure (`flushing` is cleared on the way out), so a
+      // Base-tier 402 or a 500 became a 2 req/s storm against the server AND
+      // piled up one retry timer per failure.
+      if (s.nextFlushAt && now < s.nextFlushAt) continue;
+      // A session the server does not know about yet (the boot register failed
+      // transiently) retries HERE, on the same backoff clock — publishing waits
+      // for it, the durable outbox holds everything meanwhile.
+      if (!s.registered) {
+        this.registerOrKeep(s).catch((e) => this.log('re-register error:', e.message));
+        continue;
+      }
+      if (!s.queue.length || s.flushing) continue;
+      this.flush(s).catch((e) => this.log('flush error:', e.message));
     }
+  }
+
+  // Back off after a failed batch. No timer is scheduled: flushTick is already
+  // running every FLUSH_MS and picks the session up once the window elapses —
+  // one clock, no accumulation.
+  backOff(session, why) {
+    session.backoff = Math.min((session.backoff || 1) * 2, 60);
+    session.nextFlushAt = Date.now() + session.backoff * 1000;
+    this.log(`${session.publicId}: ${why}; retry in ${session.backoff}s (nothing lost — the JSONL is durable)`);
   }
 
   async flush(session) {
@@ -479,32 +809,28 @@ class Daemon {
     const gen = session.gen;
     try {
       while (session.queue.length) {
-        if (session.gen !== gen) return; // torn down mid-flush (#66)
+        if (!this.stillOwns(session, gen)) return; // torn down mid-flush (#66)
         const batch = session.queue.slice(0, this.caps.items_per_call);
-        const items = batch.map((b64, i) => ({ seq: session.nextSeq + i, payload_sealed: b64 }));
+        const items = batch.map((e, i) => ({ seq: session.nextSeq + i, payload_sealed: e.sealed }));
         const { res, data } = await this.api('POST', `/agent_sessions/${session.publicId}/items`, { items });
+        // Re-check BEFORE any mutation: an await is a teardown window, and
+        // persistSession() on a disabled session writes it back into state.json
+        // — it would come back alive on the next boot (consent violation).
+        if (!this.stillOwns(session, gen)) {
+          this.log(`${session.publicId}: disabled mid-flush — response dropped, nothing re-persisted (#66)`);
+          return;
+        }
         if (res.status === 201) {
-          session.queue.splice(0, batch.length);
+          // ONLY here does an item leave the durable outbox: the server has it.
+          this.queueDrop(session, batch.length);
           session.nextSeq = (data.last_seq || (session.nextSeq + batch.length - 1)) + 1;
           session.backoff = 0;
+          session.nextFlushAt = 0;
           this.persistSession(session);
         } else if (res.status === 422 && data && data.code === 'seq_regression') {
-          // Server knows more than our state (restart race): re-sync from it.
-          const { data: reg } = await this.api('POST', '/agent_sessions', {
-            public_id: session.publicId, status: session.status, meta_sealed: this.sealMeta(session),
-          });
-          const serverSeq = reg && reg.session ? reg.session.last_seq : null;
-          if (serverSeq === null || serverSeq + 1 === session.nextSeq) {
-            this.log(`${session.publicId}: seq_regression did not resolve — dropping ONE batch loudly to break the loop`);
-            session.queue.splice(0, batch.length);
-          } else {
-            this.log(`${session.publicId}: seq re-synced ${session.nextSeq} → ${serverSeq + 1}`);
-            session.nextSeq = serverSeq + 1;
-          }
+          if (!(await this.resyncSeq(session, gen))) return;
         } else {
-          session.backoff = Math.min((session.backoff || 1) * 2, 60);
-          this.log(`${session.publicId}: items POST → ${res.status}; retry in ${session.backoff}s (nothing lost — the JSONL is durable)`);
-          setTimeout(() => { if (session.gen === gen) this.flush(session).catch(() => {}); }, session.backoff * 1000);
+          this.backOff(session, `items POST → ${res.status}`);
           return;
         }
       }
@@ -513,8 +839,53 @@ class Daemon {
     }
   }
 
+  // seq_regression = the server already stored seqs we are re-sending. The
+  // canonical cause is a LOST 201: the batch landed, the ack didn't, so the
+  // retry replays stored seqs. Re-register to learn the server's high-water and
+  // drop from the queue EXACTLY the items at or below it — they are persisted
+  // already. Never re-send a stored seq (duplicates in the conversation), never
+  // blind-drop an unstored one (a hole the JSONL can no longer fill).
+  // Returns false when the caller must stop this flush pass.
+  async resyncSeq(session, gen) {
+    const { data: reg } = await this.api('POST', '/agent_sessions', {
+      public_id: session.publicId, status: session.status, meta_sealed: this.sealMeta(session),
+    });
+    if (!this.stillOwns(session, gen)) return false;
+    const serverSeq = reg && reg.session && Number.isInteger(reg.session.last_seq) ? reg.session.last_seq : null;
+    if (serverSeq === null) {
+      // Could not learn the high-water: back off and retry, do NOT guess.
+      this.backOff(session, 'seq_regression but the re-register carried no last_seq');
+      return false;
+    }
+    const firstSeq = session.nextSeq; // the seq queue[0] would have been sent as
+    const stored = serverSeq - firstSeq + 1;
+    if (stored > 0) {
+      const drop = this.queueDrop(session, Math.min(stored, session.queue.length));
+      this.log(`${session.publicId}: seq_regression — ${drop} queued item(s) were already stored (server last_seq ${serverSeq}); continuing at ${serverSeq + 1}`);
+    } else if (stored === 0) {
+      // Our numbering ALREADY continues the server's high-water, yet it 422'd:
+      // the re-sync explains nothing and re-sending the same seqs would spin
+      // forever. Back off instead of looping (and keep the items).
+      this.backOff(session, `seq_regression at seq ${firstSeq} that the re-register does not explain (server last_seq ${serverSeq})`);
+      return false;
+    } else {
+      // firstSeq > serverSeq + 1: a gap this daemon cannot fill (the missing
+      // items belong to a previous process). Renumber onto the server's
+      // high-water and keep going — loudly. The phone renders the gap; looping
+      // here forever would be worse (§11: visible boundary, never a silent splice).
+      this.log(`${session.publicId}: seq GAP — queue starts at ${firstSeq} but the server is at ${serverSeq}; resuming at ${serverSeq + 1}, the missing items are only on this computer`);
+    }
+    session.nextSeq = serverSeq + 1;
+    session.backoff = 0;
+    session.nextFlushAt = 0;
+    this.persistSession(session);
+    return true;
+  }
+
   // --- status + waiting notification (spec §9) ------------------------------
 
+  // s.status IS the desired status: the transition PATCH is best-effort, and
+  // the heartbeat re-asserts whatever this last set.
   setStatus(s, status) {
     if (status === 'running') s.waitingArmed = true; // re-arm the waiting edge
     if (s.status === status) return;
@@ -524,7 +895,13 @@ class Daemon {
 
   async heartbeatTick() {
     for (const s of this.sessions.values()) {
-      this.api('PATCH', `/agent_sessions/${s.publicId}`, {}).catch(() => {});
+      if (!s.registered) continue; // flushTick owns the re-register retry
+      // Carry the CURRENT status, never `{}`. The transition PATCH is
+      // fire-and-forget: one dropped running→waiting used to leave the server
+      // (and the phone) showing `running` until the NEXT transition — a session
+      // that is actually waiting for the human, displayed as busy. The beat now
+      // re-asserts it, so a lost transition self-heals within one cadence.
+      this.api('PATCH', `/agent_sessions/${s.publicId}`, { status: s.status }).catch(() => {});
     }
   }
 
@@ -533,6 +910,10 @@ class Daemon {
     // reset by input or running (spec §9). One-and-done (#30) untouched —
     // this is an ordinary notification.
     if (!s.waitingArmed) return;
+    // Disarmed only for the duration of the send (so a burst of Notification
+    // hooks cannot double-fire); a send that does NOT land re-arms below —
+    // otherwise a single 502 ate the whole waiting episode and the human simply
+    // never learned the agent was waiting for them.
     s.waitingArmed = false;
     const cid = `ases-wait-${s.sid.slice(0, 8)}-${Date.now()}`;
     const aad = (f) => core.e2eAad(this.env.channelId, cid, f);
@@ -545,8 +926,18 @@ class Daemon {
       body_markdown: core.e2eEncryptField(this.key, aad('body_markdown'), message),
       url: core.e2eEncryptField(this.key, aad('url'), `pidge://agents/${s.publicId}`),
     };
-    const { res } = await this.api('POST', '/notify', payload);
-    if (res.status !== 201) this.log(`waiting notify → ${res.status}`);
+    let status = null;
+    try {
+      ({ res: { status } } = await this.api('POST', '/notify', payload));
+    } catch (e) {
+      s.waitingArmed = true;
+      this.log(`waiting notify failed (${e.message}) — still armed, the next waiting signal retries`);
+      return;
+    }
+    if (status !== 201) {
+      s.waitingArmed = true;
+      this.log(`waiting notify → ${status} — still armed, the next waiting signal retries`);
+    }
   }
 
   // --- approval gate (spec §9, off unless enable --approvals) ---------------
@@ -567,7 +958,11 @@ class Daemon {
       kf: core.e2eKeyFingerprint(this.key),
       title: core.e2eEncryptField(this.key, aad('title'), `Approve ${body.tool_name} in ${s.title}?`),
       body_markdown: core.e2eEncryptField(this.key, aad('body_markdown'), '```\n' + input + '\n```'),
-      actions: ['approve', 'deny'],
+      // The server's built-in pair is approve/REJECT (Notification::BUILTIN_CATALOG
+      // — there is no `deny` action id; it would be dropped silently, leaving an
+      // approve-only ask with no banner buttons). approve+reject is also an EXACT
+      // banner category (HERALD_APPROVE_REJECT), so both buttons ride the banner.
+      actions: ['approve', 'reject'],
       mirror_reply: false,
     };
     const { res, data } = await this.api('POST', '/notify', payload);
@@ -581,7 +976,7 @@ class Daemon {
         if (poll && poll.responded && poll.chosen_action) {
           const id = poll.chosen_action.action_id;
           if (id === 'approve') return { permissionDecision: 'allow', permissionDecisionReason: 'approved via Pidge' };
-          if (id === 'deny') return { permissionDecision: 'deny', permissionDecisionReason: 'denied via Pidge' };
+          if (id === 'reject') return { permissionDecision: 'deny', permissionDecisionReason: 'rejected via Pidge' };
           return null; // done/snooze/anything else: fall open to the local human
         }
       } catch { /* transient — keep waiting inside the budget */ }
