@@ -110,7 +110,9 @@ async function runConnect(v) {
     'Hooks talk only to this Mac; nothing is shared until you enable a session.');
   if (consent) {
     writeHookShim();
-    installHooks();
+    // A malformed ~/.claude/settings.json aborts the install LOUDLY: we never
+    // overwrite a config we could not read (see readClaudeSettings).
+    try { installHooks(); } catch (e) { die(`${e.message}\n(the tunnel identity above is stored; re-run \`pidge terminal connect\` once the file parses)`); }
     say('✓ hooks installed in ~/.claude/settings.json (tagged, cleanly removable via `pidge terminal disconnect`)');
   } else {
     say('· hooks NOT installed — sessions cannot announce; `pidge terminal enable` will refuse until you re-run connect');
@@ -196,9 +198,48 @@ function hookCommand(slug) {
   return `"${process.execPath}" "${core.HOOK_SHIM()}" ${slug} ${PIDGE_HOOK_MARKER}`;
 }
 
-function installHooks() {
+// Read ~/.claude/settings.json for a read-MODIFY-write cycle.
+//
+// Returns `null` when the file genuinely does not exist, and THROWS when it
+// exists but does not parse. The tolerant `readJson(file, {})` this replaces
+// swallowed a syntax error and the writer then persisted `{hooks:{…}}` over the
+// user's real config — a whole Claude Code setup (model, permissions, env,
+// statusLine, MCP) wiped by a stray trailing comma. A file we cannot understand
+// is never a file we may overwrite.
+function readClaudeSettings() {
   const file = claudeSettingsPath();
-  const settings = core.readJson(file, {});
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw new Error(`pidge terminal: cannot read ${file} (${e.message}) — refusing to touch it`);
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a JSON object');
+    return parsed;
+  } catch (e) {
+    throw new Error(
+      `pidge terminal: ${file} is not valid JSON (${e.message}).\n` +
+      'Refusing to rewrite it — that would destroy your Claude Code settings.\n' +
+      'Fix the file by hand (or move it aside) and re-run the command.');
+  }
+}
+
+// Preserve the file's permissions across the rewrite: a settings.json the user
+// deliberately kept at 0600 must not come back world-readable. A file we create
+// ourselves starts private.
+function claudeSettingsMode() {
+  try { return fs.statSync(claudeSettingsPath()).mode & 0o777; } catch { return 0o600; }
+}
+
+function writeClaudeSettings(settings) {
+  core.writeFileAtomic(claudeSettingsPath(), JSON.stringify(settings, null, 2) + '\n', claudeSettingsMode());
+}
+
+function installHooks() {
+  const settings = readClaudeSettings() || {};
   settings.hooks = settings.hooks || {};
   for (const [event, slug, timeout] of HOOK_EVENTS) {
     const entries = (settings.hooks[event] || []).filter(
@@ -209,19 +250,28 @@ function installHooks() {
     });
     settings.hooks[event] = entries;
   }
-  core.writeFileAtomic(file, JSON.stringify(settings, null, 2) + '\n');
+  writeClaudeSettings(settings);
 }
 
 function uninstallHooks() {
-  const file = claudeSettingsPath();
-  const settings = core.readJson(file, null);
+  // Same rule as the installer: a settings.json we cannot parse is left ALONE.
+  // Uninstall must not abort the rest of `disconnect`, so this one narrates and
+  // returns instead of throwing — the hook lines stay, but they are inert once
+  // the daemon and its shim are gone.
+  let settings;
+  try {
+    settings = readClaudeSettings();
+  } catch (e) {
+    console.error(`${e.message}\n· hook entries left in place (they are inert without the daemon).`);
+    return;
+  }
   if (!settings || !settings.hooks) return;
   for (const event of Object.keys(settings.hooks)) {
     settings.hooks[event] = (settings.hooks[event] || []).filter(
       (e) => !(e.hooks || []).some((h) => String(h.command || '').includes(PIDGE_HOOK_MARKER)));
     if (settings.hooks[event].length === 0) delete settings.hooks[event];
   }
-  core.writeFileAtomic(file, JSON.stringify(settings, null, 2) + '\n');
+  writeClaudeSettings(settings);
 }
 
 // --- launchd ----------------------------------------------------------------
@@ -416,9 +466,16 @@ async function runStatus() {
     say(`sessions: ${en.length} shared${en.length ? ' — ' + en.map((e) => `${e.sid.slice(0, 8)} (${e.status})`).join(', ') : ''}`);
     say(`announced: ${(data.announces || []).length} (local only, not shared)`);
   }
-  const hooks = core.readJson(claudeSettingsPath(), {});
-  const installed = JSON.stringify(hooks).includes(PIDGE_HOOK_MARKER);
-  say(`hooks:    ${installed ? 'installed' : 'NOT installed'} (~/.claude/settings.json)`);
+  let hooksLine;
+  try {
+    const settings = readClaudeSettings();
+    hooksLine = JSON.stringify(settings || {}).includes(PIDGE_HOOK_MARKER) ? 'installed' : 'NOT installed';
+  } catch {
+    // Honest: an unparseable file is not "not installed" — and `connect` will
+    // refuse to rewrite it rather than destroy it.
+    hooksLine = 'UNKNOWN — the file is not valid JSON (pidge will not rewrite it)';
+  }
+  say(`hooks:    ${hooksLine} (~/.claude/settings.json)`);
 }
 
 async function runDisable(v) {

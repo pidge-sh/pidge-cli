@@ -392,6 +392,55 @@ test('uninstallHooks on a machine that never installed is a no-op', () => {
   assert.ok(!fs.existsSync(settingsPath()), 'no settings file must be conjured out of nothing');
 });
 
+test('installHooks ABORTS on a malformed settings.json instead of overwriting it', () => {
+  freshHome();
+  freshXdg();
+  // A real Claude Code config with one stray trailing comma. The tolerant
+  // `readJson(file, {})` this replaces would have parsed it as {} and written
+  // back a settings.json containing ONLY the pidge hooks.
+  const broken = '{\n  "model": "opus",\n  "permissions": { "allow": ["Bash(git status)"], },\n}\n';
+  fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
+  fs.writeFileSync(settingsPath(), broken);
+
+  assert.throws(() => commands.installHooks(), /not valid JSON/);
+  assert.equal(fs.readFileSync(settingsPath(), 'utf8'), broken,
+    "the user's settings.json must survive byte-for-byte");
+
+  // Uninstall is equally hands-off (it must not abort `disconnect`, so it warns).
+  const errs = [];
+  const realError = console.error;
+  console.error = (...a) => errs.push(a.join(' '));
+  try { commands.uninstallHooks(); } finally { console.error = realError; }
+  assert.equal(fs.readFileSync(settingsPath(), 'utf8'), broken);
+  assert.ok(errs.some((l) => /not valid JSON/.test(l)), `expected a loud warning, got ${JSON.stringify(errs)}`);
+});
+
+test('installHooks preserves a restrictive settings.json mode and creates new ones private', () => {
+  freshHome();
+  freshXdg();
+  fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
+  fs.writeFileSync(settingsPath(), JSON.stringify({ model: 'opus' }, null, 2) + '\n', { mode: 0o600 });
+  fs.chmodSync(settingsPath(), 0o600);
+
+  commands.installHooks();
+  assert.equal(fs.statSync(settingsPath()).mode & 0o777, 0o600, 'a 0600 config must not come back world-readable');
+  commands.uninstallHooks();
+  assert.equal(fs.statSync(settingsPath()).mode & 0o777, 0o600);
+
+  freshHome();
+  commands.installHooks(); // no pre-existing file
+  assert.equal(fs.statSync(settingsPath()).mode & 0o777, 0o600);
+});
+
+test('installHooks refuses a settings.json that parses to a non-object', () => {
+  freshHome();
+  freshXdg();
+  fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
+  fs.writeFileSync(settingsPath(), '["not", "an", "object"]\n');
+  assert.throws(() => commands.installHooks(), /not valid JSON/);
+  assert.equal(fs.readFileSync(settingsPath(), 'utf8'), '["not", "an", "object"]\n');
+});
+
 test('the generated hook shim is valid JavaScript (node --check)', () => {
   const dir = tmp('pidge-term-shim-');
   const file = path.join(dir, 'pidge-hook.js');
