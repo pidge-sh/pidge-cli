@@ -663,11 +663,11 @@ test('the tool gate matches case-insensitively and honors the wildcard', () => {
 
 // A minimal live session record, registered in the daemon's map exactly as
 // enableSession would leave it.
-function liveSession(d, { queue = [], nextSeq = 1 } = {}) {
+function liveSession(d, { queue = [], nextSeq = 1, file = '/tmp/nonexistent.jsonl' } = {}) {
   const s = {
     sid: 'sess-flush', publicId: 'ases_t', paneId: '%1', tty: null, cwd: '/tmp/proj',
-    file: '/tmp/nonexistent.jsonl', title: 'proj', hv: null,
-    offset: 0, partial: '', seenUuids: new Set(), seenRing: [],
+    file, title: 'proj', hv: null,
+    offset: 0, seenUuids: new Set(), seenRing: [],
     queue: [...queue], nextSeq, status: 'idle', waitingArmed: true, approvals: [],
     flushing: false, backfilled: 0, backoff: 0, nextFlushAt: 0, gen: 0,
   };
@@ -810,6 +810,102 @@ test('enable: a failure after the register leaves neither a live record nor a pe
   assert.equal(d.sessions.has('sess-fail'), false, 'a live-but-lockless session would publish without the B3 guarantee');
   assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-fail'], undefined);
   assert.equal(fs.existsSync(d.lockPath('sess-fail')), false, 'the writer lock is released');
+});
+
+// --- the tailer: backfill, restart dedup, rescan bounds ---------------------
+
+function rec(i) {
+  return {
+    type: 'assistant', uuid: `u-${i}`, parentUuid: null, timestamp: '2026-08-02T18:33:12Z',
+    version: '2.1.220', message: { role: 'assistant', content: `line ${i}` },
+  };
+}
+function writeJsonl(file, records) {
+  fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+}
+function openItem(d, b64, publicId = 'ases_t') {
+  return JSON.parse(core.e2eDecryptBlob(d.key, core.e2eAad(1, publicId, 'agent_transcript'),
+    Buffer.from(b64, 'base64url')).toString('utf8'));
+}
+
+test('a rescan AFTER a daemon restart re-publishes nothing', async () => {
+  const dir = tmp('pidge-term-jsonl-');
+  const file = path.join(dir, 's.jsonl');
+  writeJsonl(file, [1, 2, 3].map(rec));
+
+  const d1 = makeDaemon();
+  d1.registerSession = async () => ({ last_seq: 0 });
+  d1.subscribeInput = () => {};
+  d1.flush = async () => {}; // keep the queue observable, touch no network
+  const s1 = await d1.enableSession({ sid: 'sess-r', paneId: '%1', tty: null, cwd: dir, file, approvals: [] });
+  assert.equal(s1.backfilled, 3);
+  assert.equal(s1.queue.length, 3);
+
+  const persisted = core.readJson(core.STATE_FILE(), {}).sessions['sess-r'];
+  assert.deepEqual(persisted.seen, ['u-1', 'u-2', 'u-3'],
+    'the uuid ring must ride in state.json — an in-memory-only set is empty after a restart');
+
+  // A NEW daemon process against the same config slot.
+  const d2 = new Daemon();
+  d2.logLines = [];
+  d2.log = (...a) => { d2.logLines.push(a.join(' ')); };
+  d2.registerSession = async () => ({ last_seq: 3 });
+  d2.subscribeInput = () => {};
+  await d2.rearmPersisted();
+  const s2 = d2.sessions.get('sess-r');
+  assert.ok(s2, 're-arm must keep the share the human opted into');
+  assert.equal(s2.seenUuids.size, 3, 'the dedup set is rebuilt before any tick can emit');
+
+  // The probe-proven RESCAN: the file is rewritten in place, smaller, keeping
+  // the same records. Before this fix the empty dedup set re-emitted them all
+  // under fresh seqs — the phone saw the conversation twice.
+  writeJsonl(file, [1, 2].map(rec));
+  d2.tailOne(s2);
+  assert.deepEqual(s2.queue, [], 'a rescan must not re-emit records the phone already has');
+  assert.ok(d2.logLines.some((l) => /full rescan/.test(l)));
+
+  // A genuinely new record still flows.
+  writeJsonl(file, [1, 2, 4].map(rec));
+  d2.tailOne(s2);
+  assert.equal(s2.queue.length, 1);
+  assert.equal(openItem(d2, s2.queue[0], s2.publicId).uuid, 'u-4');
+});
+
+test('a rotation/rescan obeys the §6 backfill cap instead of flooding the lane', () => {
+  const dir = tmp('pidge-term-jsonl-');
+  const file = path.join(dir, 'rot.jsonl');
+  writeJsonl(file, Array.from({ length: 300 }, (_, i) => rec(i)));
+
+  const d = makeDaemon();
+  const s = liveSession(d, { file });
+  s.bulk = true; // exactly what the /clear rotation handler and the rescan branch set
+  d.tailOne(s);
+
+  assert.equal(s.queue.length, 100, 'a 300-item bulk re-read must be bounded to the backfill window');
+  assert.equal(openItem(d, s.queue[0]).preview, 'line 200', 'the NEWEST 100 are kept, oldest-first');
+  assert.equal(openItem(d, s.queue.at(-1)).preview, 'line 299');
+  assert.ok(d.logLines.some((l) => /bounded window/.test(l)));
+});
+
+test('backfill stops at the last COMPLETE line so a record mid-write is not lost', async () => {
+  const dir = tmp('pidge-term-jsonl-');
+  const file = path.join(dir, 'p.jsonl');
+  const firstLine = JSON.stringify(rec(1)) + '\n';
+  fs.writeFileSync(file, firstLine + JSON.stringify(rec(2)).slice(0, 30)); // 2nd record still landing
+
+  const d = makeDaemon();
+  d.flush = async () => {};
+  const s = liveSession(d, { file });
+  await d.backfill(s);
+
+  assert.equal(s.backfilled, 1);
+  assert.equal(s.offset, Buffer.byteLength(firstLine, 'utf8'),
+    'the offset must not jump past a half-written record — it would be dropped forever');
+
+  writeJsonl(file, [1, 2].map(rec)); // the record completes
+  d.tailOne(s);
+  assert.equal(s.queue.length, 2);
+  assert.equal(openItem(d, s.queue[1]).uuid, 'u-2');
 });
 
 // --- approval gate ----------------------------------------------------------

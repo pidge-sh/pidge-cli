@@ -32,6 +32,10 @@ const HEARTBEAT_MS = 30_000;
 const WATCHDOG_MS = 15_000;
 const BACKFILL_ITEMS = 100;             // spec §6
 const BACKFILL_SEALED_BYTES = 512 * 1024;
+// How many recently-published uuids ride in state.json per session. The uuid
+// set is what stops a rescan/rotation from re-publishing a whole transcript,
+// and an in-memory-only set is empty after a restart — see seedSeenFromFile.
+const SEEN_RING = 500;
 const INPUT_KEYS = new Set(['Enter', 'Escape', 'Up', 'Down', 'Tab', 'BTab', 'C-c']);
 
 function nowIso() { return new Date().toISOString(); }
@@ -178,7 +182,7 @@ class Daemon {
         if (s && tp && tp !== s.file) {
           // /clear+resume rotation: same sid, new file — SAME AgentSession (spec §6).
           this.log(`session ${sid.slice(0, 8)}: transcript rotated → ${path.basename(tp)}`);
-          s.file = tp; s.offset = 0; s.partial = ''; // uuid dedup absorbs the re-read
+          s.file = tp; s.offset = 0; s.bulk = true; // uuid dedup absorbs the re-read; bulk caps it (§6)
           this.persistSession(s);
         }
         return send(200, {});
@@ -292,8 +296,8 @@ class Daemon {
       paneId, tty, cwd, file,
       title: path.basename(cwd || 'session'),
       hv: null,
-      offset: 0, partial: '',
-      seenUuids: new Set(),
+      offset: 0,
+      seenUuids: new Set(), seenRing: [],
       queue: [], nextSeq: 1,
       status: 'idle', waitingArmed: true,
       approvals: approvals || [],
@@ -311,10 +315,22 @@ class Daemon {
     return session;
   }
 
+  // Record a uuid as published. Returns false when it was already known — the
+  // ONE dedup gate for the tailer, the backfill and every rescan. `seenRing` is
+  // the bounded, persistable tail of the same knowledge (see persistSession).
+  markSeen(s, uuid) {
+    if (s.seenUuids.has(uuid)) return false;
+    s.seenUuids.add(uuid);
+    s.seenRing.push(uuid);
+    if (s.seenRing.length > SEEN_RING) s.seenRing.splice(0, s.seenRing.length - SEEN_RING);
+    return true;
+  }
+
   persistSession(s) {
     this.state.sessions[s.sid] = {
       publicId: s.publicId, paneId: s.paneId, tty: s.tty, cwd: s.cwd,
       file: s.file, offset: s.offset, nextSeq: s.nextSeq, approvals: s.approvals,
+      seen: s.seenRing, // restart dedup (§6) — see seedSeenFromFile
     };
     this.saveState();
   }
@@ -340,12 +356,16 @@ class Daemon {
         this.acquireWriterLock(sid);
         const session = {
           sid, publicId: p.publicId, paneId: p.paneId, tty: p.tty, cwd: p.cwd,
-          file: p.file, offset: p.offset || 0, partial: '',
+          file: p.file, offset: p.offset || 0,
           title: path.basename(p.cwd || 'session'), hv: null,
-          seenUuids: new Set(), queue: [], nextSeq: p.nextSeq || 1,
+          // Restart dedup: start from the persisted ring, then rebuild the rest
+          // from the bytes we already published (below) BEFORE any tick can emit.
+          seenUuids: new Set(p.seen || []), seenRing: [...(p.seen || [])],
+          queue: [], nextSeq: p.nextSeq || 1,
           status: 'idle', waitingArmed: true, approvals: p.approvals || [],
           flushing: false, backfilled: 0, backoff: 0, nextFlushAt: 0, gen: 0,
         };
+        this.seedSeenFromFile(session);
         const echo = await this.registerSession(session, 'idle');
         session.nextSeq = Math.max(session.nextSeq, (echo.last_seq || 0) + 1);
         this.sessions.set(sid, session);
@@ -387,18 +407,86 @@ class Daemon {
 
   // --- tailer + publisher ---------------------------------------------------
 
+  // Read [0, len) of the session file and return its COMPLETE lines as parsed
+  // JSONL records (the trailing fragment, if any, is left for the tailer).
+  readRecords(file, from, to) {
+    const fd = fs.openSync(file, 'r');
+    let buf;
+    try {
+      buf = Buffer.alloc(Math.max(0, to - from));
+      if (buf.length) fs.readSync(fd, buf, 0, buf.length, from);
+    } finally { fs.closeSync(fd); }
+    const lastNl = buf.lastIndexOf(0x0a);
+    const complete = lastNl >= 0 ? buf.subarray(0, lastNl + 1).toString('utf8') : '';
+    const objs = [];
+    for (const line of complete.split('\n')) {
+      if (!line.trim()) continue;
+      let obj; try { obj = JSON.parse(line); } catch { continue; }
+      objs.push(obj);
+    }
+    // consumed = how far the caller may advance its offset: never past a record
+    // still being written (a half-flushed line would otherwise be skipped forever).
+    return { objs, consumed: from + lastNl + 1 };
+  }
+
+  // Rebuild the dedup set after a daemon restart.
+  //
+  // seenUuids is what keeps a rescan (`size < offset`, the probe-proven
+  // in-place rewrite) or a /clear rotation from re-publishing an entire
+  // transcript under fresh seqs. It lives in memory, so a restart used to empty
+  // it: the very next rescan re-emitted every record the phone already had.
+  // Two guards, cheapest first: the ring persisted in state.json, plus a
+  // no-emit re-read of the prefix we already published ([0, offset)). This runs
+  // BEFORE the session joins this.sessions, so no tick can emit in between.
+  seedSeenFromFile(s) {
+    if (!s.offset) return;
+    let objs;
+    try {
+      const st = fs.statSync(s.file);
+      ({ objs } = this.readRecords(s.file, 0, Math.min(s.offset, st.size)));
+    } catch (e) {
+      this.log(`${s.sid.slice(0, 8)}: dedup set could not be reseeded (${e.message}) — the ${s.seenUuids.size} persisted uuid(s) are the only guard`);
+      return;
+    }
+    for (const obj of objs) for (const item of adapter.normalize(obj)) this.markSeen(s, item.uuid);
+    this.log(`${s.sid.slice(0, 8)}: dedup set reseeded with ${s.seenUuids.size} published uuid(s)`);
+  }
+
+  // Seal + enqueue a BULK emission (the enable backfill, a rescan, a /clear
+  // rotation), bounded to the LAST 100 items / 512 KB sealed (spec §6). Live
+  // tailing goes through the unbounded path — this cap exists so a 5k-item
+  // transcript can never flood the lane in one go.
+  enqueueBounded(s, items, why) {
+    let total = 0;
+    const sealed = [];
+    for (const item of items.slice(-BACKFILL_ITEMS).reverse()) { // newest first for the budget…
+      item._publicId = s.publicId;
+      let b64 = null;
+      try { b64 = this.sealItem(item); } catch (e) { this.log(`item ${item.uuid}: seal failed (${e.message}) — skipped`); }
+      if (b64 === null) continue;
+      const bytes = Buffer.byteLength(b64, 'utf8');
+      if (total + bytes > BACKFILL_SEALED_BYTES) break;
+      total += bytes;
+      sealed.push(b64);
+    }
+    sealed.reverse(); // …back to oldest-first for seq order
+    for (const b64 of sealed) s.queue.push(b64);
+    if (items.length > sealed.length) {
+      this.log(`${why}: seeded ${sealed.length}/${items.length} items (bounded window — earlier history stays on this Mac)`);
+    }
+    return sealed.length;
+  }
+
   async backfill(session) {
     // Seed = the LAST 100 items / 512 KB sealed, oldest-first (spec §6).
     const items = [];
     try {
-      const raw = fs.readFileSync(session.file, 'utf8');
-      session.offset = Buffer.byteLength(raw, 'utf8');
-      for (const line of raw.split('\n')) {
-        if (!line.trim()) continue;
-        let obj; try { obj = JSON.parse(line); } catch { continue; }
+      const st = fs.statSync(session.file);
+      const { objs, consumed } = this.readRecords(session.file, 0, st.size);
+      session.offset = consumed; // NOT st.size: a record mid-write stays unread
+      for (const obj of objs) {
         for (const item of adapter.normalize(obj)) {
-          if (session.seenUuids.has(item.uuid)) continue;
-          session.seenUuids.add(item.uuid);
+          if (!this.markSeen(session, item.uuid)) continue;
           if (item.hv) session.hv = item.hv;
           items.push(item);
         }
@@ -407,27 +495,10 @@ class Daemon {
       this.log(`backfill read failed (${e.message}) — starting live-only`);
       return;
     }
-    let seed = items.slice(-BACKFILL_ITEMS);
-    // Budget by sealed size, dropping OLDEST first.
-    let sealedTotal = 0;
-    const sealedSeed = [];
-    for (const item of seed.reverse()) { // newest first for the budget…
-      item._publicId = session.publicId;
-      const b64 = this.sealItem(item);
-      if (b64 === null) continue;
-      const bytes = Buffer.byteLength(b64, 'utf8');
-      if (sealedTotal + bytes > BACKFILL_SEALED_BYTES) break;
-      sealedTotal += bytes;
-      sealedSeed.push({ item, b64 });
-    }
-    sealedSeed.reverse(); // …back to oldest-first for seq order
-    for (const { b64 } of sealedSeed) {
-      session.queue.push(b64);
-    }
-    session.backfilled = sealedSeed.length;
-    if (items.length > sealedSeed.length) {
-      this.log(`backfill: seeded ${sealedSeed.length}/${items.length} items (bounded window — earlier history stays on this Mac)`);
-    }
+    session.backfilled = this.enqueueBounded(session, items, 'backfill');
+    // Persist offset + the uuid ring BEFORE publishing (same order the tailer
+    // uses): a restart mid-flush must not re-read and re-publish the seed.
+    this.persistSession(session);
     await this.flush(session);
   }
 
@@ -439,33 +510,40 @@ class Daemon {
     let st;
     try { st = fs.statSync(s.file); } catch { return; }
     if (st.size < s.offset) {
-      // Truncated/rewritten in place (probe: RESCAN) — re-read whole, dedup by uuid.
+      // Truncated/rewritten in place (probe: RESCAN) — re-read whole, dedup by
+      // uuid. `bulk` makes this re-read obey the §6 cap: a 5k-item transcript
+      // whose dedup set is somehow cold must not flood the lane in one tick.
       this.log(`${s.sid.slice(0, 8)}: size ${st.size} < offset ${s.offset} — full rescan with uuid dedup`);
-      s.offset = 0; s.partial = '';
+      s.offset = 0; s.bulk = true;
     }
     if (st.size <= s.offset) return;
-    let buf;
+    const bulk = !!s.bulk;
+    s.bulk = false;
+    let objs, consumed;
     try {
-      const fd = fs.openSync(s.file, 'r');
-      buf = Buffer.alloc(st.size - s.offset);
-      fs.readSync(fd, buf, 0, buf.length, s.offset);
-      fs.closeSync(fd);
+      ({ objs, consumed } = this.readRecords(s.file, s.offset, st.size));
     } catch { return; }
-    s.offset = st.size;
-    const data = (s.partial || '') + buf.toString('utf8');
-    const lines = data.split('\n');
-    s.partial = lines.pop();
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let obj;
-      try { obj = JSON.parse(line); } catch { continue; }
+    // The trailing fragment of a record still being written is left UNREAD
+    // rather than carried in memory: offset only ever advances past COMPLETE
+    // records, so the next tick re-reads it (and a restart resumes at a record
+    // boundary instead of skipping the half-written one forever).
+    if (consumed <= s.offset) return;
+    s.offset = consumed;
+    const fresh = [];
+    for (const obj of objs) {
       for (const item of adapter.normalize(obj)) {
-        if (s.seenUuids.has(item.uuid)) continue;
-        s.seenUuids.add(item.uuid);
+        if (!this.markSeen(s, item.uuid)) continue;
         if (item.hv && item.hv !== s.hv) {
           if (s.hv) this.log(`${s.sid.slice(0, 8)}: harness version drift ${s.hv} → ${item.hv}`);
           s.hv = item.hv;
         }
+        fresh.push(item);
+      }
+    }
+    if (bulk) {
+      this.enqueueBounded(s, fresh, `${s.sid.slice(0, 8)}: rescan`);
+    } else {
+      for (const item of fresh) {
         item._publicId = s.publicId;
         // A seal failure on ONE item must never take the tailer interval down —
         // skip it loudly and keep tailing (the JSONL remains durable).
