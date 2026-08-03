@@ -104,6 +104,7 @@ class Daemon {
     // worse than the replay window the epoch echo already closes.
     this.retiredVgens = new Set();
     this.logStream = null;
+    this.exit = (code) => process.exit(code); // injectable for tests (POST /shutdown)
   }
 
   log(...args) {
@@ -319,6 +320,19 @@ class Daemon {
           sid: s.sid, public_id: s.publicId, pane_id: s.paneId, cwd: s.cwd, status: s.status,
         }));
         return send(200, { announces: ann, enabled });
+      }
+      case 'POST /shutdown': {
+        // `connect --replace` recycles the daemon (review A2): a live process
+        // keeps the OLD tunnel identity (base/key) in memory — under systemd
+        // `enable --now` is a no-op while the unit is active, and a detached
+        // replacement dies on EADDRINUSE while the old process keeps
+        // publishing to the orphaned channel. Clean exit: neither launchd
+        // (SuccessfulExit=false) nor systemd (Restart=on-failure) respawns a
+        // 0-exit; connect starts the fresh daemon right after.
+        this.log('shutdown requested over loopback (connect --replace recycles the daemon)');
+        send(200, { ok: true });
+        setTimeout(() => this.exit(0), 50); // let the response flush first
+        return;
       }
       // There is NO POST /enable any more: the PreToolUse sentinel above is the
       // only door, so no local caller can mint a share for a session it merely

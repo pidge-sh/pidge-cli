@@ -51,6 +51,33 @@ async function daemonAlive() {
   } catch { return null; }
 }
 
+// Ask the RUNNING daemon (if any) to exit — the loopback half of the
+// `connect --replace` recycle (review A2). Returns true when a daemon
+// answered the shutdown; false when nothing was listening or the bearer did
+// not match (a daemon that refuses our token is NOT ours to kill). After a
+// successful shutdown, wait for the port to actually free so the fresh
+// daemon cannot die on EADDRINUSE against the exiting one.
+async function shutdownLocalDaemon() {
+  const cfg = core.readJson(core.DAEMON_FILE(), null);
+  if (!cfg || !cfg.port || !cfg.token) return false;
+  let res;
+  try {
+    res = await core.fetchT(`http://127.0.0.1:${cfg.port}/shutdown`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${cfg.token}` },
+    }, 3000);
+  } catch { return false; } // nothing listening — nothing to recycle
+  if (!res.ok) return false; // 401: not our daemon — leave it alone
+  for (let i = 0; i < 20; i++) {
+    try {
+      await core.fetchT(`http://127.0.0.1:${cfg.port}/health`, {}, 500);
+    } catch { return true; } // connection refused — it is gone
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  console.error('pidge terminal: WARNING — the old daemon acknowledged the shutdown but its port is still held; the fresh daemon may collide (EADDRINUSE) and exit until the service manager retries');
+  return true;
+}
+
 // --- connect ----------------------------------------------------------------
 
 async function askYesNo(question) {
@@ -167,10 +194,21 @@ async function runConnect(v) {
   // install on EVERY platform — the manual line is the same everywhere).
   const cfg = core.readJson(core.DAEMON_FILE(), null) || { port: DAEMON_PORT, token: crypto.randomBytes(24).toString('base64url') };
   core.writeJson(core.DAEMON_FILE(), cfg);
+  // --replace: a daemon may still be RUNNING with the OLD identity in memory
+  // (review A2). launchd's unload+load recycles it, but systemd's
+  // `enable --now` is a NO-OP while the unit is active, and the detached
+  // fallback's fresh daemon dies on EADDRINUSE while the old one keeps
+  // publishing to the orphaned channel — a new enable then lands there in
+  // silence. The loopback shutdown covers every platform the same way (and
+  // --no-daemon too); the systemd installer adds a belt-and-braces restart.
+  if (v.replace) {
+    const wasUp = await shutdownLocalDaemon();
+    if (wasUp) say('✓ stopped the running daemon (it held the previous tunnel identity in memory)');
+  }
   if (v['no-daemon']) {
     say('· --no-daemon: start it yourself with `pidge terminal daemon`');
   } else {
-    const svc = installDaemonService();
+    const svc = installDaemonService({ recycle: !!v.replace });
     if (svc.kind === 'launchd') say(`✓ daemon installed (launchd ${svc.label}) — logs at ${core.LOG_FILE()}`);
     else if (svc.kind === 'systemd') {
       say(`✓ daemon installed (systemd --user ${svc.label}) — logs at ${core.LOG_FILE()}`);
@@ -587,6 +625,11 @@ WantedBy=default.target
   try {
     run('systemctl', ['--user', 'daemon-reload']);
     run('systemctl', ['--user', 'enable', '--now', SYSTEMD_UNIT]);
+    // `enable --now` is a NO-OP while the unit is already active, so a
+    // --replace would leave the OLD daemon running with the previous identity
+    // in memory (review A2). The loopback shutdown usually got it first —
+    // this restart is belt-and-braces, harmless on a freshly started unit.
+    if (probe.recycle) run('systemctl', ['--user', 'restart', SYSTEMD_UNIT]);
   } catch (e) {
     console.error(`pidge terminal: systemctl failed (${e.message}) — start it manually:\n  systemctl --user daemon-reload && systemctl --user enable --now ${SYSTEMD_UNIT}`);
   }
@@ -771,5 +814,6 @@ module.exports = {
   runTerminal, installHooks, uninstallHooks, hookShimSource, PIDGE_HOOK_MARKER,
   installDaemonService, uninstallDaemonService, launchdPlistPath, systemdUnitPath,
   copyCliToStablePath, stableCliDir, stableCliEntry, installPidgeSkill,
+  shutdownLocalDaemon,
   SYSTEMD_UNIT, LAUNCHD_LABEL,
 };

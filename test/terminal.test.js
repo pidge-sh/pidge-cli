@@ -936,6 +936,87 @@ test('both service templates carry a UTF-8 locale (launchd and systemd hand the 
   assert.match(unit, /^Environment="LC_ALL=[^"]*(UTF-8|utf8)"$/im);
 });
 
+// --- the --replace daemon recycle (review A2) -------------------------------
+//
+// A daemon that survives a --replace keeps the OLD tunnel identity in memory:
+// systemd's `enable --now` is a no-op while the unit is active, and the
+// detached fallback's fresh daemon dies on EADDRINUSE while the old one keeps
+// publishing to the orphaned channel. The recycle is a loopback POST /shutdown
+// (bearer-gated) + a belt-and-braces systemd restart.
+
+test('POST /shutdown: bearer-gated, answers 200, then exits 0 — the --replace recycle door', async () => {
+  const d = makeDaemon();
+  d.hookToken = 'local-test-token';
+  const exits = [];
+  d.exit = (code) => exits.push(code);
+  const post = (auth) => new Promise((resolve) => {
+    const req = {
+      method: 'POST', url: '/shutdown', headers: { authorization: auth },
+      on(event, cb) { if (event === 'data') cb('{}'); if (event === 'end') cb(); },
+      destroy() {},
+    };
+    let code = null;
+    const res = { writeHead(c) { code = c; }, end(payload) { resolve({ code, body: payload ? JSON.parse(payload) : null }); } };
+    d.handleHttp(req, res);
+  });
+
+  const bad = await post('Bearer wrong-token');
+  assert.equal(bad.code, 401, 'a foreign token must NOT be able to kill the daemon');
+  await new Promise((r) => setTimeout(r, 80));
+  assert.deepEqual(exits, [], 'no exit on an unauthorized shutdown');
+
+  const ok = await post('Bearer local-test-token');
+  assert.equal(ok.code, 200);
+  assert.deepEqual(ok.body, { ok: true });
+  await new Promise((r) => setTimeout(r, 80));
+  assert.deepEqual(exits, [0], 'a CLEAN 0 exit — neither launchd (SuccessfulExit=false) nor systemd (on-failure) respawns it');
+  assert.ok(d.logLines.some((l) => /shutdown requested over loopback/.test(l)));
+});
+
+test('shutdownLocalDaemon: kills only OUR daemon, tolerates absence, waits for the port to free', async () => {
+  freshXdg();
+  assert.equal(await commands.shutdownLocalDaemon(), false, 'no daemon.json ⇒ nothing to recycle');
+  core.writeJson(core.DAEMON_FILE(), { port: 1, token: 'tok' }); // nothing listens on port 1
+  assert.equal(await commands.shutdownLocalDaemon(), false, 'nothing listening ⇒ false, silently');
+
+  const http = require('node:http');
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    hits.push(`${req.method} ${req.url}`);
+    if (req.headers.authorization !== 'Bearer right-token') { res.writeHead(401); return res.end('{}'); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+    if (req.url === '/shutdown') setTimeout(() => { srv.close(); srv.closeAllConnections(); }, 10); // the daemon "exits"
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const port = srv.address().port;
+
+  // A daemon that refuses our bearer is NOT ours — left alone (the fixed port
+  // is shared machine-wide; a rotated token must never kill a stranger).
+  core.writeJson(core.DAEMON_FILE(), { port, token: 'wrong-token' });
+  assert.equal(await commands.shutdownLocalDaemon(), false, 'a 401 daemon must be left alone');
+
+  core.writeJson(core.DAEMON_FILE(), { port, token: 'right-token' });
+  assert.equal(await commands.shutdownLocalDaemon(), true, 'our daemon acknowledged and the port freed');
+  assert.ok(hits.includes('POST /shutdown'));
+});
+
+test('installDaemonService(recycle): systemd RESTARTS the unit — enable --now no-ops while active (A2)', () => {
+  freshHome();
+  freshXdg();
+  const rec = recorder();
+  withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec.run, recycle: true }));
+  assert.deepEqual(rec.calls, [
+    'systemctl --user daemon-reload',
+    'systemctl --user enable --now pidge-terminal.service',
+    'systemctl --user restart pidge-terminal.service',
+  ], 'the restart is what actually cycles an already-active unit onto the new identity');
+
+  const rec2 = recorder();
+  withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec2.run }));
+  assert.ok(!rec2.calls.some((c) => /restart/.test(c)), 'a plain connect does not restart — fresh installs are already fresh');
+});
+
 // --- the enable SENTINEL matcher (the door's whole contract) ----------------
 
 test('parseEnableSentinel: the command must BE the sentinel — the whole string, never a substring', () => {
