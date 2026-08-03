@@ -4869,7 +4869,7 @@ When your human says **"enable yourself on Pidge"** (or "se habilita no pidge", 
 
 \`pidge terminal enable\`
 
-That's the whole move. The CLI walks up from your Bash process to YOUR claude process, finds its tmux pane and this session's transcript, and starts mirroring the session to the human's phone — E2E-sealed, fully interactive (their typed replies land directly in your input box; when you stop and wait, they get a real notification). Requirements the command checks for you (refuse loudly, don't guess): this computer ran \`pidge terminal connect\` once, and you are running INSIDE tmux. If it refuses, relay its message — it says exactly what's missing (e.g. "start claude inside tmux"). \`pidge terminal disable\` stops sharing when asked. Add \`--approvals Bash,Write\` only if your human explicitly asks to approve those tools from the phone.
+That's the whole move. The CLI walks up from your Bash process to YOUR claude process, finds its tmux pane and this session's transcript, and starts mirroring the session to the human's phone — E2E-sealed, fully interactive (their typed replies land directly in your input box; when you stop and wait, they get a real notification). Requirements the command checks for you (refuse loudly, don't guess): this computer ran \`pidge terminal connect\` once, and you are running INSIDE tmux. There is no other way to share — no session picker, no session id to pass — so if it refuses, relay its message verbatim ("Run this from inside the Claude session you want to share — it must be in a tmux.") instead of looking for a flag. \`pidge terminal disable\` stops sharing when asked. Add \`--approvals Bash,Write\` only if your human explicitly asks to approve those tools from the phone.
 
 ## Full spec
 
