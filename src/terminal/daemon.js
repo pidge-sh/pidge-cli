@@ -210,10 +210,27 @@ class Daemon {
         this.announces.set(sid, { tty: tty || null, cwd: cwd || null, transcriptPath: tp || null, at: Date.now() });
         const s = this.sessions.get(sid);
         if (s && tp && tp !== s.file) {
-          // /clear+resume rotation: same sid, new file — SAME AgentSession (spec §6).
+          // Same-sid rotation (an in-place transcript swap): SAME AgentSession.
           this.log(`session ${sid.slice(0, 8)}: transcript rotated → ${path.basename(tp)}`);
           s.file = tp; s.offset = 0; s.bulk = true; // uuid dedup absorbs the re-read; bulk caps it (§6)
           this.persistSession(s);
+        }
+        if (!s) {
+          // `/clear` = a NEW session, not a rotation (spec §6, corrected per QA
+          // finding #14): Claude Code mints a new sid AND a new transcript, the
+          // old JSONL never grows again, and the phone froze on a mirror that
+          // LOOKED alive. When the new sid lands where a shared session lives,
+          // the shared one ends NOW — loudly, with a final legible notice.
+          // Deliberately NOT auto-adopting the new sid: consent is per session
+          // id (§2); whether /clear carries consent over is Thiago's open
+          // product decision, and until then re-consent is the behavior.
+          const twin = this.findReplacedTwin(sid, { tty: core.normalizeTty(tty), cwd });
+          if (twin) {
+            this.log(`session ${twin.sid.slice(0, 8)}: new sid ${sid.slice(0, 8)} announced in its pane/cwd (a /clear or a fresh claude) — ending the shared session; the new one needs its own enable`);
+            // Fire-and-forget: the SessionStart hook has a 3 s budget, and the
+            // end path talks to the server. Failures are logged, never eaten.
+            this.endReplacedSession(twin, sid).catch((e) => this.log(`end-replaced ${twin.sid.slice(0, 8)} failed: ${e.message}`));
+          }
         }
         return send(200, {});
       }
@@ -331,6 +348,61 @@ class Daemon {
       this.log(`enable ${sid.slice(0, 8)} FAILED: ${e.message}`);
       return deny(`Couldn't mirror this session: ${e.message}. Do not run other commands.`);
     }
+  }
+
+  // Did this NEW sid land where a currently-shared session lives? cwd equality
+  // is the primary signal (the Claude Code hook is ttyless in practice —
+  // finding #12 — so the pane cannot be read off the announce). POSITIVE
+  // evidence of a different pane keeps the share alive: an announced tty that
+  // resolves to another pane, or 2+ panes sitting in that cwd (a second claude
+  // in the same project must not kill the first one's mirror). An unreadable
+  // pane list is no disproof — the cwd match stands (ending a dead mirror
+  // loudly beats freezing it silently).
+  findReplacedTwin(newSid, { tty, cwd }) {
+    const want = String(cwd || '').replace(/\/+$/, '');
+    if (!want) return null;
+    const twin = [...this.sessions.values()]
+      .find((s) => String(s.cwd || '').replace(/\/+$/, '') === want);
+    if (!twin) return null;
+    const opts = { onWarn: (m) => this.log(m) };
+    try {
+      if (tty) {
+        const hit = core.tmuxPaneForTty(tty, opts);
+        if (hit && hit.paneId !== twin.paneId) return null; // a different pane, provably
+      } else {
+        const hits = core.tmuxPanesForCwd(want, opts);
+        if (hits.length > 1) {
+          this.log(`session ${twin.sid.slice(0, 8)}: new sid ${newSid.slice(0, 8)} announced in ${want}, but ${hits.length} panes sit there — cannot tell a /clear from a second claude; NOT ending the share`);
+          return null;
+        }
+      }
+    } catch (e) {
+      this.log(`session ${twin.sid.slice(0, 8)}: pane list unreadable while checking a new sid (${e.message}) — treating the cwd match as the /clear signal`);
+    }
+    return twin;
+  }
+
+  // End a shared session that a NEW sid replaced (the /clear path, finding
+  // #14): one final legible notice item to the phone, then the normal disable
+  // (the server DELETE marks the row ended). Best-effort on the notice; the
+  // end itself is unconditional — a frozen mirror that looks alive is the bug.
+  async endReplacedSession(s, newSid) {
+    try {
+      const preview = 'This session ended — /clear started a new one. Share the new session again to keep mirroring.';
+      const notice = {
+        v: 1, uuid: `pidge-ended-${s.sid.slice(0, 8)}-${Date.now()}`, parent: null,
+        ts: nowIso(), role: 'system', kind: 'notice', preview,
+        truncated: false, total_bytes: adapter.byteLen(preview),
+        harness: 'claude', hv: s.hv || null, _publicId: s.publicId,
+      };
+      const b64 = this.sealItem(notice);
+      if (b64 !== null) this.queuePush(s, notice.uuid, b64);
+      await this.flush(s);
+      if (s.queue.length) this.log(`${s.publicId}: the ended notice did not reach the server (${s.queue.length} item(s) pending) — ending anyway, the status change is what the phone keys on`);
+    } catch (e) {
+      this.log(`${s.publicId}: could not publish the ended notice (${e.message}) — ending anyway`);
+    }
+    await this.disableSession(s.sid, `/clear (or a fresh claude) replaced it with sid ${newSid.slice(0, 8)}`);
   }
 
   // Bind exactly ONE pane, or refuse. Primary = the tty (authoritative: a pane

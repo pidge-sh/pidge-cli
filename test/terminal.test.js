@@ -1587,6 +1587,107 @@ test('the daemon has NO /enable endpoint any more — the hook is the only door'
   assert.equal(d.sessions.size, 0);
 });
 
+// --- /clear kills the mirror LOUDLY (QA finding #14) ------------------------
+//
+// `/clear` in Claude Code mints a NEW sid + a NEW transcript file; the daemon
+// kept tailing the frozen old file and the phone showed a screen that looked
+// alive. Detection only — auto-adoption of the new sid is an OPEN product
+// decision (Thiago's): the old session must end NOW, with a legible notice,
+// and the new sid must NOT be silently enabled.
+
+// endReplacedSession is deliberately fire-and-forget off the hook: give its
+// promise chain a beat to settle before asserting.
+const settle = () => new Promise((r) => setTimeout(r, 25));
+
+test('/clear: a NEW sid announcing in the shared session cwd ends it — notice + DELETE, no auto-adopt', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const apiLog = [];
+  d.api = async (method, p, body) => {
+    apiLog.push({ method, p, body });
+    if (method === 'POST' && /\/items$/.test(p)) {
+      return { res: { status: 201 }, data: { accepted: body.items.length, last_seq: body.items.at(-1).seq } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
+  await withPanes({ byTty: () => ({ paneId: '%3', loc: 'p:0.0' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-old', 'pidge terminal enable')));
+  assert.ok(d.sessions.get('sess-old'), 'precondition: the session is shared');
+
+  // The /clear: Claude Code announces a NEW sid, same cwd, ttyless hook, and
+  // exactly ONE pane sits in that cwd (the bound one).
+  await withPanes({ byCwd: () => [{ paneId: '%3', loc: 'p:0.0' }] },
+    () => hookPost(d, 'session-start', {
+      session_id: 'sess-new', cwd: '/tmp/proj', transcript_path: '/tmp/new.jsonl', tty: '??',
+    }));
+  await settle();
+
+  assert.equal(d.sessions.has('sess-old'), false, 'the replaced session must end IMMEDIATELY');
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-old'], undefined);
+  assert.equal(d.sessions.has('sess-new'), false,
+    'NO auto-adoption — consent is per sid; the new session needs its own paste-to-enable');
+
+  // The phone got one final LEGIBLE item…
+  const itemPosts = apiLog.filter((c) => c.method === 'POST' && /\/items$/.test(c.p));
+  assert.equal(itemPosts.length, 1, 'exactly one final notice batch');
+  const notice = openItem(d, itemPosts[0].body.items[0].payload_sealed, 'ases_sess-old');
+  assert.equal(notice.kind, 'notice');
+  assert.equal(notice.role, 'system');
+  assert.match(notice.preview, /session ended/i);
+  assert.match(notice.preview, /\/clear/);
+  assert.match(notice.preview, /[Ss]hare/, 'the notice tells the human the way back');
+
+  // …and the server row was ENDED (the DELETE marks ended).
+  assert.ok(apiLog.some((c) => c.method === 'DELETE' && c.p === '/agent_sessions/ases_sess-old'));
+  assert.ok(d.logLines.some((l) => /new sid sess-new/.test(l) && /ending the shared session/.test(l)),
+    `the end must be loud in the log, got ${JSON.stringify(d.logLines)}`);
+});
+
+test('/clear detection does NOT fire across cwds, nor when a second pane shares the cwd', async () => {
+  // A new sid in a DIFFERENT directory is just another claude — untouched.
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  d.api = async () => ({ res: { status: 200 }, data: {} });
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-a', 'pidge terminal enable')));
+  await withPanes({ byCwd: () => [] },
+    () => hookPost(d, 'session-start', { session_id: 'sess-elsewhere', cwd: '/tmp/other', tty: '??' }));
+  await settle();
+  assert.ok(d.sessions.has('sess-a'), 'a new sid in another cwd must not end the share');
+
+  // TWO panes in the shared cwd: could be a second claude, not a /clear —
+  // the share stays, and the ambiguity is logged.
+  await withPanes({ byCwd: () => [{ paneId: '%3' }, { paneId: '%9' }] },
+    () => hookPost(d, 'session-start', { session_id: 'sess-maybe', cwd: '/tmp/proj', tty: '??' }));
+  await settle();
+  assert.ok(d.sessions.has('sess-a'), 'ambiguity must not kill a live mirror');
+  assert.ok(d.logLines.some((l) => /cannot tell a \/clear from a second claude/.test(l)));
+
+  // An announced tty that resolves to a DIFFERENT pane is positive disproof.
+  await withPanes({ byTty: () => ({ paneId: '%9' }) },
+    () => hookPost(d, 'session-start', { session_id: 'sess-otherpane', cwd: '/tmp/proj', tty: 'ttys009' }));
+  await settle();
+  assert.ok(d.sessions.has('sess-a'), 'a provably different pane must not end the share');
+});
+
+test('/clear: the end happens even when the final notice cannot be delivered', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  d.api = async (method, p) => {
+    if (method === 'POST' && /\/items$/.test(p)) return { res: { status: 502 }, data: {} };
+    return { res: { status: 200 }, data: {} };
+  };
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-b', 'pidge terminal enable')));
+  await withPanes({ byCwd: () => [{ paneId: '%3' }] },
+    () => hookPost(d, 'session-start', { session_id: 'sess-b2', cwd: '/tmp/proj', tty: '??' }));
+  await settle();
+
+  assert.equal(d.sessions.has('sess-b'), false, 'the end is unconditional — the notice is best-effort');
+  assert.ok(d.logLines.some((l) => /ended notice did not reach the server/.test(l)),
+    `an undelivered notice must be narrated, got ${JSON.stringify(d.logLines)}`);
+});
+
 // --- the tailer: backfill, restart dedup, rescan bounds ---------------------
 
 function rec(i) {
