@@ -66,6 +66,20 @@ async function runConnect(v) {
   const secretRaw = process.env.PIDGE_SECRET || v.secret || null;
   const existing = core.loadTerminalEnv();
 
+  // A NEW pairing over an EXISTING identity refuses LOUDLY (QA finding #9):
+  // connect used to overwrite the slot in silence, leaving the old channel
+  // alive on the server — an orphaned "Computer N" that counts against the
+  // channel limit and shows in the app as a connected computer that never
+  // reports again (Thiago has three of those). The slot being unique is
+  // right — one computer, one identity; the SWITCH must be consented.
+  // Re-running WITHOUT --code (finishing a half-done install) stays allowed.
+  if (code && existing.token && !v.replace) {
+    die('pidge terminal connect: this computer is already connected to ' +
+      `channel ${existing.channelId != null ? existing.channelId : '(unknown)'} at ${existing.base || '(unknown url)'}.\n` +
+      'Run again with --replace to overwrite this identity, or `pidge terminal disconnect` first.\n' +
+      '(Either way the OLD channel stays on the server — remove that computer in the app: Settings → Computers.)');
+  }
+
   let token = existing.token;
   let channelId = existing.channelId;
   let effectiveBase = existing.base || base;

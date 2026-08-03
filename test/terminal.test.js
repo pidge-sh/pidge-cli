@@ -537,7 +537,8 @@ const { createMock } = require('./mock-server');
 function runConnect(port, { code = 'claim-ok', secret = SECRET43(), extra = [] } = {}) {
   const bin = path.join(__dirname, '..', 'bin', 'pidge.js');
   const child = spawn(process.execPath,
-    [bin, 'terminal', 'connect', '--code', code, '--url', `http://127.0.0.1:${port}`, '--yes', '--no-daemon', ...extra],
+    [bin, 'terminal', 'connect', ...(code ? ['--code', code] : []),
+      '--url', `http://127.0.0.1:${port}`, '--yes', '--no-daemon', ...extra],
     {
       env: {
         ...process.env,
@@ -622,6 +623,50 @@ test('connect: it refreshes the Pidge skill — the agent-side half of the door'
     assert.match(text, /is SUCCESS/, 'and that the DENIAL is the success signal');
     assert.ok(!text.includes('hld_minted_by_claim'), 'the generated skill never bakes a token');
     assert.match(out.stdout, /✓ Pidge skill refreshed/);
+  } finally { await mock.stop(); }
+});
+
+test('connect: a NEW pairing over an EXISTING identity refuses LOUDLY — --replace is the consent (QA #9)', async () => {
+  freshHome();
+  freshXdg();
+  // The identity a previous connect stored — the production link QA lost.
+  core.saveTerminalEnv({ base: 'https://api.pidge.sh', token: 'hld_prod_link', secret: SECRET43(), channelId: 396 });
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    const out = await runConnect(port);
+    assert.equal(out.code, 1, 'the silent overwrite is the sin — a second pairing must refuse');
+    assert.match(out.stderr, /already connected to channel 396 at https:\/\/api\.pidge\.sh/);
+    assert.match(out.stderr, /--replace/);
+    assert.match(out.stderr, /disconnect/);
+    assert.match(out.stderr, /stays on the server/, 'the orphaned-channel consequence is named');
+    assert.equal(core.loadTerminalEnv().token, 'hld_prod_link', 'the stored identity is untouched');
+    assert.ok(!mock.state.reqLog.some((r) => r.pathname === '/api/v1/claim'),
+      'the refusal must come BEFORE the claim — the code is not consumed');
+    assert.equal(mock.state.claimCode, 'claim-ok', 'the single-use code survives for the intended retry');
+
+    // With --replace, the same connect goes through and rotates the identity.
+    const replaced = await runConnect(port, { extra: ['--replace'] });
+    assert.equal(replaced.code, 0, `--replace must complete the switch: ${replaced.stderr}`);
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim');
+  } finally { await mock.stop(); }
+});
+
+test('connect: re-running WITHOUT --code on an existing identity still works (the finish-install path)', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    const first = await runConnect(port);
+    assert.equal(first.code, 0, first.stderr);
+    // The documented recovery path ("re-run once the file parses"): no code,
+    // same identity — must NOT trip the replace guard.
+    const again = await runConnect(port, { code: null });
+    assert.equal(again.code, 0, `a codeless re-run finishes the install, it does not re-pair: ${again.stderr}`);
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim');
   } finally { await mock.stop(); }
 });
 
