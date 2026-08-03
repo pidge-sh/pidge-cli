@@ -140,6 +140,37 @@ test('normalize: an unknown record type surfaces as a notice, known noise stays 
   }
 });
 
+test('normalize: an unknown message BLOCK becomes a notice too — drift is never a hole', () => {
+  // A record type nobody knows surfaces already; a BLOCK type nobody knows used
+  // to vanish inside a record that otherwise rendered fine — the worst kind of
+  // gap, because the conversation still LOOKS complete.
+  const items = adapter.normalize({
+    type: 'assistant',
+    uuid: 'u-blk',
+    version: '2.1.220',
+    message: {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'searching' },
+        { type: 'server_tool_use', name: 'web_search', input: { q: 'pidge' } },
+      ],
+    },
+  });
+
+  assert.equal(items.length, 2, 'the unknown block must produce an item, not silence');
+  assert.equal(items[1].kind, 'notice');
+  assert.equal(items[1].uuid, 'u-blk:1', 'it keeps its own dedup key like any other block');
+  assert.match(items[1].preview, /unknown block: server_tool_use/);
+  assert.match(items[1].preview, /update/);
+
+  // A block with no type at all is still surfaced (named, not guessed).
+  const [notice] = adapter.normalize({
+    type: 'assistant', uuid: 'u-blk2', message: { role: 'assistant', content: [{ foo: 1 }] },
+  });
+  assert.equal(notice.kind, 'notice');
+  assert.match(notice.preview, /untyped/);
+});
+
 test('normalize: snapshot system records are dropped, plain ones become notices', () => {
   assert.deepEqual(adapter.normalize({
     type: 'system', uuid: 'u-6', isSnapshotUpdate: true, content: 'snapshot noise',
@@ -673,6 +704,24 @@ function makeDaemon() {
   return d;
 }
 
+// A daemon whose state.json already carries ONE enabled session, as a previous
+// process would have left it — the input to every re-arm test below.
+function daemonWithPersisted({ sid = 'sess-k', ...overrides } = {}) {
+  makeDaemon(); // fresh slot + the epoch a first process would have written
+  const st = core.readJson(core.STATE_FILE(), { epoch: 1, sessions: {} });
+  st.sessions[sid] = {
+    publicId: `ases_${sid}`, paneId: '%1', tty: null, cwd: '/tmp/proj',
+    file: path.join(tmp('pidge-term-jsonl-'), 'absent.jsonl'),
+    offset: 0, nextSeq: 1, approvals: [], seen: [], outbox: [], ...overrides,
+  };
+  core.writeJson(core.STATE_FILE(), st);
+  const d = new Daemon();
+  d.logLines = [];
+  d.log = (...a) => { d.logLines.push(a.join(' ')); };
+  d.subscribeInput = () => {};
+  return d;
+}
+
 test('the daemon refuses to construct without a stored identity', () => {
   freshXdg();
   assert.throws(() => new Daemon(), /not connected/);
@@ -864,18 +913,23 @@ test('the tool gate matches case-insensitively and honors the wildcard', () => {
 // --- the publish lane (flush): backoff, teardown, seq re-sync ---------------
 
 // A minimal live session record, registered in the daemon's map exactly as
-// enableSession would leave it.
-function liveSession(d, { queue = [], nextSeq = 1, file = '/tmp/nonexistent.jsonl' } = {}) {
+// enableSession would leave it. `queue` accepts bare strings for readability —
+// the outbox entry is {uuid, sealed} (the uuid is what a restart re-dedups on).
+function liveSession(d, { queue = [], nextSeq = 1, file = '/tmp/nonexistent.jsonl', sid = 'sess-flush' } = {}) {
+  const entries = queue.map((q, i) => (typeof q === 'string' ? { uuid: `u-q${i}`, sealed: q } : q));
   const s = {
-    sid: 'sess-flush', publicId: 'ases_t', paneId: '%1', tty: null, cwd: '/tmp/proj',
+    sid, publicId: 'ases_t', paneId: '%1', tty: null, cwd: '/tmp/proj',
     file, title: 'proj', hv: null,
     offset: 0, seenUuids: new Set(), seenRing: [],
-    queue: [...queue], nextSeq, status: 'idle', waitingArmed: true, approvals: [],
-    flushing: false, backfilled: 0, backoff: 0, nextFlushAt: 0, gen: 0,
+    queue: entries, outboxBytes: entries.reduce((n, e) => n + e.sealed.length, 0),
+    nextSeq, status: 'idle', waitingArmed: true, approvals: [],
+    flushing: false, backfilled: 0, registered: true, registering: false,
+    backoff: 0, nextFlushAt: 0, gen: 0,
   };
   d.sessions.set(s.sid, s);
   return s;
 }
+const sealedOf = (queue) => queue.map((e) => e.sealed);
 
 test('flush: a failing POST settles into exponential backoff instead of storming', async () => {
   const d = makeDaemon();
@@ -899,7 +953,7 @@ test('flush: a failing POST settles into exponential backoff instead of storming
   await d.flushTick();
   assert.equal(posts, 2);
   assert.equal(s.backoff, 4);
-  assert.deepEqual(s.queue, ['a', 'b'], 'nothing is lost — the JSONL is durable');
+  assert.deepEqual(sealedOf(s.queue), ['a', 'b'], 'nothing is lost — the JSONL is durable');
 
   // A success clears the window.
   d.api = async () => ({ res: { status: 201 }, data: { accepted: 2, last_seq: 2 } });
@@ -973,7 +1027,7 @@ test('flush: an unexplained seq_regression backs off instead of spinning or drop
 
   await d.flush(s);
   assert.equal(posts, 1, 'no spin');
-  assert.deepEqual(s.queue, ['i1', 'i2'], 'the old code dropped a whole batch "to break the loop"');
+  assert.deepEqual(sealedOf(s.queue), ['i1', 'i2'], 'the old code dropped a whole batch "to break the loop"');
   assert.equal(s.nextSeq, 10);
   assert.ok(s.nextFlushAt > Date.now());
 });
@@ -1099,7 +1153,9 @@ function rec(i) {
 function writeJsonl(file, records) {
   fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
 }
-function openItem(d, b64, publicId = 'ases_t') {
+// Open an outbox entry (or a bare sealed string).
+function openItem(d, entry, publicId = 'ases_t') {
+  const b64 = typeof entry === 'string' ? entry : entry.sealed;
   return JSON.parse(core.e2eDecryptBlob(d.key, core.e2eAad(1, publicId, 'agent_transcript'),
     Buffer.from(b64, 'base64url')).toString('utf8'));
 }
@@ -1112,10 +1168,21 @@ test('a rescan AFTER a daemon restart re-publishes nothing', async () => {
   const d1 = makeDaemon();
   d1.registerSession = async () => ({ last_seq: 0 });
   d1.subscribeInput = () => {};
-  d1.flush = async () => {}; // keep the queue observable, touch no network
+  // A server that ACKS: the seed leaves the outbox for real (an un-acked one
+  // would — correctly — be replayed after the restart; that is the durability
+  // test below, not this one).
+  const acked = [];
+  d1.api = async (method, p, body) => {
+    if (method === 'POST' && /\/items$/.test(p)) {
+      for (const it of body.items) acked.push(it.seq);
+      return { res: { status: 201 }, data: { accepted: body.items.length, last_seq: body.items.at(-1).seq } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
   const s1 = await d1.enableSession({ sid: 'sess-r', paneId: '%1', tty: null, cwd: dir, file, approvals: [] });
   assert.equal(s1.backfilled, 3);
-  assert.equal(s1.queue.length, 3);
+  assert.deepEqual(acked, [1, 2, 3]);
+  assert.deepEqual(s1.queue, [], 'an acked item leaves the durable outbox');
 
   const persisted = core.readJson(core.STATE_FILE(), {}).sessions['sess-r'];
   assert.deepEqual(persisted.seen, ['u-1', 'u-2', 'u-3'],
@@ -1258,4 +1325,218 @@ test('the single-writer lock refuses a live holder and takes over a stale one', 
   d.releaseWriterLock('sess-a');
   assert.equal(fs.existsSync(d.lockPath('sess-a')), false);
   d.releaseWriterLock('sess-a'); // releasing twice is not an error
+});
+
+// ===========================================================================
+// 5. durability: nothing the tailer captured may be lost, and nothing loud
+//    may go quiet (the failure ledger the spec promises)
+// ===========================================================================
+
+test('the outbox survives a restart: un-acked items are re-published EXACTLY once', async () => {
+  const dir = tmp('pidge-term-jsonl-');
+  const file = path.join(dir, 'd.jsonl');
+  writeJsonl(file, [1, 2].map(rec));
+
+  // --- process 1: the server is unreachable the whole time -----------------
+  const d1 = makeDaemon();
+  d1.registerSession = async () => ({ last_seq: 0 });
+  d1.subscribeInput = () => {};
+  d1.api = async (method, p) => {
+    if (method === 'POST' && /\/items$/.test(p)) return { res: { status: 502 }, data: {} };
+    return { res: { status: 200 }, data: {} };
+  };
+  const s1 = await d1.enableSession({ sid: 'sess-d', paneId: '%1', tty: null, cwd: dir, file, approvals: [] });
+  assert.equal(s1.queue.length, 2, 'nothing was acked, so nothing may leave the outbox');
+
+  writeJsonl(file, [1, 2, 3].map(rec)); // the session keeps working while the server is down
+  d1.tailOne(s1);
+  assert.equal(s1.queue.length, 3);
+
+  const persisted = core.readJson(core.STATE_FILE(), {}).sessions['sess-d'];
+  assert.deepEqual(persisted.outbox.map((e) => e.uuid), ['u-1', 'u-2', 'u-3'],
+    'the pending items must ride in state.json — an in-memory queue is GONE after a restart');
+  assert.equal(persisted.nextSeq, 1, 'seq numbering only advances on an ACK');
+  assert.ok(persisted.offset > 0, 'the read offset did advance — which is exactly why the queue must be durable');
+
+  // --- process 2: same state dir, the server is back -----------------------
+  const d2 = new Daemon();
+  d2.logLines = [];
+  d2.log = (...a) => { d2.logLines.push(a.join(' ')); };
+  d2.subscribeInput = () => {};
+  const published = [];
+  d2.api = async (method, p, body) => {
+    if (method === 'POST' && p === '/agent_sessions') return { res: { status: 201 }, data: { session: { last_seq: 0 } } };
+    if (method === 'POST' && /\/items$/.test(p)) {
+      for (const it of body.items) published.push([it.seq, openItem(d2, it.payload_sealed, 'ases_sess-d').uuid]);
+      return { res: { status: 201 }, data: { accepted: body.items.length, last_seq: body.items.at(-1).seq } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
+  await d2.rearmPersisted();
+  const s2 = d2.sessions.get('sess-d');
+  assert.ok(s2, 're-arm must keep the share');
+  assert.equal(s2.queue.length, 3, 'the un-acked items are recovered before a single new byte is tailed');
+
+  await d2.flush(s2);
+  assert.deepEqual(published, [[1, 'u-1'], [2, 'u-2'], [3, 'u-3']],
+    'every captured item reaches the server, once, in order, with monotonic seqs');
+  assert.deepEqual(s2.queue, []);
+  assert.deepEqual(core.readJson(core.STATE_FILE(), {}).sessions['sess-d'].outbox, []);
+
+  // The replayed items must not come back a second time from the transcript.
+  d2.tailOne(s2);
+  await d2.flush(s2);
+  assert.equal(published.length, 3, 'no duplicate: the dedup set knows the replayed uuids');
+});
+
+test('a full outbox PAUSES the tailer — the transcript keeps the tail, nothing is dropped', () => {
+  const dir = tmp('pidge-term-jsonl-');
+  const file = path.join(dir, 'full.jsonl');
+  writeJsonl(file, [1, 2].map(rec));
+
+  const d = makeDaemon();
+  // 4 × ~1 MB of un-acked sealed payload: past the outbox byte cap.
+  const s = liveSession(d, { file, queue: Array.from({ length: 4 }, () => 'x'.repeat(1024 * 1024 + 1)) });
+  const before = s.offset;
+
+  d.tailOne(s);
+  assert.equal(s.offset, before, 'the read offset must NOT advance while the outbox is at its cap');
+  assert.equal(s.queue.length, 4, 'and nothing new may be enqueued');
+  assert.ok(d.logLines.some((l) => /outbox FULL/.test(l)), `expected a loud pause, got ${JSON.stringify(d.logLines)}`);
+
+  // Once the backlog drains, the very same records flow — they were never lost.
+  d.queueDrop(s, 4);
+  d.tailOne(s);
+  assert.deepEqual(s.queue.map((e) => e.uuid), ['u-1', 'u-2']);
+});
+
+test('re-arm KEEPS the share when the server is unavailable at boot, and retries on the flush clock', async () => {
+  const d = daemonWithPersisted({ sid: 'sess-k' });
+  let registers = 0;
+  d.api = async (method, p) => {
+    if (method === 'POST' && p === '/agent_sessions') {
+      registers += 1;
+      // A Mac that reboots during a deploy: the first POST hits a 503.
+      return registers === 1
+        ? { res: { status: 503 }, data: {} }
+        : { res: { status: 201 }, data: { session: { last_seq: 7 } } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
+
+  await d.rearmPersisted();
+  const s = d.sessions.get('sess-k');
+  assert.ok(s, 'a transient failure must NOT cost the human the share they opted into');
+  assert.equal(s.registered, false);
+  assert.ok(core.readJson(core.STATE_FILE(), {}).sessions['sess-k'], 'it stays in state.json too');
+  assert.ok(d.logLines.some((l) => /keeping the share/.test(l)));
+
+  s.nextFlushAt = Date.now() - 1; // the backoff window elapses
+  await d.flushTick();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(registers, 2, 'the flush tick owns the re-register retry');
+  assert.equal(s.registered, true);
+  assert.equal(s.nextSeq, 8, 'numbering continues from the server high-water');
+});
+
+test('re-arm DROPS a session only when the server refuses it definitively', async () => {
+  const d = daemonWithPersisted({ sid: 'sess-gone' });
+  d.api = async (method, p) => {
+    if (method === 'POST' && p === '/agent_sessions') return { res: { status: 404 }, data: {} };
+    return { res: { status: 200 }, data: {} };
+  };
+
+  await d.rearmPersisted();
+  assert.equal(d.sessions.has('sess-gone'), false);
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-gone'], undefined);
+  assert.equal(fs.existsSync(d.lockPath('sess-gone')), false, 'the writer lock is released with it');
+  assert.ok(d.logLines.some((l) => /for good/.test(l)), `expected a loud drop, got ${JSON.stringify(d.logLines)}`);
+});
+
+test('a waiting notification that does not land stays ARMED for the next signal', async () => {
+  const d = makeDaemon();
+  const s = { sid: 'sess-w', publicId: 'ases_t', title: 'proj', status: 'waiting', waitingArmed: true };
+  let sends = 0;
+  d.api = async () => { sends += 1; return { res: { status: sends === 1 ? 502 : 201 }, data: {} }; };
+
+  await d.maybeNotifyWaiting(s, 'needs you');
+  assert.equal(sends, 1);
+  assert.equal(s.waitingArmed, true, 'a 502 must not eat the whole waiting episode');
+  assert.ok(d.logLines.some((l) => /still armed/.test(l)));
+
+  await d.maybeNotifyWaiting(s, 'needs you');
+  assert.equal(sends, 2);
+  assert.equal(s.waitingArmed, false, 'the send that LANDED closes the episode');
+
+  await d.maybeNotifyWaiting(s, 'again'); // same episode: still one notification
+  assert.equal(sends, 2);
+
+  // A transport error is the same story.
+  s.waitingArmed = true;
+  d.api = async () => { throw new Error('socket hang up'); };
+  await d.maybeNotifyWaiting(s, 'needs you');
+  assert.equal(s.waitingArmed, true);
+  assert.ok(d.logLines.some((l) => /socket hang up/.test(l)));
+});
+
+test('the heartbeat re-asserts the CURRENT status, so a dropped transition self-heals', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d);
+  const patches = [];
+  d.api = async (method, p, body) => {
+    if (method === 'PATCH') patches.push(body);
+    return { res: { status: 200 }, data: {} };
+  };
+
+  d.setStatus(s, 'waiting');
+  await d.heartbeatTick();
+  assert.deepEqual(patches, [{ status: 'waiting' }, { status: 'waiting' }],
+    'the beat carries the status, never an empty body that re-asserts nothing');
+
+  patches.length = 0;
+  s.registered = false; // not registered yet: the register retry owns it
+  await d.heartbeatTick();
+  assert.deepEqual(patches, []);
+});
+
+test('disable is honest when the server never got the DELETE', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { sid: 'sess-off' });
+  d.persistSession(s);
+  d.api = async () => { throw new Error('connect ECONNREFUSED 127.0.0.1'); };
+
+  const out = await d.disableSession('sess-off', 'requested');
+  assert.equal(out.server_ok, false);
+  assert.match(out.detail, /ECONNREFUSED/);
+  assert.equal(d.sessions.has('sess-off'), false, 'the LOCAL stop always happens');
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-off'], undefined);
+  assert.ok(d.logLines.some((l) => /was NOT told/.test(l)));
+
+  // A 404 means the row is already gone — that IS a clean stop.
+  liveSession(d, { sid: 'sess-404' });
+  d.api = async () => ({ res: { status: 404 }, data: {} });
+  assert.equal((await d.disableSession('sess-404', 'requested')).server_ok, true);
+});
+
+test('backfill reads a bounded TAIL instead of slurping a multi-megabyte transcript', async () => {
+  const dir = tmp('pidge-term-jsonl-');
+  const file = path.join(dir, 'big.jsonl');
+  const filler = 'y'.repeat(12 * 1024);
+  writeJsonl(file, Array.from({ length: 800 }, (_, i) => ({
+    type: 'assistant', uuid: `u-${i}`, parentUuid: null, timestamp: '2026-08-02T18:33:12Z',
+    version: '2.1.220', message: { role: 'assistant', content: `line ${i} ${filler}` },
+  })));
+  const size = fs.statSync(file).size;
+  assert.ok(size > 8 * 1024 * 1024, `the fixture must exceed the read window (was ${size})`);
+
+  const d = makeDaemon();
+  d.flush = async () => {};
+  const s = liveSession(d, { file, sid: 'sess-big' });
+  await d.backfill(s);
+
+  assert.equal(s.offset, size, 'the tail still resumes at EOF — the window bounds the READ, not the position');
+  assert.equal(s.queue.length, 100, 'the seed is still the newest 100 items');
+  assert.ok(s.seenUuids.size < 800, 'records outside the window were never parsed into memory');
+  assert.ok(d.logLines.some((l) => /seeding from its last/.test(l)));
+  assert.equal(openItem(d, s.queue.at(-1)).uuid, 'u-799', 'and the newest record is in it');
 });

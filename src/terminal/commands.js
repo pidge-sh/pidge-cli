@@ -611,11 +611,22 @@ async function runStatus() {
   say(`hooks:    ${hooksLine} (~/.claude/settings.json)`);
 }
 
+// The local stop ALWAYS happens (publishing ends, the session leaves state) —
+// but a DELETE the server never received must not be reported as a clean stop:
+// the row lives on until the retention/staleness reaper catches it, and the
+// human deserves to know which of the two happened.
+function sayDisabled(label, results) {
+  const failed = (results || []).filter((r) => r && !r.server_ok);
+  if (!failed.length) { say(`✓ stopped sharing ${label}`); return; }
+  say(`✓ stopped sharing ${label} LOCALLY — nothing more is published from this computer.`);
+  say(`  Could not tell the server (${failed[0].detail || 'unreachable'}); it will reap the session shortly.`);
+}
+
 async function runDisable(v) {
   if (!(await daemonAlive())) die('pidge terminal disable: daemon not running');
   if (v.all) {
     const { data } = await daemonCall('POST', '/disable', { all: true });
-    say(`✓ disabled ${data.disabled.length} session(s)`);
+    sayDisabled(`${data.disabled.length} session(s)`, data.results);
     return;
   }
   let sid = v.session || null;
@@ -632,8 +643,8 @@ async function runDisable(v) {
   const { data } = await daemonCall('GET', '/sessions');
   const hit = (data.enabled || []).find((e) => e.sid === sid || e.sid.startsWith(sid));
   if (!hit) die(`pidge terminal disable: no shared session matching ${JSON.stringify(sid)}`);
-  await daemonCall('POST', '/disable', { sid: hit.sid });
-  say(`✓ stopped sharing ${hit.sid.slice(0, 8)}`);
+  const { data: out } = await daemonCall('POST', '/disable', { sid: hit.sid });
+  sayDisabled(hit.sid.slice(0, 8), out && out.results);
 }
 
 async function runDisconnect() {

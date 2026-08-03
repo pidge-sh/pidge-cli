@@ -4,8 +4,9 @@
 // 2.1.220 (research kit 2026-07-30); hardened per the spec:
 //   • main thread only (isSidechain:false) — subagent lanes are v2
 //   • drop thinking SIGNATURES (opaque ~7 KB), snapshots, queue-ops
-//   • unknown record types map to kind:"notice", NEVER silently dropped —
-//     format drift surfaces in the UI as an odd item, not as a hole
+//   • unknown record types AND unknown message-content block types map to
+//     kind:"notice", NEVER silently dropped — format drift surfaces in the UI
+//     as an odd item, not as a hole
 //   • preview capped at 2 KB with truncated/total_bytes honesty
 // The item `uuid` is the harness record uuid; a record whose message carries
 // SEVERAL blocks emits one item per block, suffixed ":<n>" for n>0 so viewer
@@ -106,8 +107,13 @@ function normalize(obj) {
       push(mk(base, 'user', 'tool_result', textOf(b))); // pairing rides the parent chain mk() already set
     } else if (b.type === 'image') {
       push(mk(base, role, 'notice', '[image attachment]'));
+    } else {
+      // Drift surfaces, it never leaves a hole: an unrecognized BLOCK type gets
+      // the same treatment as an unrecognized RECORD type — a visible notice.
+      // (Silently skipping them meant a new content block just… vanished from
+      // the conversation, with nothing in the log to point at.)
+      push(mk(base, role, 'notice', `[unknown block: ${String(b.type || 'untyped')}] — pidge-cli may need an update`));
     }
-    // signature-only / redacted blocks: nothing worth an item
   }
   return out;
 }
