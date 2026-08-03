@@ -51,6 +51,33 @@ async function daemonAlive() {
   } catch { return null; }
 }
 
+// Ask the RUNNING daemon (if any) to exit — the loopback half of the
+// `connect --replace` recycle (review A2). Returns true when a daemon
+// answered the shutdown; false when nothing was listening or the bearer did
+// not match (a daemon that refuses our token is NOT ours to kill). After a
+// successful shutdown, wait for the port to actually free so the fresh
+// daemon cannot die on EADDRINUSE against the exiting one.
+async function shutdownLocalDaemon() {
+  const cfg = core.readJson(core.DAEMON_FILE(), null);
+  if (!cfg || !cfg.port || !cfg.token) return false;
+  let res;
+  try {
+    res = await core.fetchT(`http://127.0.0.1:${cfg.port}/shutdown`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${cfg.token}` },
+    }, 3000);
+  } catch { return false; } // nothing listening — nothing to recycle
+  if (!res.ok) return false; // 401: not our daemon — leave it alone
+  for (let i = 0; i < 20; i++) {
+    try {
+      await core.fetchT(`http://127.0.0.1:${cfg.port}/health`, {}, 500);
+    } catch { return true; } // connection refused — it is gone
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  console.error('pidge terminal: WARNING — the old daemon acknowledged the shutdown but its port is still held; the fresh daemon may collide (EADDRINUSE) and exit until the service manager retries');
+  return true;
+}
+
 // --- connect ----------------------------------------------------------------
 
 async function askYesNo(question) {
@@ -65,6 +92,23 @@ async function runConnect(v) {
   const base = (v.url || 'https://api.pidge.sh').replace(/\/$/, '');
   const secretRaw = process.env.PIDGE_SECRET || v.secret || null;
   const existing = core.loadTerminalEnv();
+
+  // A NEW pairing over an EXISTING identity refuses LOUDLY (QA finding #9):
+  // connect used to overwrite the slot in silence, leaving the old channel
+  // alive on the server — an orphaned "Computer N" that counts against the
+  // channel limit and shows in the app as a connected computer that never
+  // reports again (Thiago has three of those). The slot being unique is
+  // right — one computer, one identity; the SWITCH must be consented.
+  // Re-running WITHOUT --code (finishing a half-done install) stays allowed.
+  if (code && existing.token && !v.replace) {
+    // NOTE: the suggestion is --replace, deliberately NOT `disconnect` —
+    // disconnect keeps the identity file (review M1), so it would send the
+    // human in a circle right back to this refusal.
+    die('pidge terminal connect: this computer is already connected to ' +
+      `channel ${existing.channelId != null ? existing.channelId : '(unknown)'} at ${existing.base || '(unknown url)'}.\n` +
+      `Run again with --replace to switch this computer over — or delete ${core.ENV_FILE()} by hand and re-run.\n` +
+      '(Either way the OLD channel stays on the server — remove that computer in the app: Settings → Computers.)');
+  }
 
   let token = existing.token;
   let channelId = existing.channelId;
@@ -153,10 +197,21 @@ async function runConnect(v) {
   // install on EVERY platform — the manual line is the same everywhere).
   const cfg = core.readJson(core.DAEMON_FILE(), null) || { port: DAEMON_PORT, token: crypto.randomBytes(24).toString('base64url') };
   core.writeJson(core.DAEMON_FILE(), cfg);
+  // --replace: a daemon may still be RUNNING with the OLD identity in memory
+  // (review A2). launchd's unload+load recycles it, but systemd's
+  // `enable --now` is a NO-OP while the unit is active, and the detached
+  // fallback's fresh daemon dies on EADDRINUSE while the old one keeps
+  // publishing to the orphaned channel — a new enable then lands there in
+  // silence. The loopback shutdown covers every platform the same way (and
+  // --no-daemon too); the systemd installer adds a belt-and-braces restart.
+  if (v.replace) {
+    const wasUp = await shutdownLocalDaemon();
+    if (wasUp) say('✓ stopped the running daemon (it held the previous tunnel identity in memory)');
+  }
   if (v['no-daemon']) {
     say('· --no-daemon: start it yourself with `pidge terminal daemon`');
   } else {
-    const svc = installDaemonService();
+    const svc = installDaemonService({ recycle: !!v.replace });
     if (svc.kind === 'launchd') say(`✓ daemon installed (launchd ${svc.label}) — logs at ${core.LOG_FILE()}`);
     else if (svc.kind === 'systemd') {
       say(`✓ daemon installed (systemd --user ${svc.label}) — logs at ${core.LOG_FILE()}`);
@@ -483,9 +538,17 @@ function installDaemonService(probe = {}) {
 
 function installLaunchd(run) {
   const { nodeBin, cli } = daemonExec();
-  const envBlock = process.env.PATH
-    ? `  <key>EnvironmentVariables</key>\n  <dict>\n    <key>PATH</key><string>${xmlEscape(process.env.PATH)}</string>\n  </dict>\n`
-    : '';
+  // launchd hands a service NO locale — and without a UTF-8 locale tmux
+  // SANITIZES control characters in its -F output, which is how the pane
+  // parser found "0 panes" with the pane right there (QA finding #10). The
+  // daemon also forces the locale on every tmux call (core.tmuxExec); setting
+  // it here too is deliberate defense in depth, per platform template.
+  const locale = core.utf8Locale();
+  const envPairs = { LANG: locale, LC_ALL: locale };
+  if (process.env.PATH) envPairs.PATH = process.env.PATH;
+  const envEntries = Object.entries(envPairs)
+    .map(([k, val]) => `    <key>${xmlEscape(k)}</key><string>${xmlEscape(val)}</string>`).join('\n');
+  const envBlock = `  <key>EnvironmentVariables</key>\n  <dict>\n${envEntries}\n  </dict>\n`;
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -532,7 +595,10 @@ function installSystemdUser(probe, run) {
   // to tmux and ps on every enable and every keystroke it delivers. A tmux from
   // homebrew/nix/~/.local/bin would simply not exist for the service while
   // working fine in the shell the human just tested from.
-  const envPairs = {};
+  // LANG/LC_ALL: same story as the launchd template — no locale in the service
+  // env makes tmux sanitize control characters in -F output (QA finding #10).
+  const locale = core.utf8Locale();
+  const envPairs = { LANG: locale, LC_ALL: locale };
   if (process.env.PATH) envPairs.PATH = process.env.PATH;
   if (process.env.XDG_CONFIG_HOME) envPairs.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
   const envLines = Object.entries(envPairs)
@@ -562,6 +628,11 @@ WantedBy=default.target
   try {
     run('systemctl', ['--user', 'daemon-reload']);
     run('systemctl', ['--user', 'enable', '--now', SYSTEMD_UNIT]);
+    // `enable --now` is a NO-OP while the unit is already active, so a
+    // --replace would leave the OLD daemon running with the previous identity
+    // in memory (review A2). The loopback shutdown usually got it first —
+    // this restart is belt-and-braces, harmless on a freshly started unit.
+    if (probe.recycle) run('systemctl', ['--user', 'restart', SYSTEMD_UNIT]);
   } catch (e) {
     console.error(`pidge terminal: systemctl failed (${e.message}) — start it manually:\n  systemctl --user daemon-reload && systemctl --user enable --now ${SYSTEMD_UNIT}`);
   }
@@ -746,5 +817,6 @@ module.exports = {
   runTerminal, installHooks, uninstallHooks, hookShimSource, PIDGE_HOOK_MARKER,
   installDaemonService, uninstallDaemonService, launchdPlistPath, systemdUnitPath,
   copyCliToStablePath, stableCliDir, stableCliEntry, installPidgeSkill,
+  shutdownLocalDaemon,
   SYSTEMD_UNIT, LAUNCHD_LABEL,
 };

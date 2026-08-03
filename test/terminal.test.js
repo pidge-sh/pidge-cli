@@ -537,7 +537,8 @@ const { createMock } = require('./mock-server');
 function runConnect(port, { code = 'claim-ok', secret = SECRET43(), extra = [] } = {}) {
   const bin = path.join(__dirname, '..', 'bin', 'pidge.js');
   const child = spawn(process.execPath,
-    [bin, 'terminal', 'connect', '--code', code, '--url', `http://127.0.0.1:${port}`, '--yes', '--no-daemon', ...extra],
+    [bin, 'terminal', 'connect', ...(code ? ['--code', code] : []),
+      '--url', `http://127.0.0.1:${port}`, '--yes', '--no-daemon', ...extra],
     {
       env: {
         ...process.env,
@@ -622,6 +623,53 @@ test('connect: it refreshes the Pidge skill — the agent-side half of the door'
     assert.match(text, /is SUCCESS/, 'and that the DENIAL is the success signal');
     assert.ok(!text.includes('hld_minted_by_claim'), 'the generated skill never bakes a token');
     assert.match(out.stdout, /✓ Pidge skill refreshed/);
+  } finally { await mock.stop(); }
+});
+
+test('connect: a NEW pairing over an EXISTING identity refuses LOUDLY — --replace is the consent (QA #9)', async () => {
+  freshHome();
+  freshXdg();
+  // The identity a previous connect stored — the production link QA lost.
+  core.saveTerminalEnv({ base: 'https://api.pidge.sh', token: 'hld_prod_link', secret: SECRET43(), channelId: 396 });
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    const out = await runConnect(port);
+    assert.equal(out.code, 1, 'the silent overwrite is the sin — a second pairing must refuse');
+    assert.match(out.stderr, /already connected to channel 396 at https:\/\/api\.pidge\.sh/);
+    assert.match(out.stderr, /--replace/);
+    // `disconnect` KEEPS the identity file — suggesting it here sends the
+    // human in a circle right back to this refusal (review M1).
+    assert.doesNotMatch(out.stderr, /disconnect/, 'never suggest a path that cannot clear the guard');
+    assert.match(out.stderr, /terminal\/env/, 'the manual escape hatch names the actual file');
+    assert.match(out.stderr, /stays on the server/, 'the orphaned-channel consequence is named');
+    assert.equal(core.loadTerminalEnv().token, 'hld_prod_link', 'the stored identity is untouched');
+    assert.ok(!mock.state.reqLog.some((r) => r.pathname === '/api/v1/claim'),
+      'the refusal must come BEFORE the claim — the code is not consumed');
+    assert.equal(mock.state.claimCode, 'claim-ok', 'the single-use code survives for the intended retry');
+
+    // With --replace, the same connect goes through and rotates the identity.
+    const replaced = await runConnect(port, { extra: ['--replace'] });
+    assert.equal(replaced.code, 0, `--replace must complete the switch: ${replaced.stderr}`);
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim');
+  } finally { await mock.stop(); }
+});
+
+test('connect: re-running WITHOUT --code on an existing identity still works (the finish-install path)', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    const first = await runConnect(port);
+    assert.equal(first.code, 0, first.stderr);
+    // The documented recovery path ("re-run once the file parses"): no code,
+    // same identity — must NOT trip the replace guard.
+    const again = await runConnect(port, { code: null });
+    assert.equal(again.code, 0, `a codeless re-run finishes the install, it does not re-pair: ${again.stderr}`);
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim');
   } finally { await mock.stop(); }
 });
 
@@ -792,21 +840,233 @@ test('normalizeTty turns a short tty name into the path tmux reports — on BOTH
   assert.equal(core.normalizeTty(null), null);
 });
 
+// --- the tmux pane parser vs the service locale (QA finding #10) ------------
+//
+// The daemon under launchd has NO LANG; without a UTF-8 locale tmux sanitizes
+// control characters in -F output, so the old TAB separator came back as `_`
+// and `split('\t')` silently yielded 0 panes — enable then told the human they
+// weren't in tmux, with the pane right there. Three defenses, each tested:
+// a printable separator, LANG/LC_ALL in the exec env + service templates, and
+// a parser that treats an impossible line as a LOUD failure.
+
+test('the tmux list-panes format has NO control characters — tmux may sanitize them', () => {
+  assert.ok(!/[\x00-\x1f\x7f]/.test(core.TMUX_PANE_FORMAT),
+    'a control-char separator (the old TAB) is sanitized to `_` under a non-UTF-8 locale');
+  assert.ok(core.TMUX_PANE_FORMAT.includes(core.TMUX_FIELD_SEP));
+  assert.equal(core.TMUX_FIELD_SEP, ':::');
+});
+
+test('parseTmuxPanes: the REAL sanitized (no-locale) output is unparsable, never 0 silent panes', () => {
+  // The literal line QA #10 captured: launchd env, tmux swapped the TAB
+  // separator for `_`, every field ran together.
+  const sanitized = '%0_/dev/ttys006_/private/tmp/pidge-qa-proj_probe:0.0';
+  const { panes, unparsable } = core.parseTmuxPanes(sanitized);
+  assert.deepEqual(panes, [], 'a mangled line must never half-parse into a bogus pane');
+  assert.deepEqual(unparsable, [sanitized], 'and it must be REPORTED, not swallowed');
+
+  // The good output with the new separator parses into exact fields.
+  const good = [
+    ['%0', '/dev/ttys006', '/private/tmp/pidge-qa-proj', 'probe:0.0'].join(core.TMUX_FIELD_SEP),
+    ['%12', '/dev/pts/3', '/home/u/proj', 'main:1.2'].join(core.TMUX_FIELD_SEP),
+  ].join('\n');
+  const ok = core.parseTmuxPanes(good);
+  assert.deepEqual(ok.unparsable, []);
+  assert.deepEqual(ok.panes, [
+    { paneId: '%0', tty: '/dev/ttys006', path: '/private/tmp/pidge-qa-proj', loc: 'probe:0.0' },
+    { paneId: '%12', tty: '/dev/pts/3', path: '/home/u/proj', loc: 'main:1.2' },
+  ]);
+
+  // A session NAME containing the separator itself (review B2): the tail is
+  // rejoined into loc — a perfectly identifiable pane is never dropped.
+  const weird = ['%7', '/dev/ttys009', '/tmp/w', 'my:::odd:::name:0.0'].join(core.TMUX_FIELD_SEP);
+  const parsed = core.parseTmuxPanes(weird);
+  assert.deepEqual(parsed.unparsable, []);
+  assert.deepEqual(parsed.panes, [
+    { paneId: '%7', tty: '/dev/ttys009', path: '/tmp/w', loc: 'my:::odd:::name:0.0' },
+  ]);
+});
+
+test('tmuxPanes: ALL lines mangled ⇒ a loud throw; a stray bad line warns but keeps the good ones', () => {
+  const sanitized = '%0_/dev/ttys006_/private/tmp/pidge-qa-proj_probe:0.0\n';
+  const warns = [];
+  assert.throws(
+    () => core.tmuxPanes({ exec: () => sanitized, onWarn: (m) => warns.push(m) }),
+    /none parsed/,
+    'reading a mangled list as "0 panes ⇒ not in tmux" is the finding-#10 lie');
+  assert.equal(warns.length, 1);
+  assert.match(warns[0], /UNPARSABLE/);
+  assert.match(warns[0], /not a user error/);
+
+  // Mixed output: the parsable pane survives, the bad line is warned about.
+  const mixed = ['%1', '/dev/ttys001', '/tmp/a', 's:0.0'].join(core.TMUX_FIELD_SEP) + '\ngarbage-line\n';
+  const warns2 = [];
+  const panes = core.tmuxPanes({ exec: () => mixed, onWarn: (m) => warns2.push(m) });
+  assert.deepEqual(panes, [{ paneId: '%1', tty: '/dev/ttys001', path: '/tmp/a', loc: 's:0.0' }]);
+  assert.equal(warns2.length, 1);
+
+  // tmux itself absent/failing is still a quiet [] — genuinely no panes.
+  assert.deepEqual(core.tmuxPanes({ exec: () => { throw new Error('no server'); } }), []);
+});
+
+test('utf8Locale: prefers the locale the shell proved, falls back per platform', () => {
+  assert.equal(core.utf8Locale({ LC_ALL: 'pt_BR.UTF-8' }, 'darwin'), 'pt_BR.UTF-8');
+  assert.equal(core.utf8Locale({ LANG: 'en_US.utf8' }, 'linux'), 'en_US.utf8');
+  assert.equal(core.utf8Locale({ LANG: 'C' }, 'darwin'), 'en_US.UTF-8', 'a non-UTF-8 LANG is exactly the failure');
+  assert.equal(core.utf8Locale({}, 'darwin'), 'en_US.UTF-8', 'macOS ships en_US.UTF-8');
+  assert.equal(core.utf8Locale({}, 'linux'), 'C.UTF-8', 'modern glibc ships C.UTF-8 without locale-gen');
+});
+
+test('a daemon whose pane list cannot be parsed refuses WITHOUT blaming the user', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const out = await withPanes({
+    byTty: () => { throw new Error('tmux listed 1 pane(s) but none parsed — mangled'); },
+  }, () => hookPost(d, 'pre-tool-use', preToolUse('sess-mangled', 'pidge terminal enable')));
+
+  assert.equal(out.decision.permissionDecision, 'deny');
+  assert.equal(out.decision.permissionDecisionReason, core.ENABLE_PANE_LOOKUP_FAILED_REASON);
+  assert.doesNotMatch(out.decision.permissionDecisionReason, /Start claude inside/i,
+    'a daemon-side parse failure must not tell the human to fix their tmux');
+  assert.equal(d.sessions.size, 0);
+  assert.ok(d.logLines.some((l) => /REFUSED: tmux listed/.test(l)), `expected the loud cause, got ${JSON.stringify(d.logLines)}`);
+});
+
+test('both service templates carry a UTF-8 locale (launchd and systemd hand the daemon none)', () => {
+  freshHome();
+  freshXdg();
+  const rec = recorder();
+  const mac = withPlatform('darwin', () => commands.installDaemonService({ run: rec.run }));
+  const plist = fs.readFileSync(mac.file, 'utf8');
+  assert.match(plist, /<key>LANG<\/key><string>[^<]*(UTF-8|utf8)<\/string>/i);
+  assert.match(plist, /<key>LC_ALL<\/key><string>[^<]*(UTF-8|utf8)<\/string>/i);
+
+  freshHome();
+  freshXdg();
+  const lin = withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: recorder().run }));
+  const unit = fs.readFileSync(lin.file, 'utf8');
+  assert.match(unit, /^Environment="LANG=[^"]*(UTF-8|utf8)"$/im);
+  assert.match(unit, /^Environment="LC_ALL=[^"]*(UTF-8|utf8)"$/im);
+});
+
+// --- the --replace daemon recycle (review A2) -------------------------------
+//
+// A daemon that survives a --replace keeps the OLD tunnel identity in memory:
+// systemd's `enable --now` is a no-op while the unit is active, and the
+// detached fallback's fresh daemon dies on EADDRINUSE while the old one keeps
+// publishing to the orphaned channel. The recycle is a loopback POST /shutdown
+// (bearer-gated) + a belt-and-braces systemd restart.
+
+test('POST /shutdown: bearer-gated, answers 200, then exits 0 — the --replace recycle door', async () => {
+  const d = makeDaemon();
+  d.hookToken = 'local-test-token';
+  const exits = [];
+  d.exit = (code) => exits.push(code);
+  const post = (auth) => new Promise((resolve) => {
+    const req = {
+      method: 'POST', url: '/shutdown', headers: { authorization: auth },
+      on(event, cb) { if (event === 'data') cb('{}'); if (event === 'end') cb(); },
+      destroy() {},
+    };
+    let code = null;
+    const res = { writeHead(c) { code = c; }, end(payload) { resolve({ code, body: payload ? JSON.parse(payload) : null }); } };
+    d.handleHttp(req, res);
+  });
+
+  const bad = await post('Bearer wrong-token');
+  assert.equal(bad.code, 401, 'a foreign token must NOT be able to kill the daemon');
+  await new Promise((r) => setTimeout(r, 80));
+  assert.deepEqual(exits, [], 'no exit on an unauthorized shutdown');
+
+  const ok = await post('Bearer local-test-token');
+  assert.equal(ok.code, 200);
+  assert.deepEqual(ok.body, { ok: true });
+  await new Promise((r) => setTimeout(r, 80));
+  assert.deepEqual(exits, [0], 'a CLEAN 0 exit — neither launchd (SuccessfulExit=false) nor systemd (on-failure) respawns it');
+  assert.ok(d.logLines.some((l) => /shutdown requested over loopback/.test(l)));
+});
+
+test('shutdownLocalDaemon: kills only OUR daemon, tolerates absence, waits for the port to free', async () => {
+  freshXdg();
+  assert.equal(await commands.shutdownLocalDaemon(), false, 'no daemon.json ⇒ nothing to recycle');
+  core.writeJson(core.DAEMON_FILE(), { port: 1, token: 'tok' }); // nothing listens on port 1
+  assert.equal(await commands.shutdownLocalDaemon(), false, 'nothing listening ⇒ false, silently');
+
+  const http = require('node:http');
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    hits.push(`${req.method} ${req.url}`);
+    if (req.headers.authorization !== 'Bearer right-token') { res.writeHead(401); return res.end('{}'); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+    if (req.url === '/shutdown') setTimeout(() => { srv.close(); srv.closeAllConnections(); }, 10); // the daemon "exits"
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const port = srv.address().port;
+
+  // A daemon that refuses our bearer is NOT ours — left alone (the fixed port
+  // is shared machine-wide; a rotated token must never kill a stranger).
+  core.writeJson(core.DAEMON_FILE(), { port, token: 'wrong-token' });
+  assert.equal(await commands.shutdownLocalDaemon(), false, 'a 401 daemon must be left alone');
+
+  core.writeJson(core.DAEMON_FILE(), { port, token: 'right-token' });
+  assert.equal(await commands.shutdownLocalDaemon(), true, 'our daemon acknowledged and the port freed');
+  assert.ok(hits.includes('POST /shutdown'));
+});
+
+test('installDaemonService(recycle): systemd RESTARTS the unit — enable --now no-ops while active (A2)', () => {
+  freshHome();
+  freshXdg();
+  const rec = recorder();
+  withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec.run, recycle: true }));
+  assert.deepEqual(rec.calls, [
+    'systemctl --user daemon-reload',
+    'systemctl --user enable --now pidge-terminal.service',
+    'systemctl --user restart pidge-terminal.service',
+  ], 'the restart is what actually cycles an already-active unit onto the new identity');
+
+  const rec2 = recorder();
+  withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec2.run }));
+  assert.ok(!rec2.calls.some((c) => /restart/.test(c)), 'a plain connect does not restart — fresh installs are already fresh');
+});
+
 // --- the enable SENTINEL matcher (the door's whole contract) ----------------
 
-test('parseEnableSentinel: only a Bash command carrying the literal opens the door', () => {
+test('parseEnableSentinel: the command must BE the sentinel — the whole string, never a substring', () => {
   const ok = (cmd, tool = 'Bash') => core.parseEnableSentinel(tool, cmd);
 
   assert.deepEqual(ok('pidge terminal enable'), { approvals: [] });
-  // The app's descriptive prompt EMBEDS the command — claude often echoes it back.
-  assert.deepEqual(ok('Run exactly this one bash command and nothing else: pidge terminal enable'), { approvals: [] });
-  // …and the improvisation a real claude fell into when `pidge` was not on PATH.
+  assert.deepEqual(ok('  pidge terminal enable  '), { approvals: [] }, 'whitespace-trimmed, nothing more');
+  // The improvisation a real claude fell into when `pidge` was not on PATH…
   assert.deepEqual(ok('npx -y pidge-cli@latest terminal enable'), { approvals: [] });
+  assert.deepEqual(ok('npx --yes pidge-cli@latest terminal enable'), { approvals: [] }, 'the long form of -y (review M5)');
   assert.deepEqual(ok('npx pidge-cli terminal enable'), { approvals: [] });
+  assert.deepEqual(ok('npx pidge-cli@0.41.0 terminal enable'), { approvals: [] });
+  // …and the stable-path binary the service install lays down.
+  assert.deepEqual(ok('/Users/x/.config/pidge/terminal/cli/bin/pidge.js terminal enable'), { approvals: [] });
+  assert.deepEqual(ok('node /Users/x/.config/pidge/terminal/cli/bin/pidge.js terminal enable'), { approvals: [] });
+  assert.deepEqual(ok('/usr/local/bin/pidge terminal enable'), { approvals: [] });
 
   // The approval gate rides the pasted command now — the CLI is not the door.
   assert.deepEqual(ok('pidge terminal enable --approvals Bash,Write'), { approvals: ['Bash', 'Write'] });
   assert.deepEqual(ok('pidge terminal enable --approvals=*'), { approvals: ['*'] });
+
+  // QA finding #11: the substring match fired on any bash that merely
+  // MENTIONED the command — denying legitimate tool calls and attempting an
+  // enable on the WRONG session. The literal reproduction must NOT match:
+  assert.equal(ok("tmux send-keys -t %0 'pidge terminal enable' Enter"), null,
+    'a send-keys PAYLOAD is a mention, not the command');
+  assert.equal(ok('echo "pidge terminal enable"'), null);
+  assert.equal(ok('grep -r "pidge terminal enable" docs/'), null);
+  assert.equal(ok('Run exactly this one bash command and nothing else: pidge terminal enable'), null,
+    'the descriptive prompt EMBEDS the command — echoing it is not running it');
+  assert.equal(ok('pidge terminal enable && rm -rf /'), null, 'no compound commands ride the sentinel');
+  assert.equal(ok('pidge terminal enable 2>&1'), null, 'no suffixes — exactly the command');
+  // Hardening (review B3): internal newlines and command-substitution spoofs.
+  assert.equal(ok('pidge\nterminal\nenable'), null, 'whitespace is [ \\t] only — a multi-line smuggle is not the command');
+  assert.equal(ok('pidge terminal\nenable'), null);
+  assert.equal(ok('$(echo pwn)/pidge terminal enable'), null, 'a path prefix admits path characters only');
+  assert.equal(ok('`evil`/pidge terminal enable'), null);
+  assert.equal(ok('$(evil) node /x/pidge.js terminal enable'), null);
 
   // Not the sentinel.
   assert.equal(ok('pidge terminal status'), null);
@@ -967,6 +1227,7 @@ function daemonWithPersisted({ sid = 'sess-k', ...overrides } = {}) {
   const st = core.readJson(core.STATE_FILE(), { epoch: 1, sessions: {} });
   st.sessions[sid] = {
     publicId: `ases_${sid}`, paneId: '%1', tty: null, cwd: '/tmp/proj',
+    channelId: 1, // the tunnel this slot is connected to (finding #13 scoping)
     file: path.join(tmp('pidge-term-jsonl-'), 'absent.jsonl'),
     offset: 0, nextSeq: 1, approvals: [], seen: [], outbox: [], ...overrides,
   };
@@ -1488,6 +1749,273 @@ test('the daemon has NO /enable endpoint any more — the hook is the only door'
   assert.equal(d.sessions.size, 0);
 });
 
+// --- /clear: SOURCE-GATED adoption (QA #14, spec §6 revised after review) ---
+//
+// `/clear` in Claude Code mints a NEW sid + a NEW transcript file; the daemon
+// kept tailing the frozen old file and the phone showed a screen that looked
+// alive. Adoption is gated on the harness's OWN rotation signal: SessionStart
+// carries source ("startup"|"resume"|"clear"|"compact"), and ONLY
+// source:"clear" + a positive pane+cwd match + a transcript_path adopts the
+// new sid into the same AgentSession. The earlier 90 s "hot window" is GONE:
+// a nested `claude -p` run as a Bash tool inside the mirrored session
+// satisfied cwd+hot and would have HIJACKED the mirror, while a human reading
+// the last answer for >90 s before /clear would have failed it. Every other
+// case ends the displaced session loudly.
+
+// endReplacedSession is deliberately fire-and-forget off the hook: give its
+// promise chain a beat to settle before asserting.
+const settle = () => new Promise((r) => setTimeout(r, 25));
+
+test('source:"clear" ⇒ ADOPTED — even when the last mirror life is OLD (no time window)', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const apiLog = [];
+  d.api = async (method, p, body) => {
+    apiLog.push({ method, p, body });
+    if (method === 'POST' && /\/items$/.test(p)) {
+      return { res: { status: 201 }, data: { accepted: body.items.length, last_seq: body.items.at(-1).seq } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
+  await withPanes({ byTty: () => ({ paneId: '%3', loc: 'p:0.0' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-old', 'pidge terminal enable')));
+  const before = d.sessions.get('sess-old');
+  assert.ok(before, 'precondition: the session is shared');
+  // The human read the last answer for 10 minutes before typing /clear — the
+  // killed 90 s window would have refused this; the harness signal must not.
+  before.lastAliveAt = Date.now() - 10 * 60 * 1000;
+
+  await withPanes({ byCwd: () => [{ paneId: '%3', loc: 'p:0.0' }] },
+    () => hookPost(d, 'session-start', {
+      session_id: 'sess-new', cwd: '/tmp/proj', transcript_path: '/tmp/new.jsonl',
+      tty: '??', source: 'clear',
+    }));
+  await settle();
+
+  // ONE continuous session: same record, same public_id, new sid + transcript.
+  const s = d.sessions.get('sess-new');
+  assert.equal(s, before, 'the SAME session record carries on — adoption, not a new share');
+  assert.equal(d.sessions.has('sess-old'), false);
+  assert.equal(s.publicId, 'ases_sess-old', 'the server row (and its seq lane) is unchanged');
+  assert.equal(s.file, '/tmp/new.jsonl', 'the tailer switched to the new transcript');
+  assert.equal(s.offset, 0);
+  const persisted = core.readJson(core.STATE_FILE(), {}).sessions;
+  assert.ok(persisted['sess-new'], 'state.json re-keys to the new sid');
+  assert.equal(persisted['sess-old'], undefined);
+
+  // The seam is visible: one notice item, monotonic seq, wording per spec §6.
+  const itemPosts = apiLog.filter((c) => c.method === 'POST' && /\/items$/.test(c.p));
+  assert.equal(itemPosts.length, 1);
+  assert.equal(itemPosts[0].body.items[0].seq, 1, 'seq continues the same lane');
+  const notice = openItem(d, itemPosts[0].body.items[0].payload_sealed, 'ases_sess-old');
+  assert.equal(notice.kind, 'notice');
+  assert.match(notice.preview, /restarted via \/clear/);
+  assert.match(notice.preview, /mirror continued/);
+
+  // meta_sealed refreshed with the NEW sid inside the blob…
+  const metaPatch = apiLog.find((c) => c.method === 'PATCH' && c.p === '/agent_sessions/ases_sess-old' && c.body.meta_sealed);
+  assert.ok(metaPatch, 'adoption must refresh the sealed meta');
+  const meta = JSON.parse(core.e2eDecryptBlob(d.key, core.e2eAad(1, 'ases_sess-old', 'agent_meta'),
+    Buffer.from(metaPatch.body.meta_sealed, 'base64url')).toString('utf8'));
+  assert.equal(meta.sid, 'sess-new');
+
+  // …and nothing ended: no DELETE, and the adoption is loud in the log.
+  assert.ok(!apiLog.some((c) => c.method === 'DELETE'), 'adoption must not end the server row');
+  assert.ok(d.logLines.some((l) => /ADOPTED \(source:"clear"/.test(l)), `expected a loud adoption, got ${JSON.stringify(d.logLines)}`);
+});
+
+test('source:"startup" on the same pane+cwd does NOT adopt — the nested-claude hijack (A1)', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const apiLog = [];
+  d.api = async (method, p, body) => {
+    apiLog.push({ method, p, body });
+    if (method === 'POST' && /\/items$/.test(p)) {
+      return { res: { status: 201 }, data: { accepted: body.items.length, last_seq: body.items.at(-1).seq } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-human', 'pidge terminal enable')));
+  assert.ok(d.sessions.get('sess-human'));
+
+  // A nested `claude -p` launched as a Bash tool INSIDE the mirrored session:
+  // same cwd, ttyless, and the mirror is piping hot from its own PreToolUse.
+  // Under the old cwd+hot rule this HIJACKED the mirror.
+  await withPanes({ byCwd: () => [{ paneId: '%3' }] },
+    () => hookPost(d, 'session-start', {
+      session_id: 'sess-nested', cwd: '/tmp/proj', transcript_path: '/tmp/nested.jsonl',
+      tty: '??', source: 'startup',
+    }));
+  await settle();
+
+  assert.equal(d.sessions.has('sess-nested'), false, 'the nested claude must NEVER take over the mirror');
+  // Per spec §6, a non-clear new sid on the shared pane/cwd ends the displaced
+  // session loudly rather than freeze it.
+  assert.equal(d.sessions.has('sess-human'), false, 'the displaced session ends — loudly, not frozen');
+  assert.ok(apiLog.some((c) => c.method === 'DELETE' && c.p === '/agent_sessions/ases_sess-human'));
+  const itemPosts = apiLog.filter((c) => c.method === 'POST' && /\/items$/.test(c.p));
+  const notice = openItem(d, itemPosts.at(-1).body.items[0].payload_sealed, 'ases_sess-human');
+  assert.match(notice.preview, /session ended/i);
+  assert.ok(d.logLines.some((l) => /source: startup/.test(l) && /no adoption/.test(l)),
+    `the refusal must name the source, got ${JSON.stringify(d.logLines)}`);
+});
+
+test('source:"clear" WITHOUT a transcript_path does NOT adopt — it ends loudly (M2)', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const apiLog = [];
+  d.api = async (method, p, body) => {
+    apiLog.push({ method, p, body });
+    if (method === 'POST' && /\/items$/.test(p)) {
+      return { res: { status: 201 }, data: { accepted: body.items.length, last_seq: body.items.at(-1).seq } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-notp', 'pidge terminal enable')));
+
+  await withPanes({ byCwd: () => [{ paneId: '%3' }] },
+    () => hookPost(d, 'session-start', { session_id: 'sess-notp2', cwd: '/tmp/proj', tty: '??', source: 'clear' }));
+  await settle();
+
+  assert.equal(d.sessions.has('sess-notp'), false, 'adopting with no new file would recreate the frozen mirror');
+  assert.equal(d.sessions.has('sess-notp2'), false);
+  assert.ok(apiLog.some((c) => c.method === 'DELETE' && c.p === '/agent_sessions/ases_sess-notp'));
+  assert.ok(d.logLines.some((l) => /NO transcript_path/.test(l)), `the missing path must be named, got ${JSON.stringify(d.logLines)}`);
+});
+
+test('even source:"clear" neither adopts nor kills without a POSITIVE pane+cwd match', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  d.api = async () => ({ res: { status: 200 }, data: {} });
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-a', 'pidge terminal enable')));
+
+  // A new sid in a DIFFERENT directory is just another claude — untouched.
+  await withPanes({ byCwd: () => [] },
+    () => hookPost(d, 'session-start', { session_id: 'sess-elsewhere', cwd: '/tmp/other', transcript_path: '/tmp/e.jsonl', tty: '??', source: 'clear' }));
+  await settle();
+  assert.ok(d.sessions.has('sess-a'), 'a new sid in another cwd must not touch the share');
+
+  // TWO panes in the shared cwd: could be a second claude — leave it alone.
+  await withPanes({ byCwd: () => [{ paneId: '%3' }, { paneId: '%9' }] },
+    () => hookPost(d, 'session-start', { session_id: 'sess-maybe', cwd: '/tmp/proj', transcript_path: '/tmp/m.jsonl', tty: '??', source: 'clear' }));
+  await settle();
+  assert.ok(d.sessions.has('sess-a'), 'ambiguity must neither adopt nor kill a live mirror');
+  assert.ok(d.logLines.some((l) => /cannot tell a \/clear from a second claude/.test(l)));
+
+  // An announced tty resolving to a DIFFERENT pane is positive disproof.
+  await withPanes({ byTty: () => ({ paneId: '%9' }) },
+    () => hookPost(d, 'session-start', { session_id: 'sess-otherpane', cwd: '/tmp/proj', transcript_path: '/tmp/o.jsonl', tty: 'ttys009', source: 'clear' }));
+  await settle();
+  assert.ok(d.sessions.has('sess-a'), 'a provably different pane must not touch the share');
+  assert.equal(d.sessions.size, 1, 'and none of the newcomers were enabled');
+});
+
+test('with TWO shared sessions in one cwd, the pane picks the right twin — never the first hit (B1)', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  d.api = async (method, p, body) => {
+    if (method === 'POST' && /\/items$/.test(p)) {
+      return { res: { status: 201 }, data: { accepted: body.items.length, last_seq: body.items.at(-1).seq } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
+  // Two tty-bound enables can legitimately share a cwd across panes.
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-one', 'pidge terminal enable')));
+  await withPanes({ byTty: () => ({ paneId: '%9' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-two', 'pidge terminal enable', { tty: '/dev/ttys009' })));
+  assert.equal(d.sessions.size, 2);
+
+  // The /clear happened in pane %9 — the SECOND candidate by insertion order.
+  await withPanes({ byTty: () => ({ paneId: '%9' }) },
+    () => hookPost(d, 'session-start', {
+      session_id: 'sess-two-b', cwd: '/tmp/proj', transcript_path: '/tmp/2b.jsonl',
+      tty: 'ttys009', source: 'clear',
+    }));
+  await settle();
+
+  assert.ok(d.sessions.has('sess-one'), 'the OTHER pane\'s share is untouched');
+  const adopted = d.sessions.get('sess-two-b');
+  assert.ok(adopted, 'the pane-matching candidate is the one adopted');
+  assert.equal(adopted.publicId, 'ases_sess-two');
+  assert.equal(d.sessions.has('sess-two'), false);
+});
+
+test('the end happens even when the final notice cannot be delivered', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  d.api = async (method, p) => {
+    if (method === 'POST' && /\/items$/.test(p)) return { res: { status: 502 }, data: {} };
+    return { res: { status: 200 }, data: {} };
+  };
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-b', 'pidge terminal enable')));
+  // source absent (an older harness) ⇒ the end-loudly path.
+  await withPanes({ byCwd: () => [{ paneId: '%3' }] },
+    () => hookPost(d, 'session-start', { session_id: 'sess-b2', cwd: '/tmp/proj', tty: '??' }));
+  await settle();
+
+  assert.equal(d.sessions.has('sess-b'), false, 'the end is unconditional — the notice is best-effort');
+  assert.ok(d.logLines.some((l) => /ended notice did not reach the server/.test(l)),
+    `an undelivered notice must be narrated, got ${JSON.stringify(d.logLines)}`);
+});
+
+// --- permission_mode rides the SEALED meta (spec §4, added 2026-08-03) ------
+
+test('permission_mode: captured at enable into the sealed meta; OMITTED when the harness does not send it', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-mode', 'pidge terminal enable', { permission_mode: 'plan' })));
+  const s = d.sessions.get('sess-mode');
+  assert.equal(s.mode, 'plan');
+  const meta = JSON.parse(core.e2eDecryptBlob(d.key, core.e2eAad(1, 'ases_sess-mode', 'agent_meta'),
+    Buffer.from(d.sealMeta(s), 'base64url')).toString('utf8'));
+  assert.equal(meta.mode, 'plan');
+
+  // An older harness without the field: the key is OMITTED, never null-filled.
+  const bare = readyDaemon();
+  bare.hookToken = 'local-test-token';
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(bare, 'pre-tool-use', preToolUse('sess-nomode', 'pidge terminal enable')));
+  const s2 = bare.sessions.get('sess-nomode');
+  const meta2 = JSON.parse(core.e2eDecryptBlob(bare.key, core.e2eAad(1, 'ases_sess-nomode', 'agent_meta'),
+    Buffer.from(bare.sealMeta(s2), 'base64url')).toString('utf8'));
+  assert.ok(!('mode' in meta2), 'absence must stay absent — viewers tolerate a missing mode, not a fake one');
+});
+
+test('a mode CHANGE refreshes meta_sealed; a mode-less payload changes nothing', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const apiLog = [];
+  d.api = async (method, p, body) => { apiLog.push({ method, p, body }); return { res: { status: 200 }, data: {} }; };
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-flip', 'pidge terminal enable', { permission_mode: 'default' })));
+  apiLog.length = 0;
+
+  // The human flips shift+tab → acceptEdits; the next PreToolUse carries it.
+  await hookPost(d, 'pre-tool-use', preToolUse('sess-flip', 'npm test', { permission_mode: 'acceptEdits' }));
+  const s = d.sessions.get('sess-flip');
+  assert.equal(s.mode, 'acceptEdits');
+  const patch = apiLog.find((c) => c.method === 'PATCH' && c.body && c.body.meta_sealed);
+  assert.ok(patch, 'a mode change must refresh the sealed meta');
+  const meta = JSON.parse(core.e2eDecryptBlob(d.key, core.e2eAad(1, 'ases_sess-flip', 'agent_meta'),
+    Buffer.from(patch.body.meta_sealed, 'base64url')).toString('utf8'));
+  assert.equal(meta.mode, 'acceptEdits');
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-flip'].mode, 'acceptEdits',
+    'the mode survives a daemon restart');
+  assert.ok(d.logLines.some((l) => /permission mode default → acceptEdits/.test(l)));
+
+  // No field ⇒ no change, no spurious meta traffic (defensive read).
+  apiLog.length = 0;
+  await hookPost(d, 'pre-tool-use', preToolUse('sess-flip', 'ls'));
+  assert.equal(d.sessions.get('sess-flip').mode, 'acceptEdits', 'absence is not a change');
+  assert.ok(!apiLog.some((c) => c.method === 'PATCH' && c.body && c.body.meta_sealed));
+});
+
 // --- the tailer: backfill, restart dedup, rescan bounds ---------------------
 
 function rec(i) {
@@ -1785,6 +2313,71 @@ test('re-arm KEEPS the share when the server is unavailable at boot, and retries
   assert.equal(s.nextSeq, 8, 'numbering continues from the server high-water');
 });
 
+// --- state.json is TUNNEL-SCOPED (QA finding #13) ---------------------------
+//
+// Reconnecting this computer from one tunnel to another used to re-publish the
+// old tunnel's sessions on the new one — re-sealing their title+cwd metadata
+// under the NEW key. The crypto held for items (they rendered empty), but the
+// metadata (project paths!) leaked across owners, and a ghost session sat
+// `idle` forever in the app.
+
+test('sessions from ANOTHER tunnel (or with no stamp) are dropped at load, never republished', () => {
+  makeDaemon(); // channel 1 identity + a first epoch in a fresh slot
+  const st = core.readJson(core.STATE_FILE(), { epoch: 1, sessions: {} });
+  const row = (publicId, extra = {}) => ({
+    publicId, paneId: '%1', tty: null, cwd: '/private/tmp/pidge-qa-proj',
+    file: '/tmp/absent.jsonl', offset: 0, nextSeq: 1, approvals: [], seen: [], outbox: [], ...extra,
+  });
+  st.sessions['sess-mine'] = row('ases_mine', { channelId: 1, cwd: '/tmp/mine' });
+  // The QA reproduction: a session enabled against the LOCAL test server
+  // (channel 103) still in state when the computer reconnects to prod.
+  st.sessions['sess-theirs'] = row('ases_theirs', { channelId: 103 });
+  // A pre-scoping state file (0.41.0) has no stamp at all — ownership it
+  // cannot prove, it does not get.
+  st.sessions['sess-legacy'] = row('ases_legacy');
+  core.writeJson(core.STATE_FILE(), st);
+
+  const { value: d, lines } = captureSay(() => new Daemon());
+  assert.deepEqual(Object.keys(d.state.sessions), ['sess-mine'],
+    'only the CURRENT tunnel\'s sessions may survive the load');
+  assert.deepEqual(Object.keys(core.readJson(core.STATE_FILE(), {}).sessions), ['sess-mine'],
+    'the purge is persisted — a crash must not resurrect the foreign rows');
+  const out = lines.join('\n');
+  assert.match(out, /sess-the.*channel 103.*DROPPED/s, 'the foreign drop is loud and names the owner');
+  assert.match(out, /sess-leg.*UNKNOWN channel.*DROPPED/s);
+});
+
+test('after a tunnel switch, re-arm registers NOTHING from the old tunnel', async () => {
+  makeDaemon();
+  const st = core.readJson(core.STATE_FILE(), { epoch: 1, sessions: {} });
+  st.sessions['sess-old-tunnel'] = {
+    publicId: 'ases_old', channelId: 103, paneId: '%1', tty: null,
+    cwd: '/private/tmp/pidge-qa-proj', file: '/tmp/absent.jsonl',
+    offset: 0, nextSeq: 1, approvals: [], seen: [], outbox: [],
+  };
+  core.writeJson(core.STATE_FILE(), st);
+
+  const { value: d } = captureSay(() => new Daemon());
+  d.logLines = [];
+  d.log = (...a) => { d.logLines.push(a.join(' ')); };
+  d.subscribeInput = () => {};
+  const registered = [];
+  d.api = async (method, p, body) => {
+    if (method === 'POST' && p === '/agent_sessions') registered.push(body.public_id);
+    return { res: { status: 201 }, data: { session: { last_seq: 0 } } };
+  };
+  await d.rearmPersisted();
+  assert.deepEqual(registered, [], 'a connect that switches tunnels inherits NO sessions');
+  assert.equal(d.sessions.size, 0);
+});
+
+test('persistSession stamps the owning channelId on every write', () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { sid: 'sess-stamp' });
+  d.persistSession(s);
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-stamp'].channelId, 1);
+});
+
 test('re-arm DROPS a session only when the server refuses it definitively', async () => {
   const d = daemonWithPersisted({ sid: 'sess-gone' });
   d.api = async (method, p) => {
@@ -1799,9 +2392,91 @@ test('re-arm DROPS a session only when the server refuses it definitively', asyn
   assert.ok(d.logLines.some((l) => /for good/.test(l)), `expected a loud drop, got ${JSON.stringify(d.logLines)}`);
 });
 
+test('waiting notify is OFF by default and opt-in per session — learned from the server echo (QA #16)', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { sid: 'sess-optin' });
+  s.registered = false;
+  let echoField; // undefined = the field is ABSENT (an old server)
+  let notifies = 0;
+  d.api = async (method, p) => {
+    if (/agent_sessions/.test(p) && (method === 'POST' || method === 'PATCH')) {
+      const session = { last_seq: 0, ...(echoField === undefined ? {} : { notify_on_waiting: echoField }) };
+      return { res: { status: method === 'POST' ? 201 : 200 }, data: { session } };
+    }
+    if (method === 'POST' && p === '/notify') { notifies += 1; return { res: { status: 201 }, data: {} }; }
+    return { res: { status: 200 }, data: {} };
+  };
+
+  // An old server never echoes the field ⇒ FALSE ⇒ never notifies.
+  await d.registerOrKeep(s);
+  assert.equal(s.notifyOnWaiting, false, 'absent field = old server = never notify');
+  await d.maybeNotifyWaiting(s, 'needs you');
+  assert.equal(notifies, 0, 'OFF by default — a fresh session never notifies on waiting');
+  assert.equal(s.waitingArmed, true, 'the opt-in gate must not consume the episode');
+
+  // The human opts in from the session screen; the next heartbeat echoes it.
+  echoField = true;
+  await d.heartbeatTick();
+  assert.equal(s.notifyOnWaiting, true, 'the flip lands within one heartbeat, no new polling surface');
+  await d.maybeNotifyWaiting(s, 'needs you');
+  assert.equal(notifies, 1, 'opted in ⇒ it notifies');
+  await d.maybeNotifyWaiting(s, 'still waiting');
+  assert.equal(notifies, 1, 'the per-episode debounce still bounds HOW OFTEN');
+
+  // running re-arms the episode; the next waiting notifies again while opted in.
+  d.setStatus(s, 'running');
+  await d.maybeNotifyWaiting(s, 'waiting again');
+  assert.equal(notifies, 2);
+
+  // Flip OFF in the app ⇒ the daemon stops within a heartbeat, armed or not.
+  echoField = false;
+  await d.heartbeatTick();
+  assert.equal(s.notifyOnWaiting, false);
+  s.waitingArmed = true;
+  await d.maybeNotifyWaiting(s, 'still waiting');
+  assert.equal(notifies, 2, 'flip to false stops the notifications');
+});
+
+test('Tranche A minimal: idle_prompt NEVER pushes — even opted in — and does not consume the episode', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  let notifies = 0;
+  d.api = async (method, p) => {
+    if (method === 'POST' && p === '/notify') { notifies += 1; return { res: { status: 201 }, data: {} }; }
+    return { res: { status: 200 }, data: {} };
+  };
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-n', 'pidge terminal enable')));
+  const s = d.sessions.get('sess-n');
+  s.notifyOnWaiting = true; // the human opted in — and idle STILL must not push
+
+  // The ~60 s "it's your turn" nudge after every turn — the 4-in-8-minutes
+  // spam QA #16 measured. Noise, not a request.
+  await hookPost(d, 'notification', {
+    session_id: 'sess-n', message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  });
+  await settle();
+  assert.equal(notifies, 0, 'idle_prompt never notifies, opted in or not');
+  assert.equal(s.status, 'waiting', 'the coarse STATUS semantics are untouched (v1.1 territory)');
+  assert.equal(s.waitingArmed, true, 'and the armed episode is NOT consumed — a real ask can still push');
+
+  // A real decision ask pushes normally.
+  await hookPost(d, 'notification', {
+    session_id: 'sess-n', message: 'Claude needs your permission to use Bash', notification_type: 'permission_prompt',
+  });
+  await settle();
+  assert.equal(notifies, 1, 'permission_prompt notifies as before');
+
+  // An ABSENT type (older harness) keeps today's behavior — defensive read.
+  d.setStatus(s, 'running'); // re-arm the episode
+  await hookPost(d, 'notification', { session_id: 'sess-n', message: 'Waiting' });
+  await settle();
+  assert.equal(notifies, 2, 'no type = current behavior, never a silent suppression');
+});
+
 test('a waiting notification that does not land stays ARMED for the next signal', async () => {
   const d = makeDaemon();
-  const s = { sid: 'sess-w', publicId: 'ases_t', title: 'proj', status: 'waiting', waitingArmed: true };
+  const s = { sid: 'sess-w', publicId: 'ases_t', title: 'proj', status: 'waiting', waitingArmed: true, notifyOnWaiting: true };
   let sends = 0;
   d.api = async () => { sends += 1; return { res: { status: sends === 1 ? 502 : 201 }, data: {} }; };
 

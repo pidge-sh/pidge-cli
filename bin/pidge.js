@@ -403,6 +403,7 @@ const OPTIONS = {
   manager: { type: 'string' },                 // update: force npm | pnpm | yarn | bun (default: inferred)
   yes: { type: 'boolean' },                    // terminal connect: skip the consent prompt (scripted installs)
   'no-daemon': { type: 'boolean' },            // terminal connect: skip the service install (any platform)
+  replace: { type: 'boolean' },                // terminal connect: consent to overwrite THIS computer's tunnel identity
   // listen keeps going after a batch (supervisor loop, one process)
   follow: { type: 'boolean' },
   force: { type: 'boolean' },                  // setup: overwrite a config owned by ANOTHER channel
@@ -716,6 +717,7 @@ const OPTION_DOCS = {
   manager: '--manager NAME           update: force the package manager (npm | pnpm | yarn | bun; default: inferred from where this copy lives)',
   yes: '--yes                    terminal connect: skip the consent prompt (scripted installs)',
   'no-daemon': '--no-daemon              terminal connect: skip the service install on any platform (run `pidge terminal daemon` yourself)',
+  replace: '--replace                terminal connect: overwrite this computer\'s EXISTING tunnel identity (without it, a second connect refuses loudly; the old channel stays on the server — remove it in the app)',
   global: '--global                 store in the shared machine file (~/.config/pidge/env) instead of the project scope — for a daemon/cron that runs outside any project',
   'url-base': '--url BASE               the Pidge server base URL (default https://api.pidge.sh)',
   print: '--print                  emit `export …` lines instead of writing a file (per-agent; you run it)',
@@ -919,7 +921,7 @@ const HELP = {
   },
   terminal: {
     summary: 'Agent Sessions: mirror a Claude Code session to the phone as structured, E2E-sealed conversation data; typed replies come back into the session.',
-    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon]  ·  pidge terminal enable (confirm)  ·  pidge terminal disable [--session SID|--all] | status | disconnect',
+    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon] [--replace]  ·  pidge terminal enable (confirm)  ·  pidge terminal disable [--session SID|--all] | status | disconnect',
     body: [
       'The user runs claude inside tmux — that is their ENTIRE responsibility. `connect` (once per computer) pairs with the phone: the app\'s Settings → Computers → Connect a computer mints a tunnel channel + E2E key and shows a one-liner carrying the claim code + PIDGE_SECRET; paste it in a terminal. It asks consent, installs Claude Code hooks (tagged `# pidge-hook`, cleanly removable), refreshes the Pidge skill, copies this CLI to ~/.config/pidge/terminal/cli (so the service never points into a prunable npx cache) and installs a background daemon (launchd on macOS, `systemd --user` on Linux/WSL; a WSL without systemd gets a detached daemon + the line that makes it durable).',
       '',
@@ -929,7 +931,7 @@ const HELP = {
       '',
       'E2E is mandatory (the transcript contains everything); the server relays sealed blobs it can never read. `disable` stops one session; `disconnect` = disable --all + uninstall hooks + daemon.',
     ].join('\n'),
-    opts: ['code', 'secret', 'session', 'approvals', 'yes', 'no-daemon', 'url'],
+    opts: ['code', 'secret', 'session', 'approvals', 'yes', 'no-daemon', 'replace', 'url'],
   },
   bridge: {
     summary: '24/7 supervisor: long-poll the channel, run YOUR handler once per batch, ack only on exit 0. Model-agnostic.',

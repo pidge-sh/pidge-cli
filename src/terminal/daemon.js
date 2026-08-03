@@ -23,7 +23,6 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
 const core = require('./core');
 const adapter = require('./adapter-claude');
 
@@ -66,8 +65,27 @@ class Daemon {
     this.key = core.e2eParseSecret(this.env.secret);
     this.caps = core.loadCaps();
     this.state = core.readJson(core.STATE_FILE(), { epoch: 0, sessions: {} });
+    // Tunnel scoping (QA finding #13): state.json used to persist sessions
+    // with no channel stamp, so reconnecting this computer to a DIFFERENT
+    // tunnel re-published the old tunnel's sessions there — re-sealing their
+    // title+cwd metadata under the NEW key (a cross-owner metadata leak; the
+    // item crypto held, the sessions rendered empty). Every persisted session
+    // now carries the channelId that owns it (persistSession); on load,
+    // anything that does not belong to the CURRENT tunnel is dropped before it
+    // can register, publish, or re-seal a byte. A missing stamp (a pre-fix
+    // state file) is foreign too: ownership it cannot prove, it does not get.
+    const foreign = [];
+    for (const [sid, p] of Object.entries(this.state.sessions || {})) {
+      if (!p || p.channelId !== this.env.channelId) {
+        foreign.push({ sid, channelId: (p && p.channelId) || null });
+        delete this.state.sessions[sid];
+      }
+    }
     this.state.epoch = (this.state.epoch || 0) + 1; // new epoch per process (B4)
     this.saveState();
+    for (const f of foreign) {
+      this.log(`session ${String(f.sid).slice(0, 8)} belongs to ${f.channelId ? `channel ${f.channelId}` : 'an UNKNOWN channel (pre-scoping state)'}, not the connected channel ${this.env.channelId} — DROPPED from state (a connect that switches tunnels inherits no sessions; metadata never re-seals under another owner's key)`);
+    }
     this.announces = new Map();  // sid → {tty, cwd, transcriptPath, at}
     this.sessions = new Map();   // sid → live session record (see enable)
     this.ws = null;              // one cable socket, N subscriptions
@@ -86,6 +104,7 @@ class Daemon {
     // worse than the replay window the epoch echo already closes.
     this.retiredVgens = new Set();
     this.logStream = null;
+    this.exit = (code) => process.exit(code); // injectable for tests (POST /shutdown)
   }
 
   log(...args) {
@@ -143,10 +162,15 @@ class Daemon {
     const meta = {
       title: session.title,
       cwd: session.cwd,
+      sid: session.sid, // inside the sealed blob only — refreshed on /clear adoption (§6)
       harness: 'claude',
       harness_version: session.hv || null,
       tmux: { pane_id: session.paneId },
       epoch: this.state.epoch,
+      // The harness's permission mode as last seen by the hooks (Claude:
+      // default | plan | acceptEdits | bypassPermissions). OMITTED when
+      // unknown — viewers must tolerate absence (spec §4, added 2026-08-03).
+      ...(session.mode ? { mode: session.mode } : {}),
     };
     return core.e2eEncryptBlob(this.key,
       core.e2eAad(this.env.channelId, session.publicId, 'agent_meta'),
@@ -206,15 +230,44 @@ class Daemon {
       case 'GET /health':
         return send(200, { ok: true, epoch: this.state.epoch, enabled: [...this.sessions.keys()] });
       case 'POST /hook/session-start': {
-        const { session_id: sid, cwd, transcript_path: tp, tty } = body;
+        const { session_id: sid, cwd, transcript_path: tp, tty, source } = body;
         if (!sid) return send(200, {});
         this.announces.set(sid, { tty: tty || null, cwd: cwd || null, transcriptPath: tp || null, at: Date.now() });
         const s = this.sessions.get(sid);
         if (s && tp && tp !== s.file) {
-          // /clear+resume rotation: same sid, new file — SAME AgentSession (spec §6).
+          // Same-sid rotation (an in-place transcript swap): SAME AgentSession.
           this.log(`session ${sid.slice(0, 8)}: transcript rotated → ${path.basename(tp)}`);
           s.file = tp; s.offset = 0; s.bulk = true; // uuid dedup absorbs the re-read; bulk caps it (§6)
           this.persistSession(s);
+        }
+        if (!s) {
+          // `/clear` = a NEW session, not a rotation (spec §6, corrected per QA
+          // finding #14): Claude Code mints a new sid AND a new transcript, the
+          // old JSONL never grows again, and the phone froze on a mirror that
+          // LOOKED alive. Adoption is gated on the HARNESS'S OWN rotation
+          // signal (§6 REVISED after adversarial review): SessionStart carries
+          // `source` ("startup"|"resume"|"clear"|"compact"), and only
+          // source:"clear" — the authoritative statement that a human typed
+          // /clear INSIDE a session they already shared — carries consent
+          // over. The earlier "mirror hot within 90 s" window is GONE: it
+          // failed both ways (a nested `claude -p` run as a Bash tool inside
+          // the mirrored session satisfies cwd+hot and would HIJACK the
+          // mirror; a human who reads the last answer for >90 s before /clear
+          // would fail it). Adoption also requires a transcript_path —
+          // adopting without a new file recreates the frozen-mirror bug.
+          // Every other case ends the displaced session loudly (§11).
+          const twin = this.findReplacedTwin(sid, { tty: core.normalizeTty(tty), cwd });
+          if (twin) {
+            const src = typeof source === 'string' && source ? source : null;
+            if (src === 'clear' && tp && this.adoptReplacedSid(twin, sid, { tp, tty: core.normalizeTty(tty) })) {
+              // adopted — everything narrated inside adoptReplacedSid.
+            } else {
+              this.log(`session ${twin.sid.slice(0, 8)}: new sid ${sid.slice(0, 8)} announced in its pane/cwd (source: ${src || 'absent'}${src === 'clear' && !tp ? ', NO transcript_path' : ''}) — no adoption; ending the old session, the new claude needs its own enable`);
+              // Fire-and-forget: the SessionStart hook has a 3 s budget, and
+              // the end path talks to the server. Failures logged, never eaten.
+              this.endReplacedSession(twin, sid).catch((e) => this.log(`end-replaced ${twin.sid.slice(0, 8)} failed: ${e.message}`));
+            }
+          }
         }
         return send(200, {});
       }
@@ -231,7 +284,11 @@ class Daemon {
           return send(200, { decision: await this.enableFromSentinel(sid, body, sentinel) });
         }
         const s = sid && this.sessions.get(sid);
-        if (s) this.setStatus(s, 'running');
+        if (s) {
+          s.lastAliveAt = Date.now();
+          this.setStatus(s, 'running');
+          this.notePermissionMode(s, body.permission_mode);
+        }
         if (s && s.approvals && s.approvals.length && this.toolGated(s, body.tool_name)) {
           const decision = await this.approvalGate(s, body);
           return send(200, decision ? { decision } : {});
@@ -242,15 +299,30 @@ class Daemon {
         const sid = body.session_id;
         const s = sid && this.sessions.get(sid);
         if (s) {
+          s.lastAliveAt = Date.now();
           this.setStatus(s, 'waiting');
-          this.maybeNotifyWaiting(s, String(body.message || 'Waiting for your input')).catch((e) => this.log('notify failed:', e.message));
+          // Composer-spec Tranche A, MINIMAL cherry-pick: the Notification
+          // hook fires for eight distinct reasons and carries
+          // `notification_type` (permission_prompt | idle_prompt |
+          // auth_success | elicitation_dialog | elicitation_complete |
+          // elicitation_response | agent_needs_input | agent_completed —
+          // read defensively). `idle_prompt` is the ~60 s "it's your turn"
+          // nudge after EVERY turn — the 4-in-8-minutes spam QA #16 measured.
+          // It is noise, not a request: it never pushes, even when
+          // notify_on_waiting is ON, and it does not consume the armed
+          // episode a real request would use. Everything else — including an
+          // absent or unknown type — keeps today's behavior; the
+          // fine-grained STATUS semantics are v1.1, untouched here.
+          if (String(body.notification_type || '') !== 'idle_prompt') {
+            this.maybeNotifyWaiting(s, String(body.message || 'Waiting for your input')).catch((e) => this.log('notify failed:', e.message));
+          }
         }
         return send(200, {});
       }
       case 'POST /hook/stop': {
         const sid = body.session_id;
         const s = sid && this.sessions.get(sid);
-        if (s) this.setStatus(s, 'idle');
+        if (s) { s.lastAliveAt = Date.now(); this.setStatus(s, 'idle'); }
         return send(200, {});
       }
       case 'GET /sessions': {
@@ -262,6 +334,19 @@ class Daemon {
           sid: s.sid, public_id: s.publicId, pane_id: s.paneId, cwd: s.cwd, status: s.status,
         }));
         return send(200, { announces: ann, enabled });
+      }
+      case 'POST /shutdown': {
+        // `connect --replace` recycles the daemon (review A2): a live process
+        // keeps the OLD tunnel identity (base/key) in memory — under systemd
+        // `enable --now` is a no-op while the unit is active, and a detached
+        // replacement dies on EADDRINUSE while the old process keeps
+        // publishing to the orphaned channel. Clean exit: neither launchd
+        // (SuccessfulExit=false) nor systemd (Restart=on-failure) respawns a
+        // 0-exit; connect starts the fresh daemon right after.
+        this.log('shutdown requested over loopback (connect --replace recycles the daemon)');
+        send(200, { ok: true });
+        setTimeout(() => this.exit(0), 50); // let the response flush first
+        return;
       }
       // There is NO POST /enable any more: the PreToolUse sentinel above is the
       // only door, so no local caller can mint a share for a session it merely
@@ -316,12 +401,15 @@ class Daemon {
       return deny(core.ENABLE_NO_TRANSCRIPT_REASON);
     }
 
-    const pane = this.resolvePane({ sid, tty, cwd });
-    if (!pane) return deny(core.ENABLE_NO_PANE_REASON);
+    const { pane, refusal } = this.resolvePane({ sid, tty, cwd });
+    if (!pane) return deny(refusal);
 
     try {
       const s = await this.enableSession({
         sid, paneId: pane.paneId, tty, cwd, file,
+        // The enable ride IS a PreToolUse payload — its permission_mode (read
+        // defensively; older harnesses omit it) seeds the very first meta.
+        mode: typeof body.permission_mode === 'string' && body.permission_mode ? body.permission_mode : null,
         approvals: (sentinel && sentinel.approvals) || [],
       });
       this.log(`enable ${sid.slice(0, 8)} via the PreToolUse sentinel → ${s.publicId} (pane ${pane.paneId}${pane.loc ? ` ${pane.loc}` : ''}, bound by ${pane.by})`);
@@ -334,31 +422,154 @@ class Daemon {
     }
   }
 
+  // Did this NEW sid land on the pane+cwd of a currently-shared session? The
+  // match must be POSITIVE on both (spec §6: pane_id AND cwd): cwd equality
+  // finds the candidate, and the pane check must AFFIRM the same pane — via
+  // the announced tty when there is one, or, in the ttyless reality of Claude
+  // Code hooks (finding #12), via "exactly one pane sits in that cwd and it IS
+  // the bound one". Ambiguity (2+ panes in the cwd), a provably different
+  // pane, or an unreadable pane list all yield NO match — logged loudly, but
+  // neither adoption nor a kill of a possibly-live mirror.
+  findReplacedTwin(newSid, { tty, cwd }) {
+    const want = String(cwd || '').replace(/\/+$/, '');
+    if (!want) return null;
+    // ALL candidates in that cwd (there can be several — tty-bound enables can
+    // legitimately share a cwd across panes); the pane check then affirms the
+    // ONE whose bound pane matches, never just the first cwd hit.
+    const candidates = [...this.sessions.values()]
+      .filter((s) => String(s.cwd || '').replace(/\/+$/, '') === want);
+    if (!candidates.length) return null;
+    const tag = `new sid ${newSid.slice(0, 8)}`;
+    const opts = { onWarn: (m) => this.log(m) };
+    try {
+      if (tty) {
+        const hit = core.tmuxPaneForTty(tty, opts);
+        const twin = hit && candidates.find((s) => s.paneId === hit.paneId);
+        if (twin) return twin;
+        this.log(`${tag} announced in ${want} but its tty ${tty} ${hit ? `is pane ${hit.paneId}, bound to no shared session` : 'is not a tmux pane'} — no pane match, leaving the share(s) alone`);
+        return null;
+      }
+      const hits = core.tmuxPanesForCwd(want, opts);
+      const twin = hits.length === 1 ? candidates.find((s) => s.paneId === hits[0].paneId) : null;
+      if (twin) return twin;
+      this.log(`${tag} announced in ${want}, but ${hits.length === 1 ? `the only pane there is ${hits[0].paneId}, bound to no shared session` : `${hits.length} pane(s) sit there — cannot tell a /clear from a second claude`}; leaving the share(s) alone`);
+      return null;
+    } catch (e) {
+      this.log(`${tag}: pane list unreadable (${e.message}) — cannot affirm the pane match, leaving the share(s) alone`);
+      return null;
+    }
+  }
+
+  // ADOPTION (spec §6, source-gated): the new sid joins the SAME AgentSession
+  // — tailer switches to the new transcript, meta_sealed refreshes (the new
+  // sid rides inside the sealed blob), seq stays monotonic, and a notice item
+  // marks the seam. The caller has already established source:"clear" + a
+  // positive pane+cwd match + a transcript_path. Returns false when the
+  // adoption cannot take the writer lock — the caller then ends the old
+  // session loudly.
+  adoptReplacedSid(s, newSid, { tp, tty }) {
+    const oldSid = s.sid;
+    try {
+      this.acquireWriterLock(newSid); // B3: the new sid's slot must be ours too
+    } catch (e) {
+      this.log(`adopt ${newSid.slice(0, 8)} REFUSED: ${e.message}`);
+      return false;
+    }
+    this.sessions.delete(oldSid);
+    delete this.state.sessions[oldSid];
+    this.releaseWriterLock(oldSid);
+    s.sid = newSid;
+    s.tty = tty || null;
+    if (tp) { s.file = tp; s.offset = 0; s.bulk = true; } // new transcript; §6 cap bounds the read, uuid dedup guards
+    s.lastAliveAt = Date.now();
+    this.sessions.set(newSid, s);
+    // The seam, visible on the phone — never a silent splice (§11).
+    try {
+      const preview = 'restarted via /clear — mirror continued';
+      const notice = {
+        v: 1, uuid: `pidge-clear-${newSid.slice(0, 8)}-${Date.now()}`, parent: null,
+        ts: nowIso(), role: 'system', kind: 'notice', preview,
+        truncated: false, total_bytes: adapter.byteLen(preview),
+        harness: 'claude', hv: s.hv || null, _publicId: s.publicId,
+      };
+      const b64 = this.sealItem(notice);
+      if (b64 !== null) this.queuePush(s, notice.uuid, b64);
+    } catch (e) {
+      this.log(`${s.publicId}: could not seal the /clear seam notice (${e.message}) — adoption continues`);
+    }
+    this.persistSession(s);
+    // Refresh the sealed meta (new sid inside the blob) — best-effort; the
+    // heartbeat's status PATCH keeps flowing regardless.
+    this.api('PATCH', `/agent_sessions/${s.publicId}`, { status: s.status, meta_sealed: this.sealMeta(s) })
+      .catch((e) => this.log(`${s.publicId}: meta refresh after adoption failed (${e.message}) — retried by the next heartbeat era`));
+    this.flush(s).catch((e) => this.log('flush error:', e.message));
+    this.log(`session ${oldSid.slice(0, 8)} → ${newSid.slice(0, 8)} ADOPTED (source:"clear" in pane ${s.paneId}) — same AgentSession ${s.publicId}, seq continues, mirror unbroken`);
+    return true;
+  }
+
+  // End a shared session that a NEW sid replaced but could NOT be adopted (the
+  // cold-match path, finding #14): one final legible notice item to the phone,
+  // then the normal disable (the server DELETE marks the row ended). Best-
+  // effort on the notice; the end itself is unconditional — a frozen mirror
+  // that looks alive is the bug.
+  async endReplacedSession(s, newSid) {
+    try {
+      const preview = 'This session ended — /clear started a new one. Share the new session again to keep mirroring.';
+      const notice = {
+        v: 1, uuid: `pidge-ended-${s.sid.slice(0, 8)}-${Date.now()}`, parent: null,
+        ts: nowIso(), role: 'system', kind: 'notice', preview,
+        truncated: false, total_bytes: adapter.byteLen(preview),
+        harness: 'claude', hv: s.hv || null, _publicId: s.publicId,
+      };
+      const b64 = this.sealItem(notice);
+      if (b64 !== null) this.queuePush(s, notice.uuid, b64);
+      await this.flush(s);
+      if (s.queue.length) this.log(`${s.publicId}: the ended notice did not reach the server (${s.queue.length} item(s) pending) — ending anyway, the status change is what the phone keys on`);
+    } catch (e) {
+      this.log(`${s.publicId}: could not publish the ended notice (${e.message}) — ending anyway`);
+    }
+    await this.disableSession(s.sid, `/clear (or a fresh claude) replaced it with sid ${newSid.slice(0, 8)}`);
+  }
+
   // Bind exactly ONE pane, or refuse. Primary = the tty (authoritative: a pane
   // OWNS its tty). Fallback = the cwd, used ONLY when there is no usable tty
   // (Claude Code can spawn a hook without a controlling tty), and only when
   // exactly one pane matches — two candidates means typing the human's words
   // into a stranger's shell, so ambiguity refuses like absence does.
+  //
+  // Returns {pane} or {refusal}. The refusal DISTINGUISHES "you are not in a
+  // tmux pane" from "the daemon could not read the pane list" — the second was
+  // reported as the first for weeks (QA finding #10: a locale-mangled
+  // list-panes read as 0 panes, and the message blamed the user).
   resolvePane({ sid, tty, cwd }) {
     const tag = String(sid || '').slice(0, 8);
-    if (tty) {
-      const hit = core.tmuxPaneForTty(tty);
-      if (hit) return { paneId: hit.paneId, loc: hit.loc, by: `tty ${tty}` };
-      // A REAL tty that no pane owns = claude is not running inside tmux. The
-      // cwd fallback must NOT rescue this: it would bind an unrelated pane.
-      this.log(`enable ${tag} REFUSED: tty ${tty} is not a tmux pane — claude is not running inside tmux`);
-      return null;
+    const opts = { onWarn: (m) => this.log(m) };
+    try {
+      if (tty) {
+        const hit = core.tmuxPaneForTty(tty, opts);
+        if (hit) return { pane: { paneId: hit.paneId, loc: hit.loc, by: `tty ${tty}` } };
+        // A REAL tty that no pane owns = claude is not running inside tmux. The
+        // cwd fallback must NOT rescue this: it would bind an unrelated pane.
+        this.log(`enable ${tag} REFUSED: tty ${tty} is not a tmux pane — claude is not running inside tmux`);
+        return { refusal: core.ENABLE_NO_PANE_REASON };
+      }
+      const hits = core.tmuxPanesForCwd(cwd, opts);
+      if (hits.length === 1) return { pane: { paneId: hits[0].paneId, loc: hits[0].loc, by: `cwd ${cwd}` } };
+      this.log(`enable ${tag} REFUSED: no controlling tty and ${hits.length} tmux pane(s) sit in ${cwd || '(unknown cwd)'} — a pane-less or guessed share would drop every keystroke`);
+      return { refusal: core.ENABLE_NO_PANE_REASON };
+    } catch (e) {
+      // The pane list existed but could not be PARSED (core.tmuxPanes threw).
+      // That is a daemon-side failure — refuse loudly WITHOUT telling the human
+      // they are not in tmux (§11: the silence/misblame is the bug).
+      this.log(`enable ${tag} REFUSED: ${e.message}`);
+      return { refusal: core.ENABLE_PANE_LOOKUP_FAILED_REASON };
     }
-    const hits = core.tmuxPanesForCwd(cwd);
-    if (hits.length === 1) return { paneId: hits[0].paneId, loc: hits[0].loc, by: `cwd ${cwd}` };
-    this.log(`enable ${tag} REFUSED: no controlling tty and ${hits.length} tmux pane(s) sit in ${cwd || '(unknown cwd)'} — a pane-less or guessed share would drop every keystroke`);
-    return null;
   }
 
-  async enableSession({ sid, paneId, tty, cwd, file, approvals }) {
+  async enableSession({ sid, paneId, tty, cwd, file, mode, approvals }) {
     this.acquireWriterLock(sid); // B3 — refuse loudly on conflict
     try {
-      return await this.enableSessionLocked({ sid, paneId, tty, cwd, file, approvals });
+      return await this.enableSessionLocked({ sid, paneId, tty, cwd, file, mode, approvals });
     } catch (e) {
       // A failed enable must not strand the lock — NOR leave the half-enabled
       // record live: enableSessionLocked inserts into this.sessions and persists
@@ -374,17 +585,20 @@ class Daemon {
     }
   }
 
-  async enableSessionLocked({ sid, paneId, tty, cwd, file, approvals }) {
+  async enableSessionLocked({ sid, paneId, tty, cwd, file, mode, approvals }) {
     const session = {
       sid,
       publicId: `ases_${sid}`,
       paneId, tty, cwd, file,
       title: path.basename(cwd || 'session'),
+      mode: mode || null, // harness permission mode — sealed meta only (§4)
       hv: null,
       offset: 0,
       seenUuids: new Set(), seenRing: [],
       queue: [], outboxBytes: 0, nextSeq: 1,
       status: 'idle', waitingArmed: true,
+      notifyOnWaiting: false, // opt-in per session, learned from the server echo (§9)
+      lastAliveAt: Date.now(), // mirror-life diagnostic (narrated in logs; NOT an adoption gate)
       approvals: approvals || [],
       flushing: false, backfilled: 0,
       registered: true, registering: false, // the server knows this session
@@ -393,6 +607,7 @@ class Daemon {
     };
     const echo = await this.registerSession(session, 'idle');
     session.nextSeq = (echo.last_seq || 0) + 1;
+    session.notifyOnWaiting = echo.notify_on_waiting === true; // absent ⇒ false (§9)
     this.sessions.set(sid, session);
     this.persistSession(session);
     await this.backfill(session);
@@ -447,7 +662,12 @@ class Daemon {
   persistSession(s) {
     this.state.sessions[s.sid] = {
       publicId: s.publicId, paneId: s.paneId, tty: s.tty, cwd: s.cwd,
+      // The tunnel that owns this session (finding #13): the load-time scope
+      // check keys on it, so a reconnect to another tunnel cannot inherit it.
+      channelId: this.env.channelId,
       file: s.file, offset: s.offset, nextSeq: s.nextSeq, approvals: s.approvals,
+      lastAliveAt: s.lastAliveAt || 0, // mirror-life diagnostic
+      mode: s.mode || null,
       seen: s.seenRing, // restart dedup (§6) — see seedSeenFromFile
       // The pending sealed items, with the uuid that produced each. Riding in
       // the SAME write as `offset`/`seen` is the point: a uuid may be marked
@@ -523,6 +743,9 @@ class Daemon {
         queue: outbox, outboxBytes: outbox.reduce((n, e) => n + e.sealed.length, 0),
         nextSeq: p.nextSeq || 1,
         status: 'idle', waitingArmed: true, approvals: p.approvals || [],
+        notifyOnWaiting: false, // re-learned from the boot register's echo (§9)
+        lastAliveAt: p.lastAliveAt || 0, // mirror-life diagnostic
+        mode: p.mode || null,
         flushing: false, backfilled: 0, registered: false, registering: false,
         backoff: 0, nextFlushAt: 0, gen: 0,
       };
@@ -553,6 +776,7 @@ class Daemon {
       const echo = await this.registerSession(session, session.status || 'idle');
       if (!this.stillOwns(session, gen)) return false; // torn down mid-flight (#66)
       session.nextSeq = Math.max(session.nextSeq || 1, (echo.last_seq || 0) + 1);
+      session.notifyOnWaiting = echo.notify_on_waiting === true; // absent ⇒ false (§9)
       session.registered = true;
       session.backoff = 0;
       session.nextFlushAt = 0;
@@ -795,6 +1019,7 @@ class Daemon {
       }
       s.offset = consumedTo;
     }
+    s.lastAliveAt = Date.now(); // transcript growth = mirror life (diagnostic)
     this.persistSession(s);
   }
 
@@ -888,6 +1113,7 @@ class Daemon {
       public_id: session.publicId, status: session.status, meta_sealed: this.sealMeta(session),
     });
     if (!this.stillOwns(session, gen)) return false;
+    this.applySessionEcho(session, reg);
     const serverSeq = reg && reg.session && Number.isInteger(reg.session.last_seq) ? reg.session.last_seq : null;
     if (serverSeq === null) {
       // Could not learn the high-water: back off and retry, do NOT guess.
@@ -921,13 +1147,41 @@ class Daemon {
 
   // --- status + waiting notification (spec §9) ------------------------------
 
+  // The harness's permission mode rides every PreToolUse payload (Claude:
+  // default | plan | acceptEdits | bypassPermissions) — read DEFENSIVELY, the
+  // field can be absent on older harnesses, and absence is never a change.
+  // A change refreshes meta_sealed so viewers see the current mode; the mode
+  // lives only inside the sealed blob (the server never reads it).
+  notePermissionMode(s, mode) {
+    if (typeof mode !== 'string' || !mode || mode === s.mode) return;
+    const had = s.mode || null;
+    s.mode = mode;
+    this.persistSession(s);
+    this.api('PATCH', `/agent_sessions/${s.publicId}`, { status: s.status, meta_sealed: this.sealMeta(s) })
+      .catch((e) => this.log(`${s.publicId}: meta refresh on mode change failed (${e.message}) — the next change retries`));
+    this.log(`${s.sid.slice(0, 8)}: permission mode ${had ? `${had} → ` : ''}${mode}`);
+  }
+
+  // The server echoes the session row on every agent-side POST/PATCH response
+  // (spec §9): notify_on_waiting is the human's per-session opt-in, learned
+  // here within one heartbeat of a flip — zero new polling surface. ABSENT
+  // (an older server, or a response with no session echo) changes nothing;
+  // an echo WITHOUT the field reads FALSE.
+  applySessionEcho(s, data) {
+    const echo = data && data.session;
+    if (!echo || typeof echo !== 'object') return;
+    s.notifyOnWaiting = echo.notify_on_waiting === true;
+  }
+
   // s.status IS the desired status: the transition PATCH is best-effort, and
   // the heartbeat re-asserts whatever this last set.
   setStatus(s, status) {
     if (status === 'running') s.waitingArmed = true; // re-arm the waiting edge
     if (s.status === status) return;
     s.status = status;
-    this.api('PATCH', `/agent_sessions/${s.publicId}`, { status }).catch((e) => this.log('status PATCH failed:', e.message));
+    this.api('PATCH', `/agent_sessions/${s.publicId}`, { status })
+      .then(({ data }) => this.applySessionEcho(s, data))
+      .catch((e) => this.log('status PATCH failed:', e.message));
   }
 
   async heartbeatTick() {
@@ -938,11 +1192,21 @@ class Daemon {
       // (and the phone) showing `running` until the NEXT transition — a session
       // that is actually waiting for the human, displayed as busy. The beat now
       // re-asserts it, so a lost transition self-heals within one cadence.
-      this.api('PATCH', `/agent_sessions/${s.publicId}`, { status: s.status }).catch(() => {});
+      await this.api('PATCH', `/agent_sessions/${s.publicId}`, { status: s.status })
+        .then(({ data }) => this.applySessionEcho(s, data))
+        .catch(() => {});
     }
   }
 
   async maybeNotifyWaiting(s, message) {
+    // OFF by default, opt-in PER SESSION (spec §9 REVISED, QA finding #16:
+    // every agent reply is a running→waiting edge, so the old always-on rule
+    // fired once per turn — 4 notifications in 8 minutes of normal use). The
+    // server echoes notify_on_waiting on every register/heartbeat; a fresh
+    // session, or any server that does not echo the field, reads FALSE and
+    // never notifies. This gate bounds WHETHER; the episode debounce below
+    // bounds HOW OFTEN once opted in.
+    if (s.notifyOnWaiting !== true) return;
     // One notification per waiting-EPISODE: armed on the running→waiting edge,
     // reset by input or running (spec §9). One-and-done (#30) untouched —
     // this is an ordinary notification.
@@ -1109,13 +1373,14 @@ class Daemon {
       return;
     }
     if (!Array.isArray(msg.keys)) return;
+    session.lastAliveAt = Date.now(); // delivered input = mirror life (diagnostic)
     for (const k of msg.keys.slice(0, 16)) {
       try {
         if (k && typeof k.lit === 'string' && k.lit.length) {
           this.sendLiteral(session.paneId, k.lit);
           session.waitingArmed = true; // input resets the waiting episode (spec §9)
         } else if (k && typeof k.key === 'string' && INPUT_KEYS.has(k.key)) {
-          execFileSync('tmux', ['send-keys', '-t', session.paneId, k.key]);
+          core.tmuxExec(['send-keys', '-t', session.paneId, k.key]);
         }
         // anything else: dropped whole (deliberately tiny allowlist)
       } catch (e) {
@@ -1125,19 +1390,21 @@ class Daemon {
   }
 
   sendLiteral(paneId, text) {
+    // core.tmuxExec carries a UTF-8 locale on every call (finding #10 defense
+    // in depth): a service env without one makes tmux mangle non-ASCII.
     if (text.includes('\n')) {
       // Multiline rides a tmux buffer + bracketed paste (spec §8).
       const bufName = `pidge-${Date.now()}`;
-      execFileSync('tmux', ['set-buffer', '-b', bufName, text]);
-      execFileSync('tmux', ['paste-buffer', '-p', '-b', bufName, '-t', paneId, '-d']);
+      core.tmuxExec(['set-buffer', '-b', bufName, text]);
+      core.tmuxExec(['paste-buffer', '-p', '-b', bufName, '-t', paneId, '-d']);
     } else {
-      execFileSync('tmux', ['send-keys', '-t', paneId, '-l', text]);
+      core.tmuxExec(['send-keys', '-t', paneId, '-l', text]);
     }
   }
 
   paneAlive(paneId) {
     try {
-      const out = execFileSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}'], { encoding: 'utf8' });
+      const out = core.tmuxExec(['list-panes', '-a', '-F', '#{pane_id}'], { encoding: 'utf8' });
       return out.split('\n').includes(paneId);
     } catch { return false; }
   }
