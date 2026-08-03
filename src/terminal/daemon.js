@@ -565,6 +565,7 @@ class Daemon {
       seenUuids: new Set(), seenRing: [],
       queue: [], outboxBytes: 0, nextSeq: 1,
       status: 'idle', waitingArmed: true,
+      notifyOnWaiting: false, // opt-in per session, learned from the server echo (§9)
       lastAliveAt: Date.now(), // mirror life — the /clear hot-window clock (§6)
       approvals: approvals || [],
       flushing: false, backfilled: 0,
@@ -574,6 +575,7 @@ class Daemon {
     };
     const echo = await this.registerSession(session, 'idle');
     session.nextSeq = (echo.last_seq || 0) + 1;
+    session.notifyOnWaiting = echo.notify_on_waiting === true; // absent ⇒ false (§9)
     this.sessions.set(sid, session);
     this.persistSession(session);
     await this.backfill(session);
@@ -709,6 +711,7 @@ class Daemon {
         queue: outbox, outboxBytes: outbox.reduce((n, e) => n + e.sealed.length, 0),
         nextSeq: p.nextSeq || 1,
         status: 'idle', waitingArmed: true, approvals: p.approvals || [],
+        notifyOnWaiting: false, // re-learned from the boot register's echo (§9)
         lastAliveAt: p.lastAliveAt || 0, // a restart past the hot window reads cold, by design
         mode: p.mode || null,
         flushing: false, backfilled: 0, registered: false, registering: false,
@@ -741,6 +744,7 @@ class Daemon {
       const echo = await this.registerSession(session, session.status || 'idle');
       if (!this.stillOwns(session, gen)) return false; // torn down mid-flight (#66)
       session.nextSeq = Math.max(session.nextSeq || 1, (echo.last_seq || 0) + 1);
+      session.notifyOnWaiting = echo.notify_on_waiting === true; // absent ⇒ false (§9)
       session.registered = true;
       session.backoff = 0;
       session.nextFlushAt = 0;
@@ -1077,6 +1081,7 @@ class Daemon {
       public_id: session.publicId, status: session.status, meta_sealed: this.sealMeta(session),
     });
     if (!this.stillOwns(session, gen)) return false;
+    this.applySessionEcho(session, reg);
     const serverSeq = reg && reg.session && Number.isInteger(reg.session.last_seq) ? reg.session.last_seq : null;
     if (serverSeq === null) {
       // Could not learn the high-water: back off and retry, do NOT guess.
@@ -1125,13 +1130,26 @@ class Daemon {
     this.log(`${s.sid.slice(0, 8)}: permission mode ${had ? `${had} → ` : ''}${mode}`);
   }
 
+  // The server echoes the session row on every agent-side POST/PATCH response
+  // (spec §9): notify_on_waiting is the human's per-session opt-in, learned
+  // here within one heartbeat of a flip — zero new polling surface. ABSENT
+  // (an older server, or a response with no session echo) changes nothing;
+  // an echo WITHOUT the field reads FALSE.
+  applySessionEcho(s, data) {
+    const echo = data && data.session;
+    if (!echo || typeof echo !== 'object') return;
+    s.notifyOnWaiting = echo.notify_on_waiting === true;
+  }
+
   // s.status IS the desired status: the transition PATCH is best-effort, and
   // the heartbeat re-asserts whatever this last set.
   setStatus(s, status) {
     if (status === 'running') s.waitingArmed = true; // re-arm the waiting edge
     if (s.status === status) return;
     s.status = status;
-    this.api('PATCH', `/agent_sessions/${s.publicId}`, { status }).catch((e) => this.log('status PATCH failed:', e.message));
+    this.api('PATCH', `/agent_sessions/${s.publicId}`, { status })
+      .then(({ data }) => this.applySessionEcho(s, data))
+      .catch((e) => this.log('status PATCH failed:', e.message));
   }
 
   async heartbeatTick() {
@@ -1142,11 +1160,21 @@ class Daemon {
       // (and the phone) showing `running` until the NEXT transition — a session
       // that is actually waiting for the human, displayed as busy. The beat now
       // re-asserts it, so a lost transition self-heals within one cadence.
-      this.api('PATCH', `/agent_sessions/${s.publicId}`, { status: s.status }).catch(() => {});
+      await this.api('PATCH', `/agent_sessions/${s.publicId}`, { status: s.status })
+        .then(({ data }) => this.applySessionEcho(s, data))
+        .catch(() => {});
     }
   }
 
   async maybeNotifyWaiting(s, message) {
+    // OFF by default, opt-in PER SESSION (spec §9 REVISED, QA finding #16:
+    // every agent reply is a running→waiting edge, so the old always-on rule
+    // fired once per turn — 4 notifications in 8 minutes of normal use). The
+    // server echoes notify_on_waiting on every register/heartbeat; a fresh
+    // session, or any server that does not echo the field, reads FALSE and
+    // never notifies. This gate bounds WHETHER; the episode debounce below
+    // bounds HOW OFTEN once opted in.
+    if (s.notifyOnWaiting !== true) return;
     // One notification per waiting-EPISODE: armed on the running→waiting edge,
     // reset by input or running (spec §9). One-and-done (#30) untouched —
     // this is an ordinary notification.

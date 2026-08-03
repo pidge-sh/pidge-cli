@@ -2233,9 +2233,54 @@ test('re-arm DROPS a session only when the server refuses it definitively', asyn
   assert.ok(d.logLines.some((l) => /for good/.test(l)), `expected a loud drop, got ${JSON.stringify(d.logLines)}`);
 });
 
+test('waiting notify is OFF by default and opt-in per session — learned from the server echo (QA #16)', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { sid: 'sess-optin' });
+  s.registered = false;
+  let echoField; // undefined = the field is ABSENT (an old server)
+  let notifies = 0;
+  d.api = async (method, p) => {
+    if (/agent_sessions/.test(p) && (method === 'POST' || method === 'PATCH')) {
+      const session = { last_seq: 0, ...(echoField === undefined ? {} : { notify_on_waiting: echoField }) };
+      return { res: { status: method === 'POST' ? 201 : 200 }, data: { session } };
+    }
+    if (method === 'POST' && p === '/notify') { notifies += 1; return { res: { status: 201 }, data: {} }; }
+    return { res: { status: 200 }, data: {} };
+  };
+
+  // An old server never echoes the field ⇒ FALSE ⇒ never notifies.
+  await d.registerOrKeep(s);
+  assert.equal(s.notifyOnWaiting, false, 'absent field = old server = never notify');
+  await d.maybeNotifyWaiting(s, 'needs you');
+  assert.equal(notifies, 0, 'OFF by default — a fresh session never notifies on waiting');
+  assert.equal(s.waitingArmed, true, 'the opt-in gate must not consume the episode');
+
+  // The human opts in from the session screen; the next heartbeat echoes it.
+  echoField = true;
+  await d.heartbeatTick();
+  assert.equal(s.notifyOnWaiting, true, 'the flip lands within one heartbeat, no new polling surface');
+  await d.maybeNotifyWaiting(s, 'needs you');
+  assert.equal(notifies, 1, 'opted in ⇒ it notifies');
+  await d.maybeNotifyWaiting(s, 'still waiting');
+  assert.equal(notifies, 1, 'the per-episode debounce still bounds HOW OFTEN');
+
+  // running re-arms the episode; the next waiting notifies again while opted in.
+  d.setStatus(s, 'running');
+  await d.maybeNotifyWaiting(s, 'waiting again');
+  assert.equal(notifies, 2);
+
+  // Flip OFF in the app ⇒ the daemon stops within a heartbeat, armed or not.
+  echoField = false;
+  await d.heartbeatTick();
+  assert.equal(s.notifyOnWaiting, false);
+  s.waitingArmed = true;
+  await d.maybeNotifyWaiting(s, 'still waiting');
+  assert.equal(notifies, 2, 'flip to false stops the notifications');
+});
+
 test('a waiting notification that does not land stays ARMED for the next signal', async () => {
   const d = makeDaemon();
-  const s = { sid: 'sess-w', publicId: 'ases_t', title: 'proj', status: 'waiting', waitingArmed: true };
+  const s = { sid: 'sess-w', publicId: 'ases_t', title: 'proj', status: 'waiting', waitingArmed: true, notifyOnWaiting: true };
   let sends = 0;
   d.api = async () => { sends += 1; return { res: { status: sends === 1 ? 502 : 201 }, data: {} }; };
 
