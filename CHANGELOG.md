@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.40.0 — 2026-08-03
+
+**Agent Sessions hardening** — three adversarial reviews over 0.39.0 (which was
+never published to npm with these fixes). Behavior/UX changes worth calling out:
+
+- **Single enable door (lock-down).** `pidge terminal ls` and `enable --session`
+  are **removed**, and there is no read-only tier. The only way to share is to
+  tell the Claude running inside a tmux *"enable yourself on Pidge"* (the skill
+  runs `pidge terminal enable`, which walks its process tree to that claude).
+  Run outside a claude session, or outside tmux, and it **refuses loudly** —
+  never guesses which session to capture, never creates a pane-less share.
+- **Cross-platform daemon.** `connect` installs launchd on macOS, a
+  `systemd --user` unit on Linux/WSL2, or a detached process + shell-profile
+  hint on WSL without systemd. Fixed a real Linux bug (`ps -o tty=` prints `?`
+  not `??`) and dropped the hard `lsof` dependency (`/proc/<pid>/cwd`).
+- **All user-facing copy says "computer"** (the app flow is Settings →
+  Computers → Connect a computer).
+- **Durability (never eats data).** A durable outbox in `state.json` means a
+  daemon restart no longer silently drops the un-published queue; rearm retries
+  on a transient outage instead of abandoning the session; a `waiting`
+  notification re-arms on failure; the heartbeat re-asserts status; `disable`
+  reports honestly when it couldn't reach the server.
+- **Safety fixes.** The approval gate now asks `approve`/`reject` (the server's
+  real pair — `deny` was silently dropped); `installHooks` aborts instead of
+  overwriting an unparseable `~/.claude/settings.json`; unknown Claude block
+  types surface as a visible notice instead of vanishing.
+
 ## 0.39.0 — 2026-08-02
 
 **Agent Sessions — `pidge terminal` reborn as transcript-as-data** (pidge repo
