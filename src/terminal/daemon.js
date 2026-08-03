@@ -1,9 +1,10 @@
 'use strict';
 // The pidge terminal daemon (agent-sessions-spec §1/§2/§8/§9/§11).
 //
-// One per computer (launchd), owns: the loopback hook endpoint (SessionStart/
-// PreToolUse/Notification/Stop announce to it — LOCAL ONLY, publishing is
-// gated per-session by the explicit enable), the JSONL tailers for ENABLED
+// One per computer (launchd on macOS, `systemd --user` on Linux/WSL), owns:
+// the loopback hook endpoint (SessionStart/PreToolUse/Notification/Stop
+// announce to it — LOCAL ONLY, publishing is gated per-session by the
+// explicit enable), the JSONL tailers for ENABLED
 // sessions, the sealed publisher, status heartbeats, the waiting→notification
 // edge, and the cable input lane (sealed frames → tmux send-keys into the
 // BOUND pane). Consent boundary = capability boundary: nothing about a

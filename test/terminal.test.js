@@ -454,6 +454,177 @@ test('the generated hook shim is valid JavaScript (node --check)', () => {
 });
 
 // ===========================================================================
+// 3b. commands: the daemon service install, one branch per platform
+// ===========================================================================
+//
+// SAFETY: every branch here writes through launchdPlistPath() (os.homedir())
+// or systemdUnitPath() (XDG_CONFIG_HOME) — both redirected to fresh tmp dirs
+// by freshHome()/freshXdg() before each test, and asserted at load time above.
+// The real ~/Library/LaunchAgents and ~/.config/systemd are never touched, and
+// no OS command runs: `run`/`spawn` are injected recorders.
+
+// Capture what the installer printed (say() → console.log).
+function captureSay(fn) {
+  const lines = [];
+  const real = console.log;
+  console.log = (...a) => lines.push(a.join(' '));
+  try { return { value: fn(), lines }; } finally { console.log = real; }
+}
+
+// A recorder for the OS commands the installer would run.
+function recorder() {
+  const calls = [];
+  return { calls, run: (cmd, args) => { calls.push([cmd, ...args].join(' ')); } };
+}
+
+function withPlatform(platform, fn) {
+  const prev = process.env.PIDGE_TERMINAL_PLATFORM;
+  process.env.PIDGE_TERMINAL_PLATFORM = platform;
+  try { return fn(); } finally {
+    if (prev === undefined) delete process.env.PIDGE_TERMINAL_PLATFORM;
+    else process.env.PIDGE_TERMINAL_PLATFORM = prev;
+  }
+}
+
+test('darwin: installDaemonService writes the launchd plist and loads it (never systemctl)', () => {
+  freshHome();
+  freshXdg();
+  const rec = recorder();
+  const svc = withPlatform('darwin', () => commands.installDaemonService({ run: rec.run }));
+
+  assert.equal(svc.kind, 'launchd');
+  assert.equal(svc.file, commands.launchdPlistPath());
+  assert.ok(svc.file.startsWith(process.env.HOME), 'the plist must land in the tmp HOME');
+  const plist = fs.readFileSync(svc.file, 'utf8');
+  assert.match(plist, /<key>Label<\/key><string>sh\.pidge\.terminal<\/string>/);
+  assert.match(plist, /<string>terminal<\/string>\s*<string>daemon<\/string>/, 'the service runs `terminal daemon`');
+  assert.ok(!/PIDGE_SECRET|hld_/.test(plist), 'the tunnel key is NEVER embedded in the template');
+
+  assert.ok(rec.calls.some((c) => c.startsWith('launchctl load -w')), `expected a launchctl load, got ${JSON.stringify(rec.calls)}`);
+  assert.ok(!rec.calls.some((c) => c.startsWith('systemctl')), 'darwin must never shell out to systemctl');
+  assert.ok(!fs.existsSync(commands.systemdUnitPath()), 'no systemd unit on darwin');
+});
+
+test('linux + systemd: a --user unit is written and enabled (launchctl is never called)', () => {
+  freshHome();
+  freshXdg();
+  const rec = recorder();
+  const svc = withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec.run }));
+
+  assert.equal(svc.kind, 'systemd');
+  assert.equal(svc.label, 'pidge-terminal.service');
+  assert.equal(svc.file, path.join(process.env.XDG_CONFIG_HOME, 'systemd', 'user', 'pidge-terminal.service'));
+  const unit = fs.readFileSync(svc.file, 'utf8');
+  assert.match(unit, /^\[Unit\]$/m);
+  assert.match(unit, /^\[Install\]\nWantedBy=default\.target$/m);
+  assert.match(unit, /^Restart=on-failure$/m);
+  assert.match(unit, /^ExecStart=".+" ".+" terminal daemon$/m, 'the service runs `<node> <cli> terminal daemon`');
+  assert.match(unit, /^Environment="PATH=/m, 'the shell PATH rides along — the daemon shells out to tmux');
+  assert.ok(!/PIDGE_SECRET|hld_/.test(unit), 'the tunnel key is NEVER embedded in the template');
+
+  assert.deepEqual(rec.calls, [
+    'systemctl --user daemon-reload',
+    'systemctl --user enable --now pidge-terminal.service',
+  ]);
+  assert.ok(!fs.existsSync(commands.launchdPlistPath()), 'no launchd plist on linux');
+});
+
+test('WSL without systemd: no unit, the daemon starts DETACHED and the fallback is spelled out', () => {
+  freshHome();
+  freshXdg();
+  const rec = recorder();
+  const spawned = [];
+  const fakeSpawn = (cmd, args, opts) => {
+    spawned.push({ cmd, args, opts });
+    return { pid: 4242, unref() { this.unrefed = true; } };
+  };
+
+  const { value: svc, lines } = captureSay(() => withPlatform('linux', () =>
+    commands.installDaemonService({ systemd: false, wsl: true, run: rec.run, spawn: fakeSpawn })));
+
+  assert.equal(svc.kind, 'detached');
+  assert.equal(svc.pid, 4242);
+  assert.deepEqual(rec.calls, [], 'no service manager exists — nothing may be shelled out');
+  assert.ok(!fs.existsSync(commands.systemdUnitPath()), 'a unit nothing would load must not be written');
+  assert.ok(!fs.existsSync(commands.launchdPlistPath()));
+
+  assert.equal(spawned.length, 1, 'the daemon is started anyway — connect never leaves a tunnel daemon-less');
+  assert.deepEqual(spawned[0].args.slice(-2), ['terminal', 'daemon']);
+  assert.equal(spawned[0].opts.detached, true, 'detached: it must outlive this shell');
+  assert.equal(spawned[0].opts.stdio, 'ignore');
+
+  const out = lines.join('\n');
+  assert.match(out, /no systemd/, 'the reason is named');
+  assert.match(out, /pid 4242/);
+  assert.match(out, /\/etc\/wsl\.conf/, 'WSL gets the systemd=true recipe');
+  assert.match(out, /systemd=true/);
+  assert.match(out, /wsl --shutdown/);
+  assert.match(out, /\.bashrc/, 'and the shell-profile fallback');
+});
+
+test('linux without systemd (not WSL): same detached fallback, without the wsl.conf recipe', () => {
+  freshHome();
+  freshXdg();
+  const fakeSpawn = () => ({ pid: 77, unref() {} });
+  const { value: svc, lines } = captureSay(() => withPlatform('linux', () =>
+    commands.installDaemonService({ systemd: false, wsl: false, spawn: fakeSpawn })));
+
+  assert.equal(svc.kind, 'detached');
+  const out = lines.join('\n');
+  assert.ok(!/wsl\.conf/.test(out), 'a plain Linux box must not be told to edit /etc/wsl.conf');
+  assert.match(out, /\.bashrc/);
+});
+
+test('uninstallDaemonService removes the right thing per platform', () => {
+  freshHome();
+  freshXdg();
+  const install = recorder();
+  withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: install.run }));
+  const unit = commands.systemdUnitPath();
+  assert.ok(fs.existsSync(unit));
+
+  const rec = recorder();
+  const out = withPlatform('linux', () => commands.uninstallDaemonService({ run: rec.run }));
+  assert.deepEqual(out, { kind: 'systemd', removed: true });
+  assert.ok(!fs.existsSync(unit), 'the unit file is gone');
+  assert.deepEqual(rec.calls, [
+    'systemctl --user disable --now pidge-terminal.service',
+    'systemctl --user daemon-reload',
+  ]);
+  assert.ok(!rec.calls.some((c) => c.startsWith('launchctl')), 'linux teardown never calls launchctl');
+
+  // darwin side: the plist goes, and a second pass is honest about finding nothing.
+  freshHome();
+  const mac = recorder();
+  withPlatform('darwin', () => commands.installDaemonService({ run: mac.run }));
+  const plist = commands.launchdPlistPath();
+  assert.ok(fs.existsSync(plist));
+  const rec2 = recorder();
+  assert.deepEqual(withPlatform('darwin', () => commands.uninstallDaemonService({ run: rec2.run })),
+    { kind: 'launchd', removed: true });
+  assert.ok(!fs.existsSync(plist));
+  assert.deepEqual(withPlatform('darwin', () => commands.uninstallDaemonService({ run: rec2.run })),
+    { kind: 'launchd', removed: false }, 'a second teardown reports nothing removed instead of throwing');
+});
+
+test('ttyPath turns a ps short name into the path tmux reports — on BOTH ps flavors', () => {
+  // tmux's #{pane_tty} is always absolute; `ps -o tty=` is short and its
+  // "no controlling tty" marker differs by OS ('??' macOS, '?' Linux).
+  assert.equal(commands.ttyPath('ttys003'), '/dev/ttys003');
+  assert.equal(commands.ttyPath('pts/3'), '/dev/pts/3', 'Linux panes must resolve to /dev/pts/N');
+  assert.equal(commands.ttyPath('/dev/pts/3'), '/dev/pts/3', 'an already-absolute name is not doubled');
+  assert.equal(commands.ttyPath('??'), null, 'macOS: no controlling tty');
+  assert.equal(commands.ttyPath('?'), null, 'Linux: no controlling tty — never /dev/?');
+  assert.equal(commands.ttyPath(''), null);
+  assert.equal(commands.ttyPath(null), null);
+});
+
+test('processCwd resolves a live process without needing lsof', () => {
+  // /proc/<pid>/cwd on Linux, lsof on macOS — either way THIS process's cwd.
+  assert.equal(commands.processCwd(process.pid), process.cwd());
+});
+
+// ===========================================================================
 // 4. daemon: sealing and the input-lane replay ledger
 // ===========================================================================
 

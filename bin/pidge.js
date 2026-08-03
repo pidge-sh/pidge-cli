@@ -401,7 +401,7 @@ const OPTIONS = {
   session: { type: 'string' },                 // terminal enable/disable: explicit session id (else ancestor-walk)
   approvals: { type: 'string' },               // terminal enable: comma tool list for the approval gate (off by default)
   yes: { type: 'boolean' },                    // terminal connect: skip the consent prompt (scripted installs)
-  'no-daemon': { type: 'boolean' },            // terminal connect: skip the launchd install
+  'no-daemon': { type: 'boolean' },            // terminal connect: skip the service install (any platform)
   // listen keeps going after a batch (supervisor loop, one process)
   follow: { type: 'boolean' },
   force: { type: 'boolean' },                  // setup: overwrite a config owned by ANOTHER channel
@@ -706,7 +706,7 @@ const OPTION_DOCS = {
   session: '--session SID            terminal: target a session id from `pidge terminal ls` (default: ancestor-walk)',
   approvals: '--approvals T1,T2        terminal enable: gate these tools behind an Approve/Deny push (off by default)',
   yes: '--yes                    terminal connect: skip the consent prompt (scripted installs)',
-  'no-daemon': '--no-daemon              terminal connect: skip the launchd install (run `pidge terminal daemon` yourself)',
+  'no-daemon': '--no-daemon              terminal connect: skip the service install on any platform (run `pidge terminal daemon` yourself)',
   global: '--global                 store in the shared machine file (~/.config/pidge/env) instead of the project scope — for a daemon/cron that runs outside any project',
   'url-base': '--url BASE               the Pidge server base URL (default https://api.pidge.sh)',
   print: '--print                  emit `export …` lines instead of writing a file (per-agent; you run it)',
@@ -906,7 +906,7 @@ const HELP = {
     summary: 'Agent Sessions: mirror a Claude Code session to the phone as structured, E2E-sealed conversation data; typed replies come back into the session.',
     usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon]  ·  pidge terminal enable [--session SID] [--approvals Tool1,Tool2]  ·  pidge terminal ls | disable [--session SID|--all] | status | disconnect',
     body: [
-      'The user runs claude inside tmux — that is their ENTIRE responsibility. `connect` (once per computer) pairs with the phone: the app\'s Settings → Computers → Connect a computer mints a tunnel channel + E2E key and shows a one-liner carrying the claim code + PIDGE_SECRET; paste it in a terminal. It asks consent, installs Claude Code hooks (tagged `# pidge-hook`, cleanly removable) and a background daemon.',
+      'The user runs claude inside tmux — that is their ENTIRE responsibility. `connect` (once per computer) pairs with the phone: the app\'s Settings → Computers → Connect a computer mints a tunnel channel + E2E key and shows a one-liner carrying the claim code + PIDGE_SECRET; paste it in a terminal. It asks consent, installs Claude Code hooks (tagged `# pidge-hook`, cleanly removable) and a background daemon (launchd on macOS, `systemd --user` on Linux/WSL; a WSL without systemd gets a detached daemon + the line that makes it durable).',
       '',
       'SHARING IS PER SESSION and opt-in: nothing leaves the computer until `enable`. The prompt door: tell the claude running in tmux "enable yourself on Pidge" — the skill runs `pidge terminal enable`, which walks its process tree to the claude ancestor, reads its tty+cwd, binds the exact tmux pane and the exact transcript. The picker door: `pidge terminal ls` lists shareable sessions. A NEW claude in the same pane is NOT auto-enabled (consent is per session id).',
       '',

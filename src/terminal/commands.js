@@ -11,12 +11,13 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const readline = require('readline');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const core = require('./core');
 
 const PIDGE_HOOK_MARKER = '# pidge-hook';
 const DAEMON_PORT = 41717;
 const LAUNCHD_LABEL = 'sh.pidge.terminal';
+const SYSTEMD_UNIT = 'pidge-terminal.service';
 const HOOK_EVENTS = [
   ['SessionStart', 'session-start', 10],
   ['PreToolUse', 'pre-tool-use', 90], // holds for the approval gate (spec §9)
@@ -118,14 +119,19 @@ async function runConnect(v) {
     say('· hooks NOT installed — sessions cannot announce; `pidge terminal enable` will refuse until you re-run connect');
   }
 
-  // Daemon config + launchd.
+  // Daemon config + this computer's service manager (--no-daemon skips the
+  // install on EVERY platform — the manual line is the same everywhere).
   const cfg = core.readJson(core.DAEMON_FILE(), null) || { port: DAEMON_PORT, token: crypto.randomBytes(24).toString('base64url') };
   core.writeJson(core.DAEMON_FILE(), cfg);
   if (v['no-daemon']) {
     say('· --no-daemon: start it yourself with `pidge terminal daemon`');
   } else {
-    installLaunchd();
-    say(`✓ daemon installed (launchd ${LAUNCHD_LABEL}) — logs at ${core.LOG_FILE()}`);
+    const svc = installDaemonService();
+    if (svc.kind === 'launchd') say(`✓ daemon installed (launchd ${svc.label}) — logs at ${core.LOG_FILE()}`);
+    else if (svc.kind === 'systemd') {
+      say(`✓ daemon installed (systemd --user ${svc.label}) — logs at ${core.LOG_FILE()}`);
+      say('  (survive logout: `loginctl enable-linger $USER`)');
+    } else say(`· daemon logs at ${core.LOG_FILE()}`);
   }
   say('\nDone. Start (or restart) claude inside a tmux pane, then tell it\n"enable yourself on Pidge" — or run `pidge terminal ls` to pick a session.');
 }
@@ -154,10 +160,13 @@ process.stdin.on('data', (c) => { input += c; });
 process.stdin.on('end', async () => {
   let body; try { body = JSON.parse(input || '{}'); } catch { body = {}; }
   try {
+    // The short tty name (macOS 'ttys003', Linux 'pts/3') becomes the absolute
+    // path tmux reports as #{pane_tty}. "no tty" is '??' on macOS and '?' on
+    // Linux — both must resolve to null, never to '/dev/?'.
     body.tty = (() => {
       try {
         const t = execFileSync('ps', ['-o', 'tty=', '-p', String(process.pid)], { encoding: 'utf8' }).trim();
-        return t && t !== '??' ? '/dev/' + t : null;
+        return t && !/^\\?+$/.test(t) ? (t.startsWith('/') ? t : '/dev/' + t) : null;
       } catch { return null; }
     })();
     const ctl = new AbortController();
@@ -274,23 +283,87 @@ function uninstallHooks() {
   writeClaudeSettings(settings);
 }
 
-// --- launchd ----------------------------------------------------------------
+// --- the daemon service (launchd · systemd --user · detached fallback) -------
+//
+// The feature is not macOS-only: it needs node + tmux, which every developer
+// box has. So the supervisor is chosen per platform — launchd on macOS,
+// `systemd --user` on Linux (including WSL2 with systemd enabled) — and a
+// computer with NO user service manager (an older WSL, a container) still gets
+// a RUNNING daemon plus the two lines that make it durable. Never a hard
+// failure: `connect` that half-works is worse than one that says what's left.
 
 function xmlEscape(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
+// systemd unit-file quoting: double quotes with backslash escapes, PLUS the
+// unit-file expansions ('$$' = literal $, '%%' = literal %) — a node path or a
+// PATH entry containing either must arrive verbatim.
+function systemdQuote(s) {
+  return '"' + String(s)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\$/g, () => '$$')
+    .replace(/%/g, '%%') + '"';
+}
+
 function launchdPlistPath() {
   return path.join(os.homedir(), 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`);
 }
 
-function installLaunchd() {
+function systemdUnitPath() {
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+    'systemd', 'user', SYSTEMD_UNIT);
+}
+
+// PIDGE_TERMINAL_PLATFORM: test hook so EVERY template is exercised on any OS
+// (same shape as the bridge installer's PIDGE_BRIDGE_PLATFORM).
+function daemonPlatform(probe = {}) {
+  return probe.platform || process.env.PIDGE_TERMINAL_PLATFORM || process.platform;
+}
+
+// A user service manager we can actually talk to. `/run/systemd/system` is the
+// canonical "systemd is PID 1" marker; the systemctl probe additionally proves
+// the per-user manager is reachable (a WSL2 with systemd=true but no user bus
+// would otherwise take us down a path that silently does nothing).
+function hasSystemd() {
+  if (fs.existsSync('/run/systemd/system')) return true;
+  try {
+    execFileSync('systemctl', ['--user', '--no-pager'], { stdio: 'ignore' });
+    return true;
+  } catch { return false; }
+}
+
+// WSL has no user service manager unless the human opted into systemd, so it
+// gets its own (actionable) fallback text.
+function isWsl() {
+  if (process.env.WSL_DISTRO_NAME) return true;
+  try { return /microsoft/i.test(fs.readFileSync('/proc/version', 'utf8')); } catch { return false; }
+}
+
+// node + the CLI entry point the service will run. Shared by every branch.
+function daemonExec() {
   const nodeBin = process.execPath;
   const cli = require.main ? require.main.filename : path.join(__dirname, '..', '..', 'bin', 'pidge.js');
   if (/[\\/]_npx[\\/]/.test(cli)) {
-    console.error('pidge terminal: WARNING — running from the npx CACHE; the launchd template points into it and BREAKS when npx prunes. Install durably (npm i -g pidge-cli) and re-run `pidge terminal connect`.');
+    console.error('pidge terminal: WARNING — running from the npx CACHE; the service template points into it and BREAKS when npx prunes. Install durably (npm i -g pidge-cli) and re-run `pidge terminal connect`.');
   }
+  return { nodeBin, cli };
+}
+
+// `probe` exists for the TESTS and nothing else: it lets one machine exercise
+// every template (and lets the assertions prove which OS command was, and was
+// NOT, run). Production always takes the defaults.
+function installDaemonService(probe = {}) {
+  const run = probe.run || ((cmd, args) => execFileSync(cmd, args, { stdio: 'ignore' }));
+  return daemonPlatform(probe) === 'darwin'
+    ? installLaunchd(run)
+    : installSystemdUser(probe, run);
+}
+
+function installLaunchd(run) {
+  const { nodeBin, cli } = daemonExec();
   const envBlock = process.env.PATH
     ? `  <key>EnvironmentVariables</key>\n  <dict>\n    <key>PATH</key><string>${xmlEscape(process.env.PATH)}</string>\n  </dict>\n`
     : '';
@@ -322,20 +395,139 @@ ${envBlock}  <key>StandardOutPath</key><string>${xmlEscape(core.LOG_FILE())}</st
   const file = launchdPlistPath();
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, plist);
-  try { execFileSync('launchctl', ['unload', file], { stdio: 'ignore' }); } catch {}
+  try { run('launchctl', ['unload', file]); } catch {}
   try {
-    execFileSync('launchctl', ['load', '-w', file], { stdio: 'ignore' });
+    run('launchctl', ['load', '-w', file]);
   } catch (e) {
     console.error(`pidge terminal: launchctl load failed (${e.message}) — start manually: launchctl load -w "${file}"`);
   }
+  return { kind: 'launchd', file, label: LAUNCHD_LABEL };
+}
+
+function installSystemdUser(probe, run) {
+  const systemd = probe.systemd !== undefined ? probe.systemd : hasSystemd();
+  if (!systemd) return startDetachedDaemon(probe);
+
+  const { nodeBin, cli } = daemonExec();
+  // launchd/systemd hand a service a MINIMAL PATH — and this daemon SHELLS OUT
+  // to tmux and ps on every enable and every keystroke it delivers. A tmux from
+  // homebrew/nix/~/.local/bin would simply not exist for the service while
+  // working fine in the shell the human just tested from.
+  const envPairs = {};
+  if (process.env.PATH) envPairs.PATH = process.env.PATH;
+  if (process.env.XDG_CONFIG_HOME) envPairs.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
+  const envLines = Object.entries(envPairs)
+    .map(([k, val]) => `Environment=${systemdQuote(`${k}=${val}`)}`).join('\n');
+  const unit = `# generated by \`pidge terminal connect\`. The tunnel key stays in
+# ~/.config/pidge/terminal/env — NEVER embedded here.
+[Unit]
+Description=pidge terminal daemon — Agent Sessions (local hook endpoint, sealed publisher, input lane)
+# Wants + After: After alone only ORDERS against the target if something else
+# pulls it in — Wants actually pulls it into the transaction.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=${systemdQuote(nodeBin)} ${systemdQuote(cli)} terminal daemon
+Restart=on-failure
+RestartSec=10
+${envLines ? envLines + '\n' : ''}StandardOutput=append:${core.LOG_FILE()}
+StandardError=append:${path.join(core.terminalDir(), 'terminal.err.log')}
+
+[Install]
+WantedBy=default.target
+`;
+  const file = systemdUnitPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, unit);
+  try {
+    run('systemctl', ['--user', 'daemon-reload']);
+    run('systemctl', ['--user', 'enable', '--now', SYSTEMD_UNIT]);
+  } catch (e) {
+    console.error(`pidge terminal: systemctl failed (${e.message}) — start it manually:\n  systemctl --user daemon-reload && systemctl --user enable --now ${SYSTEMD_UNIT}`);
+  }
+  return { kind: 'systemd', file, label: SYSTEMD_UNIT };
+}
+
+// No user service manager (an older WSL, /etc/wsl.conf without systemd, a bare
+// container). Refusing here would leave a connected tunnel with no daemon, so
+// we START it — detached, so it outlives this shell — and say exactly what
+// makes it survive a reboot.
+function startDetachedDaemon(probe = {}) {
+  const { nodeBin, cli } = daemonExec();
+  const spawnFn = probe.spawn || spawn;
+  let pid = null;
+  try {
+    const child = spawnFn(nodeBin, [cli, 'terminal', 'daemon'], { detached: true, stdio: 'ignore' });
+    child.unref();
+    pid = child.pid;
+  } catch (e) {
+    console.error(`pidge terminal: could not start the daemon (${e.message}) — run it yourself: pidge terminal daemon`);
+  }
+  const wsl = probe.wsl !== undefined ? probe.wsl : isWsl();
+  say(`· no user service manager here (no systemd)${pid ? ` — daemon started detached (pid ${pid})` : ''}`);
+  say('  It will NOT come back after a reboot. Make it durable, either:');
+  if (wsl) {
+    say('   · enable systemd — add to /etc/wsl.conf:');
+    say('       [boot]');
+    say('       systemd=true');
+    say('     then `wsl --shutdown` from Windows and re-run `pidge terminal connect`');
+  }
+  say('   · or start it from your shell profile (~/.bashrc, ~/.zshrc):');
+  say('       pgrep -f "terminal daemon" >/dev/null || (pidge terminal daemon &)');
+  return { kind: 'detached', pid, wsl };
+}
+
+function uninstallDaemonService(probe = {}) {
+  const run = probe.run || ((cmd, args) => execFileSync(cmd, args, { stdio: 'ignore' }));
+  if (daemonPlatform(probe) === 'darwin') {
+    const file = launchdPlistPath();
+    try { run('launchctl', ['unload', '-w', file]); } catch {}
+    try { fs.unlinkSync(file); return { kind: 'launchd', removed: true }; } catch { return { kind: 'launchd', removed: false }; }
+  }
+  const file = systemdUnitPath();
+  try { run('systemctl', ['--user', 'disable', '--now', SYSTEMD_UNIT]); } catch {}
+  let removed = false;
+  try { fs.unlinkSync(file); removed = true; } catch {}
+  if (removed) { try { run('systemctl', ['--user', 'daemon-reload']); } catch {} }
+  return { kind: 'systemd', removed };
 }
 
 // --- enable (the ancestor walk — spec §2's prompt door) ---------------------
 
+// `command`, `ppid` and `tty` are POSIX/GNU `ps` output specs — identical on
+// macOS (BSD ps) and Linux (procps).
 function psField(pid, field) {
   try {
     return execFileSync('ps', ['-o', `${field}=`, '-p', String(pid)], { encoding: 'utf8' }).trim();
   } catch { return ''; }
+}
+
+// `ps -o tty=` prints a SHORT name (`ttys003` on macOS, `pts/3` on Linux) that
+// must become the absolute path tmux reports as `#{pane_tty}` (`/dev/pts/3`).
+// "no controlling tty" is `??` on macOS but a single `?` on Linux — reading
+// that as a name yields the nonexistent `/dev/?`, and the pane lookup then
+// fails with a confusing message instead of the honest "no tty" refusal.
+function ttyPath(short) {
+  const t = String(short || '').trim();
+  if (!t || /^\?+$/.test(t)) return null;
+  return t.startsWith('/') ? t : `/dev/${t}`;
+}
+
+// The working directory of another process. `/proc/<pid>/cwd` is a symlink on
+// Linux — free, always present, and lsof frequently is NOT installed on a
+// minimal distro or container. macOS has no /proc, so it falls through to lsof.
+function processCwd(pid) {
+  try {
+    const link = fs.readlinkSync(`/proc/${pid}/cwd`);
+    if (link) return link.replace(/ \(deleted\)$/, '');
+  } catch {}
+  try {
+    const out = execFileSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8' });
+    const m = out.split('\n').find((l) => l.startsWith('n'));
+    return m ? m.slice(1) : null;
+  } catch {}
+  return null;
 }
 
 function isClaudeCommand(c) {
@@ -349,15 +541,7 @@ function findClaudeAncestor() {
   for (let hops = 0; hops < 20 && pid > 1; hops++) {
     const command = psField(pid, 'command');
     if (isClaudeCommand(command)) {
-      const ttyShort = psField(pid, 'tty');
-      const tty = ttyShort && ttyShort !== '??' ? `/dev/${ttyShort}` : null;
-      let cwd = null;
-      try {
-        const out = execFileSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8' });
-        const m = out.split('\n').find((l) => l.startsWith('n'));
-        cwd = m ? m.slice(1) : null;
-      } catch {}
-      return { pid, tty, cwd };
+      return { pid, tty: ttyPath(psField(pid, 'tty')), cwd: processCwd(pid) };
     }
     const up = psField(pid, 'ppid');
     if (!up) break;
@@ -510,9 +694,9 @@ async function runDisconnect() {
   if (health) { try { await daemonCall('POST', '/disable', { all: true }); } catch {} }
   uninstallHooks();
   say('✓ hooks removed from ~/.claude/settings.json');
-  const file = launchdPlistPath();
-  try { execFileSync('launchctl', ['unload', '-w', file], { stdio: 'ignore' }); } catch {}
-  try { fs.unlinkSync(file); say('✓ daemon uninstalled (launchd)'); } catch {}
+  const svc = uninstallDaemonService();
+  if (svc.removed) say(`✓ daemon uninstalled (${svc.kind})`);
+  else say(`· no ${svc.kind} service to remove — if a daemon is still running (the no-systemd fallback starts one detached), stop it with: pkill -f "terminal daemon"`);
   say('· tunnel identity kept at ' + core.ENV_FILE() + ' — delete it (and the tunnel in the app) to fully unlink');
 }
 
@@ -536,4 +720,8 @@ async function runTerminal(sub, v) {
   }
 }
 
-module.exports = { runTerminal, installHooks, uninstallHooks, hookShimSource, PIDGE_HOOK_MARKER };
+module.exports = {
+  runTerminal, installHooks, uninstallHooks, hookShimSource, PIDGE_HOOK_MARKER,
+  installDaemonService, uninstallDaemonService, launchdPlistPath, systemdUnitPath,
+  ttyPath, processCwd, SYSTEMD_UNIT, LAUNCHD_LABEL,
+};
