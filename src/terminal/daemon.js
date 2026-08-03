@@ -32,6 +32,10 @@ const HEARTBEAT_MS = 30_000;
 const WATCHDOG_MS = 15_000;
 const BACKFILL_ITEMS = 100;             // spec §6
 const BACKFILL_SEALED_BYTES = 512 * 1024;
+// How many recently-published uuids ride in state.json per session. The uuid
+// set is what stops a rescan/rotation from re-publishing a whole transcript,
+// and an in-memory-only set is empty after a restart — see seedSeenFromFile.
+const SEEN_RING = 500;
 const INPUT_KEYS = new Set(['Enter', 'Escape', 'Up', 'Down', 'Tab', 'BTab', 'C-c']);
 
 function nowIso() { return new Date().toISOString(); }
@@ -52,7 +56,17 @@ class Daemon {
     this.ws = null;              // one cable socket, N subscriptions
     this.wsGen = 0;              // identity guard for reconnects (#66)
     this.wsLastBeat = 0;
-    this.replay = new Map();     // `${publicId}|${vgen}` → last seq
+    this.replay = new Map();     // `${publicId}|${vgen}` → last seq (never pruned:
+                                 // a viewer generation must stay monotonic for the
+                                 // life of the process, including across a
+                                 // disable/re-enable of the same sid)
+    // RESERVED, deliberately empty in v1: there is no wire signal that retires a
+    // viewer generation (the spec's grow-only retired set needs one). Replay
+    // defense in v1 rests on the mandatory `he` epoch echo — which kills every
+    // pre-restart ciphertext — plus the per-vgen monotonic seq ledger above.
+    // Populating this on disable was considered and REJECTED: the app can reuse
+    // a vgen across a re-enable, and dropping a live viewer's input silently is
+    // worse than the replay window the epoch echo already closes.
     this.retiredVgens = new Set();
     this.logStream = null;
   }
@@ -178,7 +192,7 @@ class Daemon {
         if (s && tp && tp !== s.file) {
           // /clear+resume rotation: same sid, new file — SAME AgentSession (spec §6).
           this.log(`session ${sid.slice(0, 8)}: transcript rotated → ${path.basename(tp)}`);
-          s.file = tp; s.offset = 0; s.partial = ''; // uuid dedup absorbs the re-read
+          s.file = tp; s.offset = 0; s.bulk = true; // uuid dedup absorbs the re-read; bulk caps it (§6)
           this.persistSession(s);
         }
         return send(200, {});
@@ -252,14 +266,33 @@ class Daemon {
     }
     if (this.sessions.has(sid)) {
       const s = this.sessions.get(sid);
-      return send(200, { already: true, public_id: s.publicId });
+      return send(200, { already: true, public_id: s.publicId, pane_bound: !!s.paneId, read_only: !s.paneId });
+    }
+    // The `--session <sid>` (ls-fallback) door sends no pane_id: the CLI never
+    // walked an ancestor, so it has nothing to offer. Resolve the pane from the
+    // ANNOUNCED tty exactly as the ancestor-walk door does — otherwise this door
+    // quietly produced a read-only session the phone still showed as
+    // interactive, and every keystroke from the composer was dropped (spec §8).
+    let bound = paneId || null;
+    if (!bound) {
+      const hit = core.tmuxPaneForTty(ann.tty || tty || null);
+      if (hit) {
+        bound = hit.paneId;
+        this.log(`enable ${sid.slice(0, 8)}: pane ${hit.paneId} (${hit.loc}) resolved from tty ${ann.tty || tty}`);
+      }
     }
     try {
       const s = await this.enableSession({
-        sid, paneId: paneId || null, tty: ann.tty, cwd: cwd || ann.cwd,
+        sid, paneId: bound, tty: ann.tty, cwd: cwd || ann.cwd,
         file: ann.transcriptPath, approvals: Array.isArray(approvals) ? approvals : [],
       });
-      return send(200, { public_id: s.publicId, backfilled: s.backfilled });
+      // read_only is the honest flag: enable still SUCCEEDS (the transcript is
+      // worth sharing on its own), but the human must be told that typing back
+      // will not reach this session.
+      return send(200, {
+        public_id: s.publicId, backfilled: s.backfilled,
+        pane_bound: !!s.paneId, read_only: !s.paneId,
+      });
     } catch (e) {
       this.log('enable failed:', e.message);
       return send(502, { error: e.message });
@@ -271,7 +304,16 @@ class Daemon {
     try {
       return await this.enableSessionLocked({ sid, paneId, tty, cwd, file, approvals });
     } catch (e) {
-      this.releaseWriterLock(sid); // a failed enable must not strand the lock
+      // A failed enable must not strand the lock — NOR leave the half-enabled
+      // record live: enableSessionLocked inserts into this.sessions and persists
+      // before the first backfill flush, so a throw after that point would leave
+      // a session publishing without the single-writer guarantee and reviving
+      // from state.json on the next boot.
+      const s = this.sessions.get(sid);
+      if (s) { s.gen += 1; this.sessions.delete(sid); }
+      delete this.state.sessions[sid];
+      this.saveState();
+      this.releaseWriterLock(sid);
       throw e;
     }
   }
@@ -283,12 +325,13 @@ class Daemon {
       paneId, tty, cwd, file,
       title: path.basename(cwd || 'session'),
       hv: null,
-      offset: 0, partial: '',
-      seenUuids: new Set(),
+      offset: 0,
+      seenUuids: new Set(), seenRing: [],
       queue: [], nextSeq: 1,
       status: 'idle', waitingArmed: true,
       approvals: approvals || [],
       flushing: false, backfilled: 0,
+      backoff: 0, nextFlushAt: 0, // publish backoff window (flushTick honors it)
       gen: 0, // teardown identity (#66)
     };
     const echo = await this.registerSession(session, 'idle');
@@ -301,10 +344,22 @@ class Daemon {
     return session;
   }
 
+  // Record a uuid as published. Returns false when it was already known — the
+  // ONE dedup gate for the tailer, the backfill and every rescan. `seenRing` is
+  // the bounded, persistable tail of the same knowledge (see persistSession).
+  markSeen(s, uuid) {
+    if (s.seenUuids.has(uuid)) return false;
+    s.seenUuids.add(uuid);
+    s.seenRing.push(uuid);
+    if (s.seenRing.length > SEEN_RING) s.seenRing.splice(0, s.seenRing.length - SEEN_RING);
+    return true;
+  }
+
   persistSession(s) {
     this.state.sessions[s.sid] = {
       publicId: s.publicId, paneId: s.paneId, tty: s.tty, cwd: s.cwd,
       file: s.file, offset: s.offset, nextSeq: s.nextSeq, approvals: s.approvals,
+      seen: s.seenRing, // restart dedup (§6) — see seedSeenFromFile
     };
     this.saveState();
   }
@@ -330,12 +385,16 @@ class Daemon {
         this.acquireWriterLock(sid);
         const session = {
           sid, publicId: p.publicId, paneId: p.paneId, tty: p.tty, cwd: p.cwd,
-          file: p.file, offset: p.offset || 0, partial: '',
+          file: p.file, offset: p.offset || 0,
           title: path.basename(p.cwd || 'session'), hv: null,
-          seenUuids: new Set(), queue: [], nextSeq: p.nextSeq || 1,
+          // Restart dedup: start from the persisted ring, then rebuild the rest
+          // from the bytes we already published (below) BEFORE any tick can emit.
+          seenUuids: new Set(p.seen || []), seenRing: [...(p.seen || [])],
+          queue: [], nextSeq: p.nextSeq || 1,
           status: 'idle', waitingArmed: true, approvals: p.approvals || [],
-          flushing: false, backfilled: 0, gen: 0,
+          flushing: false, backfilled: 0, backoff: 0, nextFlushAt: 0, gen: 0,
         };
+        this.seedSeenFromFile(session);
         const echo = await this.registerSession(session, 'idle');
         session.nextSeq = Math.max(session.nextSeq, (echo.last_seq || 0) + 1);
         this.sessions.set(sid, session);
@@ -377,18 +436,86 @@ class Daemon {
 
   // --- tailer + publisher ---------------------------------------------------
 
+  // Read [0, len) of the session file and return its COMPLETE lines as parsed
+  // JSONL records (the trailing fragment, if any, is left for the tailer).
+  readRecords(file, from, to) {
+    const fd = fs.openSync(file, 'r');
+    let buf;
+    try {
+      buf = Buffer.alloc(Math.max(0, to - from));
+      if (buf.length) fs.readSync(fd, buf, 0, buf.length, from);
+    } finally { fs.closeSync(fd); }
+    const lastNl = buf.lastIndexOf(0x0a);
+    const complete = lastNl >= 0 ? buf.subarray(0, lastNl + 1).toString('utf8') : '';
+    const objs = [];
+    for (const line of complete.split('\n')) {
+      if (!line.trim()) continue;
+      let obj; try { obj = JSON.parse(line); } catch { continue; }
+      objs.push(obj);
+    }
+    // consumed = how far the caller may advance its offset: never past a record
+    // still being written (a half-flushed line would otherwise be skipped forever).
+    return { objs, consumed: from + lastNl + 1 };
+  }
+
+  // Rebuild the dedup set after a daemon restart.
+  //
+  // seenUuids is what keeps a rescan (`size < offset`, the probe-proven
+  // in-place rewrite) or a /clear rotation from re-publishing an entire
+  // transcript under fresh seqs. It lives in memory, so a restart used to empty
+  // it: the very next rescan re-emitted every record the phone already had.
+  // Two guards, cheapest first: the ring persisted in state.json, plus a
+  // no-emit re-read of the prefix we already published ([0, offset)). This runs
+  // BEFORE the session joins this.sessions, so no tick can emit in between.
+  seedSeenFromFile(s) {
+    if (!s.offset) return;
+    let objs;
+    try {
+      const st = fs.statSync(s.file);
+      ({ objs } = this.readRecords(s.file, 0, Math.min(s.offset, st.size)));
+    } catch (e) {
+      this.log(`${s.sid.slice(0, 8)}: dedup set could not be reseeded (${e.message}) — the ${s.seenUuids.size} persisted uuid(s) are the only guard`);
+      return;
+    }
+    for (const obj of objs) for (const item of adapter.normalize(obj)) this.markSeen(s, item.uuid);
+    this.log(`${s.sid.slice(0, 8)}: dedup set reseeded with ${s.seenUuids.size} published uuid(s)`);
+  }
+
+  // Seal + enqueue a BULK emission (the enable backfill, a rescan, a /clear
+  // rotation), bounded to the LAST 100 items / 512 KB sealed (spec §6). Live
+  // tailing goes through the unbounded path — this cap exists so a 5k-item
+  // transcript can never flood the lane in one go.
+  enqueueBounded(s, items, why) {
+    let total = 0;
+    const sealed = [];
+    for (const item of items.slice(-BACKFILL_ITEMS).reverse()) { // newest first for the budget…
+      item._publicId = s.publicId;
+      let b64 = null;
+      try { b64 = this.sealItem(item); } catch (e) { this.log(`item ${item.uuid}: seal failed (${e.message}) — skipped`); }
+      if (b64 === null) continue;
+      const bytes = Buffer.byteLength(b64, 'utf8');
+      if (total + bytes > BACKFILL_SEALED_BYTES) break;
+      total += bytes;
+      sealed.push(b64);
+    }
+    sealed.reverse(); // …back to oldest-first for seq order
+    for (const b64 of sealed) s.queue.push(b64);
+    if (items.length > sealed.length) {
+      this.log(`${why}: seeded ${sealed.length}/${items.length} items (bounded window — earlier history stays on this Mac)`);
+    }
+    return sealed.length;
+  }
+
   async backfill(session) {
     // Seed = the LAST 100 items / 512 KB sealed, oldest-first (spec §6).
     const items = [];
     try {
-      const raw = fs.readFileSync(session.file, 'utf8');
-      session.offset = Buffer.byteLength(raw, 'utf8');
-      for (const line of raw.split('\n')) {
-        if (!line.trim()) continue;
-        let obj; try { obj = JSON.parse(line); } catch { continue; }
+      const st = fs.statSync(session.file);
+      const { objs, consumed } = this.readRecords(session.file, 0, st.size);
+      session.offset = consumed; // NOT st.size: a record mid-write stays unread
+      for (const obj of objs) {
         for (const item of adapter.normalize(obj)) {
-          if (session.seenUuids.has(item.uuid)) continue;
-          session.seenUuids.add(item.uuid);
+          if (!this.markSeen(session, item.uuid)) continue;
           if (item.hv) session.hv = item.hv;
           items.push(item);
         }
@@ -397,27 +524,10 @@ class Daemon {
       this.log(`backfill read failed (${e.message}) — starting live-only`);
       return;
     }
-    let seed = items.slice(-BACKFILL_ITEMS);
-    // Budget by sealed size, dropping OLDEST first.
-    let sealedTotal = 0;
-    const sealedSeed = [];
-    for (const item of seed.reverse()) { // newest first for the budget…
-      item._publicId = session.publicId;
-      const b64 = this.sealItem(item);
-      if (b64 === null) continue;
-      const bytes = Buffer.byteLength(b64, 'utf8');
-      if (sealedTotal + bytes > BACKFILL_SEALED_BYTES) break;
-      sealedTotal += bytes;
-      sealedSeed.push({ item, b64 });
-    }
-    sealedSeed.reverse(); // …back to oldest-first for seq order
-    for (const { b64 } of sealedSeed) {
-      session.queue.push(b64);
-    }
-    session.backfilled = sealedSeed.length;
-    if (items.length > sealedSeed.length) {
-      this.log(`backfill: seeded ${sealedSeed.length}/${items.length} items (bounded window — earlier history stays on this Mac)`);
-    }
+    session.backfilled = this.enqueueBounded(session, items, 'backfill');
+    // Persist offset + the uuid ring BEFORE publishing (same order the tailer
+    // uses): a restart mid-flush must not re-read and re-publish the seed.
+    this.persistSession(session);
     await this.flush(session);
   }
 
@@ -429,33 +539,40 @@ class Daemon {
     let st;
     try { st = fs.statSync(s.file); } catch { return; }
     if (st.size < s.offset) {
-      // Truncated/rewritten in place (probe: RESCAN) — re-read whole, dedup by uuid.
+      // Truncated/rewritten in place (probe: RESCAN) — re-read whole, dedup by
+      // uuid. `bulk` makes this re-read obey the §6 cap: a 5k-item transcript
+      // whose dedup set is somehow cold must not flood the lane in one tick.
       this.log(`${s.sid.slice(0, 8)}: size ${st.size} < offset ${s.offset} — full rescan with uuid dedup`);
-      s.offset = 0; s.partial = '';
+      s.offset = 0; s.bulk = true;
     }
     if (st.size <= s.offset) return;
-    let buf;
+    const bulk = !!s.bulk;
+    s.bulk = false;
+    let objs, consumed;
     try {
-      const fd = fs.openSync(s.file, 'r');
-      buf = Buffer.alloc(st.size - s.offset);
-      fs.readSync(fd, buf, 0, buf.length, s.offset);
-      fs.closeSync(fd);
+      ({ objs, consumed } = this.readRecords(s.file, s.offset, st.size));
     } catch { return; }
-    s.offset = st.size;
-    const data = (s.partial || '') + buf.toString('utf8');
-    const lines = data.split('\n');
-    s.partial = lines.pop();
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let obj;
-      try { obj = JSON.parse(line); } catch { continue; }
+    // The trailing fragment of a record still being written is left UNREAD
+    // rather than carried in memory: offset only ever advances past COMPLETE
+    // records, so the next tick re-reads it (and a restart resumes at a record
+    // boundary instead of skipping the half-written one forever).
+    if (consumed <= s.offset) return;
+    s.offset = consumed;
+    const fresh = [];
+    for (const obj of objs) {
       for (const item of adapter.normalize(obj)) {
-        if (s.seenUuids.has(item.uuid)) continue;
-        s.seenUuids.add(item.uuid);
+        if (!this.markSeen(s, item.uuid)) continue;
         if (item.hv && item.hv !== s.hv) {
           if (s.hv) this.log(`${s.sid.slice(0, 8)}: harness version drift ${s.hv} → ${item.hv}`);
           s.hv = item.hv;
         }
+        fresh.push(item);
+      }
+    }
+    if (bulk) {
+      this.enqueueBounded(s, fresh, `${s.sid.slice(0, 8)}: rescan`);
+    } else {
+      for (const item of fresh) {
         item._publicId = s.publicId;
         // A seal failure on ONE item must never take the tailer interval down —
         // skip it loudly and keep tailing (the JSONL remains durable).
@@ -467,10 +584,33 @@ class Daemon {
     this.persistSession(s);
   }
 
+  // Does this record still own its slot? Every await inside flush must ask:
+  // `disable` bumps gen AND removes the session, and a late success that then
+  // persisted the record would REVIVE a share the human just revoked (#66).
+  stillOwns(session, gen) {
+    return session.gen === gen && this.sessions.get(session.sid) === session;
+  }
+
   async flushTick() {
+    const now = Date.now();
     for (const s of this.sessions.values()) {
-      if (s.queue.length && !s.flushing) this.flush(s).catch((e) => this.log('flush error:', e.message));
+      if (!s.queue.length || s.flushing) continue;
+      // Honor the backoff window. Without this the tick simply re-fired every
+      // 500 ms after every failure (`flushing` is cleared on the way out), so a
+      // Base-tier 402 or a 500 became a 2 req/s storm against the server AND
+      // piled up one retry timer per failure.
+      if (s.nextFlushAt && now < s.nextFlushAt) continue;
+      this.flush(s).catch((e) => this.log('flush error:', e.message));
     }
+  }
+
+  // Back off after a failed batch. No timer is scheduled: flushTick is already
+  // running every FLUSH_MS and picks the session up once the window elapses —
+  // one clock, no accumulation.
+  backOff(session, why) {
+    session.backoff = Math.min((session.backoff || 1) * 2, 60);
+    session.nextFlushAt = Date.now() + session.backoff * 1000;
+    this.log(`${session.publicId}: ${why}; retry in ${session.backoff}s (nothing lost — the JSONL is durable)`);
   }
 
   async flush(session) {
@@ -479,38 +619,77 @@ class Daemon {
     const gen = session.gen;
     try {
       while (session.queue.length) {
-        if (session.gen !== gen) return; // torn down mid-flush (#66)
+        if (!this.stillOwns(session, gen)) return; // torn down mid-flush (#66)
         const batch = session.queue.slice(0, this.caps.items_per_call);
         const items = batch.map((b64, i) => ({ seq: session.nextSeq + i, payload_sealed: b64 }));
         const { res, data } = await this.api('POST', `/agent_sessions/${session.publicId}/items`, { items });
+        // Re-check BEFORE any mutation: an await is a teardown window, and
+        // persistSession() on a disabled session writes it back into state.json
+        // — it would come back alive on the next boot (consent violation).
+        if (!this.stillOwns(session, gen)) {
+          this.log(`${session.publicId}: disabled mid-flush — response dropped, nothing re-persisted (#66)`);
+          return;
+        }
         if (res.status === 201) {
           session.queue.splice(0, batch.length);
           session.nextSeq = (data.last_seq || (session.nextSeq + batch.length - 1)) + 1;
           session.backoff = 0;
+          session.nextFlushAt = 0;
           this.persistSession(session);
         } else if (res.status === 422 && data && data.code === 'seq_regression') {
-          // Server knows more than our state (restart race): re-sync from it.
-          const { data: reg } = await this.api('POST', '/agent_sessions', {
-            public_id: session.publicId, status: session.status, meta_sealed: this.sealMeta(session),
-          });
-          const serverSeq = reg && reg.session ? reg.session.last_seq : null;
-          if (serverSeq === null || serverSeq + 1 === session.nextSeq) {
-            this.log(`${session.publicId}: seq_regression did not resolve — dropping ONE batch loudly to break the loop`);
-            session.queue.splice(0, batch.length);
-          } else {
-            this.log(`${session.publicId}: seq re-synced ${session.nextSeq} → ${serverSeq + 1}`);
-            session.nextSeq = serverSeq + 1;
-          }
+          if (!(await this.resyncSeq(session, gen))) return;
         } else {
-          session.backoff = Math.min((session.backoff || 1) * 2, 60);
-          this.log(`${session.publicId}: items POST → ${res.status}; retry in ${session.backoff}s (nothing lost — the JSONL is durable)`);
-          setTimeout(() => { if (session.gen === gen) this.flush(session).catch(() => {}); }, session.backoff * 1000);
+          this.backOff(session, `items POST → ${res.status}`);
           return;
         }
       }
     } finally {
       session.flushing = false;
     }
+  }
+
+  // seq_regression = the server already stored seqs we are re-sending. The
+  // canonical cause is a LOST 201: the batch landed, the ack didn't, so the
+  // retry replays stored seqs. Re-register to learn the server's high-water and
+  // drop from the queue EXACTLY the items at or below it — they are persisted
+  // already. Never re-send a stored seq (duplicates in the conversation), never
+  // blind-drop an unstored one (a hole the JSONL can no longer fill).
+  // Returns false when the caller must stop this flush pass.
+  async resyncSeq(session, gen) {
+    const { data: reg } = await this.api('POST', '/agent_sessions', {
+      public_id: session.publicId, status: session.status, meta_sealed: this.sealMeta(session),
+    });
+    if (!this.stillOwns(session, gen)) return false;
+    const serverSeq = reg && reg.session && Number.isInteger(reg.session.last_seq) ? reg.session.last_seq : null;
+    if (serverSeq === null) {
+      // Could not learn the high-water: back off and retry, do NOT guess.
+      this.backOff(session, 'seq_regression but the re-register carried no last_seq');
+      return false;
+    }
+    const firstSeq = session.nextSeq; // the seq queue[0] would have been sent as
+    const stored = serverSeq - firstSeq + 1;
+    if (stored > 0) {
+      const drop = Math.min(stored, session.queue.length);
+      session.queue.splice(0, drop);
+      this.log(`${session.publicId}: seq_regression — ${drop} queued item(s) were already stored (server last_seq ${serverSeq}); continuing at ${serverSeq + 1}`);
+    } else if (stored === 0) {
+      // Our numbering ALREADY continues the server's high-water, yet it 422'd:
+      // the re-sync explains nothing and re-sending the same seqs would spin
+      // forever. Back off instead of looping (and keep the items).
+      this.backOff(session, `seq_regression at seq ${firstSeq} that the re-register does not explain (server last_seq ${serverSeq})`);
+      return false;
+    } else {
+      // firstSeq > serverSeq + 1: a gap this daemon cannot fill (the missing
+      // items belong to a previous process). Renumber onto the server's
+      // high-water and keep going — loudly. The phone renders the gap; looping
+      // here forever would be worse (§11: visible boundary, never a silent splice).
+      this.log(`${session.publicId}: seq GAP — queue starts at ${firstSeq} but the server is at ${serverSeq}; resuming at ${serverSeq + 1}, the missing items are only on this Mac`);
+    }
+    session.nextSeq = serverSeq + 1;
+    session.backoff = 0;
+    session.nextFlushAt = 0;
+    this.persistSession(session);
+    return true;
   }
 
   // --- status + waiting notification (spec §9) ------------------------------
@@ -567,7 +746,11 @@ class Daemon {
       kf: core.e2eKeyFingerprint(this.key),
       title: core.e2eEncryptField(this.key, aad('title'), `Approve ${body.tool_name} in ${s.title}?`),
       body_markdown: core.e2eEncryptField(this.key, aad('body_markdown'), '```\n' + input + '\n```'),
-      actions: ['approve', 'deny'],
+      // The server's built-in pair is approve/REJECT (Notification::BUILTIN_CATALOG
+      // — there is no `deny` action id; it would be dropped silently, leaving an
+      // approve-only ask with no banner buttons). approve+reject is also an EXACT
+      // banner category (HERALD_APPROVE_REJECT), so both buttons ride the banner.
+      actions: ['approve', 'reject'],
       mirror_reply: false,
     };
     const { res, data } = await this.api('POST', '/notify', payload);
@@ -581,7 +764,7 @@ class Daemon {
         if (poll && poll.responded && poll.chosen_action) {
           const id = poll.chosen_action.action_id;
           if (id === 'approve') return { permissionDecision: 'allow', permissionDecisionReason: 'approved via Pidge' };
-          if (id === 'deny') return { permissionDecision: 'deny', permissionDecisionReason: 'denied via Pidge' };
+          if (id === 'reject') return { permissionDecision: 'deny', permissionDecisionReason: 'rejected via Pidge' };
           return null; // done/snooze/anything else: fall open to the local human
         }
       } catch { /* transient — keep waiting inside the budget */ }

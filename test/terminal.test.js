@@ -392,6 +392,55 @@ test('uninstallHooks on a machine that never installed is a no-op', () => {
   assert.ok(!fs.existsSync(settingsPath()), 'no settings file must be conjured out of nothing');
 });
 
+test('installHooks ABORTS on a malformed settings.json instead of overwriting it', () => {
+  freshHome();
+  freshXdg();
+  // A real Claude Code config with one stray trailing comma. The tolerant
+  // `readJson(file, {})` this replaces would have parsed it as {} and written
+  // back a settings.json containing ONLY the pidge hooks.
+  const broken = '{\n  "model": "opus",\n  "permissions": { "allow": ["Bash(git status)"], },\n}\n';
+  fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
+  fs.writeFileSync(settingsPath(), broken);
+
+  assert.throws(() => commands.installHooks(), /not valid JSON/);
+  assert.equal(fs.readFileSync(settingsPath(), 'utf8'), broken,
+    "the user's settings.json must survive byte-for-byte");
+
+  // Uninstall is equally hands-off (it must not abort `disconnect`, so it warns).
+  const errs = [];
+  const realError = console.error;
+  console.error = (...a) => errs.push(a.join(' '));
+  try { commands.uninstallHooks(); } finally { console.error = realError; }
+  assert.equal(fs.readFileSync(settingsPath(), 'utf8'), broken);
+  assert.ok(errs.some((l) => /not valid JSON/.test(l)), `expected a loud warning, got ${JSON.stringify(errs)}`);
+});
+
+test('installHooks preserves a restrictive settings.json mode and creates new ones private', () => {
+  freshHome();
+  freshXdg();
+  fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
+  fs.writeFileSync(settingsPath(), JSON.stringify({ model: 'opus' }, null, 2) + '\n', { mode: 0o600 });
+  fs.chmodSync(settingsPath(), 0o600);
+
+  commands.installHooks();
+  assert.equal(fs.statSync(settingsPath()).mode & 0o777, 0o600, 'a 0600 config must not come back world-readable');
+  commands.uninstallHooks();
+  assert.equal(fs.statSync(settingsPath()).mode & 0o777, 0o600);
+
+  freshHome();
+  commands.installHooks(); // no pre-existing file
+  assert.equal(fs.statSync(settingsPath()).mode & 0o777, 0o600);
+});
+
+test('installHooks refuses a settings.json that parses to a non-object', () => {
+  freshHome();
+  freshXdg();
+  fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
+  fs.writeFileSync(settingsPath(), '["not", "an", "object"]\n');
+  assert.throws(() => commands.installHooks(), /not valid JSON/);
+  assert.equal(fs.readFileSync(settingsPath(), 'utf8'), '["not", "an", "object"]\n');
+});
+
 test('the generated hook shim is valid JavaScript (node --check)', () => {
   const dir = tmp('pidge-term-shim-');
   const file = path.join(dir, 'pidge-hook.js');
@@ -608,6 +657,360 @@ test('the tool gate matches case-insensitively and honors the wildcard', () => {
   assert.equal(d.toolGated({ approvals: ['*'] }, 'Anything'), true);
   assert.equal(d.toolGated({ approvals: [] }, 'Bash'), false);
   assert.equal(d.toolGated({ approvals: ['*'] }, undefined), false);
+});
+
+// --- the publish lane (flush): backoff, teardown, seq re-sync ---------------
+
+// A minimal live session record, registered in the daemon's map exactly as
+// enableSession would leave it.
+function liveSession(d, { queue = [], nextSeq = 1, file = '/tmp/nonexistent.jsonl' } = {}) {
+  const s = {
+    sid: 'sess-flush', publicId: 'ases_t', paneId: '%1', tty: null, cwd: '/tmp/proj',
+    file, title: 'proj', hv: null,
+    offset: 0, seenUuids: new Set(), seenRing: [],
+    queue: [...queue], nextSeq, status: 'idle', waitingArmed: true, approvals: [],
+    flushing: false, backfilled: 0, backoff: 0, nextFlushAt: 0, gen: 0,
+  };
+  d.sessions.set(s.sid, s);
+  return s;
+}
+
+test('flush: a failing POST settles into exponential backoff instead of storming', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { queue: ['a', 'b'] });
+  let posts = 0;
+  d.api = async () => { posts += 1; return { res: { status: 402 }, data: { code: 'terminal_requires_pro' } }; };
+
+  await d.flush(s);
+  assert.equal(posts, 1);
+  assert.equal(s.backoff, 2);
+  assert.ok(s.nextFlushAt > Date.now(), 'the backoff window must be armed');
+  assert.equal(s.flushing, false);
+
+  // The 500 ms tick used to re-enter immediately (flushing was already false),
+  // turning every failure into a 2 req/s storm. It must now skip the session.
+  for (let i = 0; i < 10; i++) await d.flushTick();
+  assert.equal(posts, 1, 'flushTick must honor the backoff window');
+
+  // Once the window elapses, exactly ONE retry goes out and the window doubles.
+  s.nextFlushAt = Date.now() - 1;
+  await d.flushTick();
+  assert.equal(posts, 2);
+  assert.equal(s.backoff, 4);
+  assert.deepEqual(s.queue, ['a', 'b'], 'nothing is lost — the JSONL is durable');
+
+  // A success clears the window.
+  d.api = async () => ({ res: { status: 201 }, data: { accepted: 2, last_seq: 2 } });
+  s.nextFlushAt = Date.now() - 1;
+  await d.flushTick();
+  assert.deepEqual(s.queue, []);
+  assert.equal(s.backoff, 0);
+  assert.equal(s.nextFlushAt, 0);
+  assert.equal(s.nextSeq, 3);
+});
+
+test('flush: a session disabled mid-POST is NOT revived by the late 201', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { queue: ['a'] });
+  d.persistSession(s); // as enable would have
+  assert.ok(core.readJson(core.STATE_FILE(), {}).sessions['sess-flush'], 'precondition: persisted');
+
+  d.api = async (method, p) => {
+    if (method === 'POST' && /\/items$/.test(p)) {
+      // The human hits `pidge terminal disable` while the request is in flight.
+      await d.disableSession('sess-flush', 'requested');
+      return { res: { status: 201 }, data: { accepted: 1, last_seq: 1 } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
+
+  await d.flush(s);
+  assert.equal(d.sessions.has('sess-flush'), false);
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-flush'], undefined,
+    'a disabled session must not be written back into state.json — it would revive on the next boot');
+  assert.ok(d.logLines.some((l) => /disabled mid-flush/.test(l)));
+});
+
+test('flush: a lost 201 drops exactly the already-stored items, never re-sends or blind-drops', async () => {
+  const d = makeDaemon();
+  // 5 items queued as seq 1..5; the server already stored 1..3 (the ack for
+  // that batch was lost), so only 4 and 5 may go out.
+  const s = liveSession(d, { queue: ['i1', 'i2', 'i3', 'i4', 'i5'], nextSeq: 1 });
+  const sent = [];
+  let serverLastSeq = 3;
+  d.api = async (method, p, body) => {
+    if (method === 'POST' && /\/items$/.test(p)) {
+      const first = body.items[0].seq;
+      if (first <= serverLastSeq) return { res: { status: 422 }, data: { code: 'seq_regression' } };
+      for (const it of body.items) sent.push(it.seq);
+      serverLastSeq = body.items.at(-1).seq;
+      return { res: { status: 201 }, data: { accepted: body.items.length, last_seq: serverLastSeq } };
+    }
+    if (method === 'POST' && p === '/agent_sessions') {
+      return { res: { status: 201 }, data: { session: { public_id: 'ases_t', last_seq: serverLastSeq } } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
+
+  await d.flush(s);
+  assert.deepEqual(sent, [4, 5], 'stored seqs are never re-sent, unstored ones are never dropped');
+  assert.deepEqual(s.queue, []);
+  assert.equal(s.nextSeq, 6);
+  assert.ok(d.logLines.some((l) => /already stored/.test(l)));
+});
+
+test('flush: an unexplained seq_regression backs off instead of spinning or dropping a batch', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { queue: ['i1', 'i2'], nextSeq: 10 });
+  let posts = 0;
+  d.api = async (method, p) => {
+    if (method === 'POST' && /\/items$/.test(p)) { posts += 1; return { res: { status: 422 }, data: { code: 'seq_regression' } }; }
+    if (method === 'POST' && p === '/agent_sessions') return { res: { status: 201 }, data: { session: { last_seq: 9 } } };
+    return { res: { status: 200 }, data: {} };
+  };
+
+  await d.flush(s);
+  assert.equal(posts, 1, 'no spin');
+  assert.deepEqual(s.queue, ['i1', 'i2'], 'the old code dropped a whole batch "to break the loop"');
+  assert.equal(s.nextSeq, 10);
+  assert.ok(s.nextFlushAt > Date.now());
+});
+
+test('flush: a seq gap the daemon cannot fill resumes loudly above the server high-water', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { queue: ['i1'], nextSeq: 50 });
+  const sent = [];
+  let serverLastSeq = 7;
+  d.api = async (method, p, body) => {
+    if (method === 'POST' && /\/items$/.test(p)) {
+      if (body.items[0].seq > serverLastSeq + 40) return { res: { status: 422 }, data: { code: 'seq_regression' } };
+      for (const it of body.items) sent.push(it.seq);
+      return { res: { status: 201 }, data: { accepted: 1, last_seq: body.items.at(-1).seq } };
+    }
+    if (method === 'POST' && p === '/agent_sessions') return { res: { status: 201 }, data: { session: { last_seq: serverLastSeq } } };
+    return { res: { status: 200 }, data: {} };
+  };
+
+  await d.flush(s);
+  assert.deepEqual(sent, [8], 'the item is published, renumbered onto the server high-water');
+  assert.deepEqual(s.queue, []);
+  assert.ok(d.logLines.some((l) => /seq GAP/.test(l)));
+});
+
+test('enable: a failure after the register leaves neither a live record nor a persisted one', async () => {
+  const d = makeDaemon();
+  d.registerSession = async () => ({ last_seq: 0 });
+  d.backfill = async () => { throw new Error('network went away mid-backfill'); };
+  d.subscribeInput = () => {};
+
+  await assert.rejects(() => d.enableSession({
+    sid: 'sess-fail', paneId: '%1', tty: null, cwd: '/tmp/proj', file: '/tmp/x.jsonl', approvals: [],
+  }), /mid-backfill/);
+
+  assert.equal(d.sessions.has('sess-fail'), false, 'a live-but-lockless session would publish without the B3 guarantee');
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-fail'], undefined);
+  assert.equal(fs.existsSync(d.lockPath('sess-fail')), false, 'the writer lock is released');
+});
+
+// --- enable: pane binding on both doors -------------------------------------
+
+async function enableVia(d, body, paneLookup) {
+  const real = core.tmuxPaneForTty;
+  core.tmuxPaneForTty = paneLookup;
+  let out = null;
+  try {
+    await d.enableFromRequest(body, (code, obj) => { out = { code, obj }; });
+  } finally { core.tmuxPaneForTty = real; }
+  return out;
+}
+
+function announceOnly(d, sid = 'sess-x', tty = '/dev/ttys004') {
+  d.registerSession = async () => ({ last_seq: 0 });
+  d.backfill = async () => {};
+  d.subscribeInput = () => {};
+  d.announces.set(sid, { tty, cwd: '/tmp/proj', transcriptPath: '/tmp/none.jsonl', at: Date.now() });
+}
+
+test('enable --session binds the pane from the announced tty (the ls door is interactive too)', async () => {
+  const d = makeDaemon();
+  announceOnly(d);
+  // The `--session <sid>` door sends NO pane_id: the CLI never walked an
+  // ancestor. The daemon must resolve it the same way the ancestor door does.
+  const out = await enableVia(d, { sid: 'sess-x' },
+    (tty) => (tty === '/dev/ttys004' ? { paneId: '%7', loc: 'main:0.1' } : null));
+
+  assert.equal(out.code, 200);
+  assert.equal(out.obj.pane_bound, true);
+  assert.equal(out.obj.read_only, false);
+  assert.equal(d.sessions.get('sess-x').paneId, '%7');
+});
+
+test('enable that cannot bind a pane still succeeds but says READ-ONLY', async () => {
+  const d = makeDaemon();
+  announceOnly(d);
+  const out = await enableVia(d, { sid: 'sess-x' }, () => null);
+
+  assert.equal(out.code, 200);
+  assert.equal(out.obj.pane_bound, false);
+  assert.equal(out.obj.read_only, true, 'the phone must not show an interactive composer for a dead input lane');
+  assert.equal(d.sessions.get('sess-x').paneId, null);
+
+  // An explicit pane_id (the ancestor door) always wins and is never re-looked-up.
+  const d2 = makeDaemon();
+  announceOnly(d2, 'sess-y');
+  const out2 = await enableVia(d2, { sid: 'sess-y', pane_id: '%3' }, () => { throw new Error('must not be consulted'); });
+  assert.equal(out2.obj.read_only, false);
+  assert.equal(d2.sessions.get('sess-y').paneId, '%3');
+});
+
+// --- the tailer: backfill, restart dedup, rescan bounds ---------------------
+
+function rec(i) {
+  return {
+    type: 'assistant', uuid: `u-${i}`, parentUuid: null, timestamp: '2026-08-02T18:33:12Z',
+    version: '2.1.220', message: { role: 'assistant', content: `line ${i}` },
+  };
+}
+function writeJsonl(file, records) {
+  fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+}
+function openItem(d, b64, publicId = 'ases_t') {
+  return JSON.parse(core.e2eDecryptBlob(d.key, core.e2eAad(1, publicId, 'agent_transcript'),
+    Buffer.from(b64, 'base64url')).toString('utf8'));
+}
+
+test('a rescan AFTER a daemon restart re-publishes nothing', async () => {
+  const dir = tmp('pidge-term-jsonl-');
+  const file = path.join(dir, 's.jsonl');
+  writeJsonl(file, [1, 2, 3].map(rec));
+
+  const d1 = makeDaemon();
+  d1.registerSession = async () => ({ last_seq: 0 });
+  d1.subscribeInput = () => {};
+  d1.flush = async () => {}; // keep the queue observable, touch no network
+  const s1 = await d1.enableSession({ sid: 'sess-r', paneId: '%1', tty: null, cwd: dir, file, approvals: [] });
+  assert.equal(s1.backfilled, 3);
+  assert.equal(s1.queue.length, 3);
+
+  const persisted = core.readJson(core.STATE_FILE(), {}).sessions['sess-r'];
+  assert.deepEqual(persisted.seen, ['u-1', 'u-2', 'u-3'],
+    'the uuid ring must ride in state.json — an in-memory-only set is empty after a restart');
+
+  // A NEW daemon process against the same config slot.
+  const d2 = new Daemon();
+  d2.logLines = [];
+  d2.log = (...a) => { d2.logLines.push(a.join(' ')); };
+  d2.registerSession = async () => ({ last_seq: 3 });
+  d2.subscribeInput = () => {};
+  await d2.rearmPersisted();
+  const s2 = d2.sessions.get('sess-r');
+  assert.ok(s2, 're-arm must keep the share the human opted into');
+  assert.equal(s2.seenUuids.size, 3, 'the dedup set is rebuilt before any tick can emit');
+
+  // The probe-proven RESCAN: the file is rewritten in place, smaller, keeping
+  // the same records. Before this fix the empty dedup set re-emitted them all
+  // under fresh seqs — the phone saw the conversation twice.
+  writeJsonl(file, [1, 2].map(rec));
+  d2.tailOne(s2);
+  assert.deepEqual(s2.queue, [], 'a rescan must not re-emit records the phone already has');
+  assert.ok(d2.logLines.some((l) => /full rescan/.test(l)));
+
+  // A genuinely new record still flows.
+  writeJsonl(file, [1, 2, 4].map(rec));
+  d2.tailOne(s2);
+  assert.equal(s2.queue.length, 1);
+  assert.equal(openItem(d2, s2.queue[0], s2.publicId).uuid, 'u-4');
+});
+
+test('a rotation/rescan obeys the §6 backfill cap instead of flooding the lane', () => {
+  const dir = tmp('pidge-term-jsonl-');
+  const file = path.join(dir, 'rot.jsonl');
+  writeJsonl(file, Array.from({ length: 300 }, (_, i) => rec(i)));
+
+  const d = makeDaemon();
+  const s = liveSession(d, { file });
+  s.bulk = true; // exactly what the /clear rotation handler and the rescan branch set
+  d.tailOne(s);
+
+  assert.equal(s.queue.length, 100, 'a 300-item bulk re-read must be bounded to the backfill window');
+  assert.equal(openItem(d, s.queue[0]).preview, 'line 200', 'the NEWEST 100 are kept, oldest-first');
+  assert.equal(openItem(d, s.queue.at(-1)).preview, 'line 299');
+  assert.ok(d.logLines.some((l) => /bounded window/.test(l)));
+});
+
+test('backfill stops at the last COMPLETE line so a record mid-write is not lost', async () => {
+  const dir = tmp('pidge-term-jsonl-');
+  const file = path.join(dir, 'p.jsonl');
+  const firstLine = JSON.stringify(rec(1)) + '\n';
+  fs.writeFileSync(file, firstLine + JSON.stringify(rec(2)).slice(0, 30)); // 2nd record still landing
+
+  const d = makeDaemon();
+  d.flush = async () => {};
+  const s = liveSession(d, { file });
+  await d.backfill(s);
+
+  assert.equal(s.backfilled, 1);
+  assert.equal(s.offset, Buffer.byteLength(firstLine, 'utf8'),
+    'the offset must not jump past a half-written record — it would be dropped forever');
+
+  writeJsonl(file, [1, 2].map(rec)); // the record completes
+  d.tailOne(s);
+  assert.equal(s.queue.length, 2);
+  assert.equal(openItem(d, s.queue[1]).uuid, 'u-2');
+});
+
+// --- approval gate ----------------------------------------------------------
+
+// The gate never touches the network in tests: d.api is swapped for a recorder.
+function stubApi(d, handler) {
+  const calls = [];
+  d.api = async (method, p, body) => {
+    calls.push({ method, p, body });
+    return (await handler(method, p, body)) || { res: { status: 200 }, data: {} };
+  };
+  return calls;
+}
+
+test('approval gate: the ask carries the server approve/reject pair (never the nonexistent `deny`)', async () => {
+  const d = makeDaemon();
+  const calls = stubApi(d, async (method, p) => {
+    if (method === 'POST' && p === '/notify') return { res: { status: 201 }, data: {} };
+    if (method === 'GET') return { res: { status: 200 }, data: { responded: true, chosen_action: { action_id: 'approve' } } };
+  });
+  const s = { sid: 'sess-appr', publicId: 'ases_t', title: 'proj', approvals: ['Bash'] };
+
+  const decision = await d.approvalGate(s, { tool_name: 'Bash', tool_input: { command: 'ls' } });
+  assert.deepEqual(decision, { permissionDecision: 'allow', permissionDecisionReason: 'approved via Pidge' });
+
+  const notify = calls.find((c) => c.p === '/notify');
+  assert.deepEqual(notify.body.actions, ['approve', 'reject'],
+    'the server built-in pair is approve/reject — `deny` is not an action id and would be dropped silently');
+  assert.equal(notify.body.profile, 'urgent');
+});
+
+test('approval gate: reject maps to a deny decision, anything else falls open', async () => {
+  for (const [actionId, expected] of [
+    ['reject', { permissionDecision: 'deny', permissionDecisionReason: 'rejected via Pidge' }],
+    ['done', null],
+    ['snooze', null],
+  ]) {
+    const d = makeDaemon();
+    stubApi(d, async (method, p) => {
+      if (method === 'POST' && p === '/notify') return { res: { status: 201 }, data: {} };
+      if (method === 'GET') return { res: { status: 200 }, data: { responded: true, chosen_action: { action_id: actionId } } };
+    });
+    const s = { sid: 'sess-appr', publicId: 'ases_t', title: 'proj', approvals: ['*'] };
+    assert.deepEqual(await d.approvalGate(s, { tool_name: 'Bash', tool_input: {} }), expected,
+      `action_id ${actionId} mapped wrong`);
+  }
+});
+
+test('approval gate: a failed notify falls open to the local prompt instead of blocking', async () => {
+  const d = makeDaemon();
+  stubApi(d, async () => ({ res: { status: 402 }, data: { code: 'terminal_requires_pro' } }));
+  const s = { sid: 'sess-appr', publicId: 'ases_t', title: 'proj', approvals: ['*'] };
+  assert.equal(await d.approvalGate(s, { tool_name: 'Bash', tool_input: {} }), null);
+  assert.ok(d.logLines.some((l) => /falling open/.test(l)));
 });
 
 test('the single-writer lock refuses a live holder and takes over a stale one', () => {
