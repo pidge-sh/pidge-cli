@@ -659,6 +659,159 @@ test('the tool gate matches case-insensitively and honors the wildcard', () => {
   assert.equal(d.toolGated({ approvals: ['*'] }, undefined), false);
 });
 
+// --- the publish lane (flush): backoff, teardown, seq re-sync ---------------
+
+// A minimal live session record, registered in the daemon's map exactly as
+// enableSession would leave it.
+function liveSession(d, { queue = [], nextSeq = 1 } = {}) {
+  const s = {
+    sid: 'sess-flush', publicId: 'ases_t', paneId: '%1', tty: null, cwd: '/tmp/proj',
+    file: '/tmp/nonexistent.jsonl', title: 'proj', hv: null,
+    offset: 0, partial: '', seenUuids: new Set(), seenRing: [],
+    queue: [...queue], nextSeq, status: 'idle', waitingArmed: true, approvals: [],
+    flushing: false, backfilled: 0, backoff: 0, nextFlushAt: 0, gen: 0,
+  };
+  d.sessions.set(s.sid, s);
+  return s;
+}
+
+test('flush: a failing POST settles into exponential backoff instead of storming', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { queue: ['a', 'b'] });
+  let posts = 0;
+  d.api = async () => { posts += 1; return { res: { status: 402 }, data: { code: 'terminal_requires_pro' } }; };
+
+  await d.flush(s);
+  assert.equal(posts, 1);
+  assert.equal(s.backoff, 2);
+  assert.ok(s.nextFlushAt > Date.now(), 'the backoff window must be armed');
+  assert.equal(s.flushing, false);
+
+  // The 500 ms tick used to re-enter immediately (flushing was already false),
+  // turning every failure into a 2 req/s storm. It must now skip the session.
+  for (let i = 0; i < 10; i++) await d.flushTick();
+  assert.equal(posts, 1, 'flushTick must honor the backoff window');
+
+  // Once the window elapses, exactly ONE retry goes out and the window doubles.
+  s.nextFlushAt = Date.now() - 1;
+  await d.flushTick();
+  assert.equal(posts, 2);
+  assert.equal(s.backoff, 4);
+  assert.deepEqual(s.queue, ['a', 'b'], 'nothing is lost — the JSONL is durable');
+
+  // A success clears the window.
+  d.api = async () => ({ res: { status: 201 }, data: { accepted: 2, last_seq: 2 } });
+  s.nextFlushAt = Date.now() - 1;
+  await d.flushTick();
+  assert.deepEqual(s.queue, []);
+  assert.equal(s.backoff, 0);
+  assert.equal(s.nextFlushAt, 0);
+  assert.equal(s.nextSeq, 3);
+});
+
+test('flush: a session disabled mid-POST is NOT revived by the late 201', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { queue: ['a'] });
+  d.persistSession(s); // as enable would have
+  assert.ok(core.readJson(core.STATE_FILE(), {}).sessions['sess-flush'], 'precondition: persisted');
+
+  d.api = async (method, p) => {
+    if (method === 'POST' && /\/items$/.test(p)) {
+      // The human hits `pidge terminal disable` while the request is in flight.
+      await d.disableSession('sess-flush', 'requested');
+      return { res: { status: 201 }, data: { accepted: 1, last_seq: 1 } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
+
+  await d.flush(s);
+  assert.equal(d.sessions.has('sess-flush'), false);
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-flush'], undefined,
+    'a disabled session must not be written back into state.json — it would revive on the next boot');
+  assert.ok(d.logLines.some((l) => /disabled mid-flush/.test(l)));
+});
+
+test('flush: a lost 201 drops exactly the already-stored items, never re-sends or blind-drops', async () => {
+  const d = makeDaemon();
+  // 5 items queued as seq 1..5; the server already stored 1..3 (the ack for
+  // that batch was lost), so only 4 and 5 may go out.
+  const s = liveSession(d, { queue: ['i1', 'i2', 'i3', 'i4', 'i5'], nextSeq: 1 });
+  const sent = [];
+  let serverLastSeq = 3;
+  d.api = async (method, p, body) => {
+    if (method === 'POST' && /\/items$/.test(p)) {
+      const first = body.items[0].seq;
+      if (first <= serverLastSeq) return { res: { status: 422 }, data: { code: 'seq_regression' } };
+      for (const it of body.items) sent.push(it.seq);
+      serverLastSeq = body.items.at(-1).seq;
+      return { res: { status: 201 }, data: { accepted: body.items.length, last_seq: serverLastSeq } };
+    }
+    if (method === 'POST' && p === '/agent_sessions') {
+      return { res: { status: 201 }, data: { session: { public_id: 'ases_t', last_seq: serverLastSeq } } };
+    }
+    return { res: { status: 200 }, data: {} };
+  };
+
+  await d.flush(s);
+  assert.deepEqual(sent, [4, 5], 'stored seqs are never re-sent, unstored ones are never dropped');
+  assert.deepEqual(s.queue, []);
+  assert.equal(s.nextSeq, 6);
+  assert.ok(d.logLines.some((l) => /already stored/.test(l)));
+});
+
+test('flush: an unexplained seq_regression backs off instead of spinning or dropping a batch', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { queue: ['i1', 'i2'], nextSeq: 10 });
+  let posts = 0;
+  d.api = async (method, p) => {
+    if (method === 'POST' && /\/items$/.test(p)) { posts += 1; return { res: { status: 422 }, data: { code: 'seq_regression' } }; }
+    if (method === 'POST' && p === '/agent_sessions') return { res: { status: 201 }, data: { session: { last_seq: 9 } } };
+    return { res: { status: 200 }, data: {} };
+  };
+
+  await d.flush(s);
+  assert.equal(posts, 1, 'no spin');
+  assert.deepEqual(s.queue, ['i1', 'i2'], 'the old code dropped a whole batch "to break the loop"');
+  assert.equal(s.nextSeq, 10);
+  assert.ok(s.nextFlushAt > Date.now());
+});
+
+test('flush: a seq gap the daemon cannot fill resumes loudly above the server high-water', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { queue: ['i1'], nextSeq: 50 });
+  const sent = [];
+  let serverLastSeq = 7;
+  d.api = async (method, p, body) => {
+    if (method === 'POST' && /\/items$/.test(p)) {
+      if (body.items[0].seq > serverLastSeq + 40) return { res: { status: 422 }, data: { code: 'seq_regression' } };
+      for (const it of body.items) sent.push(it.seq);
+      return { res: { status: 201 }, data: { accepted: 1, last_seq: body.items.at(-1).seq } };
+    }
+    if (method === 'POST' && p === '/agent_sessions') return { res: { status: 201 }, data: { session: { last_seq: serverLastSeq } } };
+    return { res: { status: 200 }, data: {} };
+  };
+
+  await d.flush(s);
+  assert.deepEqual(sent, [8], 'the item is published, renumbered onto the server high-water');
+  assert.deepEqual(s.queue, []);
+  assert.ok(d.logLines.some((l) => /seq GAP/.test(l)));
+});
+
+test('enable: a failure after the register leaves neither a live record nor a persisted one', async () => {
+  const d = makeDaemon();
+  d.registerSession = async () => ({ last_seq: 0 });
+  d.backfill = async () => { throw new Error('network went away mid-backfill'); };
+  d.subscribeInput = () => {};
+
+  await assert.rejects(() => d.enableSession({
+    sid: 'sess-fail', paneId: '%1', tty: null, cwd: '/tmp/proj', file: '/tmp/x.jsonl', approvals: [],
+  }), /mid-backfill/);
+
+  assert.equal(d.sessions.has('sess-fail'), false, 'a live-but-lockless session would publish without the B3 guarantee');
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-fail'], undefined);
+  assert.equal(fs.existsSync(d.lockPath('sess-fail')), false, 'the writer lock is released');
+});
+
 // --- approval gate ----------------------------------------------------------
 
 // The gate never touches the network in tests: d.api is swapped for a recorder.

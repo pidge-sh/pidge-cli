@@ -271,7 +271,16 @@ class Daemon {
     try {
       return await this.enableSessionLocked({ sid, paneId, tty, cwd, file, approvals });
     } catch (e) {
-      this.releaseWriterLock(sid); // a failed enable must not strand the lock
+      // A failed enable must not strand the lock — NOR leave the half-enabled
+      // record live: enableSessionLocked inserts into this.sessions and persists
+      // before the first backfill flush, so a throw after that point would leave
+      // a session publishing without the single-writer guarantee and reviving
+      // from state.json on the next boot.
+      const s = this.sessions.get(sid);
+      if (s) { s.gen += 1; this.sessions.delete(sid); }
+      delete this.state.sessions[sid];
+      this.saveState();
+      this.releaseWriterLock(sid);
       throw e;
     }
   }
@@ -289,6 +298,7 @@ class Daemon {
       status: 'idle', waitingArmed: true,
       approvals: approvals || [],
       flushing: false, backfilled: 0,
+      backoff: 0, nextFlushAt: 0, // publish backoff window (flushTick honors it)
       gen: 0, // teardown identity (#66)
     };
     const echo = await this.registerSession(session, 'idle');
@@ -334,7 +344,7 @@ class Daemon {
           title: path.basename(p.cwd || 'session'), hv: null,
           seenUuids: new Set(), queue: [], nextSeq: p.nextSeq || 1,
           status: 'idle', waitingArmed: true, approvals: p.approvals || [],
-          flushing: false, backfilled: 0, gen: 0,
+          flushing: false, backfilled: 0, backoff: 0, nextFlushAt: 0, gen: 0,
         };
         const echo = await this.registerSession(session, 'idle');
         session.nextSeq = Math.max(session.nextSeq, (echo.last_seq || 0) + 1);
@@ -467,10 +477,33 @@ class Daemon {
     this.persistSession(s);
   }
 
+  // Does this record still own its slot? Every await inside flush must ask:
+  // `disable` bumps gen AND removes the session, and a late success that then
+  // persisted the record would REVIVE a share the human just revoked (#66).
+  stillOwns(session, gen) {
+    return session.gen === gen && this.sessions.get(session.sid) === session;
+  }
+
   async flushTick() {
+    const now = Date.now();
     for (const s of this.sessions.values()) {
-      if (s.queue.length && !s.flushing) this.flush(s).catch((e) => this.log('flush error:', e.message));
+      if (!s.queue.length || s.flushing) continue;
+      // Honor the backoff window. Without this the tick simply re-fired every
+      // 500 ms after every failure (`flushing` is cleared on the way out), so a
+      // Base-tier 402 or a 500 became a 2 req/s storm against the server AND
+      // piled up one retry timer per failure.
+      if (s.nextFlushAt && now < s.nextFlushAt) continue;
+      this.flush(s).catch((e) => this.log('flush error:', e.message));
     }
+  }
+
+  // Back off after a failed batch. No timer is scheduled: flushTick is already
+  // running every FLUSH_MS and picks the session up once the window elapses —
+  // one clock, no accumulation.
+  backOff(session, why) {
+    session.backoff = Math.min((session.backoff || 1) * 2, 60);
+    session.nextFlushAt = Date.now() + session.backoff * 1000;
+    this.log(`${session.publicId}: ${why}; retry in ${session.backoff}s (nothing lost — the JSONL is durable)`);
   }
 
   async flush(session) {
@@ -479,38 +512,77 @@ class Daemon {
     const gen = session.gen;
     try {
       while (session.queue.length) {
-        if (session.gen !== gen) return; // torn down mid-flush (#66)
+        if (!this.stillOwns(session, gen)) return; // torn down mid-flush (#66)
         const batch = session.queue.slice(0, this.caps.items_per_call);
         const items = batch.map((b64, i) => ({ seq: session.nextSeq + i, payload_sealed: b64 }));
         const { res, data } = await this.api('POST', `/agent_sessions/${session.publicId}/items`, { items });
+        // Re-check BEFORE any mutation: an await is a teardown window, and
+        // persistSession() on a disabled session writes it back into state.json
+        // — it would come back alive on the next boot (consent violation).
+        if (!this.stillOwns(session, gen)) {
+          this.log(`${session.publicId}: disabled mid-flush — response dropped, nothing re-persisted (#66)`);
+          return;
+        }
         if (res.status === 201) {
           session.queue.splice(0, batch.length);
           session.nextSeq = (data.last_seq || (session.nextSeq + batch.length - 1)) + 1;
           session.backoff = 0;
+          session.nextFlushAt = 0;
           this.persistSession(session);
         } else if (res.status === 422 && data && data.code === 'seq_regression') {
-          // Server knows more than our state (restart race): re-sync from it.
-          const { data: reg } = await this.api('POST', '/agent_sessions', {
-            public_id: session.publicId, status: session.status, meta_sealed: this.sealMeta(session),
-          });
-          const serverSeq = reg && reg.session ? reg.session.last_seq : null;
-          if (serverSeq === null || serverSeq + 1 === session.nextSeq) {
-            this.log(`${session.publicId}: seq_regression did not resolve — dropping ONE batch loudly to break the loop`);
-            session.queue.splice(0, batch.length);
-          } else {
-            this.log(`${session.publicId}: seq re-synced ${session.nextSeq} → ${serverSeq + 1}`);
-            session.nextSeq = serverSeq + 1;
-          }
+          if (!(await this.resyncSeq(session, gen))) return;
         } else {
-          session.backoff = Math.min((session.backoff || 1) * 2, 60);
-          this.log(`${session.publicId}: items POST → ${res.status}; retry in ${session.backoff}s (nothing lost — the JSONL is durable)`);
-          setTimeout(() => { if (session.gen === gen) this.flush(session).catch(() => {}); }, session.backoff * 1000);
+          this.backOff(session, `items POST → ${res.status}`);
           return;
         }
       }
     } finally {
       session.flushing = false;
     }
+  }
+
+  // seq_regression = the server already stored seqs we are re-sending. The
+  // canonical cause is a LOST 201: the batch landed, the ack didn't, so the
+  // retry replays stored seqs. Re-register to learn the server's high-water and
+  // drop from the queue EXACTLY the items at or below it — they are persisted
+  // already. Never re-send a stored seq (duplicates in the conversation), never
+  // blind-drop an unstored one (a hole the JSONL can no longer fill).
+  // Returns false when the caller must stop this flush pass.
+  async resyncSeq(session, gen) {
+    const { data: reg } = await this.api('POST', '/agent_sessions', {
+      public_id: session.publicId, status: session.status, meta_sealed: this.sealMeta(session),
+    });
+    if (!this.stillOwns(session, gen)) return false;
+    const serverSeq = reg && reg.session && Number.isInteger(reg.session.last_seq) ? reg.session.last_seq : null;
+    if (serverSeq === null) {
+      // Could not learn the high-water: back off and retry, do NOT guess.
+      this.backOff(session, 'seq_regression but the re-register carried no last_seq');
+      return false;
+    }
+    const firstSeq = session.nextSeq; // the seq queue[0] would have been sent as
+    const stored = serverSeq - firstSeq + 1;
+    if (stored > 0) {
+      const drop = Math.min(stored, session.queue.length);
+      session.queue.splice(0, drop);
+      this.log(`${session.publicId}: seq_regression — ${drop} queued item(s) were already stored (server last_seq ${serverSeq}); continuing at ${serverSeq + 1}`);
+    } else if (stored === 0) {
+      // Our numbering ALREADY continues the server's high-water, yet it 422'd:
+      // the re-sync explains nothing and re-sending the same seqs would spin
+      // forever. Back off instead of looping (and keep the items).
+      this.backOff(session, `seq_regression at seq ${firstSeq} that the re-register does not explain (server last_seq ${serverSeq})`);
+      return false;
+    } else {
+      // firstSeq > serverSeq + 1: a gap this daemon cannot fill (the missing
+      // items belong to a previous process). Renumber onto the server's
+      // high-water and keep going — loudly. The phone renders the gap; looping
+      // here forever would be worse (§11: visible boundary, never a silent splice).
+      this.log(`${session.publicId}: seq GAP — queue starts at ${firstSeq} but the server is at ${serverSeq}; resuming at ${serverSeq + 1}, the missing items are only on this Mac`);
+    }
+    session.nextSeq = serverSeq + 1;
+    session.backoff = 0;
+    session.nextFlushAt = 0;
+    this.persistSession(session);
+    return true;
   }
 
   // --- status + waiting notification (spec §9) ------------------------------
