@@ -229,7 +229,7 @@ class Daemon {
       case 'GET /health':
         return send(200, { ok: true, epoch: this.state.epoch, enabled: [...this.sessions.keys()] });
       case 'POST /hook/session-start': {
-        const { session_id: sid, cwd, transcript_path: tp, tty } = body;
+        const { session_id: sid, cwd, transcript_path: tp, tty, source } = body;
         if (!sid) return send(200, {});
         this.announces.set(sid, { tty: tty || null, cwd: cwd || null, transcriptPath: tp || null, at: Date.now() });
         const s = this.sessions.get(sid);
@@ -243,18 +243,25 @@ class Daemon {
           // `/clear` = a NEW session, not a rotation (spec §6, corrected per QA
           // finding #14): Claude Code mints a new sid AND a new transcript, the
           // old JSONL never grows again, and the phone froze on a mirror that
-          // LOOKED alive. DECIDED (Thiago, 2026-08-03): consent rides the PANE
-          // while continuity is unbroken — a new sid on the SAME pane+cwd of a
-          // shared session whose mirror is still HOT is ADOPTED into the same
-          // AgentSession (hot-swap; the phone sees one continuous session). A
-          // stale/cold match gets NO adoption: the old session ends loudly and
-          // the new claude needs a fresh paste-to-enable.
+          // LOOKED alive. Adoption is gated on the HARNESS'S OWN rotation
+          // signal (§6 REVISED after adversarial review): SessionStart carries
+          // `source` ("startup"|"resume"|"clear"|"compact"), and only
+          // source:"clear" — the authoritative statement that a human typed
+          // /clear INSIDE a session they already shared — carries consent
+          // over. The earlier "mirror hot within 90 s" window is GONE: it
+          // failed both ways (a nested `claude -p` run as a Bash tool inside
+          // the mirrored session satisfies cwd+hot and would HIJACK the
+          // mirror; a human who reads the last answer for >90 s before /clear
+          // would fail it). Adoption also requires a transcript_path —
+          // adopting without a new file recreates the frozen-mirror bug.
+          // Every other case ends the displaced session loudly (§11).
           const twin = this.findReplacedTwin(sid, { tty: core.normalizeTty(tty), cwd });
           if (twin) {
-            if (this.mirrorIsHot(twin) && this.adoptReplacedSid(twin, sid, { tp, tty: core.normalizeTty(tty) })) {
+            const src = typeof source === 'string' && source ? source : null;
+            if (src === 'clear' && tp && this.adoptReplacedSid(twin, sid, { tp, tty: core.normalizeTty(tty) })) {
               // adopted — everything narrated inside adoptReplacedSid.
             } else {
-              this.log(`session ${twin.sid.slice(0, 8)}: new sid ${sid.slice(0, 8)} announced in its pane/cwd but the mirror is not hot (last life ${twin.lastAliveAt ? `${Math.round((Date.now() - twin.lastAliveAt) / 1000)}s ago` : 'unknown'}, window ${this.caps.offline_after_seconds}s) — ending the old session; the new claude needs its own enable`);
+              this.log(`session ${twin.sid.slice(0, 8)}: new sid ${sid.slice(0, 8)} announced in its pane/cwd (source: ${src || 'absent'}${src === 'clear' && !tp ? ', NO transcript_path' : ''}) — no adoption; ending the old session, the new claude needs its own enable`);
               // Fire-and-forget: the SessionStart hook has a 3 s budget, and
               // the end path talks to the server. Failures logged, never eaten.
               this.endReplacedSession(twin, sid).catch((e) => this.log(`end-replaced ${twin.sid.slice(0, 8)} failed: ${e.message}`));
@@ -398,43 +405,40 @@ class Daemon {
   findReplacedTwin(newSid, { tty, cwd }) {
     const want = String(cwd || '').replace(/\/+$/, '');
     if (!want) return null;
-    const twin = [...this.sessions.values()]
-      .find((s) => String(s.cwd || '').replace(/\/+$/, '') === want);
-    if (!twin) return null;
-    const tag = `session ${twin.sid.slice(0, 8)}: new sid ${newSid.slice(0, 8)}`;
+    // ALL candidates in that cwd (there can be several — tty-bound enables can
+    // legitimately share a cwd across panes); the pane check then affirms the
+    // ONE whose bound pane matches, never just the first cwd hit.
+    const candidates = [...this.sessions.values()]
+      .filter((s) => String(s.cwd || '').replace(/\/+$/, '') === want);
+    if (!candidates.length) return null;
+    const tag = `new sid ${newSid.slice(0, 8)}`;
     const opts = { onWarn: (m) => this.log(m) };
     try {
       if (tty) {
         const hit = core.tmuxPaneForTty(tty, opts);
-        if (hit && hit.paneId === twin.paneId) return twin;
-        this.log(`${tag} announced in ${want} but its tty ${tty} ${hit ? `is pane ${hit.paneId}, not the bound ${twin.paneId}` : 'is not a tmux pane'} — no pane match, leaving the share alone`);
+        const twin = hit && candidates.find((s) => s.paneId === hit.paneId);
+        if (twin) return twin;
+        this.log(`${tag} announced in ${want} but its tty ${tty} ${hit ? `is pane ${hit.paneId}, bound to no shared session` : 'is not a tmux pane'} — no pane match, leaving the share(s) alone`);
         return null;
       }
       const hits = core.tmuxPanesForCwd(want, opts);
-      if (hits.length === 1 && hits[0].paneId === twin.paneId) return twin;
-      this.log(`${tag} announced in ${want}, but ${hits.length === 1 ? `the only pane there is ${hits[0].paneId}, not the bound ${twin.paneId}` : `${hits.length} pane(s) sit there — cannot tell a /clear from a second claude`}; leaving the share alone`);
+      const twin = hits.length === 1 ? candidates.find((s) => s.paneId === hits[0].paneId) : null;
+      if (twin) return twin;
+      this.log(`${tag} announced in ${want}, but ${hits.length === 1 ? `the only pane there is ${hits[0].paneId}, bound to no shared session` : `${hits.length} pane(s) sit there — cannot tell a /clear from a second claude`}; leaving the share(s) alone`);
       return null;
     } catch (e) {
-      this.log(`${tag}: pane list unreadable (${e.message}) — cannot affirm the pane match, leaving the share alone`);
+      this.log(`${tag}: pane list unreadable (${e.message}) — cannot affirm the pane match, leaving the share(s) alone`);
       return null;
     }
   }
 
-  // Is this mirror still alive within the offline threshold (spec §6: the
-  // "/clear just happened" case)? lastAliveAt is harness/mirror LIFE — hook
-  // events, transcript growth, delivered input — never the daemon's own
-  // heartbeat (a heartbeat only proves the daemon is up, and would make a
-  // pane reused hours later read as "hot": the surprise-sharing scenario §2
-  // exists to prevent).
-  mirrorIsHot(s) {
-    return !!s.lastAliveAt && Date.now() - s.lastAliveAt <= this.caps.offline_after_seconds * 1000;
-  }
-
-  // HOT-SWAP ADOPTION (spec §6, decided 2026-08-03): the new sid joins the
-  // SAME AgentSession — tailer switches to the new transcript, meta_sealed
-  // refreshes (the new sid rides inside the sealed blob), seq stays monotonic,
-  // and a notice item marks the seam. Returns false when the adoption cannot
-  // take the writer lock — the caller then ends the old session loudly.
+  // ADOPTION (spec §6, source-gated): the new sid joins the SAME AgentSession
+  // — tailer switches to the new transcript, meta_sealed refreshes (the new
+  // sid rides inside the sealed blob), seq stays monotonic, and a notice item
+  // marks the seam. The caller has already established source:"clear" + a
+  // positive pane+cwd match + a transcript_path. Returns false when the
+  // adoption cannot take the writer lock — the caller then ends the old
+  // session loudly.
   adoptReplacedSid(s, newSid, { tp, tty }) {
     const oldSid = s.sid;
     try {
@@ -471,7 +475,7 @@ class Daemon {
     this.api('PATCH', `/agent_sessions/${s.publicId}`, { status: s.status, meta_sealed: this.sealMeta(s) })
       .catch((e) => this.log(`${s.publicId}: meta refresh after adoption failed (${e.message}) — retried by the next heartbeat era`));
     this.flush(s).catch((e) => this.log('flush error:', e.message));
-    this.log(`session ${oldSid.slice(0, 8)} → ${newSid.slice(0, 8)} ADOPTED (hot /clear in pane ${s.paneId}) — same AgentSession ${s.publicId}, seq continues, mirror unbroken`);
+    this.log(`session ${oldSid.slice(0, 8)} → ${newSid.slice(0, 8)} ADOPTED (source:"clear" in pane ${s.paneId}) — same AgentSession ${s.publicId}, seq continues, mirror unbroken`);
     return true;
   }
 
@@ -566,7 +570,7 @@ class Daemon {
       queue: [], outboxBytes: 0, nextSeq: 1,
       status: 'idle', waitingArmed: true,
       notifyOnWaiting: false, // opt-in per session, learned from the server echo (§9)
-      lastAliveAt: Date.now(), // mirror life — the /clear hot-window clock (§6)
+      lastAliveAt: Date.now(), // mirror-life diagnostic (narrated in logs; NOT an adoption gate)
       approvals: approvals || [],
       flushing: false, backfilled: 0,
       registered: true, registering: false, // the server knows this session
@@ -634,7 +638,7 @@ class Daemon {
       // check keys on it, so a reconnect to another tunnel cannot inherit it.
       channelId: this.env.channelId,
       file: s.file, offset: s.offset, nextSeq: s.nextSeq, approvals: s.approvals,
-      lastAliveAt: s.lastAliveAt || 0, // survives a quick daemon restart inside the hot window
+      lastAliveAt: s.lastAliveAt || 0, // mirror-life diagnostic
       mode: s.mode || null,
       seen: s.seenRing, // restart dedup (§6) — see seedSeenFromFile
       // The pending sealed items, with the uuid that produced each. Riding in
@@ -712,7 +716,7 @@ class Daemon {
         nextSeq: p.nextSeq || 1,
         status: 'idle', waitingArmed: true, approvals: p.approvals || [],
         notifyOnWaiting: false, // re-learned from the boot register's echo (§9)
-        lastAliveAt: p.lastAliveAt || 0, // a restart past the hot window reads cold, by design
+        lastAliveAt: p.lastAliveAt || 0, // mirror-life diagnostic
         mode: p.mode || null,
         flushing: false, backfilled: 0, registered: false, registering: false,
         backoff: 0, nextFlushAt: 0, gen: 0,
@@ -987,7 +991,7 @@ class Daemon {
       }
       s.offset = consumedTo;
     }
-    s.lastAliveAt = Date.now(); // transcript growth = mirror life (§6 hot window)
+    s.lastAliveAt = Date.now(); // transcript growth = mirror life (diagnostic)
     this.persistSession(s);
   }
 
@@ -1341,7 +1345,7 @@ class Daemon {
       return;
     }
     if (!Array.isArray(msg.keys)) return;
-    session.lastAliveAt = Date.now(); // delivered input = mirror life (§6 hot window)
+    session.lastAliveAt = Date.now(); // delivered input = mirror life (diagnostic)
     for (const k of msg.keys.slice(0, 16)) {
       try {
         if (k && typeof k.lit === 'string' && k.lit.length) {
