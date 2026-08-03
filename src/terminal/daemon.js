@@ -247,53 +247,49 @@ class Daemon {
 
   // --- enable / disable -----------------------------------------------------
 
+  // The ONE enable door. The CLI has already walked its ancestors to the claude
+  // process, so it arrives with that claude's tty (which announce to pick) and
+  // its pane. No explicit sid is accepted — "which session did you mean?" is
+  // exactly the guess this feature refuses to make — and a session with NO
+  // bound pane is a hard error, never a read-only share: shared ⇔ interactive.
   async enableFromRequest(body, send) {
-    const { tty, cwd, pane_id: paneId, sid: explicitSid, approvals } = body;
-    let sid = explicitSid || null;
-    if (!sid && tty) {
-      const now = Date.now();
-      const hits = [...this.announces.entries()]
-        .filter(([, a]) => now - a.at < HOOK_TTL_MS && a.tty === tty)
-        .sort((a, b) => b[1].at - a[1].at);
-      if (hits.length === 0) {
-        return send(422, { error: 'no announced session on this tty — restart claude inside the tmux pane (the SessionStart hook announces it), then retry' });
-      }
-      sid = hits[0][0]; // newest announce on the tty — a new claude re-announces
+    const { tty, cwd, pane_id: paneId, approvals } = body;
+    if (!tty) return send(422, { error: core.ENABLE_REFUSAL });
+    const now = Date.now();
+    const hits = [...this.announces.entries()]
+      .filter(([, a]) => now - a.at < HOOK_TTL_MS && a.tty === tty)
+      .sort((a, b) => b[1].at - a[1].at);
+    if (hits.length === 0) {
+      return send(422, { error: 'no announced session on this tty — restart claude inside the tmux pane (the SessionStart hook announces it), then retry' });
     }
-    if (!sid) return send(422, { error: 'need sid or tty' });
+    const sid = hits[0][0]; // newest announce on the tty — a new claude re-announces
     const ann = this.announces.get(sid);
     if (!ann || !ann.transcriptPath) {
       return send(422, { error: `session ${sid.slice(0, 8)} has no announced transcript path — restart claude and retry` });
     }
     if (this.sessions.has(sid)) {
-      const s = this.sessions.get(sid);
-      return send(200, { already: true, public_id: s.publicId, pane_bound: !!s.paneId, read_only: !s.paneId });
+      return send(200, { already: true, public_id: this.sessions.get(sid).publicId });
     }
-    // The `--session <sid>` (ls-fallback) door sends no pane_id: the CLI never
-    // walked an ancestor, so it has nothing to offer. Resolve the pane from the
-    // ANNOUNCED tty exactly as the ancestor-walk door does — otherwise this door
-    // quietly produced a read-only session the phone still showed as
-    // interactive, and every keystroke from the composer was dropped (spec §8).
+    // The CLI's pane wins; the announced tty is the belt (a pane the CLI could
+    // not name is still a pane). Neither ⇒ refuse, with the one instruction.
     let bound = paneId || null;
     if (!bound) {
-      const hit = core.tmuxPaneForTty(ann.tty || tty || null);
+      const hit = core.tmuxPaneForTty(ann.tty || tty);
       if (hit) {
         bound = hit.paneId;
         this.log(`enable ${sid.slice(0, 8)}: pane ${hit.paneId} (${hit.loc}) resolved from tty ${ann.tty || tty}`);
       }
+    }
+    if (!bound) {
+      this.log(`enable ${sid.slice(0, 8)} REFUSED: no tmux pane owns tty ${ann.tty || tty} — a pane-less share would drop every keystroke`);
+      return send(422, { error: core.ENABLE_REFUSAL });
     }
     try {
       const s = await this.enableSession({
         sid, paneId: bound, tty: ann.tty, cwd: cwd || ann.cwd,
         file: ann.transcriptPath, approvals: Array.isArray(approvals) ? approvals : [],
       });
-      // read_only is the honest flag: enable still SUCCEEDS (the transcript is
-      // worth sharing on its own), but the human must be told that typing back
-      // will not reach this session.
-      return send(200, {
-        public_id: s.publicId, backfilled: s.backfilled,
-        pane_bound: !!s.paneId, read_only: !s.paneId,
-      });
+      return send(200, { public_id: s.publicId, backfilled: s.backfilled, pane_bound: true });
     } catch (e) {
       this.log('enable failed:', e.message);
       return send(502, { error: e.message });
@@ -341,7 +337,7 @@ class Daemon {
     this.persistSession(session);
     await this.backfill(session);
     this.subscribeInput(session);
-    this.log(`enabled ${sid.slice(0, 8)} → ${session.publicId} (pane ${paneId || 'NONE — read-only'}, seq from ${session.nextSeq})`);
+    this.log(`enabled ${sid.slice(0, 8)} → ${session.publicId} (pane ${paneId}, seq from ${session.nextSeq})`);
     return session;
   }
 

@@ -453,6 +453,37 @@ test('the generated hook shim is valid JavaScript (node --check)', () => {
   assert.ok(!src.includes('PIDGE_SECRET'), 'the shim never handles the tunnel key');
 });
 
+// --- the CLI surface of the one-door lock-down ------------------------------
+//
+// These shell out to bin/pidge.js. Both paths die before any config, network
+// or daemon call — and HOME/XDG_CONFIG_HOME are the tmp dirs inherited from
+// this process, so nothing real is read or written either way.
+
+function runPidge(args) {
+  const bin = path.join(__dirname, '..', 'bin', 'pidge.js');
+  try {
+    return { code: 0, stdout: execFileSync(process.execPath, [bin, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }), stderr: '' };
+  } catch (e) {
+    return { code: e.status, stdout: e.stdout || '', stderr: e.stderr || '' };
+  }
+}
+
+test('`pidge terminal ls` is GONE — the picker is not a door, not even a deprecated one', () => {
+  const out = runPidge(['terminal', 'ls']);
+  assert.equal(out.code, 1);
+  assert.match(out.stderr, /unknown subcommand "ls"/);
+  assert.doesNotMatch(out.stderr, /\bls\b,/, 'ls must not survive in the subcommand list either');
+});
+
+test('terminal --help documents ONE enable door: no picker, no --session on enable', () => {
+  const out = runPidge(['terminal', '--help']);
+  assert.equal(out.code, 0, out.stderr);
+  assert.doesNotMatch(out.stdout, /terminal ls/, 'the picker is off the help');
+  assert.doesNotMatch(out.stdout, /enable \[--session/, 'enable takes no session id');
+  assert.match(out.stdout, /Run this from inside the Claude session you want to share/,
+    'the help quotes the refusal, so the one instruction is discoverable');
+});
+
 // ===========================================================================
 // 3b. commands: the daemon service install, one branch per platform
 // ===========================================================================
@@ -1002,36 +1033,59 @@ function announceOnly(d, sid = 'sess-x', tty = '/dev/ttys004') {
   d.announces.set(sid, { tty, cwd: '/tmp/proj', transcriptPath: '/tmp/none.jsonl', at: Date.now() });
 }
 
-test('enable --session binds the pane from the announced tty (the ls door is interactive too)', async () => {
+test('enable: the tty picks the session and the CLI pane binds it', async () => {
   const d = makeDaemon();
   announceOnly(d);
-  // The `--session <sid>` door sends NO pane_id: the CLI never walked an
-  // ancestor. The daemon must resolve it the same way the ancestor door does.
-  const out = await enableVia(d, { sid: 'sess-x' },
-    (tty) => (tty === '/dev/ttys004' ? { paneId: '%7', loc: 'main:0.1' } : null));
+  const out = await enableVia(d, { tty: '/dev/ttys004', pane_id: '%3' },
+    () => { throw new Error('the pane the CLI walked to must not be re-looked-up'); });
 
   assert.equal(out.code, 200);
   assert.equal(out.obj.pane_bound, true);
-  assert.equal(out.obj.read_only, false);
-  assert.equal(d.sessions.get('sess-x').paneId, '%7');
+  assert.equal(out.obj.read_only, undefined, 'there is no read-only tier to report');
+  assert.equal(d.sessions.get('sess-x').paneId, '%3');
 });
 
-test('enable that cannot bind a pane still succeeds but says READ-ONLY', async () => {
+test('enable: with no pane the daemon REFUSES — it never mints a read-only share', async () => {
   const d = makeDaemon();
   announceOnly(d);
-  const out = await enableVia(d, { sid: 'sess-x' }, () => null);
+  const out = await enableVia(d, { tty: '/dev/ttys004' }, () => null);
 
-  assert.equal(out.code, 200);
-  assert.equal(out.obj.pane_bound, false);
-  assert.equal(out.obj.read_only, true, 'the phone must not show an interactive composer for a dead input lane');
-  assert.equal(d.sessions.get('sess-x').paneId, null);
+  assert.equal(out.code, 422, 'a pane-less session is a hard error now, not a degraded success');
+  assert.equal(out.obj.error, core.ENABLE_REFUSAL);
+  assert.equal(d.sessions.has('sess-x'), false, 'NO session may exist after a refusal');
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-x'], undefined);
+  assert.ok(d.logLines.some((l) => /REFUSED/.test(l)), `expected a loud refusal, got ${JSON.stringify(d.logLines)}`);
 
-  // An explicit pane_id (the ancestor door) always wins and is never re-looked-up.
+  // The announced tty is the belt: a pane the CLI could not name still binds.
   const d2 = makeDaemon();
   announceOnly(d2, 'sess-y');
-  const out2 = await enableVia(d2, { sid: 'sess-y', pane_id: '%3' }, () => { throw new Error('must not be consulted'); });
-  assert.equal(out2.obj.read_only, false);
-  assert.equal(d2.sessions.get('sess-y').paneId, '%3');
+  const out2 = await enableVia(d2, { tty: '/dev/ttys004' },
+    (tty) => (tty === '/dev/ttys004' ? { paneId: '%7', loc: 'main:0.1' } : null));
+  assert.equal(out2.code, 200);
+  assert.equal(d2.sessions.get('sess-y').paneId, '%7');
+});
+
+test('enable: an explicit sid is IGNORED — the tty is the only selector', async () => {
+  const d = makeDaemon();
+  announceOnly(d, 'sess-other', '/dev/ttys001');
+  d.announces.set('sess-mine', { tty: '/dev/ttys004', cwd: '/tmp/proj', transcriptPath: '/tmp/none.jsonl', at: Date.now() });
+
+  // The removed `--session` door is not just off the CLI: the daemon does not
+  // read a sid at all, so nothing can re-open "guess which session I meant".
+  const out = await enableVia(d, { sid: 'sess-other', tty: '/dev/ttys004', pane_id: '%2' }, () => null);
+  assert.equal(out.code, 200);
+  assert.equal(d.sessions.has('sess-mine'), true);
+  assert.equal(d.sessions.has('sess-other'), false);
+
+  // …and with no tty at all there is nothing to resolve: the one instruction.
+  const out2 = await enableVia(d, { sid: 'sess-other' }, () => null);
+  assert.equal(out2.code, 422);
+  assert.equal(out2.obj.error, core.ENABLE_REFUSAL);
+});
+
+test('the enable refusal is one sentence that says what to do', () => {
+  assert.equal(core.ENABLE_REFUSAL,
+    'Run this from inside the Claude session you want to share — it must be in a tmux.');
 });
 
 // --- the tailer: backfill, restart dedup, rescan bounds ---------------------

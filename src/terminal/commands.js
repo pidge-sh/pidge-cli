@@ -1,10 +1,11 @@
 'use strict';
 // `pidge terminal <sub>` — the user-facing side of Agent Sessions v1
 // (agent-sessions-spec §2). connect = once per computer (claim exchange + consent +
-// hooks + daemon install); enable = per session, via the ancestor walk (the
-// "enable yourself on Pidge" prompt door) or the `ls` picker; disable/status/
-// disconnect complete the lifecycle. Everything session-scoped talks to the
-// LOCAL daemon over loopback — commands never publish anything themselves.
+// hooks + daemon install); enable = per session, through the ONE door: the
+// ancestor walk from inside the running claude ("enable yourself on Pidge");
+// disable/status/disconnect complete the lifecycle. Everything session-scoped
+// talks to the LOCAL daemon over loopback — commands never publish anything
+// themselves.
 
 const fs = require('fs');
 const os = require('os');
@@ -133,7 +134,7 @@ async function runConnect(v) {
       say('  (survive logout: `loginctl enable-linger $USER`)');
     } else say(`· daemon logs at ${core.LOG_FILE()}`);
   }
-  say('\nDone. Start (or restart) claude inside a tmux pane, then tell it\n"enable yourself on Pidge" — or run `pidge terminal ls` to pick a session.');
+  say('\nDone. Start (or restart) claude inside a tmux pane, then tell it\n"enable yourself on Pidge" — that is the only way to share a session.');
 }
 
 // --- hook shim + settings.json installer ------------------------------------
@@ -493,7 +494,7 @@ function uninstallDaemonService(probe = {}) {
   return { kind: 'systemd', removed };
 }
 
-// --- enable (the ancestor walk — spec §2's prompt door) ---------------------
+// --- enable (the ancestor walk — spec §2's ONE door) ------------------------
 
 // `command`, `ppid` and `tty` are POSIX/GNU `ps` output specs — identical on
 // macOS (BSD ps) and Linux (procps).
@@ -550,96 +551,36 @@ function findClaudeAncestor() {
   return null;
 }
 
-// Both enable doors resolve the pane through core.tmuxPaneForTty — see there.
+// The pane lookup lives in core so the CLI and the daemon bind identically.
 function paneForTty(tty) { return core.tmuxPaneForTty(tty); }
 
+// The ONE door (spec §2, locked down): no picker, no `--session`, no pane-less
+// share. Anything that isn't "a claude ancestor, in a tmux pane" refuses with
+// the single instruction that fixes it — never a guess, never a read-only tier.
 async function runEnable(v) {
   if (!(await daemonAlive())) die('pidge terminal enable: the local daemon is not running — run `pidge terminal connect` (or `pidge terminal daemon` in another shell) first');
   const approvals = v.approvals ? String(v.approvals).split(',').map((s) => s.trim()).filter(Boolean) : [];
 
-  let target;
-  if (v.session) {
-    target = { sid: v.session };
-  } else {
-    const claude = findClaudeAncestor();
-    if (!claude) {
-      die('pidge terminal enable: no claude ancestor found in this process tree.\n' +
-          'This command is meant to run FROM INSIDE a Claude Code session ("enable yourself on Pidge").\n' +
-          'Fallback: `pidge terminal ls` lists shareable sessions; enable one with `pidge terminal enable --session <sid>`.');
-    }
-    if (!claude.tty) {
-      die('pidge terminal enable: the claude ancestor has no controlling tty — cannot bind a tmux pane.\n' +
-          'v1 shares only sessions running INSIDE tmux (start: `tmux`, then `claude`).');
-    }
-    const pane = paneForTty(claude.tty);
-    if (!pane) {
-      die(`pidge terminal enable: claude's tty (${claude.tty}) is not a tmux pane.\n` +
-          'v1 shares only sessions running INSIDE tmux — start claude inside tmux and retry.');
-    }
-    target = { tty: claude.tty, cwd: claude.cwd, pane_id: pane.paneId, loc: pane.loc };
-  }
+  // No claude ancestor (a bare terminal) · a claude with no controlling tty ·
+  // a tty that is not a tmux pane — three ways to be un-shareable, ONE answer.
+  const claude = findClaudeAncestor();
+  const pane = claude && claude.tty ? paneForTty(claude.tty) : null;
+  if (!pane) die(core.ENABLE_REFUSAL);
+  const target = { tty: claude.tty, cwd: claude.cwd, pane_id: pane.paneId, loc: pane.loc };
 
   const { res, data } = await daemonCall('POST', '/enable', { ...target, approvals });
   if (res.status !== 200) die(`pidge terminal enable: ${data && data.error ? data.error : `daemon answered ${res.status}`}`);
   if (data.already) {
     say(`✓ this session is already shared (${data.public_id})`);
-    if (data.read_only) say('  (read-only — no tmux pane is bound, so replies from the phone will not reach it)');
-  } else if (data.read_only) {
-    // The daemon could not bind a pane. Sharing still succeeded — the
-    // transcript publishes — but the input lane is dead, and saying "✓ session
-    // shared" alone would let the human type into the void (spec §8).
-    say(`✓ session shared → ${data.public_id} — READ-ONLY`);
-    say('  No tmux pane could be bound to this session, so anything you type from');
-    say('  the phone will NOT reach it. To get the reply lane, run claude inside a');
-    say('  tmux pane and enable from that session ("enable yourself on Pidge").');
-    if (data.backfilled) say(`  seeded ${data.backfilled} recent items; earlier history stays on this computer`);
-  } else {
-    say(`✓ session shared → ${data.public_id}${target.loc ? ` (pane ${target.loc})` : ''}`);
-    if (data.backfilled) say(`  seeded ${data.backfilled} recent items; earlier history stays on this computer`);
-    say('  Open the Pidge app → Agents to watch and reply. `pidge terminal disable` stops sharing.');
-    if (approvals.length) say(`  approval gate ON for: ${approvals.join(', ')}`);
+    return;
   }
+  say(`✓ session shared → ${data.public_id}${target.loc ? ` (pane ${target.loc})` : ''}`);
+  if (data.backfilled) say(`  seeded ${data.backfilled} recent items; earlier history stays on this computer`);
+  say('  Open the Pidge app → Agents to watch and reply. `pidge terminal disable` stops sharing.');
+  if (approvals.length) say(`  approval gate ON for: ${approvals.join(', ')}`);
 }
 
-// --- ls / status / disable / disconnect -------------------------------------
-
-async function runLs() {
-  const health = await daemonAlive();
-  if (!health) die('pidge terminal ls: the local daemon is not running — run `pidge terminal connect` first');
-  const { data } = await daemonCall('GET', '/sessions');
-  let panes = [];
-  try {
-    panes = execFileSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_tty}\t#{pane_current_command}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_path}'], { encoding: 'utf8' })
-      .trim().split('\n').filter(Boolean).map((l) => {
-        const [paneId, tty, cmd, loc, cwd] = l.split('\t');
-        return { paneId, tty, cmd, loc, cwd };
-      });
-  } catch { say('(no tmux server running — only announced sessions shown)'); }
-
-  const enabledBySid = new Map((data.enabled || []).map((e) => [e.sid, e]));
-  const announceByTty = new Map((data.announces || []).map((a) => [a.tty, a]));
-  const rows = [];
-  for (const p of panes) {
-    const ann = announceByTty.get(p.tty);
-    const looksAgent = /^(claude|node)$/.test(p.cmd) || ann;
-    if (!looksAgent) continue;
-    if (ann) {
-      const en = enabledBySid.get(ann.sid);
-      rows.push(`${p.loc.padEnd(16)} ${ann.sid.slice(0, 8)}  ${path.basename(ann.cwd || p.cwd)}  ${en ? `SHARED (${en.status})` : 'shareable'}`);
-    } else {
-      rows.push(`${p.loc.padEnd(16)} ${'—'.padEnd(8)}  ${path.basename(p.cwd)}  restart claude to share (no announcement)`);
-    }
-  }
-  for (const a of data.announces || []) {
-    if (panes.some((p) => p.tty === a.tty)) continue;
-    const en = enabledBySid.get(a.sid);
-    rows.push(`${'(no tmux pane)'.padEnd(16)} ${a.sid.slice(0, 8)}  ${path.basename(a.cwd || '?')}  ${en ? `SHARED (${en.status})` : 'not shareable (outside tmux)'}`);
-  }
-  if (!rows.length) { say('no claude sessions found — start claude inside a tmux pane'); return; }
-  say('PANE             SESSION   PROJECT  STATE');
-  for (const r of rows) say(r);
-  say('\nenable: tell that claude "enable yourself on Pidge", or `pidge terminal enable --session <sid>`');
-}
+// --- status / disable / disconnect ------------------------------------------
 
 async function runStatus() {
   const env = core.loadTerminalEnv();
@@ -649,8 +590,14 @@ async function runStatus() {
   if (health) {
     const { data } = await daemonCall('GET', '/sessions');
     const en = data.enabled || [];
+    const announced = (data.announces || []).length;
     say(`sessions: ${en.length} shared${en.length ? ' — ' + en.map((e) => `${e.sid.slice(0, 8)} (${e.status})`).join(', ') : ''}`);
-    say(`announced: ${(data.announces || []).length} (local only, not shared)`);
+    say(`announced: ${announced} (local only, not shared)`);
+    // The announce map is diagnostics, never a picker: a session can only be
+    // shared from inside itself, so this points at the prompt, not at a list.
+    if (announced > en.length) {
+      say('          share one by telling that Claude "enable yourself on Pidge" (from inside its tmux pane)');
+    }
   }
   let hooksLine;
   try {
@@ -680,7 +627,7 @@ async function runDisable(v) {
       if (ann) sid = ann.sid;
     }
   }
-  if (!sid) die('pidge terminal disable: pass --session <sid> (see `pidge terminal ls`) or --all');
+  if (!sid) die('pidge terminal disable: run it from inside the shared Claude session, or pass --session <sid> (`pidge terminal status` lists them) or --all');
   // Prefix match against enabled sessions for convenience.
   const { data } = await daemonCall('GET', '/sessions');
   const hit = (data.enabled || []).find((e) => e.sid === sid || e.sid.startsWith(sid));
@@ -706,7 +653,6 @@ async function runTerminal(sub, v) {
   switch (sub) {
     case 'connect': return runConnect(v);
     case 'enable': return runEnable(v);
-    case 'ls': return runLs();
     case 'status': return runStatus();
     case 'disable': return runDisable(v);
     case 'disconnect': return runDisconnect();
@@ -716,7 +662,10 @@ async function runTerminal(sub, v) {
       return d.run();
     }
     default:
-      die(`pidge terminal: unknown subcommand ${JSON.stringify(sub || '')} — one of: connect, ls, enable, disable, status, disconnect, daemon`);
+      // `ls` (the session picker) was REMOVED with the enable lock-down: it is
+      // not deprecated-but-tolerated, it is gone — sharing happens only from
+      // inside the session, so a list of other people's sessions is not a door.
+      die(`pidge terminal: unknown subcommand ${JSON.stringify(sub || '')} — one of: connect, enable, disable, status, disconnect, daemon`);
   }
 }
 

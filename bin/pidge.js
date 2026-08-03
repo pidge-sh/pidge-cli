@@ -398,7 +398,7 @@ const OPTIONS = {
   // Agent Sessions (`pidge terminal …`) — see src/terminal/
   code: { type: 'string' },                    // terminal connect: the Connect-a-computer claim code
   secret: { type: 'string' },                  // terminal connect: PIDGE_SECRET fallback (env var preferred)
-  session: { type: 'string' },                 // terminal enable/disable: explicit session id (else ancestor-walk)
+  session: { type: 'string' },                 // terminal disable: explicit session id (else ancestor-walk)
   approvals: { type: 'string' },               // terminal enable: comma tool list for the approval gate (off by default)
   yes: { type: 'boolean' },                    // terminal connect: skip the consent prompt (scripted installs)
   'no-daemon': { type: 'boolean' },            // terminal connect: skip the service install (any platform)
@@ -506,9 +506,10 @@ USAGE
                                           structured transcript, E2E-sealed) to the human's phone,
                                           typed replies land in the session's input box.
                                           connect --code C   once per computer (paste the app's one-liner)
-                                          enable             share THIS session (run from inside claude,
-                                                             in tmux — "enable yourself on Pidge")
-                                          ls · disable · status · disconnect
+                                          enable             share THIS session — the ONLY door: run it
+                                                             from inside claude, in tmux ("enable
+                                                             yourself on Pidge"). No picker, no sid.
+                                          disable · status · disconnect
   pidge bridge --exec '<handler>'         24/7 SUPERVISOR: loop listen --all → your handler runs
                                           ONCE per batch (batch JSON on stdin) → exit 0 ⇒ ack of the
                                           batch's EXACT ids · non-zero ⇒ NOT acked (the server lease
@@ -703,7 +704,7 @@ const OPTION_DOCS = {
   claim: '--claim CODE             the single-use setup code (the human copies it from the Pidge app)',
   code: '--code CODE              terminal connect: the Connect-a-computer claim code (from the app\'s one-liner)',
   secret: '--secret S               terminal connect: PIDGE_SECRET fallback (prefer the env var — keeps it out of argv)',
-  session: '--session SID            terminal: target a session id from `pidge terminal ls` (default: ancestor-walk)',
+  session: '--session SID            terminal disable: a session id from `pidge terminal status` (default: THIS session, via the ancestor walk). `enable` takes no sid — it shares the session it runs inside.',
   approvals: '--approvals T1,T2        terminal enable: gate these tools behind an Approve/Deny push (off by default)',
   yes: '--yes                    terminal connect: skip the consent prompt (scripted installs)',
   'no-daemon': '--no-daemon              terminal connect: skip the service install on any platform (run `pidge terminal daemon` yourself)',
@@ -904,11 +905,11 @@ const HELP = {
   },
   terminal: {
     summary: 'Agent Sessions: mirror a Claude Code session to the phone as structured, E2E-sealed conversation data; typed replies come back into the session.',
-    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon]  ·  pidge terminal enable [--session SID] [--approvals Tool1,Tool2]  ·  pidge terminal ls | disable [--session SID|--all] | status | disconnect',
+    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon]  ·  pidge terminal enable [--approvals Tool1,Tool2]  ·  pidge terminal disable [--session SID|--all] | status | disconnect',
     body: [
       'The user runs claude inside tmux — that is their ENTIRE responsibility. `connect` (once per computer) pairs with the phone: the app\'s Settings → Computers → Connect a computer mints a tunnel channel + E2E key and shows a one-liner carrying the claim code + PIDGE_SECRET; paste it in a terminal. It asks consent, installs Claude Code hooks (tagged `# pidge-hook`, cleanly removable) and a background daemon (launchd on macOS, `systemd --user` on Linux/WSL; a WSL without systemd gets a detached daemon + the line that makes it durable).',
       '',
-      'SHARING IS PER SESSION and opt-in: nothing leaves the computer until `enable`. The prompt door: tell the claude running in tmux "enable yourself on Pidge" — the skill runs `pidge terminal enable`, which walks its process tree to the claude ancestor, reads its tty+cwd, binds the exact tmux pane and the exact transcript. The picker door: `pidge terminal ls` lists shareable sessions. A NEW claude in the same pane is NOT auto-enabled (consent is per session id).',
+      'SHARING IS PER SESSION and opt-in: nothing leaves the computer until `enable`, and there is exactly ONE door. Tell the claude running in tmux "enable yourself on Pidge" — the skill runs `pidge terminal enable`, which walks its process tree to the claude ancestor, reads its tty+cwd, binds the exact tmux pane and the exact transcript. There is no picker and no --session for enable: a command that cannot see a claude ancestor in a tmux pane REFUSES ("Run this from inside the Claude session you want to share — it must be in a tmux.") instead of guessing or minting a share nobody can reply to. A NEW claude in the same pane is NOT auto-enabled (consent is per session id).',
       '',
       'Everything shared is fully interactive: the phone renders the transcript natively (tool cards, diffs) and typed replies land in the session\'s real input box via tmux send-keys. Sessions outside tmux are not shareable in v1. When claude stops and waits, the human gets a REAL notification. `--approvals Bash,Write` (off by default) additionally gates those tools behind an Approve/Deny push — timeout falls open to the local prompt.',
       '',
