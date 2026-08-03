@@ -53,6 +53,13 @@ const ENABLE_NO_PANE_REASON =
 const ENABLE_NO_TRANSCRIPT_REASON =
   "Couldn't mirror this session: this computer has no transcript path for it. " +
   'Restart claude inside its own tmux pane and paste the command again. Do not run other commands.';
+// When the daemon could not even READ the pane list (mangled tmux output), the
+// refusal must not blame the human — "start claude inside tmux" with the pane
+// right there is exactly the lie QA finding #10 caught.
+const ENABLE_PANE_LOOKUP_FAILED_REASON =
+  "Couldn't mirror this session: the local Pidge daemon failed to read the tmux pane list " +
+  '(a daemon-side problem, NOT your setup — see ~/.config/pidge/terminal/terminal.log). ' +
+  'Do not run other commands.';
 
 // What `pidge terminal enable` says when it is run OUTSIDE the door (a bare
 // terminal, or a claude whose hooks are not installed): the command is a
@@ -95,25 +102,83 @@ function normalizeTty(short) {
   return t.startsWith('/') ? t : `/dev/${t}`;
 }
 
+// The UTF-8 locale every tmux call must carry (QA finding #10): launchd and
+// `systemd --user` hand a service NO locale, and without a UTF-8 locale tmux
+// SANITIZES control characters in its -F output — the old TAB separator came
+// back as `_` (byte 0x5f, proven on the byte), the parser found 0 panes, and
+// enable refused "you're not in tmux" with the pane right there. Prefer the
+// locale the human's shell already proved works; fall back to one that exists
+// on the platform (en_US.UTF-8 ships on macOS; C.UTF-8 on any modern glibc).
+function utf8Locale(env = process.env, platform = process.platform) {
+  for (const v of [env.LC_ALL, env.LANG]) {
+    if (v && /utf-?8/i.test(v)) return v;
+  }
+  return platform === 'darwin' ? 'en_US.UTF-8' : 'C.UTF-8';
+}
+
+// Defense in depth: the service templates set LANG/LC_ALL too (commands.js),
+// but the daemon must not depend on being installed by a template that did.
+function tmuxExec(args, opts = {}) {
+  const locale = utf8Locale();
+  return execFileSync('tmux', args,
+    { ...opts, env: { ...process.env, LANG: locale, LC_ALL: locale, ...(opts.env || {}) } });
+}
+
+// The list-panes field separator is a PRINTABLE, improbable delimiter on
+// purpose: TAB is a control character and tmux has license to sanitize it away
+// under a non-UTF-8 locale (finding #10). `:::` survives any locale; a pane
+// path that somehow contains it makes the line unparsable — which is LOUD
+// below, never silent.
+const TMUX_FIELD_SEP = ':::';
+const TMUX_PANE_FORMAT =
+  ['#{pane_id}', '#{pane_tty}', '#{pane_current_path}', '#{session_name}:#{window_index}.#{pane_index}']
+    .join(TMUX_FIELD_SEP);
+
+// Pure parser for `tmux list-panes -F TMUX_PANE_FORMAT` output. A line that
+// does not yield the expected fields goes to `unparsable` — the caller decides
+// how loud (spec §11: an impossible line NEVER becomes silent 0 panes).
+function parseTmuxPanes(out) {
+  const panes = [];
+  const unparsable = [];
+  for (const line of String(out || '').split('\n')) {
+    if (!line.trim()) continue;
+    const parts = line.split(TMUX_FIELD_SEP);
+    if (parts.length === 4 && /^%\d+$/.test(parts[0]) && parts[1]) {
+      panes.push({ paneId: parts[0], tty: parts[1], path: parts[2], loc: parts[3] });
+    } else {
+      unparsable.push(line);
+    }
+  }
+  return { panes, unparsable };
+}
+
 // Every tmux pane on this computer: {paneId, tty, path, loc}.
-function tmuxPanes() {
+// `opts.exec`/`opts.onWarn` exist for tests and for the daemon's logger.
+function tmuxPanes(opts = {}) {
+  const exec = opts.exec || ((args) => tmuxExec(args, { encoding: 'utf8' }));
+  const onWarn = opts.onWarn || ((msg) => console.error(msg));
+  let out;
   try {
-    const out = execFileSync('tmux',
-      ['list-panes', '-a', '-F',
-        '#{pane_id}\t#{pane_tty}\t#{pane_current_path}\t#{session_name}:#{window_index}.#{pane_index}'],
-      { encoding: 'utf8' });
-    return out.trim().split('\n').filter(Boolean).map((line) => {
-      const [paneId, tty, panePath, loc] = line.split('\t');
-      return { paneId, tty, path: panePath, loc };
-    });
-  } catch { return []; }
+    out = exec(['list-panes', '-a', '-F', TMUX_PANE_FORMAT]);
+  } catch { return []; } // no tmux binary / no server: genuinely zero panes
+  const { panes, unparsable } = parseTmuxPanes(out);
+  for (const line of unparsable) {
+    onWarn(`tmux list-panes: UNPARSABLE line ${JSON.stringify(line)} — expected 4 fields separated by ${JSON.stringify(TMUX_FIELD_SEP)}. This is a pidge/tmux mismatch, not a user error.`);
+  }
+  if (!panes.length && unparsable.length) {
+    // tmux LISTED panes and we understood none of them. Reading that as "0
+    // panes ⇒ you are not in tmux" is the silent lie finding #10 caught —
+    // fail LOUD instead, and let the caller refuse without blaming the user.
+    throw new Error(`tmux listed ${unparsable.length} pane(s) but none parsed — the pane list came back mangled (locale/sanitization?); refusing to read that as "no panes"`);
+  }
+  return panes;
 }
 
 // Resolve the tmux pane that owns a controlling tty — the PRIMARY binding.
 // No pane ⇒ no share (spec §8: enable pins ONE pane_id).
-function tmuxPaneForTty(tty) {
+function tmuxPaneForTty(tty, opts) {
   if (!tty) return null;
-  const hit = tmuxPanes().find((p) => p.tty === tty);
+  const hit = tmuxPanes(opts).find((p) => p.tty === tty);
   return hit ? { paneId: hit.paneId, loc: hit.loc } : null;
 }
 
@@ -121,10 +186,10 @@ function tmuxPaneForTty(tty) {
 // panes whose current path IS the session's cwd. Returns ALL of them on
 // purpose — the caller binds only when there is EXACTLY one, because guessing
 // between two panes means typing the human's words into a stranger's shell.
-function tmuxPanesForCwd(cwd) {
+function tmuxPanesForCwd(cwd, opts) {
   const want = String(cwd || '').replace(/\/+$/, '');
   if (!want) return [];
-  return tmuxPanes()
+  return tmuxPanes(opts)
     .filter((p) => String(p.path || '').replace(/\/+$/, '') === want)
     .map((p) => ({ paneId: p.paneId, loc: p.loc }));
 }
@@ -282,8 +347,10 @@ function saveCaps(caps) {
 module.exports = {
   baseDir, terminalDir, ENV_FILE, DAEMON_FILE, STATE_FILE, LOG_FILE, HOOK_SHIM, LOCKS_DIR,
   tmuxPanes, tmuxPaneForTty, tmuxPanesForCwd, normalizeTty,
+  parseTmuxPanes, tmuxExec, utf8Locale, TMUX_FIELD_SEP, TMUX_PANE_FORMAT,
   parseEnableSentinel, ENABLE_SENTINEL, ENABLE_PROMPT, ENABLE_NOT_MIRRORED,
   ENABLE_OK_REASON, ENABLE_NO_PANE_REASON, ENABLE_NO_TRANSCRIPT_REASON,
+  ENABLE_PANE_LOOKUP_FAILED_REASON,
   readEnvFile, writeFileAtomic, readJson, writeJson,
   loadTerminalEnv, saveTerminalEnv,
   e2eAad, e2eParseSecret, e2eKeyFingerprint, e2eEncryptField, e2eEncryptBlob, e2eDecryptBlob,

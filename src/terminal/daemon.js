@@ -23,7 +23,6 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
 const core = require('./core');
 const adapter = require('./adapter-claude');
 
@@ -316,8 +315,8 @@ class Daemon {
       return deny(core.ENABLE_NO_TRANSCRIPT_REASON);
     }
 
-    const pane = this.resolvePane({ sid, tty, cwd });
-    if (!pane) return deny(core.ENABLE_NO_PANE_REASON);
+    const { pane, refusal } = this.resolvePane({ sid, tty, cwd });
+    if (!pane) return deny(refusal);
 
     try {
       const s = await this.enableSession({
@@ -339,20 +338,34 @@ class Daemon {
   // (Claude Code can spawn a hook without a controlling tty), and only when
   // exactly one pane matches — two candidates means typing the human's words
   // into a stranger's shell, so ambiguity refuses like absence does.
+  //
+  // Returns {pane} or {refusal}. The refusal DISTINGUISHES "you are not in a
+  // tmux pane" from "the daemon could not read the pane list" — the second was
+  // reported as the first for weeks (QA finding #10: a locale-mangled
+  // list-panes read as 0 panes, and the message blamed the user).
   resolvePane({ sid, tty, cwd }) {
     const tag = String(sid || '').slice(0, 8);
-    if (tty) {
-      const hit = core.tmuxPaneForTty(tty);
-      if (hit) return { paneId: hit.paneId, loc: hit.loc, by: `tty ${tty}` };
-      // A REAL tty that no pane owns = claude is not running inside tmux. The
-      // cwd fallback must NOT rescue this: it would bind an unrelated pane.
-      this.log(`enable ${tag} REFUSED: tty ${tty} is not a tmux pane — claude is not running inside tmux`);
-      return null;
+    const opts = { onWarn: (m) => this.log(m) };
+    try {
+      if (tty) {
+        const hit = core.tmuxPaneForTty(tty, opts);
+        if (hit) return { pane: { paneId: hit.paneId, loc: hit.loc, by: `tty ${tty}` } };
+        // A REAL tty that no pane owns = claude is not running inside tmux. The
+        // cwd fallback must NOT rescue this: it would bind an unrelated pane.
+        this.log(`enable ${tag} REFUSED: tty ${tty} is not a tmux pane — claude is not running inside tmux`);
+        return { refusal: core.ENABLE_NO_PANE_REASON };
+      }
+      const hits = core.tmuxPanesForCwd(cwd, opts);
+      if (hits.length === 1) return { pane: { paneId: hits[0].paneId, loc: hits[0].loc, by: `cwd ${cwd}` } };
+      this.log(`enable ${tag} REFUSED: no controlling tty and ${hits.length} tmux pane(s) sit in ${cwd || '(unknown cwd)'} — a pane-less or guessed share would drop every keystroke`);
+      return { refusal: core.ENABLE_NO_PANE_REASON };
+    } catch (e) {
+      // The pane list existed but could not be PARSED (core.tmuxPanes threw).
+      // That is a daemon-side failure — refuse loudly WITHOUT telling the human
+      // they are not in tmux (§11: the silence/misblame is the bug).
+      this.log(`enable ${tag} REFUSED: ${e.message}`);
+      return { refusal: core.ENABLE_PANE_LOOKUP_FAILED_REASON };
     }
-    const hits = core.tmuxPanesForCwd(cwd);
-    if (hits.length === 1) return { paneId: hits[0].paneId, loc: hits[0].loc, by: `cwd ${cwd}` };
-    this.log(`enable ${tag} REFUSED: no controlling tty and ${hits.length} tmux pane(s) sit in ${cwd || '(unknown cwd)'} — a pane-less or guessed share would drop every keystroke`);
-    return null;
   }
 
   async enableSession({ sid, paneId, tty, cwd, file, approvals }) {
@@ -1115,7 +1128,7 @@ class Daemon {
           this.sendLiteral(session.paneId, k.lit);
           session.waitingArmed = true; // input resets the waiting episode (spec §9)
         } else if (k && typeof k.key === 'string' && INPUT_KEYS.has(k.key)) {
-          execFileSync('tmux', ['send-keys', '-t', session.paneId, k.key]);
+          core.tmuxExec(['send-keys', '-t', session.paneId, k.key]);
         }
         // anything else: dropped whole (deliberately tiny allowlist)
       } catch (e) {
@@ -1125,19 +1138,21 @@ class Daemon {
   }
 
   sendLiteral(paneId, text) {
+    // core.tmuxExec carries a UTF-8 locale on every call (finding #10 defense
+    // in depth): a service env without one makes tmux mangle non-ASCII.
     if (text.includes('\n')) {
       // Multiline rides a tmux buffer + bracketed paste (spec §8).
       const bufName = `pidge-${Date.now()}`;
-      execFileSync('tmux', ['set-buffer', '-b', bufName, text]);
-      execFileSync('tmux', ['paste-buffer', '-p', '-b', bufName, '-t', paneId, '-d']);
+      core.tmuxExec(['set-buffer', '-b', bufName, text]);
+      core.tmuxExec(['paste-buffer', '-p', '-b', bufName, '-t', paneId, '-d']);
     } else {
-      execFileSync('tmux', ['send-keys', '-t', paneId, '-l', text]);
+      core.tmuxExec(['send-keys', '-t', paneId, '-l', text]);
     }
   }
 
   paneAlive(paneId) {
     try {
-      const out = execFileSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}'], { encoding: 'utf8' });
+      const out = core.tmuxExec(['list-panes', '-a', '-F', '#{pane_id}'], { encoding: 'utf8' });
       return out.split('\n').includes(paneId);
     } catch { return false; }
   }

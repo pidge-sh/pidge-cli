@@ -483,9 +483,17 @@ function installDaemonService(probe = {}) {
 
 function installLaunchd(run) {
   const { nodeBin, cli } = daemonExec();
-  const envBlock = process.env.PATH
-    ? `  <key>EnvironmentVariables</key>\n  <dict>\n    <key>PATH</key><string>${xmlEscape(process.env.PATH)}</string>\n  </dict>\n`
-    : '';
+  // launchd hands a service NO locale — and without a UTF-8 locale tmux
+  // SANITIZES control characters in its -F output, which is how the pane
+  // parser found "0 panes" with the pane right there (QA finding #10). The
+  // daemon also forces the locale on every tmux call (core.tmuxExec); setting
+  // it here too is deliberate defense in depth, per platform template.
+  const locale = core.utf8Locale();
+  const envPairs = { LANG: locale, LC_ALL: locale };
+  if (process.env.PATH) envPairs.PATH = process.env.PATH;
+  const envEntries = Object.entries(envPairs)
+    .map(([k, val]) => `    <key>${xmlEscape(k)}</key><string>${xmlEscape(val)}</string>`).join('\n');
+  const envBlock = `  <key>EnvironmentVariables</key>\n  <dict>\n${envEntries}\n  </dict>\n`;
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -532,7 +540,10 @@ function installSystemdUser(probe, run) {
   // to tmux and ps on every enable and every keystroke it delivers. A tmux from
   // homebrew/nix/~/.local/bin would simply not exist for the service while
   // working fine in the shell the human just tested from.
-  const envPairs = {};
+  // LANG/LC_ALL: same story as the launchd template — no locale in the service
+  // env makes tmux sanitize control characters in -F output (QA finding #10).
+  const locale = core.utf8Locale();
+  const envPairs = { LANG: locale, LC_ALL: locale };
   if (process.env.PATH) envPairs.PATH = process.env.PATH;
   if (process.env.XDG_CONFIG_HOME) envPairs.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
   const envLines = Object.entries(envPairs)

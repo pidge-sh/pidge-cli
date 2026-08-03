@@ -792,6 +792,105 @@ test('normalizeTty turns a short tty name into the path tmux reports — on BOTH
   assert.equal(core.normalizeTty(null), null);
 });
 
+// --- the tmux pane parser vs the service locale (QA finding #10) ------------
+//
+// The daemon under launchd has NO LANG; without a UTF-8 locale tmux sanitizes
+// control characters in -F output, so the old TAB separator came back as `_`
+// and `split('\t')` silently yielded 0 panes — enable then told the human they
+// weren't in tmux, with the pane right there. Three defenses, each tested:
+// a printable separator, LANG/LC_ALL in the exec env + service templates, and
+// a parser that treats an impossible line as a LOUD failure.
+
+test('the tmux list-panes format has NO control characters — tmux may sanitize them', () => {
+  assert.ok(!/[\x00-\x1f\x7f]/.test(core.TMUX_PANE_FORMAT),
+    'a control-char separator (the old TAB) is sanitized to `_` under a non-UTF-8 locale');
+  assert.ok(core.TMUX_PANE_FORMAT.includes(core.TMUX_FIELD_SEP));
+  assert.equal(core.TMUX_FIELD_SEP, ':::');
+});
+
+test('parseTmuxPanes: the REAL sanitized (no-locale) output is unparsable, never 0 silent panes', () => {
+  // The literal line QA #10 captured: launchd env, tmux swapped the TAB
+  // separator for `_`, every field ran together.
+  const sanitized = '%0_/dev/ttys006_/private/tmp/pidge-qa-proj_probe:0.0';
+  const { panes, unparsable } = core.parseTmuxPanes(sanitized);
+  assert.deepEqual(panes, [], 'a mangled line must never half-parse into a bogus pane');
+  assert.deepEqual(unparsable, [sanitized], 'and it must be REPORTED, not swallowed');
+
+  // The good output with the new separator parses into exact fields.
+  const good = [
+    ['%0', '/dev/ttys006', '/private/tmp/pidge-qa-proj', 'probe:0.0'].join(core.TMUX_FIELD_SEP),
+    ['%12', '/dev/pts/3', '/home/u/proj', 'main:1.2'].join(core.TMUX_FIELD_SEP),
+  ].join('\n');
+  const ok = core.parseTmuxPanes(good);
+  assert.deepEqual(ok.unparsable, []);
+  assert.deepEqual(ok.panes, [
+    { paneId: '%0', tty: '/dev/ttys006', path: '/private/tmp/pidge-qa-proj', loc: 'probe:0.0' },
+    { paneId: '%12', tty: '/dev/pts/3', path: '/home/u/proj', loc: 'main:1.2' },
+  ]);
+});
+
+test('tmuxPanes: ALL lines mangled ⇒ a loud throw; a stray bad line warns but keeps the good ones', () => {
+  const sanitized = '%0_/dev/ttys006_/private/tmp/pidge-qa-proj_probe:0.0\n';
+  const warns = [];
+  assert.throws(
+    () => core.tmuxPanes({ exec: () => sanitized, onWarn: (m) => warns.push(m) }),
+    /none parsed/,
+    'reading a mangled list as "0 panes ⇒ not in tmux" is the finding-#10 lie');
+  assert.equal(warns.length, 1);
+  assert.match(warns[0], /UNPARSABLE/);
+  assert.match(warns[0], /not a user error/);
+
+  // Mixed output: the parsable pane survives, the bad line is warned about.
+  const mixed = ['%1', '/dev/ttys001', '/tmp/a', 's:0.0'].join(core.TMUX_FIELD_SEP) + '\ngarbage-line\n';
+  const warns2 = [];
+  const panes = core.tmuxPanes({ exec: () => mixed, onWarn: (m) => warns2.push(m) });
+  assert.deepEqual(panes, [{ paneId: '%1', tty: '/dev/ttys001', path: '/tmp/a', loc: 's:0.0' }]);
+  assert.equal(warns2.length, 1);
+
+  // tmux itself absent/failing is still a quiet [] — genuinely no panes.
+  assert.deepEqual(core.tmuxPanes({ exec: () => { throw new Error('no server'); } }), []);
+});
+
+test('utf8Locale: prefers the locale the shell proved, falls back per platform', () => {
+  assert.equal(core.utf8Locale({ LC_ALL: 'pt_BR.UTF-8' }, 'darwin'), 'pt_BR.UTF-8');
+  assert.equal(core.utf8Locale({ LANG: 'en_US.utf8' }, 'linux'), 'en_US.utf8');
+  assert.equal(core.utf8Locale({ LANG: 'C' }, 'darwin'), 'en_US.UTF-8', 'a non-UTF-8 LANG is exactly the failure');
+  assert.equal(core.utf8Locale({}, 'darwin'), 'en_US.UTF-8', 'macOS ships en_US.UTF-8');
+  assert.equal(core.utf8Locale({}, 'linux'), 'C.UTF-8', 'modern glibc ships C.UTF-8 without locale-gen');
+});
+
+test('a daemon whose pane list cannot be parsed refuses WITHOUT blaming the user', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const out = await withPanes({
+    byTty: () => { throw new Error('tmux listed 1 pane(s) but none parsed — mangled'); },
+  }, () => hookPost(d, 'pre-tool-use', preToolUse('sess-mangled', 'pidge terminal enable')));
+
+  assert.equal(out.decision.permissionDecision, 'deny');
+  assert.equal(out.decision.permissionDecisionReason, core.ENABLE_PANE_LOOKUP_FAILED_REASON);
+  assert.doesNotMatch(out.decision.permissionDecisionReason, /Start claude inside/i,
+    'a daemon-side parse failure must not tell the human to fix their tmux');
+  assert.equal(d.sessions.size, 0);
+  assert.ok(d.logLines.some((l) => /REFUSED: tmux listed/.test(l)), `expected the loud cause, got ${JSON.stringify(d.logLines)}`);
+});
+
+test('both service templates carry a UTF-8 locale (launchd and systemd hand the daemon none)', () => {
+  freshHome();
+  freshXdg();
+  const rec = recorder();
+  const mac = withPlatform('darwin', () => commands.installDaemonService({ run: rec.run }));
+  const plist = fs.readFileSync(mac.file, 'utf8');
+  assert.match(plist, /<key>LANG<\/key><string>[^<]*(UTF-8|utf8)<\/string>/i);
+  assert.match(plist, /<key>LC_ALL<\/key><string>[^<]*(UTF-8|utf8)<\/string>/i);
+
+  freshHome();
+  freshXdg();
+  const lin = withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: recorder().run }));
+  const unit = fs.readFileSync(lin.file, 'utf8');
+  assert.match(unit, /^Environment="LANG=[^"]*(UTF-8|utf8)"$/im);
+  assert.match(unit, /^Environment="LC_ALL=[^"]*(UTF-8|utf8)"$/im);
+});
+
 // --- the enable SENTINEL matcher (the door's whole contract) ----------------
 
 test('parseEnableSentinel: only a Bash command carrying the literal opens the door', () => {
