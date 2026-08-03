@@ -457,7 +457,10 @@ class Daemon {
           s.hv = item.hv;
         }
         item._publicId = s.publicId;
-        const b64 = this.sealItem(item);
+        // A seal failure on ONE item must never take the tailer interval down —
+        // skip it loudly and keep tailing (the JSONL remains durable).
+        let b64 = null;
+        try { b64 = this.sealItem(item); } catch (e) { this.log(`item ${item.uuid}: seal failed (${e.message}) — skipped`); }
         if (b64 !== null) s.queue.push(b64);
       }
     }

@@ -103,9 +103,7 @@ function normalize(obj) {
       item.tool = b.name || null;
       push(item);
     } else if (b.type === 'tool_result') {
-      const item = mk(base, 'user', 'tool_result', textOf(b));
-      if (b.tool_use_id) item.parent = base.parent; // pairing rides parent chains
-      push(item);
+      push(mk(base, 'user', 'tool_result', textOf(b))); // pairing rides the parent chain mk() already set
     } else if (b.type === 'image') {
       push(mk(base, role, 'notice', '[image attachment]'));
     }
