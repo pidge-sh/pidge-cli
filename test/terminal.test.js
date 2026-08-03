@@ -610,6 +610,60 @@ test('the tool gate matches case-insensitively and honors the wildcard', () => {
   assert.equal(d.toolGated({ approvals: ['*'] }, undefined), false);
 });
 
+// --- approval gate ----------------------------------------------------------
+
+// The gate never touches the network in tests: d.api is swapped for a recorder.
+function stubApi(d, handler) {
+  const calls = [];
+  d.api = async (method, p, body) => {
+    calls.push({ method, p, body });
+    return (await handler(method, p, body)) || { res: { status: 200 }, data: {} };
+  };
+  return calls;
+}
+
+test('approval gate: the ask carries the server approve/reject pair (never the nonexistent `deny`)', async () => {
+  const d = makeDaemon();
+  const calls = stubApi(d, async (method, p) => {
+    if (method === 'POST' && p === '/notify') return { res: { status: 201 }, data: {} };
+    if (method === 'GET') return { res: { status: 200 }, data: { responded: true, chosen_action: { action_id: 'approve' } } };
+  });
+  const s = { sid: 'sess-appr', publicId: 'ases_t', title: 'proj', approvals: ['Bash'] };
+
+  const decision = await d.approvalGate(s, { tool_name: 'Bash', tool_input: { command: 'ls' } });
+  assert.deepEqual(decision, { permissionDecision: 'allow', permissionDecisionReason: 'approved via Pidge' });
+
+  const notify = calls.find((c) => c.p === '/notify');
+  assert.deepEqual(notify.body.actions, ['approve', 'reject'],
+    'the server built-in pair is approve/reject — `deny` is not an action id and would be dropped silently');
+  assert.equal(notify.body.profile, 'urgent');
+});
+
+test('approval gate: reject maps to a deny decision, anything else falls open', async () => {
+  for (const [actionId, expected] of [
+    ['reject', { permissionDecision: 'deny', permissionDecisionReason: 'rejected via Pidge' }],
+    ['done', null],
+    ['snooze', null],
+  ]) {
+    const d = makeDaemon();
+    stubApi(d, async (method, p) => {
+      if (method === 'POST' && p === '/notify') return { res: { status: 201 }, data: {} };
+      if (method === 'GET') return { res: { status: 200 }, data: { responded: true, chosen_action: { action_id: actionId } } };
+    });
+    const s = { sid: 'sess-appr', publicId: 'ases_t', title: 'proj', approvals: ['*'] };
+    assert.deepEqual(await d.approvalGate(s, { tool_name: 'Bash', tool_input: {} }), expected,
+      `action_id ${actionId} mapped wrong`);
+  }
+});
+
+test('approval gate: a failed notify falls open to the local prompt instead of blocking', async () => {
+  const d = makeDaemon();
+  stubApi(d, async () => ({ res: { status: 402 }, data: { code: 'terminal_requires_pro' } }));
+  const s = { sid: 'sess-appr', publicId: 'ases_t', title: 'proj', approvals: ['*'] };
+  assert.equal(await d.approvalGate(s, { tool_name: 'Bash', tool_input: {} }), null);
+  assert.ok(d.logLines.some((l) => /falling open/.test(l)));
+});
+
 test('the single-writer lock refuses a live holder and takes over a stale one', () => {
   const d = makeDaemon();
   d.acquireWriterLock('sess-a');

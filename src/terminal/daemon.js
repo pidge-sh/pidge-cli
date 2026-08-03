@@ -567,7 +567,11 @@ class Daemon {
       kf: core.e2eKeyFingerprint(this.key),
       title: core.e2eEncryptField(this.key, aad('title'), `Approve ${body.tool_name} in ${s.title}?`),
       body_markdown: core.e2eEncryptField(this.key, aad('body_markdown'), '```\n' + input + '\n```'),
-      actions: ['approve', 'deny'],
+      // The server's built-in pair is approve/REJECT (Notification::BUILTIN_CATALOG
+      // — there is no `deny` action id; it would be dropped silently, leaving an
+      // approve-only ask with no banner buttons). approve+reject is also an EXACT
+      // banner category (HERALD_APPROVE_REJECT), so both buttons ride the banner.
+      actions: ['approve', 'reject'],
       mirror_reply: false,
     };
     const { res, data } = await this.api('POST', '/notify', payload);
@@ -581,7 +585,7 @@ class Daemon {
         if (poll && poll.responded && poll.chosen_action) {
           const id = poll.chosen_action.action_id;
           if (id === 'approve') return { permissionDecision: 'allow', permissionDecisionReason: 'approved via Pidge' };
-          if (id === 'deny') return { permissionDecision: 'deny', permissionDecisionReason: 'denied via Pidge' };
+          if (id === 'reject') return { permissionDecision: 'deny', permissionDecisionReason: 'rejected via Pidge' };
           return null; // done/snooze/anything else: fall open to the local human
         }
       } catch { /* transient — keep waiting inside the budget */ }
