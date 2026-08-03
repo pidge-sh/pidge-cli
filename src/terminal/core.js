@@ -80,17 +80,22 @@ const ENABLE_NOT_MIRRORED =
 //   /path/to/pidge terminal enable              (stable-path binary)
 //   /path/to/pidge.js terminal enable           (the shebang'd entry)
 //   node /path/to/pidge.js terminal enable      (explicit node)
-//   npx [-y] pidge-cli[@tag] terminal enable    (the observed PATH-less improvisation)
+//   npx [-y|--yes] pidge-cli[@tag] terminal enable  (the observed PATH-less improvisation)
 // plus an optional trailing `--approvals LIST`. Anything else — prefixes,
 // suffixes, redirects, compound commands — is NOT the door.
+// Hardened (review B3): path prefixes allow path-looking characters ONLY —
+// no `$()`, backticks, spaces — so `$(evil)/pidge …` can never read as the
+// sentinel; and whitespace is `[ \t]` only, so a multi-line command smuggling
+// the words (`pidge\nterminal\nenable`) does not match either.
 // Returns null (not the sentinel) or {approvals:[…]} parsed from the command.
+const ENABLE_PATHISH = '[\\w@.~/\\-]*';
 const ENABLE_COMMAND_RE = new RegExp(
   '^(?:' +
-    '(?:\\S*[/\\\\])?node(?:\\.exe)?\\s+\\S*[/\\\\]pidge(?:\\.js)?' +
-    '|(?:\\S*[/\\\\])?pidge(?:\\.js)?' +
-    '|npx\\s+(?:-y\\s+)?pidge-cli(?:@[\\w.^~-]+)?' +
-  ')\\s+terminal\\s+enable' +
-  '(?:\\s+--approvals[=\\s]+[A-Za-z0-9_,*-]+)?\\s*$'
+    `${ENABLE_PATHISH}node(?:\\.exe)?[ \\t]+${ENABLE_PATHISH}/pidge(?:\\.js)?` +
+    `|${ENABLE_PATHISH}pidge(?:\\.js)?` +
+    '|npx[ \\t]+(?:(?:-y|--yes)[ \\t]+)?pidge-cli(?:@[\\w.^~-]+)?' +
+  ')[ \\t]+terminal[ \\t]+enable' +
+  '(?:[ \\t]+--approvals[= \\t]+[A-Za-z0-9_,*-]+)?[ \\t]*$'
 );
 function parseEnableSentinel(toolName, command) {
   if (String(toolName || '').toLowerCase() !== 'bash') return null;
@@ -98,7 +103,7 @@ function parseEnableSentinel(toolName, command) {
   if (!ENABLE_COMMAND_RE.test(c)) return null;
   // `--approvals Bash,Write` still rides the sentinel COMMAND (the pasted text
   // is the only carrier left now that the CLI is not the mechanism).
-  const m = c.match(/--approvals[=\s]+([A-Za-z0-9_,*-]+)/);
+  const m = c.match(/--approvals[= \t]+([A-Za-z0-9_,*-]+)/);
   const approvals = m ? m[1].split(',').map((s) => s.trim()).filter(Boolean) : [];
   return { approvals };
 }
@@ -158,8 +163,11 @@ function parseTmuxPanes(out) {
   for (const line of String(out || '').split('\n')) {
     if (!line.trim()) continue;
     const parts = line.split(TMUX_FIELD_SEP);
-    if (parts.length === 4 && /^%\d+$/.test(parts[0]) && parts[1]) {
-      panes.push({ paneId: parts[0], tty: parts[1], path: parts[2], loc: parts[3] });
+    if (parts.length >= 4 && /^%\d+$/.test(parts[0]) && parts[1]) {
+      // >4 parts: the separator appeared inside the LAST field (a tmux session
+      // name may contain ':::') — rejoin the tail into loc instead of dropping
+      // a perfectly identifiable pane (review B2).
+      panes.push({ paneId: parts[0], tty: parts[1], path: parts[2], loc: parts.slice(3).join(TMUX_FIELD_SEP) });
     } else {
       unparsable.push(line);
     }

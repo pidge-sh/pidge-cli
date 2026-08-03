@@ -101,9 +101,12 @@ async function runConnect(v) {
   // right — one computer, one identity; the SWITCH must be consented.
   // Re-running WITHOUT --code (finishing a half-done install) stays allowed.
   if (code && existing.token && !v.replace) {
+    // NOTE: the suggestion is --replace, deliberately NOT `disconnect` —
+    // disconnect keeps the identity file (review M1), so it would send the
+    // human in a circle right back to this refusal.
     die('pidge terminal connect: this computer is already connected to ' +
       `channel ${existing.channelId != null ? existing.channelId : '(unknown)'} at ${existing.base || '(unknown url)'}.\n` +
-      'Run again with --replace to overwrite this identity, or `pidge terminal disconnect` first.\n' +
+      `Run again with --replace to switch this computer over — or delete ${core.ENV_FILE()} by hand and re-run.\n` +
       '(Either way the OLD channel stays on the server — remove that computer in the app: Settings → Computers.)');
   }
 

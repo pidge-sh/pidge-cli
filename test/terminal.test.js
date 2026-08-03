@@ -639,7 +639,10 @@ test('connect: a NEW pairing over an EXISTING identity refuses LOUDLY — --repl
     assert.equal(out.code, 1, 'the silent overwrite is the sin — a second pairing must refuse');
     assert.match(out.stderr, /already connected to channel 396 at https:\/\/api\.pidge\.sh/);
     assert.match(out.stderr, /--replace/);
-    assert.match(out.stderr, /disconnect/);
+    // `disconnect` KEEPS the identity file — suggesting it here sends the
+    // human in a circle right back to this refusal (review M1).
+    assert.doesNotMatch(out.stderr, /disconnect/, 'never suggest a path that cannot clear the guard');
+    assert.match(out.stderr, /terminal\/env/, 'the manual escape hatch names the actual file');
     assert.match(out.stderr, /stays on the server/, 'the orphaned-channel consequence is named');
     assert.equal(core.loadTerminalEnv().token, 'hld_prod_link', 'the stored identity is untouched');
     assert.ok(!mock.state.reqLog.some((r) => r.pathname === '/api/v1/claim'),
@@ -872,6 +875,15 @@ test('parseTmuxPanes: the REAL sanitized (no-locale) output is unparsable, never
     { paneId: '%0', tty: '/dev/ttys006', path: '/private/tmp/pidge-qa-proj', loc: 'probe:0.0' },
     { paneId: '%12', tty: '/dev/pts/3', path: '/home/u/proj', loc: 'main:1.2' },
   ]);
+
+  // A session NAME containing the separator itself (review B2): the tail is
+  // rejoined into loc — a perfectly identifiable pane is never dropped.
+  const weird = ['%7', '/dev/ttys009', '/tmp/w', 'my:::odd:::name:0.0'].join(core.TMUX_FIELD_SEP);
+  const parsed = core.parseTmuxPanes(weird);
+  assert.deepEqual(parsed.unparsable, []);
+  assert.deepEqual(parsed.panes, [
+    { paneId: '%7', tty: '/dev/ttys009', path: '/tmp/w', loc: 'my:::odd:::name:0.0' },
+  ]);
 });
 
 test('tmuxPanes: ALL lines mangled ⇒ a loud throw; a stray bad line warns but keeps the good ones', () => {
@@ -1026,6 +1038,7 @@ test('parseEnableSentinel: the command must BE the sentinel — the whole string
   assert.deepEqual(ok('  pidge terminal enable  '), { approvals: [] }, 'whitespace-trimmed, nothing more');
   // The improvisation a real claude fell into when `pidge` was not on PATH…
   assert.deepEqual(ok('npx -y pidge-cli@latest terminal enable'), { approvals: [] });
+  assert.deepEqual(ok('npx --yes pidge-cli@latest terminal enable'), { approvals: [] }, 'the long form of -y (review M5)');
   assert.deepEqual(ok('npx pidge-cli terminal enable'), { approvals: [] });
   assert.deepEqual(ok('npx pidge-cli@0.41.0 terminal enable'), { approvals: [] });
   // …and the stable-path binary the service install lays down.
@@ -1048,6 +1061,12 @@ test('parseEnableSentinel: the command must BE the sentinel — the whole string
     'the descriptive prompt EMBEDS the command — echoing it is not running it');
   assert.equal(ok('pidge terminal enable && rm -rf /'), null, 'no compound commands ride the sentinel');
   assert.equal(ok('pidge terminal enable 2>&1'), null, 'no suffixes — exactly the command');
+  // Hardening (review B3): internal newlines and command-substitution spoofs.
+  assert.equal(ok('pidge\nterminal\nenable'), null, 'whitespace is [ \\t] only — a multi-line smuggle is not the command');
+  assert.equal(ok('pidge terminal\nenable'), null);
+  assert.equal(ok('$(echo pwn)/pidge terminal enable'), null, 'a path prefix admits path characters only');
+  assert.equal(ok('`evil`/pidge terminal enable'), null);
+  assert.equal(ok('$(evil) node /x/pidge.js terminal enable'), null);
 
   // Not the sentinel.
   assert.equal(ok('pidge terminal status'), null);
