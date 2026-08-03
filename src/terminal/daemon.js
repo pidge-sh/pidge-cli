@@ -301,7 +301,21 @@ class Daemon {
         if (s) {
           s.lastAliveAt = Date.now();
           this.setStatus(s, 'waiting');
-          this.maybeNotifyWaiting(s, String(body.message || 'Waiting for your input')).catch((e) => this.log('notify failed:', e.message));
+          // Composer-spec Tranche A, MINIMAL cherry-pick: the Notification
+          // hook fires for eight distinct reasons and carries
+          // `notification_type` (permission_prompt | idle_prompt |
+          // auth_success | elicitation_dialog | elicitation_complete |
+          // elicitation_response | agent_needs_input | agent_completed —
+          // read defensively). `idle_prompt` is the ~60 s "it's your turn"
+          // nudge after EVERY turn — the 4-in-8-minutes spam QA #16 measured.
+          // It is noise, not a request: it never pushes, even when
+          // notify_on_waiting is ON, and it does not consume the armed
+          // episode a real request would use. Everything else — including an
+          // absent or unknown type — keeps today's behavior; the
+          // fine-grained STATUS semantics are v1.1, untouched here.
+          if (String(body.notification_type || '') !== 'idle_prompt') {
+            this.maybeNotifyWaiting(s, String(body.message || 'Waiting for your input')).catch((e) => this.log('notify failed:', e.message));
+          }
         }
         return send(200, {});
       }

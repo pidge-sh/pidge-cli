@@ -2437,6 +2437,43 @@ test('waiting notify is OFF by default and opt-in per session — learned from t
   assert.equal(notifies, 2, 'flip to false stops the notifications');
 });
 
+test('Tranche A minimal: idle_prompt NEVER pushes — even opted in — and does not consume the episode', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  let notifies = 0;
+  d.api = async (method, p) => {
+    if (method === 'POST' && p === '/notify') { notifies += 1; return { res: { status: 201 }, data: {} }; }
+    return { res: { status: 200 }, data: {} };
+  };
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-n', 'pidge terminal enable')));
+  const s = d.sessions.get('sess-n');
+  s.notifyOnWaiting = true; // the human opted in — and idle STILL must not push
+
+  // The ~60 s "it's your turn" nudge after every turn — the 4-in-8-minutes
+  // spam QA #16 measured. Noise, not a request.
+  await hookPost(d, 'notification', {
+    session_id: 'sess-n', message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  });
+  await settle();
+  assert.equal(notifies, 0, 'idle_prompt never notifies, opted in or not');
+  assert.equal(s.status, 'waiting', 'the coarse STATUS semantics are untouched (v1.1 territory)');
+  assert.equal(s.waitingArmed, true, 'and the armed episode is NOT consumed — a real ask can still push');
+
+  // A real decision ask pushes normally.
+  await hookPost(d, 'notification', {
+    session_id: 'sess-n', message: 'Claude needs your permission to use Bash', notification_type: 'permission_prompt',
+  });
+  await settle();
+  assert.equal(notifies, 1, 'permission_prompt notifies as before');
+
+  // An ABSENT type (older harness) keeps today's behavior — defensive read.
+  d.setStatus(s, 'running'); // re-arm the episode
+  await hookPost(d, 'notification', { session_id: 'sess-n', message: 'Waiting' });
+  await settle();
+  assert.equal(notifies, 2, 'no type = current behavior, never a silent suppression');
+});
+
 test('a waiting notification that does not land stays ARMED for the next signal', async () => {
   const d = makeDaemon();
   const s = { sid: 'sess-w', publicId: 'ases_t', title: 'proj', status: 'waiting', waitingArmed: true, notifyOnWaiting: true };
