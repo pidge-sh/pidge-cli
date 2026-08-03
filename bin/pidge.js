@@ -400,6 +400,7 @@ const OPTIONS = {
   secret: { type: 'string' },                  // terminal connect: PIDGE_SECRET fallback (env var preferred)
   session: { type: 'string' },                 // terminal disable: explicit session id (else ancestor-walk)
   approvals: { type: 'string' },               // terminal enable: comma tool list for the approval gate (off by default)
+  manager: { type: 'string' },                 // update: force npm | pnpm | yarn | bun (default: inferred)
   yes: { type: 'boolean' },                    // terminal connect: skip the consent prompt (scripted installs)
   'no-daemon': { type: 'boolean' },            // terminal connect: skip the service install (any platform)
   // listen keeps going after a batch (supervisor loop, one process)
@@ -506,10 +507,16 @@ USAGE
                                           structured transcript, E2E-sealed) to the human's phone,
                                           typed replies land in the session's input box.
                                           connect --code C   once per computer (paste the app's one-liner)
-                                          enable             share THIS session — the ONLY door: run it
-                                                             from inside claude, in tmux ("enable
-                                                             yourself on Pidge"). No picker, no sid.
+                                          (sharing)          the ONLY door is the PreToolUse HOOK: paste
+                                                             "Run exactly this one bash command and nothing
+                                                             else: \`pidge terminal enable\`" INTO the session
+                                                             you want mirrored. The hook fires before the
+                                                             command runs, shares that session id and denies
+                                                             the tool — no PATH, no picker, no sid.
+                                          enable             a CONFIRMATION of the above (never the door)
                                           disable · status · disconnect
+  pidge update                            update this CLI to the latest published pidge-cli
+                                          (npm/pnpm/yarn/bun auto-detected; \`terminal connect\` nudges you here)
   pidge bridge --exec '<handler>'         24/7 SUPERVISOR: loop listen --all → your handler runs
                                           ONCE per batch (batch JSON on stdin) → exit 0 ⇒ ack of the
                                           batch's EXACT ids · non-zero ⇒ NOT acked (the server lease
@@ -704,8 +711,9 @@ const OPTION_DOCS = {
   claim: '--claim CODE             the single-use setup code (the human copies it from the Pidge app)',
   code: '--code CODE              terminal connect: the Connect-a-computer claim code (from the app\'s one-liner)',
   secret: '--secret S               terminal connect: PIDGE_SECRET fallback (prefer the env var — keeps it out of argv)',
-  session: '--session SID            terminal disable: a session id from `pidge terminal status` (default: THIS session, via the ancestor walk). `enable` takes no sid — it shares the session it runs inside.',
-  approvals: '--approvals T1,T2        terminal enable: gate these tools behind an Approve/Deny push (off by default)',
+  session: '--session SID            terminal disable: a session id from `pidge terminal status` (optional when exactly one session is shared). `enable` takes no sid — the hook that catches the pasted command knows it.',
+  approvals: '--approvals T1,T2        gate these tools behind an Approve/Deny push (off by default). It rides the PASTED command (`pidge terminal enable --approvals Bash,Write`) — the hook reads it there.',
+  manager: '--manager NAME           update: force the package manager (npm | pnpm | yarn | bun; default: inferred from where this copy lives)',
   yes: '--yes                    terminal connect: skip the consent prompt (scripted installs)',
   'no-daemon': '--no-daemon              terminal connect: skip the service install on any platform (run `pidge terminal daemon` yourself)',
   global: '--global                 store in the shared machine file (~/.config/pidge/env) instead of the project scope — for a daemon/cron that runs outside any project',
@@ -776,6 +784,12 @@ const HELP = {
     summary: 'which channel does this key speak for (prints the identity JSON).',
     usage: 'pidge whoami',
     opts: [],
+  },
+  update: {
+    summary: 'update this CLI to the latest published pidge-cli (npm/pnpm/yarn/bun, auto-detected).',
+    usage: 'pidge update [--manager npm|pnpm|yarn|bun]',
+    body: 'The installed base is the failure mode: `npx pidge-cli` prefers a copy your machine ALREADY has, so an old install keeps running (0.28.0 was measured on a real Mac while 0.40.0 was published) and every newer subcommand reads as "unknown option". This installs `pidge-cli@latest` globally with the manager that owns this copy. Already current ⇒ it says so and exits 0; an unreachable registry ⇒ it warns and installs anyway; a failed install ⇒ exit 2 with the manual line. `pidge terminal connect` runs the same check and points here.',
+    opts: ['manager'],
   },
   hello: {
     summary: 'first-contact WOW: your channel\'s debut handshake, narrated live by a 3-stage Live Activity. send + wait in one.',
@@ -905,13 +919,13 @@ const HELP = {
   },
   terminal: {
     summary: 'Agent Sessions: mirror a Claude Code session to the phone as structured, E2E-sealed conversation data; typed replies come back into the session.',
-    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon]  ·  pidge terminal enable [--approvals Tool1,Tool2]  ·  pidge terminal disable [--session SID|--all] | status | disconnect',
+    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon]  ·  pidge terminal enable (confirm)  ·  pidge terminal disable [--session SID|--all] | status | disconnect',
     body: [
-      'The user runs claude inside tmux — that is their ENTIRE responsibility. `connect` (once per computer) pairs with the phone: the app\'s Settings → Computers → Connect a computer mints a tunnel channel + E2E key and shows a one-liner carrying the claim code + PIDGE_SECRET; paste it in a terminal. It asks consent, installs Claude Code hooks (tagged `# pidge-hook`, cleanly removable) and a background daemon (launchd on macOS, `systemd --user` on Linux/WSL; a WSL without systemd gets a detached daemon + the line that makes it durable).',
+      'The user runs claude inside tmux — that is their ENTIRE responsibility. `connect` (once per computer) pairs with the phone: the app\'s Settings → Computers → Connect a computer mints a tunnel channel + E2E key and shows a one-liner carrying the claim code + PIDGE_SECRET; paste it in a terminal. It asks consent, installs Claude Code hooks (tagged `# pidge-hook`, cleanly removable), refreshes the Pidge skill, copies this CLI to ~/.config/pidge/terminal/cli (so the service never points into a prunable npx cache) and installs a background daemon (launchd on macOS, `systemd --user` on Linux/WSL; a WSL without systemd gets a detached daemon + the line that makes it durable).',
       '',
-      'SHARING IS PER SESSION and opt-in: nothing leaves the computer until `enable`, and there is exactly ONE door. Tell the claude running in tmux "enable yourself on Pidge" — the skill runs `pidge terminal enable`, which walks its process tree to the claude ancestor, reads its tty+cwd, binds the exact tmux pane and the exact transcript. There is no picker and no --session for enable: a command that cannot see a claude ancestor in a tmux pane REFUSES ("Run this from inside the Claude session you want to share — it must be in a tmux.") instead of guessing or minting a share nobody can reply to. A NEW claude in the same pane is NOT auto-enabled (consent is per session id).',
+      'SHARING IS PER SESSION and opt-in, through exactly ONE door — the PreToolUse HOOK. To share a session, PASTE into it: "Run exactly this one bash command and nothing else: `pidge terminal enable` — it signals a local Pidge daemon to mirror THIS Claude session to my phone." Claude runs it, the hook fires BEFORE the command does, carrying the authoritative session_id, and the daemon shares THAT session and DENIES the tool (so the command never actually runs — `pidge` need not be on any PATH; its denial reason is the ✓). No process-tree walk, no picker, no --session. A session whose tty is not a uniquely-identifiable tmux pane is refused loudly, never guessed. A NEW claude in the same pane is NOT auto-enabled (consent is per session id). `pidge terminal enable` typed in a bare terminal is only a CONFIRMATION — it reports what is being mirrored and prints the prompt to paste.',
       '',
-      'Everything shared is fully interactive: the phone renders the transcript natively (tool cards, diffs) and typed replies land in the session\'s real input box via tmux send-keys. Sessions outside tmux are not shareable in v1. When claude stops and waits, the human gets a REAL notification. `--approvals Bash,Write` (off by default) additionally gates those tools behind an Approve/Deny push — timeout falls open to the local prompt.',
+      'Everything shared is fully interactive: the phone renders the transcript natively (tool cards, diffs) and typed replies land in the session\'s real input box via tmux send-keys. Sessions outside tmux are not shareable in v1. When claude stops and waits, the human gets a REAL notification. The approval gate (off by default) rides the PASTED command — `pidge terminal enable --approvals Bash,Write` — and gates those tools behind an Approve/Deny push; a timeout falls open to the local prompt.',
       '',
       'E2E is mandatory (the transcript contains everything); the server relays sealed blobs it can never read. `disable` stops one session; `disconnect` = disable --all + uninstall hooks + daemon.',
     ].join('\n'),
@@ -1078,7 +1092,7 @@ const KNOWN_MANIFEST_VERSION = 67;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 18;
+const SKILL_REVISION = 19;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -4863,13 +4877,19 @@ So the human can tell ONE continuous session apart from three disposable cold on
 
 This is **attribution, not a credential** — your channel key still authenticates; the run only reveals which execution is talking (the human sees "label · mode/SEAL"). An old server just ignores it (you keep sending unsigned). \`pidge run status\` lists the channel's live runs. \`pidge bridge\` mints its own run per handler automatically — don't call these inside it.
 
-## Enable yourself on Pidge (Agent Sessions — live session mirror)
+## Mirror THIS session to the human's phone (Agent Sessions)
 
-When your human says **"enable yourself on Pidge"** (or "se habilita no pidge", "share this session"), run via Bash:
+When your human asks you to mirror/share this session with Pidge — usually by pasting *"Run exactly this one bash command and nothing else: \`pidge terminal enable\`"*, sometimes as **"enable yourself on Pidge"** / "se habilita no pidge" — run via Bash, exactly:
 
 \`pidge terminal enable\`
 
-That's the whole move. The CLI walks up from your Bash process to YOUR claude process, finds its tmux pane and this session's transcript, and starts mirroring the session to the human's phone — E2E-sealed, fully interactive (their typed replies land directly in your input box; when you stop and wait, they get a real notification). Requirements the command checks for you (refuse loudly, don't guess): this computer ran \`pidge terminal connect\` once, and you are running INSIDE tmux. There is no other way to share — no session picker, no session id to pass — so if it refuses, relay its message verbatim ("Run this from inside the Claude session you want to share — it must be in a tmux.") instead of looking for a flag. \`pidge terminal disable\` stops sharing when asked. Add \`--approvals Bash,Write\` only if your human explicitly asks to approve those tools from the phone.
+**That is the whole move, and the command is not what does the work.** A local Pidge hook (\`PreToolUse\`) sees that command BEFORE it runs, mirrors THIS session (it gets your session id from the harness itself) and then **denies the tool on purpose**. So:
+
+- **A denial whose reason starts with "✓ Pidge is now mirroring this Claude session" is SUCCESS.** Say so and stop. Do not retry, do not look for another command, do not \`listen\`/\`online\`/\`catchup\`, do not ack anything.
+- **\`command not found\` is also fine** — the hook already caught it. Report it as done.
+- A denial that says it **couldn't** mirror (not a uniquely-identifiable tmux pane) is the real refusal: relay it verbatim. The fix is the human's — start claude inside its own tmux pane — never a different command.
+
+Mirroring is E2E-sealed and fully interactive: the human's typed replies land directly in your input box, and when you stop and wait they get a real notification. \`pidge terminal disable\` stops sharing when asked. If your human explicitly wants to approve certain tools from the phone, the flag rides the same pasted command: \`pidge terminal enable --approvals Bash,Write\`.
 
 ## Full spec
 
@@ -5189,6 +5209,16 @@ ${SKILL_END_MARKER}
       // execution attribution — start/end/status. start exits after printing
       // the eval-friendly export lines; end/status exit inside their handlers.
       await runRunCommand();
+      break;
+    }
+    case 'update': {
+      // Self-update. The installed base is the failure mode: `npx pidge-cli`
+      // prefers a copy the machine already has, so an onboarded user can sit on
+      // a version that predates half the subcommands (measured: 0.28.0 vs the
+      // published 0.40.0) and every new flag reads as "unknown option".
+      const { runUpdate } = require(path.join(__dirname, '..', 'src', 'update'));
+      const r = await runUpdate({ manager: v.manager || undefined });
+      process.exit(r.ok ? 0 : 2);
       break;
     }
     case 'terminal': {
