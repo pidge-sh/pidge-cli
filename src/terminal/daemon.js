@@ -140,6 +140,14 @@ class Daemon {
       this.log('http error:', e.message);
       try { res.writeHead(500); res.end('{}'); } catch {}
     }));
+    this.httpServer.on('error', (e) => {
+      if (e.code === 'EADDRINUSE') {
+        this.log(`port ${port} already held — another daemon is running; exiting cleanly`);
+        process.exit(0); // clean exit: launchd's SuccessfulExit=false won't respawn-loop
+      }
+      this.log(`hook server error: ${e.message}`);
+      process.exit(1);
+    });
     this.httpServer.listen(port, '127.0.0.1', () => this.log(`daemon listening on 127.0.0.1:${port}`));
   }
 
@@ -260,6 +268,15 @@ class Daemon {
 
   async enableSession({ sid, paneId, tty, cwd, file, approvals }) {
     this.acquireWriterLock(sid); // B3 — refuse loudly on conflict
+    try {
+      return await this.enableSessionLocked({ sid, paneId, tty, cwd, file, approvals });
+    } catch (e) {
+      this.releaseWriterLock(sid); // a failed enable must not strand the lock
+      throw e;
+    }
+  }
+
+  async enableSessionLocked({ sid, paneId, tty, cwd, file, approvals }) {
     const session = {
       sid,
       publicId: `ases_${sid}`,
@@ -344,12 +361,13 @@ class Daemon {
       fs.writeFileSync(p, mine, { flag: 'wx' });
       return;
     } catch {
-      const holder = Number((core.readEnvFile && fs.readFileSync(p, 'utf8').trim()) || 0);
+      let holder = 0;
+      try { holder = Number(fs.readFileSync(p, 'utf8').trim()) || 0; } catch {}
       const alive = holder && (() => { try { process.kill(holder, 0); return true; } catch { return false; } })();
       if (alive && holder !== process.pid) {
         throw new Error(`session ${sid.slice(0, 8)} already has a live writer (pid ${holder}) — refuse loudly, never rebind (B3)`);
       }
-      fs.writeFileSync(p, mine); // stale lock: take over
+      fs.writeFileSync(p, mine); // stale/own lock: take over
     }
   }
 
