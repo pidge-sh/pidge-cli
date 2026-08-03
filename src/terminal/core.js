@@ -70,17 +70,32 @@ const ENABLE_NOT_MIRRORED =
   'Paste this into the Claude session you want to share (it must be running in its own tmux pane):\n\n' +
   `  ${ENABLE_PROMPT}\n`;
 
-// Is this PreToolUse payload the enable sentinel? Tolerant of the app's
-// descriptive prompt (which EMBEDS the literal command) and of an agent that
-// reaches for `npx pidge-cli@latest terminal enable` when `pidge` is not on its
-// PATH — but never loose: something must name pidge AND `terminal enable`.
+// Is this PreToolUse payload the enable sentinel? The command must BE the
+// sentinel — the WHOLE trimmed string, not a substring (QA finding #11: the
+// substring match fired on ANY bash that merely MENTIONED the command — a
+// `tmux send-keys` payload, an echo, a doc snippet — denying legitimate tool
+// calls and trying to enable the WRONG session). Accepted invokers, all
+// anchored end-to-end:
+//   pidge terminal enable                       (the pasted literal)
+//   /path/to/pidge terminal enable              (stable-path binary)
+//   /path/to/pidge.js terminal enable           (the shebang'd entry)
+//   node /path/to/pidge.js terminal enable      (explicit node)
+//   npx [-y] pidge-cli[@tag] terminal enable    (the observed PATH-less improvisation)
+// plus an optional trailing `--approvals LIST`. Anything else — prefixes,
+// suffixes, redirects, compound commands — is NOT the door.
 // Returns null (not the sentinel) or {approvals:[…]} parsed from the command.
+const ENABLE_COMMAND_RE = new RegExp(
+  '^(?:' +
+    '(?:\\S*[/\\\\])?node(?:\\.exe)?\\s+\\S*[/\\\\]pidge(?:\\.js)?' +
+    '|(?:\\S*[/\\\\])?pidge(?:\\.js)?' +
+    '|npx\\s+(?:-y\\s+)?pidge-cli(?:@[\\w.^~-]+)?' +
+  ')\\s+terminal\\s+enable' +
+  '(?:\\s+--approvals[=\\s]+[A-Za-z0-9_,*-]+)?\\s*$'
+);
 function parseEnableSentinel(toolName, command) {
   if (String(toolName || '').toLowerCase() !== 'bash') return null;
-  const c = String(command || '');
-  const literal = c.includes(ENABLE_SENTINEL);
-  const viaNpx = /pidge-cli(@[^\s]+)?\s+terminal\s+enable\b/.test(c);
-  if (!literal && !viaNpx) return null;
+  const c = String(command || '').trim();
+  if (!ENABLE_COMMAND_RE.test(c)) return null;
   // `--approvals Bash,Write` still rides the sentinel COMMAND (the pasted text
   // is the only carrier left now that the CLI is not the mechanism).
   const m = c.match(/--approvals[=\s]+([A-Za-z0-9_,*-]+)/);

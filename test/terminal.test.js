@@ -893,19 +893,35 @@ test('both service templates carry a UTF-8 locale (launchd and systemd hand the 
 
 // --- the enable SENTINEL matcher (the door's whole contract) ----------------
 
-test('parseEnableSentinel: only a Bash command carrying the literal opens the door', () => {
+test('parseEnableSentinel: the command must BE the sentinel — the whole string, never a substring', () => {
   const ok = (cmd, tool = 'Bash') => core.parseEnableSentinel(tool, cmd);
 
   assert.deepEqual(ok('pidge terminal enable'), { approvals: [] });
-  // The app's descriptive prompt EMBEDS the command — claude often echoes it back.
-  assert.deepEqual(ok('Run exactly this one bash command and nothing else: pidge terminal enable'), { approvals: [] });
-  // …and the improvisation a real claude fell into when `pidge` was not on PATH.
+  assert.deepEqual(ok('  pidge terminal enable  '), { approvals: [] }, 'whitespace-trimmed, nothing more');
+  // The improvisation a real claude fell into when `pidge` was not on PATH…
   assert.deepEqual(ok('npx -y pidge-cli@latest terminal enable'), { approvals: [] });
   assert.deepEqual(ok('npx pidge-cli terminal enable'), { approvals: [] });
+  assert.deepEqual(ok('npx pidge-cli@0.41.0 terminal enable'), { approvals: [] });
+  // …and the stable-path binary the service install lays down.
+  assert.deepEqual(ok('/Users/x/.config/pidge/terminal/cli/bin/pidge.js terminal enable'), { approvals: [] });
+  assert.deepEqual(ok('node /Users/x/.config/pidge/terminal/cli/bin/pidge.js terminal enable'), { approvals: [] });
+  assert.deepEqual(ok('/usr/local/bin/pidge terminal enable'), { approvals: [] });
 
   // The approval gate rides the pasted command now — the CLI is not the door.
   assert.deepEqual(ok('pidge terminal enable --approvals Bash,Write'), { approvals: ['Bash', 'Write'] });
   assert.deepEqual(ok('pidge terminal enable --approvals=*'), { approvals: ['*'] });
+
+  // QA finding #11: the substring match fired on any bash that merely
+  // MENTIONED the command — denying legitimate tool calls and attempting an
+  // enable on the WRONG session. The literal reproduction must NOT match:
+  assert.equal(ok("tmux send-keys -t %0 'pidge terminal enable' Enter"), null,
+    'a send-keys PAYLOAD is a mention, not the command');
+  assert.equal(ok('echo "pidge terminal enable"'), null);
+  assert.equal(ok('grep -r "pidge terminal enable" docs/'), null);
+  assert.equal(ok('Run exactly this one bash command and nothing else: pidge terminal enable'), null,
+    'the descriptive prompt EMBEDS the command — echoing it is not running it');
+  assert.equal(ok('pidge terminal enable && rm -rf /'), null, 'no compound commands ride the sentinel');
+  assert.equal(ok('pidge terminal enable 2>&1'), null, 'no suffixes — exactly the command');
 
   // Not the sentinel.
   assert.equal(ok('pidge terminal status'), null);
