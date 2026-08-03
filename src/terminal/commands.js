@@ -1,6 +1,6 @@
 'use strict';
 // `pidge terminal <sub>` — the user-facing side of Agent Sessions v1
-// (agent-sessions-spec §2). connect = once per Mac (claim exchange + consent +
+// (agent-sessions-spec §2). connect = once per computer (claim exchange + consent +
 // hooks + daemon install); enable = per session, via the ancestor walk (the
 // "enable yourself on Pidge" prompt door) or the `ls` picker; disable/status/
 // disconnect complete the lifecycle. Everything session-scoped talks to the
@@ -76,18 +76,18 @@ async function runConnect(v) {
       headers: { 'content-type': 'application/json', 'x-pidge-fingerprint': fp },
       body: JSON.stringify({ code }),
     });
-    if (res.status === 404) die('pidge terminal connect: that code is unknown, expired or already used by another machine — mint a fresh one in the app (Settings → Tunnels → Link a Mac)');
+    if (res.status === 404) die('pidge terminal connect: that code is unknown, expired or already used by another machine — mint a fresh one in the app (Settings → Computers → Connect a computer)');
     if (!res.ok) die(`pidge terminal connect: claim exchange failed (${res.status})`);
     const data = await res.json();
     token = data.key;
     channelId = data.channel && data.channel.id;
     effectiveBase = (data.base_url || base).replace(/\/$/, '');
     if (data.channel && data.channel.kind !== 'tunnel') {
-      die(`pidge terminal connect: this code belongs to a ${data.channel.kind || 'standard'} channel, not a tunnel — use the app's Settings → Tunnels → Link a Mac flow (it mints the right kind)`);
+      die(`pidge terminal connect: this code belongs to a ${data.channel.kind || 'standard'} channel, not a tunnel — use the app's Settings → Computers → Connect a computer flow (it mints the right kind)`);
     }
   }
-  if (!token) die('pidge terminal connect: no stored identity and no --code — paste the one-liner from the app (Settings → Tunnels → Link a Mac)');
-  if (!secret) die('pidge terminal connect: PIDGE_SECRET missing — the app\'s Link-a-Mac one-liner carries it (E2E is mandatory on tunnels; there is no clear mode)');
+  if (!token) die('pidge terminal connect: no stored identity and no --code — paste the one-liner from the app (Settings → Computers → Connect a computer)');
+  if (!secret) die('pidge terminal connect: PIDGE_SECRET missing — the app\'s Connect-a-computer one-liner carries it (E2E is mandatory on tunnels; there is no clear mode)');
   try { core.e2eParseSecret(secret); } catch (e) { die(`pidge terminal connect: ${e.message}`); }
 
   core.saveTerminalEnv({ base: effectiveBase, token, secret, channelId });
@@ -107,7 +107,7 @@ async function runConnect(v) {
   // construction; nothing is shared until a per-session enable.
   const consent = v.yes || await askYesNo(
     'Install Claude Code hooks so sessions can announce themselves to the local Pidge daemon?\n' +
-    'Hooks talk only to this Mac; nothing is shared until you enable a session.');
+    'Hooks talk only to this computer; nothing is shared until you enable a session.');
   if (consent) {
     writeHookShim();
     // A malformed ~/.claude/settings.json aborts the install LOUDLY: we never
@@ -408,10 +408,10 @@ async function runEnable(v) {
     say('  No tmux pane could be bound to this session, so anything you type from');
     say('  the phone will NOT reach it. To get the reply lane, run claude inside a');
     say('  tmux pane and enable from that session ("enable yourself on Pidge").');
-    if (data.backfilled) say(`  seeded ${data.backfilled} recent items; earlier history stays on this Mac`);
+    if (data.backfilled) say(`  seeded ${data.backfilled} recent items; earlier history stays on this computer`);
   } else {
     say(`✓ session shared → ${data.public_id}${target.loc ? ` (pane ${target.loc})` : ''}`);
-    if (data.backfilled) say(`  seeded ${data.backfilled} recent items; earlier history stays on this Mac`);
+    if (data.backfilled) say(`  seeded ${data.backfilled} recent items; earlier history stays on this computer`);
     say('  Open the Pidge app → Agents to watch and reply. `pidge terminal disable` stops sharing.');
     if (approvals.length) say(`  approval gate ON for: ${approvals.join(', ')}`);
   }

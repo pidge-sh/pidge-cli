@@ -1,13 +1,13 @@
 'use strict';
 // The pidge terminal daemon (agent-sessions-spec §1/§2/§8/§9/§11).
 //
-// One per Mac (launchd), owns: the loopback hook endpoint (SessionStart/
+// One per computer (launchd), owns: the loopback hook endpoint (SessionStart/
 // PreToolUse/Notification/Stop announce to it — LOCAL ONLY, publishing is
 // gated per-session by the explicit enable), the JSONL tailers for ENABLED
 // sessions, the sealed publisher, status heartbeats, the waiting→notification
 // edge, and the cable input lane (sealed frames → tmux send-keys into the
 // BOUND pane). Consent boundary = capability boundary: nothing about a
-// session leaves this Mac before `pidge terminal enable`, and everything
+// session leaves this computer before `pidge terminal enable`, and everything
 // enabled is fully interactive.
 //
 // Inherited scars (see the spec §15): #65 — items degrade INSIDE the cap
@@ -501,7 +501,7 @@ class Daemon {
     sealed.reverse(); // …back to oldest-first for seq order
     for (const b64 of sealed) s.queue.push(b64);
     if (items.length > sealed.length) {
-      this.log(`${why}: seeded ${sealed.length}/${items.length} items (bounded window — earlier history stays on this Mac)`);
+      this.log(`${why}: seeded ${sealed.length}/${items.length} items (bounded window — earlier history stays on this computer)`);
     }
     return sealed.length;
   }
@@ -683,7 +683,7 @@ class Daemon {
       // items belong to a previous process). Renumber onto the server's
       // high-water and keep going — loudly. The phone renders the gap; looping
       // here forever would be worse (§11: visible boundary, never a silent splice).
-      this.log(`${session.publicId}: seq GAP — queue starts at ${firstSeq} but the server is at ${serverSeq}; resuming at ${serverSeq + 1}, the missing items are only on this Mac`);
+      this.log(`${session.publicId}: seq GAP — queue starts at ${firstSeq} but the server is at ${serverSeq}; resuming at ${serverSeq + 1}, the missing items are only on this computer`);
     }
     session.nextSeq = serverSeq + 1;
     session.backoff = 0;
