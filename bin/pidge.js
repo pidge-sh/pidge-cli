@@ -395,6 +395,13 @@ const OPTIONS = {
   'quiet-nag': { type: 'boolean' },            // silence the manifest-version nag for this run
   // onboarding v2
   claim: { type: 'string' },                   // setup --claim <single-use code>
+  // Agent Sessions (`pidge terminal …`) — see src/terminal/
+  code: { type: 'string' },                    // terminal connect: the Link-a-Mac claim code
+  secret: { type: 'string' },                  // terminal connect: PIDGE_SECRET fallback (env var preferred)
+  session: { type: 'string' },                 // terminal enable/disable: explicit session id (else ancestor-walk)
+  approvals: { type: 'string' },               // terminal enable: comma tool list for the approval gate (off by default)
+  yes: { type: 'boolean' },                    // terminal connect: skip the consent prompt (scripted installs)
+  'no-daemon': { type: 'boolean' },            // terminal connect: skip the launchd install
   // listen keeps going after a batch (supervisor loop, one process)
   follow: { type: 'boolean' },
   force: { type: 'boolean' },                  // setup: overwrite a config owned by ANOTHER channel
@@ -495,6 +502,13 @@ USAGE
                                           you learn what's already handled WITHOUT stealing a message.
                                           Exit 0 (printed, even if empty) · 2 error. NEVER run \`listen\`
                                           on a channel another runtime consumes (double-consume).
+  pidge terminal <sub>                    AGENT SESSIONS: mirror a Claude Code session (its
+                                          structured transcript, E2E-sealed) to the human's phone,
+                                          typed replies land in the session's input box.
+                                          connect --code C   once per Mac (paste the app's one-liner)
+                                          enable             share THIS session (run from inside claude,
+                                                             in tmux — "enable yourself on Pidge")
+                                          ls · disable · status · disconnect
   pidge bridge --exec '<handler>'         24/7 SUPERVISOR: loop listen --all → your handler runs
                                           ONCE per batch (batch JSON on stdin) → exit 0 ⇒ ack of the
                                           batch's EXACT ids · non-zero ⇒ NOT acked (the server lease
@@ -687,6 +701,12 @@ const OPTION_DOCS = {
   digest: '--digest                 catchup: one condensed line per message (id · kind · 60 chars · handled by X: <note> / ✓ acked (no note) / PENDING)',
   target: '--target T               skill install: claude (default) → .claude/skills/pidge/SKILL.md · agents → AGENTS.md · gemini → GEMINI.md',
   claim: '--claim CODE             the single-use setup code (the human copies it from the Pidge app)',
+  code: '--code CODE              terminal connect: the Link-a-Mac claim code (from the app\'s one-liner)',
+  secret: '--secret S               terminal connect: PIDGE_SECRET fallback (prefer the env var — keeps it out of argv)',
+  session: '--session SID            terminal: target a session id from `pidge terminal ls` (default: ancestor-walk)',
+  approvals: '--approvals T1,T2        terminal enable: gate these tools behind an Approve/Deny push (off by default)',
+  yes: '--yes                    terminal connect: skip the consent prompt (scripted installs)',
+  'no-daemon': '--no-daemon              terminal connect: skip the launchd install (run `pidge terminal daemon` yourself)',
   global: '--global                 store in the shared machine file (~/.config/pidge/env) instead of the project scope — for a daemon/cron that runs outside any project',
   'url-base': '--url BASE               the Pidge server base URL (default https://api.pidge.sh)',
   print: '--print                  emit `export …` lines instead of writing a file (per-agent; you run it)',
@@ -882,6 +902,20 @@ const HELP = {
     body: 'It exists so a pasted prompt can just say "stay online: pidge online". Every listen flag forwards; --all is forced (the single ear: composer messages + notification answers). The LOOP is the contract: run it as a background task your harness TRACKS (never a loose shell &); it blocks until something lands — handle it, `pidge ack`, then RELAUNCH it. That loop is what "online" means.',
     opts: ['timeout', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
   },
+  terminal: {
+    summary: 'Agent Sessions: mirror a Claude Code session to the phone as structured, E2E-sealed conversation data; typed replies come back into the session.',
+    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon]  ·  pidge terminal enable [--session SID] [--approvals Tool1,Tool2]  ·  pidge terminal ls | disable [--session SID|--all] | status | disconnect',
+    body: [
+      'The user runs claude inside tmux — that is their ENTIRE responsibility. `connect` (once per Mac) pairs with the phone: the app\'s Settings → Tunnels → Link a Mac mints a tunnel channel + E2E key and shows a one-liner carrying the claim code + PIDGE_SECRET; paste it in Terminal. It asks consent, installs Claude Code hooks (tagged `# pidge-hook`, cleanly removable) and a launchd daemon.',
+      '',
+      'SHARING IS PER SESSION and opt-in: nothing leaves the Mac until `enable`. The prompt door: tell the claude running in tmux "enable yourself on Pidge" — the skill runs `pidge terminal enable`, which walks its process tree to the claude ancestor, reads its tty+cwd, binds the exact tmux pane and the exact transcript. The picker door: `pidge terminal ls` lists shareable sessions. A NEW claude in the same pane is NOT auto-enabled (consent is per session id).',
+      '',
+      'Everything shared is fully interactive: the phone renders the transcript natively (tool cards, diffs) and typed replies land in the session\'s real input box via tmux send-keys. Sessions outside tmux are not shareable in v1. When claude stops and waits, the human gets a REAL notification. `--approvals Bash,Write` (off by default) additionally gates those tools behind an Approve/Deny push — timeout falls open to the local prompt.',
+      '',
+      'E2E is mandatory (the transcript contains everything); the server relays sealed blobs it can never read. `disable` stops one session; `disconnect` = disable --all + uninstall hooks + daemon.',
+    ].join('\n'),
+    opts: ['code', 'secret', 'session', 'approvals', 'yes', 'no-daemon', 'url'],
+  },
   bridge: {
     summary: '24/7 supervisor: long-poll the channel, run YOUR handler once per batch, ack only on exit 0. Model-agnostic.',
     usage: "pidge bridge --exec '<handler>'  ·  pidge bridge install --exec '<handler>'",
@@ -1008,7 +1042,9 @@ if (v.help || command === 'help') {
 }
 if (!command) { console.error(USAGE); process.exit(1); }
 // `setup` is the command that CREATES the token config — it must run without one.
-if (!TOKEN && command !== 'setup')
+// `terminal` (Agent Sessions) has its OWN machine-scoped identity slot at
+// ~/.config/pidge/terminal/env — never the per-project token resolution.
+if (!TOKEN && command !== 'setup' && command !== 'terminal')
   die('pidge: set PIDGE_TOKEN (env var, or put PIDGE_TOKEN=… in ~/.config/pidge/env) — or onboard with: pidge setup --claim <code> (ask your human for the code: Pidge app → Canais → o canal → copiar prompt de setup)');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1041,7 +1077,7 @@ const KNOWN_MANIFEST_VERSION = 67;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 16;
+const SKILL_REVISION = 17;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -4826,6 +4862,14 @@ So the human can tell ONE continuous session apart from three disposable cold on
 
 This is **attribution, not a credential** — your channel key still authenticates; the run only reveals which execution is talking (the human sees "label · mode/SEAL"). An old server just ignores it (you keep sending unsigned). \`pidge run status\` lists the channel's live runs. \`pidge bridge\` mints its own run per handler automatically — don't call these inside it.
 
+## Enable yourself on Pidge (Agent Sessions — live session mirror)
+
+When your human says **"enable yourself on Pidge"** (or "se habilita no pidge", "share this session"), run via Bash:
+
+\`pidge terminal enable\`
+
+That's the whole move. The CLI walks up from your Bash process to YOUR claude process, finds its tmux pane and this session's transcript, and starts mirroring the session to the human's phone — E2E-sealed, fully interactive (their typed replies land directly in your input box; when you stop and wait, they get a real notification). Requirements the command checks for you (refuse loudly, don't guess): the Mac ran \`pidge terminal connect\` once, and you are running INSIDE tmux. If it refuses, relay its message — it says exactly what's missing (e.g. "start claude inside tmux"). \`pidge terminal disable\` stops sharing when asked. Add \`--approvals Bash,Write\` only if your human explicitly asks to approve those tools from the phone.
+
 ## Full spec
 
 \`curl $PIDGE_URL/api/v1/manifest -H "Authorization: Bearer $PIDGE_TOKEN"\` — the always-current contract (fields, profiles, custom actions, media, threads, realtime).
@@ -5144,6 +5188,15 @@ ${SKILL_END_MARKER}
       // execution attribution — start/end/status. start exits after printing
       // the eval-friendly export lines; end/status exit inside their handlers.
       await runRunCommand();
+      break;
+    }
+    case 'terminal': {
+      // Agent Sessions v1 (pidge repo docs/agent-sessions-spec.md): mirror a
+      // Claude Code session as structured conversation data — connect once per
+      // Mac, enable per tmux session, E2E always. Lives in src/terminal/ (its
+      // own machine-scoped identity slot, independent of TOKEN above).
+      const { runTerminal } = require(path.join(__dirname, '..', 'src', 'terminal', 'commands'));
+      await runTerminal(parsed.positionals[1], v);
       break;
     }
     case 'bridge': {
