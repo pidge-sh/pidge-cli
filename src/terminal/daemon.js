@@ -256,14 +256,33 @@ class Daemon {
     }
     if (this.sessions.has(sid)) {
       const s = this.sessions.get(sid);
-      return send(200, { already: true, public_id: s.publicId });
+      return send(200, { already: true, public_id: s.publicId, pane_bound: !!s.paneId, read_only: !s.paneId });
+    }
+    // The `--session <sid>` (ls-fallback) door sends no pane_id: the CLI never
+    // walked an ancestor, so it has nothing to offer. Resolve the pane from the
+    // ANNOUNCED tty exactly as the ancestor-walk door does — otherwise this door
+    // quietly produced a read-only session the phone still showed as
+    // interactive, and every keystroke from the composer was dropped (spec §8).
+    let bound = paneId || null;
+    if (!bound) {
+      const hit = core.tmuxPaneForTty(ann.tty || tty || null);
+      if (hit) {
+        bound = hit.paneId;
+        this.log(`enable ${sid.slice(0, 8)}: pane ${hit.paneId} (${hit.loc}) resolved from tty ${ann.tty || tty}`);
+      }
     }
     try {
       const s = await this.enableSession({
-        sid, paneId: paneId || null, tty: ann.tty, cwd: cwd || ann.cwd,
+        sid, paneId: bound, tty: ann.tty, cwd: cwd || ann.cwd,
         file: ann.transcriptPath, approvals: Array.isArray(approvals) ? approvals : [],
       });
-      return send(200, { public_id: s.publicId, backfilled: s.backfilled });
+      // read_only is the honest flag: enable still SUCCEEDS (the transcript is
+      // worth sharing on its own), but the human must be told that typing back
+      // will not reach this session.
+      return send(200, {
+        public_id: s.publicId, backfilled: s.backfilled,
+        pane_bound: !!s.paneId, read_only: !s.paneId,
+      });
     } catch (e) {
       this.log('enable failed:', e.message);
       return send(502, { error: e.message });

@@ -812,6 +812,57 @@ test('enable: a failure after the register leaves neither a live record nor a pe
   assert.equal(fs.existsSync(d.lockPath('sess-fail')), false, 'the writer lock is released');
 });
 
+// --- enable: pane binding on both doors -------------------------------------
+
+async function enableVia(d, body, paneLookup) {
+  const real = core.tmuxPaneForTty;
+  core.tmuxPaneForTty = paneLookup;
+  let out = null;
+  try {
+    await d.enableFromRequest(body, (code, obj) => { out = { code, obj }; });
+  } finally { core.tmuxPaneForTty = real; }
+  return out;
+}
+
+function announceOnly(d, sid = 'sess-x', tty = '/dev/ttys004') {
+  d.registerSession = async () => ({ last_seq: 0 });
+  d.backfill = async () => {};
+  d.subscribeInput = () => {};
+  d.announces.set(sid, { tty, cwd: '/tmp/proj', transcriptPath: '/tmp/none.jsonl', at: Date.now() });
+}
+
+test('enable --session binds the pane from the announced tty (the ls door is interactive too)', async () => {
+  const d = makeDaemon();
+  announceOnly(d);
+  // The `--session <sid>` door sends NO pane_id: the CLI never walked an
+  // ancestor. The daemon must resolve it the same way the ancestor door does.
+  const out = await enableVia(d, { sid: 'sess-x' },
+    (tty) => (tty === '/dev/ttys004' ? { paneId: '%7', loc: 'main:0.1' } : null));
+
+  assert.equal(out.code, 200);
+  assert.equal(out.obj.pane_bound, true);
+  assert.equal(out.obj.read_only, false);
+  assert.equal(d.sessions.get('sess-x').paneId, '%7');
+});
+
+test('enable that cannot bind a pane still succeeds but says READ-ONLY', async () => {
+  const d = makeDaemon();
+  announceOnly(d);
+  const out = await enableVia(d, { sid: 'sess-x' }, () => null);
+
+  assert.equal(out.code, 200);
+  assert.equal(out.obj.pane_bound, false);
+  assert.equal(out.obj.read_only, true, 'the phone must not show an interactive composer for a dead input lane');
+  assert.equal(d.sessions.get('sess-x').paneId, null);
+
+  // An explicit pane_id (the ancestor door) always wins and is never re-looked-up.
+  const d2 = makeDaemon();
+  announceOnly(d2, 'sess-y');
+  const out2 = await enableVia(d2, { sid: 'sess-y', pane_id: '%3' }, () => { throw new Error('must not be consulted'); });
+  assert.equal(out2.obj.read_only, false);
+  assert.equal(d2.sessions.get('sess-y').paneId, '%3');
+});
+
 // --- the tailer: backfill, restart dedup, rescan bounds ---------------------
 
 function rec(i) {

@@ -366,16 +366,8 @@ function findClaudeAncestor() {
   return null;
 }
 
-function paneForTty(tty) {
-  try {
-    const out = execFileSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}'], { encoding: 'utf8' });
-    for (const line of out.trim().split('\n')) {
-      const [paneId, paneTty, loc] = line.split('\t');
-      if (paneTty === tty) return { paneId, loc };
-    }
-  } catch {}
-  return null;
-}
+// Both enable doors resolve the pane through core.tmuxPaneForTty — see there.
+function paneForTty(tty) { return core.tmuxPaneForTty(tty); }
 
 async function runEnable(v) {
   if (!(await daemonAlive())) die('pidge terminal enable: the local daemon is not running — run `pidge terminal connect` (or `pidge terminal daemon` in another shell) first');
@@ -407,6 +399,16 @@ async function runEnable(v) {
   if (res.status !== 200) die(`pidge terminal enable: ${data && data.error ? data.error : `daemon answered ${res.status}`}`);
   if (data.already) {
     say(`✓ this session is already shared (${data.public_id})`);
+    if (data.read_only) say('  (read-only — no tmux pane is bound, so replies from the phone will not reach it)');
+  } else if (data.read_only) {
+    // The daemon could not bind a pane. Sharing still succeeded — the
+    // transcript publishes — but the input lane is dead, and saying "✓ session
+    // shared" alone would let the human type into the void (spec §8).
+    say(`✓ session shared → ${data.public_id} — READ-ONLY`);
+    say('  No tmux pane could be bound to this session, so anything you type from');
+    say('  the phone will NOT reach it. To get the reply lane, run claude inside a');
+    say('  tmux pane and enable from that session ("enable yourself on Pidge").');
+    if (data.backfilled) say(`  seeded ${data.backfilled} recent items; earlier history stays on this Mac`);
   } else {
     say(`✓ session shared → ${data.public_id}${target.loc ? ` (pane ${target.loc})` : ''}`);
     if (data.backfilled) say(`  seeded ${data.backfilled} recent items; earlier history stays on this Mac`);

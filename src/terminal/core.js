@@ -10,6 +10,28 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+
+// --- tmux ------------------------------------------------------------------
+
+// Resolve the tmux pane that owns a controlling tty. The ONE place both enable
+// doors look it up — the ancestor-walk door (commands.runEnable) and the daemon
+// (`enable --session`, where the CLI has no pane to offer). Both must bind the
+// same way or the ls door silently produces a read-only session the phone still
+// shows as interactive (spec §8: enable pins ONE pane_id).
+function tmuxPaneForTty(tty) {
+  if (!tty) return null;
+  try {
+    const out = execFileSync('tmux',
+      ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}'],
+      { encoding: 'utf8' });
+    for (const line of out.trim().split('\n')) {
+      const [paneId, paneTty, loc] = line.split('\t');
+      if (paneTty === tty) return { paneId, loc };
+    }
+  } catch {}
+  return null;
+}
 
 // --- config slot -----------------------------------------------------------
 
@@ -163,6 +185,7 @@ function saveCaps(caps) {
 
 module.exports = {
   baseDir, terminalDir, ENV_FILE, DAEMON_FILE, STATE_FILE, LOG_FILE, HOOK_SHIM, LOCKS_DIR,
+  tmuxPaneForTty,
   readEnvFile, writeFileAtomic, readJson, writeJson,
   loadTerminalEnv, saveTerminalEnv,
   e2eAad, e2eParseSecret, e2eKeyFingerprint, e2eEncryptField, e2eEncryptBlob, e2eDecryptBlob,
