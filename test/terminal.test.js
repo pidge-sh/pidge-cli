@@ -14,7 +14,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 
 function tmp(prefix) { return fs.mkdtempSync(path.join(os.tmpdir(), prefix)); }
 
@@ -506,13 +506,123 @@ test('`pidge terminal ls` is GONE — the picker is not a door, not even a depre
   assert.doesNotMatch(out.stderr, /\bls\b,/, 'ls must not survive in the subcommand list either');
 });
 
-test('terminal --help documents ONE enable door: no picker, no --session on enable', () => {
+test('terminal --help documents ONE enable door — the HOOK, not a command to find', () => {
   const out = runPidge(['terminal', '--help']);
   assert.equal(out.code, 0, out.stderr);
   assert.doesNotMatch(out.stdout, /terminal ls/, 'the picker is off the help');
   assert.doesNotMatch(out.stdout, /enable \[--session/, 'enable takes no session id');
-  assert.match(out.stdout, /Run this from inside the Claude session you want to share/,
-    'the help quotes the refusal, so the one instruction is discoverable');
+  assert.doesNotMatch(out.stdout, /walks its process tree|claude ancestor/i,
+    'the ancestor walk must not be described as the mechanism — it is gone');
+  assert.match(out.stdout, /PreToolUse HOOK/, 'the help names the actual mechanism');
+  assert.match(out.stdout, /Run exactly this one bash command and nothing else/,
+    'the help quotes the text to paste, so the one door is discoverable');
+});
+
+test('`pidge update` is a real command with focused help', () => {
+  const out = runPidge(['update', '--help']);
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stdout, /pidge update \[--manager npm\|pnpm\|yarn\|bun\]/);
+  assert.match(out.stdout, /pidge-cli@latest/);
+});
+
+// --- connect: the claim contract (kind tolerance + claim order) -------------
+//
+// These run the REAL `pidge terminal connect` against the mock server, with
+// --no-daemon (no launchctl/systemctl ever runs) and HOME/XDG in tmp dirs.
+
+const { createMock } = require('./mock-server');
+
+// ASYNC on purpose: the mock server runs in THIS process's event loop, and a
+// blocking execFileSync would deadlock against the child's own claim request.
+function runConnect(port, { code = 'claim-ok', secret = SECRET43(), extra = [] } = {}) {
+  const bin = path.join(__dirname, '..', 'bin', 'pidge.js');
+  const child = spawn(process.execPath,
+    [bin, 'terminal', 'connect', '--code', code, '--url', `http://127.0.0.1:${port}`, '--yes', '--no-daemon', ...extra],
+    {
+      env: {
+        ...process.env,
+        PIDGE_SECRET: secret,
+        PIDGE_NO_UPDATE_CHECK: '1',  // never reach the npm registry from a test
+        PIDGE_QUIET_NAG: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  const out = { code: null, stdout: '', stderr: '' };
+  child.stdout.on('data', (c) => { out.stdout += c; });
+  child.stderr.on('data', (c) => { out.stderr += c; });
+  return new Promise((resolve) => child.on('exit', (c) => { out.code = c; resolve(out); }));
+}
+
+test('connect: a server that reports kind "tunnel" completes the whole install', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    const out = await runConnect(port);
+    assert.equal(out.code, 0, `connect died: ${out.stderr}`);
+    assert.match(out.stdout, /✓ tunnel identity stored/);
+    assert.match(out.stdout, /✓ hooks installed/);
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim');
+    // The paste-the-command door is what connect leaves the human with.
+    assert.match(out.stdout, /Run exactly this one bash command and nothing else/);
+    assert.doesNotMatch(out.stdout, /enable yourself on Pidge/, 'a magic phrase is not the mechanism');
+  } finally { await mock.stop(); }
+});
+
+test('connect: a server that reports NO kind is tolerated (an old server is not evidence)', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = null; // every deploy before manifest v100
+  try {
+    const out = await runConnect(port);
+    assert.equal(out.code, 0, `the missing field killed 100% of connects — it must not: ${out.stderr}`);
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim');
+  } finally { await mock.stop(); }
+});
+
+test('connect: a STANDARD channel still refuses — and KEEPS the key the claim rotated', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'standard';
+  try {
+    const out = await runConnect(port);
+    assert.equal(out.code, 1, 'the guard must keep working when the server DOES report the kind');
+    assert.match(out.stderr, /belongs to a standard channel, not a tunnel/);
+    assert.match(out.stderr, /Settings → Computers/);
+    // The claim already rotated the key server-side. Dying before persisting it
+    // threw it away (QA finding #5): identity first, validation after.
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim',
+      'a post-claim refusal must not discard the rotated key');
+    assert.equal(fs.statSync(core.ENV_FILE()).mode & 0o777, 0o600);
+    // …and it stopped there: no hooks, no daemon, no skill.
+    assert.ok(!fs.existsSync(path.join(process.env.HOME, '.claude', 'settings.json')),
+      'a refused connect must not install anything');
+  } finally { await mock.stop(); }
+});
+
+test('connect: it refreshes the Pidge skill — the agent-side half of the door', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    const out = await runConnect(port);
+    assert.equal(out.code, 0, out.stderr);
+    const skill = path.join(process.env.HOME, '.claude', 'skills', 'pidge', 'SKILL.md');
+    assert.ok(fs.existsSync(skill), `connect must leave a HOME skill (stdout: ${out.stdout})`);
+    const text = fs.readFileSync(skill, 'utf8');
+    assert.match(text, /pidge terminal enable/, 'the installed skill knows the sentinel command');
+    assert.match(text, /is SUCCESS/, 'and that the DENIAL is the success signal');
+    assert.ok(!text.includes('hld_minted_by_claim'), 'the generated skill never bakes a token');
+    assert.match(out.stdout, /✓ Pidge skill refreshed/);
+  } finally { await mock.stop(); }
 });
 
 // ===========================================================================
@@ -669,21 +779,167 @@ test('uninstallDaemonService removes the right thing per platform', () => {
     { kind: 'launchd', removed: false }, 'a second teardown reports nothing removed instead of throwing');
 });
 
-test('ttyPath turns a ps short name into the path tmux reports — on BOTH ps flavors', () => {
-  // tmux's #{pane_tty} is always absolute; `ps -o tty=` is short and its
-  // "no controlling tty" marker differs by OS ('??' macOS, '?' Linux).
-  assert.equal(commands.ttyPath('ttys003'), '/dev/ttys003');
-  assert.equal(commands.ttyPath('pts/3'), '/dev/pts/3', 'Linux panes must resolve to /dev/pts/N');
-  assert.equal(commands.ttyPath('/dev/pts/3'), '/dev/pts/3', 'an already-absolute name is not doubled');
-  assert.equal(commands.ttyPath('??'), null, 'macOS: no controlling tty');
-  assert.equal(commands.ttyPath('?'), null, 'Linux: no controlling tty — never /dev/?');
-  assert.equal(commands.ttyPath(''), null);
-  assert.equal(commands.ttyPath(null), null);
+test('normalizeTty turns a short tty name into the path tmux reports — on BOTH ps flavors', () => {
+  // tmux's #{pane_tty} is always absolute; a hook payload / `ps -o tty=` is
+  // short, and the "no controlling tty" marker differs by OS ('??' macOS, '?'
+  // Linux). A null here is what routes the enable to the cwd fallback.
+  assert.equal(core.normalizeTty('ttys003'), '/dev/ttys003');
+  assert.equal(core.normalizeTty('pts/3'), '/dev/pts/3', 'Linux panes must resolve to /dev/pts/N');
+  assert.equal(core.normalizeTty('/dev/pts/3'), '/dev/pts/3', 'an already-absolute name is not doubled');
+  assert.equal(core.normalizeTty('??'), null, 'macOS: no controlling tty');
+  assert.equal(core.normalizeTty('?'), null, 'Linux: no controlling tty — never /dev/?');
+  assert.equal(core.normalizeTty(''), null);
+  assert.equal(core.normalizeTty(null), null);
 });
 
-test('processCwd resolves a live process without needing lsof', () => {
-  // /proc/<pid>/cwd on Linux, lsof on macOS — either way THIS process's cwd.
-  assert.equal(commands.processCwd(process.pid), process.cwd());
+// --- the enable SENTINEL matcher (the door's whole contract) ----------------
+
+test('parseEnableSentinel: only a Bash command carrying the literal opens the door', () => {
+  const ok = (cmd, tool = 'Bash') => core.parseEnableSentinel(tool, cmd);
+
+  assert.deepEqual(ok('pidge terminal enable'), { approvals: [] });
+  // The app's descriptive prompt EMBEDS the command — claude often echoes it back.
+  assert.deepEqual(ok('Run exactly this one bash command and nothing else: pidge terminal enable'), { approvals: [] });
+  // …and the improvisation a real claude fell into when `pidge` was not on PATH.
+  assert.deepEqual(ok('npx -y pidge-cli@latest terminal enable'), { approvals: [] });
+  assert.deepEqual(ok('npx pidge-cli terminal enable'), { approvals: [] });
+
+  // The approval gate rides the pasted command now — the CLI is not the door.
+  assert.deepEqual(ok('pidge terminal enable --approvals Bash,Write'), { approvals: ['Bash', 'Write'] });
+  assert.deepEqual(ok('pidge terminal enable --approvals=*'), { approvals: ['*'] });
+
+  // Not the sentinel.
+  assert.equal(ok('pidge terminal status'), null);
+  assert.equal(ok('pidge listen --all'), null);
+  assert.equal(ok('echo terminal enable'), null, 'nothing names pidge — not our command');
+  assert.equal(ok('pidge terminal enable', 'Read'), null, 'only the Bash tool carries commands');
+  assert.equal(core.parseEnableSentinel('Bash', undefined), null);
+  assert.equal(core.parseEnableSentinel(undefined, 'pidge terminal enable'), null);
+});
+
+test('the two deny reasons are the exact strings claude will read', () => {
+  assert.equal(core.ENABLE_OK_REASON,
+    "✓ Pidge is now mirroring this Claude session to the human's phone. This is expected — do NOT run any other command, do NOT go online, do NOT read or ack any queue.");
+  assert.equal(core.ENABLE_NO_PANE_REASON,
+    "Couldn't mirror this session: it isn't in a uniquely-identifiable tmux pane. Start claude inside its own tmux pane and paste the command again. Do not run other commands.");
+  // The pasted prompt is self-sufficient: it constrains the agent to ONE
+  // command and pre-empts both improvisations QA caught (go online / ack).
+  assert.match(core.ENABLE_PROMPT, /Run exactly this one bash command and nothing else: `pidge terminal enable`/);
+  assert.match(core.ENABLE_PROMPT, /do not read or ack any queue/);
+});
+
+// --- the stable CLI copy (the service must not point into the npx cache) ----
+
+test('installing the service COPIES the CLI to a stable path and points ExecStart THERE', () => {
+  freshHome();
+  freshXdg();
+  const rec = recorder();
+  const svc = withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec.run }));
+  const unit = fs.readFileSync(svc.file, 'utf8');
+  const exec = unit.split('\n').find((l) => l.startsWith('ExecStart='));
+
+  assert.ok(fs.existsSync(commands.stableCliEntry()), 'the copy must exist before the unit names it');
+  assert.ok(fs.existsSync(path.join(commands.stableCliDir(), 'src', 'terminal', 'daemon.js')),
+    'src/ rides along — bin/pidge.js requires it at runtime');
+  assert.ok(exec.includes(commands.stableCliEntry()), `ExecStart must point at the stable copy, got ${exec}`);
+  assert.ok(!/_npx/.test(exec), 'a service pointing into the npx cache dies when npm prunes it');
+  assert.ok(commands.stableCliEntry().startsWith(process.env.XDG_CONFIG_HOME), 'and it lives in this feature own slot');
+
+  // The copy is a real, runnable CLI — not a shell of files.
+  const out = execFileSync(process.execPath, [commands.stableCliEntry(), '--version'], { encoding: 'utf8' }).trim();
+  assert.match(out, /^\d+\.\d+\.\d+/, `the stable copy must run standalone, got ${JSON.stringify(out)}`);
+
+  // darwin says the same thing through the plist.
+  freshHome();
+  freshXdg();
+  const mac = recorder();
+  const macSvc = withPlatform('darwin', () => commands.installDaemonService({ run: mac.run }));
+  const plist = fs.readFileSync(macSvc.file, 'utf8');
+  assert.ok(plist.includes(commands.stableCliEntry()));
+  assert.ok(!/_npx/.test(plist));
+});
+
+test('a second connect REPLACES the stable copy instead of merging into a half-old tree', () => {
+  freshHome();
+  freshXdg();
+  const first = commands.copyCliToStablePath();
+  fs.writeFileSync(path.join(commands.stableCliDir(), 'stale-marker'), 'x');
+
+  const second = commands.copyCliToStablePath();
+  assert.equal(second, first);
+  assert.ok(!fs.existsSync(path.join(commands.stableCliDir(), 'stale-marker')),
+    'an upgrade must not leave a previous version file behind');
+  assert.deepEqual(fs.readdirSync(core.terminalDir()).filter((f) => /^cli\.new\./.test(f)), [],
+    'no staging dir may survive a successful swap');
+});
+
+// ===========================================================================
+// 3c. `pidge update` — the CLI keeps itself current
+// ===========================================================================
+
+const update = require('../src/update');
+
+test('update: it INVOKES the package manager and reports the version it moved to', async () => {
+  const runs = [];
+  const said = [];
+  const r = await update.runUpdate({
+    run: (cmd, args) => runs.push([cmd, ...args].join(' ')),
+    fetchLatest: async () => '9.9.9',
+    current: '0.41.0',
+    manager: 'npm',
+    say: (m) => said.push(m),
+    warn: (m) => said.push(m),
+  });
+
+  assert.deepEqual(runs, ['npm i -g pidge-cli@latest'], 'the whole point is that it actually installs');
+  assert.equal(r.ok, true);
+  assert.equal(r.ran, true);
+  assert.match(said.join('\n'), /installed pidge-cli@9\.9\.9 \(was 0\.41\.0\)/);
+});
+
+test('update: already current ⇒ no manager runs; a failed install is non-ok + the manual line', async () => {
+  const runs = [];
+  const current = await update.runUpdate({
+    run: (cmd, args) => runs.push(cmd + args.join(' ')), fetchLatest: async () => '0.41.0',
+    current: '0.41.0', manager: 'npm', say: () => {}, warn: () => {},
+  });
+  assert.deepEqual(runs, [], 'no reinstall when there is nothing to gain');
+  assert.equal(current.ran, false);
+  assert.equal(current.ok, true);
+
+  const warns = [];
+  const failed = await update.runUpdate({
+    run: () => { throw new Error('EACCES'); }, fetchLatest: async () => '9.9.9',
+    current: '0.41.0', manager: 'npm', say: () => {}, warn: (m) => warns.push(m),
+  });
+  assert.equal(failed.ok, false);
+  assert.match(warns.join('\n'), /npm i -g pidge-cli@latest failed \(EACCES\)/);
+  assert.match(warns.join('\n'), /Install it yourself/, 'a failure always hands back the manual line');
+});
+
+test('update: an unreachable registry warns and installs anyway (never blocks)', async () => {
+  const runs = [];
+  const warns = [];
+  const r = await update.runUpdate({
+    run: (cmd, args) => runs.push([cmd, ...args].join(' ')), fetchLatest: async () => null,
+    current: '0.41.0', manager: 'pnpm', say: () => {}, warn: (m) => warns.push(m),
+  });
+  assert.deepEqual(runs, ['pnpm add -g pidge-cli@latest'], 'each manager gets its own verb');
+  assert.equal(r.ok, true);
+  assert.match(warns.join('\n'), /could not reach the npm registry/);
+});
+
+test('update: the manager is inferred from where THIS copy lives; semver compares numerically', () => {
+  assert.equal(update.detectManager('/Users/x/.npm/_npx/abc/node_modules/.bin/pidge'), 'npm');
+  assert.equal(update.detectManager('/Users/x/Library/pnpm/global/5/node_modules/pidge-cli/bin/pidge.js'), 'pnpm');
+  assert.equal(update.detectManager('/Users/x/.yarn/bin/pidge'), 'yarn');
+  assert.equal(update.detectManager('/Users/x/.bun/install/global/node_modules/pidge-cli/bin/pidge.js'), 'bun');
+
+  assert.equal(update.isOlder('0.28.0', '0.41.0'), true, 'the exact gap the installed base sat in');
+  assert.equal(update.isOlder('0.9.0', '0.10.0'), true, 'numeric, not lexicographic');
+  assert.equal(update.isOlder('0.41.0', '0.41.0'), false);
+  assert.equal(update.isOlder('1.0.0', '0.41.0'), false);
+  assert.equal(update.currentVersion(), require('../package.json').version);
 });
 
 // ===========================================================================
@@ -1068,78 +1324,168 @@ test('enable: a failure after the register leaves neither a live record nor a pe
   assert.equal(fs.existsSync(d.lockPath('sess-fail')), false, 'the writer lock is released');
 });
 
-// --- enable: pane binding on both doors -------------------------------------
+// --- the enable door: the PreToolUse sentinel -------------------------------
+//
+// These drive the daemon's REAL http handler with a synthetic Claude Code
+// PreToolUse body, exactly as the hook shim would POST it. No tmux runs: the
+// pane lookups are injected (core.tmuxPaneForTty / core.tmuxPanesForCwd are
+// called by property, so a swap is enough) — the point under test is the
+// correlation and the response, not tmux itself.
 
-async function enableVia(d, body, paneLookup) {
-  const real = core.tmuxPaneForTty;
-  core.tmuxPaneForTty = paneLookup;
-  let out = null;
-  try {
-    await d.enableFromRequest(body, (code, obj) => { out = { code, obj }; });
-  } finally { core.tmuxPaneForTty = real; }
-  return out;
-}
-
-function announceOnly(d, sid = 'sess-x', tty = '/dev/ttys004') {
+function readyDaemon() {
+  const d = makeDaemon();
   d.registerSession = async () => ({ last_seq: 0 });
   d.backfill = async () => {};
   d.subscribeInput = () => {};
-  d.announces.set(sid, { tty, cwd: '/tmp/proj', transcriptPath: '/tmp/none.jsonl', at: Date.now() });
+  return d;
 }
 
-test('enable: the tty picks the session and the CLI pane binds it', async () => {
-  const d = makeDaemon();
-  announceOnly(d);
-  const out = await enableVia(d, { tty: '/dev/ttys004', pane_id: '%3' },
-    () => { throw new Error('the pane the CLI walked to must not be re-looked-up'); });
+// POST a hook event through handleHttp and return the parsed response.
+async function hookPost(d, slug, body) {
+  const req = {
+    method: 'POST', url: `/hook/${slug}`,
+    headers: { authorization: `Bearer ${d.hookToken}` },
+    on(event, cb) {
+      if (event === 'data') cb(JSON.stringify(body));
+      if (event === 'end') cb();
+    },
+    destroy() {},
+  };
+  let out = null;
+  const res = { writeHead() {}, end(payload) { out = JSON.parse(payload || '{}'); } };
+  await d.handleHttp(req, res);
+  return out;
+}
 
-  assert.equal(out.code, 200);
-  assert.equal(out.obj.pane_bound, true);
-  assert.equal(out.obj.read_only, undefined, 'there is no read-only tier to report');
-  assert.equal(d.sessions.get('sess-x').paneId, '%3');
+// The pane resolvers, swapped for the duration of one call.
+async function withPanes({ byTty = () => null, byCwd = () => [] }, fn) {
+  const realTty = core.tmuxPaneForTty;
+  const realCwd = core.tmuxPanesForCwd;
+  core.tmuxPaneForTty = byTty;
+  core.tmuxPanesForCwd = byCwd;
+  try { return await fn(); } finally {
+    core.tmuxPaneForTty = realTty;
+    core.tmuxPanesForCwd = realCwd;
+  }
+}
+
+const preToolUse = (sid, command, extra = {}) => ({
+  session_id: sid, tool_name: 'Bash', tool_input: { command },
+  cwd: '/tmp/proj', transcript_path: '/tmp/none.jsonl', tty: '/dev/ttys004', ...extra,
 });
 
-test('enable: with no pane the daemon REFUSES — it never mints a read-only share', async () => {
-  const d = makeDaemon();
-  announceOnly(d);
-  const out = await enableVia(d, { tty: '/dev/ttys004' }, () => null);
+test('sentinel: the PreToolUse hook enables the announced session and DENIES the tool', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  // The SessionStart announce this session made when it started.
+  await hookPost(d, 'session-start', {
+    session_id: 'sess-hook', cwd: '/tmp/proj', transcript_path: '/tmp/none.jsonl', tty: '/dev/ttys004',
+  });
+  assert.equal(d.announces.get('sess-hook').tty, '/dev/ttys004');
 
-  assert.equal(out.code, 422, 'a pane-less session is a hard error now, not a degraded success');
-  assert.equal(out.obj.error, core.ENABLE_REFUSAL);
-  assert.equal(d.sessions.has('sess-x'), false, 'NO session may exist after a refusal');
-  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-x'], undefined);
+  const out = await withPanes({ byTty: (tty) => (tty === '/dev/ttys004' ? { paneId: '%3', loc: 'probe:0.0' } : null) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-hook', 'pidge terminal enable')));
+
+  // The session is REGISTERED, bound to the announced pane…
+  const s = d.sessions.get('sess-hook');
+  assert.ok(s, 'the hook must enable the exact session id the harness handed it');
+  assert.equal(s.paneId, '%3');
+  assert.equal(s.publicId, 'ases_sess-hook');
+  assert.ok(core.readJson(core.STATE_FILE(), {}).sessions['sess-hook'], 'and persisted, like any share');
+
+  // …and the tool is DENIED, carrying the outcome as its reason: the bash never
+  // runs, so `pidge` need not exist on this machine (QA finding #8).
+  assert.deepEqual(out, {
+    decision: { permissionDecision: 'deny', permissionDecisionReason: core.ENABLE_OK_REASON },
+  });
+
+  // Idempotent: pasting twice says the same ✓, never a second share.
+  const again = await withPanes({ byTty: () => { throw new Error('an already-shared session must not re-resolve a pane'); } },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-hook', 'pidge terminal enable')));
+  assert.equal(again.decision.permissionDecisionReason, core.ENABLE_OK_REASON);
+  assert.equal(d.sessions.size, 1);
+});
+
+test('sentinel: with no announce at all, the hook payload itself is the binding source', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  // claude started BEFORE the daemon: no SessionStart ever reached us.
+  const out = await withPanes({ byTty: () => ({ paneId: '%9', loc: 'probe:1.0' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-cold', 'pidge terminal enable')));
+
+  assert.equal(out.decision.permissionDecisionReason, core.ENABLE_OK_REASON);
+  const s = d.sessions.get('sess-cold');
+  assert.equal(s.paneId, '%9');
+  assert.equal(s.file, '/tmp/none.jsonl', 'the payload carries the transcript path too');
+});
+
+test('sentinel: no tty ⇒ the cwd fallback binds, but ONLY when exactly one pane matches', async () => {
+  // Claude Code can run a hook without a controlling tty ('??' / '?'), which
+  // normalizes to null — the case the tty match cannot serve.
+  const one = readyDaemon();
+  one.hookToken = 'local-test-token';
+  const ok = await withPanes({ byCwd: (cwd) => (cwd === '/tmp/proj' ? [{ paneId: '%5', loc: 'probe:0.1' }] : []) },
+    () => hookPost(one, 'pre-tool-use', preToolUse('sess-cwd', 'pidge terminal enable', { tty: '??' })));
+  assert.equal(ok.decision.permissionDecisionReason, core.ENABLE_OK_REASON);
+  assert.equal(one.sessions.get('sess-cwd').paneId, '%5');
+  assert.ok(one.logLines.some((l) => /bound by cwd/.test(l)));
+
+  // TWO panes in that directory: refuse. Guessing here types the human's words
+  // into a stranger's shell.
+  const many = readyDaemon();
+  many.hookToken = 'local-test-token';
+  const no = await withPanes({ byCwd: () => [{ paneId: '%5' }, { paneId: '%6' }] },
+    () => hookPost(many, 'pre-tool-use', preToolUse('sess-amb', 'pidge terminal enable', { tty: '??' })));
+  assert.equal(no.decision.permissionDecisionReason, core.ENABLE_NO_PANE_REASON);
+  assert.equal(many.sessions.size, 0, 'an ambiguous bind must create NOTHING');
+  assert.ok(many.logLines.some((l) => /REFUSED/.test(l)));
+});
+
+test('sentinel: a claude outside tmux is refused loudly — no share, no read-only tier', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const out = await withPanes({
+    byTty: () => null,                                   // a REAL tty no pane owns
+    byCwd: () => { throw new Error('a usable tty must not fall through to the cwd guess'); },
+  }, () => hookPost(d, 'pre-tool-use', preToolUse('sess-bare', 'pidge terminal enable')));
+
+  assert.deepEqual(out, {
+    decision: { permissionDecision: 'deny', permissionDecisionReason: core.ENABLE_NO_PANE_REASON },
+  });
+  assert.equal(d.sessions.size, 0, 'NO session may exist after a refusal');
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-bare'], undefined);
   assert.ok(d.logLines.some((l) => /REFUSED/.test(l)), `expected a loud refusal, got ${JSON.stringify(d.logLines)}`);
-
-  // The announced tty is the belt: a pane the CLI could not name still binds.
-  const d2 = makeDaemon();
-  announceOnly(d2, 'sess-y');
-  const out2 = await enableVia(d2, { tty: '/dev/ttys004' },
-    (tty) => (tty === '/dev/ttys004' ? { paneId: '%7', loc: 'main:0.1' } : null));
-  assert.equal(out2.code, 200);
-  assert.equal(d2.sessions.get('sess-y').paneId, '%7');
 });
 
-test('enable: an explicit sid is IGNORED — the tty is the only selector', async () => {
-  const d = makeDaemon();
-  announceOnly(d, 'sess-other', '/dev/ttys001');
-  d.announces.set('sess-mine', { tty: '/dev/ttys004', cwd: '/tmp/proj', transcriptPath: '/tmp/none.jsonl', at: Date.now() });
-
-  // The removed `--session` door is not just off the CLI: the daemon does not
-  // read a sid at all, so nothing can re-open "guess which session I meant".
-  const out = await enableVia(d, { sid: 'sess-other', tty: '/dev/ttys004', pane_id: '%2' }, () => null);
-  assert.equal(out.code, 200);
-  assert.equal(d.sessions.has('sess-mine'), true);
-  assert.equal(d.sessions.has('sess-other'), false);
-
-  // …and with no tty at all there is nothing to resolve: the one instruction.
-  const out2 = await enableVia(d, { sid: 'sess-other' }, () => null);
-  assert.equal(out2.code, 422);
-  assert.equal(out2.obj.error, core.ENABLE_REFUSAL);
+test('sentinel: an ordinary Bash command is NOT a door — it only moves the status', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const out = await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-plain', 'npm test')));
+  assert.deepEqual(out, {}, 'a normal tool call gets no decision at all');
+  assert.equal(d.sessions.size, 0, 'and certainly no share');
 });
 
-test('the enable refusal is one sentence that says what to do', () => {
-  assert.equal(core.ENABLE_REFUSAL,
-    'Run this from inside the Claude session you want to share — it must be in a tmux.');
+test('sentinel: --approvals rides the pasted command (the CLI is not the door any more)', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-appr', 'pidge terminal enable --approvals Bash,Write')));
+  assert.deepEqual(d.sessions.get('sess-appr').approvals, ['Bash', 'Write']);
+});
+
+test('the daemon has NO /enable endpoint any more — the hook is the only door', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const req = {
+    method: 'POST', url: '/enable', headers: { authorization: 'Bearer local-test-token' },
+    on(event, cb) { if (event === 'data') cb('{"tty":"/dev/ttys004","pane_id":"%1"}'); if (event === 'end') cb(); },
+    destroy() {},
+  };
+  let code = null;
+  await d.handleHttp(req, { writeHead(c) { code = c; }, end() {} });
+  assert.equal(code, 404, 'a local caller must not be able to name a session into a share');
+  assert.equal(d.sessions.size, 0);
 });
 
 // --- the tailer: backfill, restart dedup, rescan bounds ---------------------

@@ -4,7 +4,8 @@
 // One per computer (launchd on macOS, `systemd --user` on Linux/WSL), owns:
 // the loopback hook endpoint (SessionStart/PreToolUse/Notification/Stop
 // announce to it — LOCAL ONLY, publishing is gated per-session by the
-// explicit enable), the JSONL tailers for ENABLED
+// explicit enable, which is itself a PreToolUse SENTINEL the human pastes into
+// the session they choose — see enableFromSentinel), the JSONL tailers for ENABLED
 // sessions, the sealed publisher, status heartbeats, the waiting→notification
 // edge, and the cable input lane (sealed frames → tmux send-keys into the
 // BOUND pane). Consent boundary = capability boundary: nothing about a
@@ -219,6 +220,16 @@ class Daemon {
       }
       case 'POST /hook/pre-tool-use': {
         const sid = body.session_id;
+        // THE ENABLE DOOR (spec §2, hook correlation). The human pasted the
+        // instruction into THIS session; claude is about to run one bash
+        // carrying the sentinel. We enable the session id the hook hands us —
+        // authoritative, no process introspection — and DENY the tool, so the
+        // command never runs (its success was always cosmetic) and the outcome
+        // reaches claude as the denial reason.
+        const sentinel = core.parseEnableSentinel(body.tool_name, body.tool_input && body.tool_input.command);
+        if (sid && sentinel) {
+          return send(200, { decision: await this.enableFromSentinel(sid, body, sentinel) });
+        }
         const s = sid && this.sessions.get(sid);
         if (s) this.setStatus(s, 'running');
         if (s && s.approvals && s.approvals.length && this.toolGated(s, body.tool_name)) {
@@ -252,8 +263,9 @@ class Daemon {
         }));
         return send(200, { announces: ann, enabled });
       }
-      case 'POST /enable':
-        return this.enableFromRequest(body, send);
+      // There is NO POST /enable any more: the PreToolUse sentinel above is the
+      // only door, so no local caller can mint a share for a session it merely
+      // named (the "which session did you mean?" guess this feature refuses).
       case 'POST /disable': {
         const targets = body.all ? [...this.sessions.keys()] : [body.sid].filter(Boolean);
         // The results carry whether the server was actually told — the CLI
@@ -269,53 +281,78 @@ class Daemon {
 
   // --- enable / disable -----------------------------------------------------
 
-  // The ONE enable door. The CLI has already walked its ancestors to the claude
-  // process, so it arrives with that claude's tty (which announce to pick) and
-  // its pane. No explicit sid is accepted — "which session did you mean?" is
-  // exactly the guess this feature refuses to make — and a session with NO
-  // bound pane is a hard error, never a read-only share: shared ⇔ interactive.
-  async enableFromRequest(body, send) {
-    const { tty, cwd, pane_id: paneId, approvals } = body;
-    if (!tty) return send(422, { error: core.ENABLE_REFUSAL });
-    const now = Date.now();
-    const hits = [...this.announces.entries()]
-      .filter(([, a]) => now - a.at < HOOK_TTL_MS && a.tty === tty)
-      .sort((a, b) => b[1].at - a[1].at);
-    if (hits.length === 0) {
-      return send(422, { error: 'no announced session on this tty — restart claude inside the tmux pane (the SessionStart hook announces it), then retry' });
+  // The ONE enable door: a PreToolUse hook whose Bash command carries the
+  // sentinel. The session id comes from the harness itself, so nothing is
+  // guessed and nothing is introspected — the failure class that kept this door
+  // shut (a shell wrapper matched as "claude", with no controlling tty) simply
+  // has no surface here.
+  //
+  // ALWAYS returns a permissionDecision: the sentinel command is a carrier, not
+  // a command we want executed. Denying it is what makes the door independent
+  // of PATH — `pidge` need not exist on this machine at all.
+  async enableFromSentinel(sid, body, sentinel) {
+    const deny = (reason) => ({ permissionDecision: 'deny', permissionDecisionReason: reason });
+
+    // The SessionStart announce is the preferred binding source (it is the
+    // claude process's own tty/cwd/transcript); the PreToolUse payload is the
+    // fallback, so a session that started before the daemon can still be
+    // shared. Whatever we learn here also refreshes the announce map.
+    // …but only a FRESH announce (the map ages out at 24 h, spec §2): a stale
+    // entry's transcript path can be a file this session no longer writes.
+    const known = this.announces.get(sid);
+    const ann = known && Date.now() - known.at < HOOK_TTL_MS ? known : null;
+    const tty = (ann && ann.tty) || core.normalizeTty(body.tty) || null;
+    const cwd = (ann && ann.cwd) || body.cwd || null;
+    const file = (ann && ann.transcriptPath) || body.transcript_path || null;
+    this.announces.set(sid, { tty, cwd, transcriptPath: file, at: Date.now() });
+
+    const live = this.sessions.get(sid);
+    if (live) {
+      this.log(`enable ${sid.slice(0, 8)}: already shared as ${live.publicId} — the sentinel is idempotent`);
+      return deny(core.ENABLE_OK_REASON);
     }
-    const sid = hits[0][0]; // newest announce on the tty — a new claude re-announces
-    const ann = this.announces.get(sid);
-    if (!ann || !ann.transcriptPath) {
-      return send(422, { error: `session ${sid.slice(0, 8)} has no announced transcript path — restart claude and retry` });
+    if (!file) {
+      this.log(`enable ${sid.slice(0, 8)} REFUSED: no transcript path announced and none in the hook payload`);
+      return deny(core.ENABLE_NO_TRANSCRIPT_REASON);
     }
-    if (this.sessions.has(sid)) {
-      return send(200, { already: true, public_id: this.sessions.get(sid).publicId });
-    }
-    // The CLI's pane wins; the announced tty is the belt (a pane the CLI could
-    // not name is still a pane). Neither ⇒ refuse, with the one instruction.
-    let bound = paneId || null;
-    if (!bound) {
-      const hit = core.tmuxPaneForTty(ann.tty || tty);
-      if (hit) {
-        bound = hit.paneId;
-        this.log(`enable ${sid.slice(0, 8)}: pane ${hit.paneId} (${hit.loc}) resolved from tty ${ann.tty || tty}`);
-      }
-    }
-    if (!bound) {
-      this.log(`enable ${sid.slice(0, 8)} REFUSED: no tmux pane owns tty ${ann.tty || tty} — a pane-less share would drop every keystroke`);
-      return send(422, { error: core.ENABLE_REFUSAL });
-    }
+
+    const pane = this.resolvePane({ sid, tty, cwd });
+    if (!pane) return deny(core.ENABLE_NO_PANE_REASON);
+
     try {
       const s = await this.enableSession({
-        sid, paneId: bound, tty: ann.tty, cwd: cwd || ann.cwd,
-        file: ann.transcriptPath, approvals: Array.isArray(approvals) ? approvals : [],
+        sid, paneId: pane.paneId, tty, cwd, file,
+        approvals: (sentinel && sentinel.approvals) || [],
       });
-      return send(200, { public_id: s.publicId, backfilled: s.backfilled, pane_bound: true });
+      this.log(`enable ${sid.slice(0, 8)} via the PreToolUse sentinel → ${s.publicId} (pane ${pane.paneId}${pane.loc ? ` ${pane.loc}` : ''}, bound by ${pane.by})`);
+      return deny(core.ENABLE_OK_REASON);
     } catch (e) {
-      this.log('enable failed:', e.message);
-      return send(502, { error: e.message });
+      // enableSession already tore its half-built record down; say what broke
+      // instead of claiming a share that does not exist (§11: never quiet).
+      this.log(`enable ${sid.slice(0, 8)} FAILED: ${e.message}`);
+      return deny(`Couldn't mirror this session: ${e.message}. Do not run other commands.`);
     }
+  }
+
+  // Bind exactly ONE pane, or refuse. Primary = the tty (authoritative: a pane
+  // OWNS its tty). Fallback = the cwd, used ONLY when there is no usable tty
+  // (Claude Code can spawn a hook without a controlling tty), and only when
+  // exactly one pane matches — two candidates means typing the human's words
+  // into a stranger's shell, so ambiguity refuses like absence does.
+  resolvePane({ sid, tty, cwd }) {
+    const tag = String(sid || '').slice(0, 8);
+    if (tty) {
+      const hit = core.tmuxPaneForTty(tty);
+      if (hit) return { paneId: hit.paneId, loc: hit.loc, by: `tty ${tty}` };
+      // A REAL tty that no pane owns = claude is not running inside tmux. The
+      // cwd fallback must NOT rescue this: it would bind an unrelated pane.
+      this.log(`enable ${tag} REFUSED: tty ${tty} is not a tmux pane — claude is not running inside tmux`);
+      return null;
+    }
+    const hits = core.tmuxPanesForCwd(cwd);
+    if (hits.length === 1) return { paneId: hits[0].paneId, loc: hits[0].loc, by: `cwd ${cwd}` };
+    this.log(`enable ${tag} REFUSED: no controlling tty and ${hits.length} tmux pane(s) sit in ${cwd || '(unknown cwd)'} — a pane-less or guessed share would drop every keystroke`);
+    return null;
   }
 
   async enableSession({ sid, paneId, tty, cwd, file, approvals }) {

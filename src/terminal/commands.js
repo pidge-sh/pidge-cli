@@ -1,8 +1,10 @@
 'use strict';
 // `pidge terminal <sub>` — the user-facing side of Agent Sessions v1
-// (agent-sessions-spec §2). connect = once per computer (claim exchange + consent +
-// hooks + daemon install); enable = per session, through the ONE door: the
-// ancestor walk from inside the running claude ("enable yourself on Pidge");
+// (agent-sessions-spec §2). connect = once per computer (claim exchange +
+// consent + hooks + skill + daemon install); enable happens in the DAEMON, on
+// the PreToolUse hook that carries the sentinel the human pasted into the
+// session (see core.ENABLE_PROMPT and daemon.enableFromSentinel) — this file's
+// `enable` is a friendly confirmation of that, never the mechanism;
 // disable/status/disconnect complete the lifecycle. Everything session-scoped
 // talks to the LOCAL daemon over loopback — commands never publish anything
 // themselves.
@@ -68,7 +70,15 @@ async function runConnect(v) {
   let channelId = existing.channelId;
   let effectiveBase = existing.base || base;
   let secret = secretRaw || existing.secret;
+  // The one moment we KNOW this computer is about to run Agent Sessions — so
+  // it is the one moment to notice this CLI is behind (an old copy is how the
+  // whole pairing broke for the installed base: npx prefers a local install).
+  await warnIfOutdated();
 
+  // `kind` is validated AFTER the identity is persisted (below): the claim has
+  // already rotated the key server-side, and dying here used to throw that key
+  // away. Retry-safety (gotcha #52) covered it; the order was still wrong.
+  let serverKind = null;
   if (code) {
     // The claim exchange (retry-safe per fingerprint — the pidge server's #52
     // contract): a network fumble re-runs to the SAME key, never a rotation.
@@ -84,9 +94,7 @@ async function runConnect(v) {
     token = data.key;
     channelId = data.channel && data.channel.id;
     effectiveBase = (data.base_url || base).replace(/\/$/, '');
-    if (data.channel && data.channel.kind !== 'tunnel') {
-      die(`pidge terminal connect: this code belongs to a ${data.channel.kind || 'standard'} channel, not a tunnel — use the app's Settings → Computers → Connect a computer flow (it mints the right kind)`);
-    }
+    serverKind = (data.channel && data.channel.kind) || null;
   }
   if (!token) die('pidge terminal connect: no stored identity and no --code — paste the one-liner from the app (Settings → Computers → Connect a computer)');
   if (!secret) die('pidge terminal connect: PIDGE_SECRET missing — the app\'s Connect-a-computer one-liner carries it (E2E is mandatory on tunnels; there is no clear mode)');
@@ -94,6 +102,14 @@ async function runConnect(v) {
 
   core.saveTerminalEnv({ base: effectiveBase, token, secret, channelId });
   say(`✓ tunnel identity stored (${core.ENV_FILE()}, 0600)`);
+
+  // Only refuse when the server ACTUALLY says a different kind. A server that
+  // does not report `kind` at all (every deploy before manifest v100) is not
+  // evidence of anything — reading `undefined !== 'tunnel'` as "wrong kind" is
+  // what killed 100% of connects (QA finding #1); §12 says tolerate absence.
+  if (serverKind && serverKind !== 'tunnel') {
+    die(`pidge terminal connect: this code belongs to a ${serverKind} channel, not a tunnel — use the app's Settings → Computers → Connect a computer flow (it mints the right kind)`);
+  }
 
   // Refresh the server caps from the manifest (never hardcode — spec §12).
   try {
@@ -117,7 +133,20 @@ async function runConnect(v) {
     try { installHooks(); } catch (e) { die(`${e.message}\n(the tunnel identity above is stored; re-run \`pidge terminal connect\` once the file parses)`); }
     say('✓ hooks installed in ~/.claude/settings.json (tagged, cleanly removable via `pidge terminal disconnect`)');
   } else {
-    say('· hooks NOT installed — sessions cannot announce; `pidge terminal enable` will refuse until you re-run connect');
+    say('· hooks NOT installed — the enable door IS the PreToolUse hook, so nothing can be shared until you re-run connect and accept');
+  }
+
+  // The skill is the agent-side half of the door: a claude running an OLD rev
+  // reads "enable yourself on Pidge" with its pre-existing meaning and goes
+  // ONLINE on a notification channel instead (QA finding #2 — it drained and
+  // acked 21 real messages while reporting success). connect is the one moment
+  // we know this computer will be used for Agent Sessions, so it refreshes the
+  // skill here. A failure WARNS — the hook door works without any skill.
+  try {
+    const file = installPidgeSkill({ base: effectiveBase, token });
+    say(`✓ Pidge skill refreshed (${file})`);
+  } catch (e) {
+    console.error(`pidge terminal: WARNING — could not refresh the Pidge skill (${e.message}).\n  Fix it with:  cd ~ && npx -y pidge-cli@latest skill install\n  (sharing still works without it — the PreToolUse hook is the door, not the skill.)`);
   }
 
   // Daemon config + this computer's service manager (--no-daemon skips the
@@ -134,7 +163,51 @@ async function runConnect(v) {
       say('  (survive logout: `loginctl enable-linger $USER`)');
     } else say(`· daemon logs at ${core.LOG_FILE()}`);
   }
-  say('\nDone. Start (or restart) claude inside a tmux pane, then tell it\n"enable yourself on Pidge" — that is the only way to share a session.');
+  say('\nDone. This computer is linked. To share a session: start (or restart) claude');
+  say('inside its own tmux pane and PASTE this into it —\n');
+  say(`  ${core.ENABLE_PROMPT}\n`);
+  say('The PreToolUse hook catches that command and shares THAT session (per session id);');
+  say('the command itself never runs, so it does not matter whether `pidge` is on your PATH.');
+}
+
+// --- the Pidge skill (agent-side half of the door) --------------------------
+
+// Run `skill install` from the HOME dir, so the refreshed skill lands in
+// ~/.claude/skills/pidge/SKILL.md — the copy EVERY session loads, not one
+// project's. The child gets the tunnel identity purely to read the (public)
+// manifest; the generated skill bakes no token. THROWS with a short message —
+// the caller decides warn-vs-die (here: warn).
+function installPidgeSkill({ base, token }) {
+  const entry = cliEntryPath();
+  const home = os.homedir();
+  try {
+    execFileSync(process.execPath, [entry, 'skill', 'install'], {
+      cwd: home,
+      env: { ...process.env, PIDGE_URL: base, PIDGE_TOKEN: token, PIDGE_QUIET_NAG: '1' },
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: 60_000,
+      encoding: 'utf8',
+    });
+  } catch (e) {
+    const detail = String((e && e.stderr) || (e && e.message) || '').trim().split('\n').slice(-1)[0];
+    throw new Error(detail || 'skill install failed');
+  }
+  return path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
+}
+
+// --- version self-check -----------------------------------------------------
+
+// Never blocks and never installs behind the human's back: it says the one line
+// that fixes it. (A network failure is silence — connect must work offline.)
+async function warnIfOutdated() {
+  if (process.env.PIDGE_NO_UPDATE_CHECK) return; // offline boxes + hermetic tests
+  try {
+    const { currentVersion, latestVersion, isOlder } = require('../update');
+    const current = currentVersion();
+    const latest = await latestVersion();
+    if (!current || !latest || !isOlder(current, latest)) return;
+    console.error(`pidge terminal: this CLI is ${current}; ${latest} is published. Update it first:  pidge update   (or: npm i -g pidge-cli@latest)`);
+  } catch { /* best-effort — a version probe must never break connect */ }
 }
 
 // --- hook shim + settings.json installer ------------------------------------
@@ -343,14 +416,59 @@ function isWsl() {
   try { return /microsoft/i.test(fs.readFileSync('/proc/version', 'utf8')); } catch { return false; }
 }
 
+// Where THIS process's CLI lives (bin/pidge.js) and its package root.
+function cliEntryPath() {
+  return require.main ? require.main.filename : path.join(__dirname, '..', '..', 'bin', 'pidge.js');
+}
+function cliRootPath() {
+  return path.resolve(path.dirname(cliEntryPath()), '..'); // <root>/bin/pidge.js → <root>
+}
+function stableCliDir() { return path.join(core.terminalDir(), 'cli'); }
+function stableCliEntry() { return path.join(stableCliDir(), 'bin', 'pidge.js'); }
+
+// A service template must NEVER point at where the CLI happens to be running
+// from: `npx` runs it out of ~/.npm/_npx/<hash>, npm prunes that cache, and the
+// daemon dies silently weeks later (QA finding #4 — proven on a real launchd
+// plist). And `npm i -g` cannot be trusted either: on a real machine the npm
+// prefix was outside PATH entirely (finding #8). So connect COPIES the CLI it
+// is running into ~/.config/pidge/terminal/cli/ and the service runs that —
+// a path this feature owns, with no cache and no PATH in the loop.
+function copyCliToStablePath() {
+  const root = cliRootPath();
+  const dest = stableCliDir();
+  if (path.resolve(root) === path.resolve(dest)) return stableCliEntry(); // already the copy
+  const staging = `${dest}.new.${process.pid}`;
+  fs.rmSync(staging, { recursive: true, force: true });
+  fs.mkdirSync(staging, { recursive: true });
+  // bin/ + src/ is the whole runtime (pidge-cli has no runtime dependencies);
+  // package.json rides along so `pidge --version` keeps telling the truth.
+  for (const part of ['bin', 'src', 'package.json']) {
+    const from = path.join(root, part);
+    if (!fs.existsSync(from)) continue;
+    fs.cpSync(from, path.join(staging, part), { recursive: true });
+  }
+  if (!fs.existsSync(path.join(staging, 'bin', 'pidge.js'))) {
+    fs.rmSync(staging, { recursive: true, force: true });
+    throw new Error(`could not find bin/pidge.js under ${root}`);
+  }
+  // Swap last: a half-copied tree must never be what the service points at.
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.renameSync(staging, dest);
+  try { fs.chmodSync(stableCliEntry(), 0o755); } catch {}
+  return stableCliEntry();
+}
+
 // node + the CLI entry point the service will run. Shared by every branch.
 function daemonExec() {
   const nodeBin = process.execPath;
-  const cli = require.main ? require.main.filename : path.join(__dirname, '..', '..', 'bin', 'pidge.js');
-  if (/[\\/]_npx[\\/]/.test(cli)) {
-    console.error('pidge terminal: WARNING — running from the npx CACHE; the service template points into it and BREAKS when npx prunes. Install durably (npm i -g pidge-cli) and re-run `pidge terminal connect`.');
+  const fallback = cliEntryPath();
+  try {
+    return { nodeBin, cli: copyCliToStablePath() };
+  } catch (e) {
+    const npx = /[\\/]_npx[\\/]/.test(fallback);
+    console.error(`pidge terminal: WARNING — could not copy the CLI to ${stableCliDir()} (${e.message}); the service will point at ${fallback}${npx ? ' — the npx CACHE, which npm PRUNES: the daemon would die silently later. Install durably (npm i -g pidge-cli@latest) and re-run `pidge terminal connect`.' : '.'}`);
+    return { nodeBin, cli: fallback };
   }
-  return { nodeBin, cli };
 }
 
 // `probe` exists for the TESTS and nothing else: it lets one machine exercise
@@ -494,90 +612,33 @@ function uninstallDaemonService(probe = {}) {
   return { kind: 'systemd', removed };
 }
 
-// --- enable (the ancestor walk — spec §2's ONE door) ------------------------
-
-// `command`, `ppid` and `tty` are POSIX/GNU `ps` output specs — identical on
-// macOS (BSD ps) and Linux (procps).
-function psField(pid, field) {
-  try {
-    return execFileSync('ps', ['-o', `${field}=`, '-p', String(pid)], { encoding: 'utf8' }).trim();
-  } catch { return ''; }
-}
-
-// `ps -o tty=` prints a SHORT name (`ttys003` on macOS, `pts/3` on Linux) that
-// must become the absolute path tmux reports as `#{pane_tty}` (`/dev/pts/3`).
-// "no controlling tty" is `??` on macOS but a single `?` on Linux — reading
-// that as a name yields the nonexistent `/dev/?`, and the pane lookup then
-// fails with a confusing message instead of the honest "no tty" refusal.
-function ttyPath(short) {
-  const t = String(short || '').trim();
-  if (!t || /^\?+$/.test(t)) return null;
-  return t.startsWith('/') ? t : `/dev/${t}`;
-}
-
-// The working directory of another process. `/proc/<pid>/cwd` is a symlink on
-// Linux — free, always present, and lsof frequently is NOT installed on a
-// minimal distro or container. macOS has no /proc, so it falls through to lsof.
-function processCwd(pid) {
-  try {
-    const link = fs.readlinkSync(`/proc/${pid}/cwd`);
-    if (link) return link.replace(/ \(deleted\)$/, '');
-  } catch {}
-  try {
-    const out = execFileSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8' });
-    const m = out.split('\n').find((l) => l.startsWith('n'));
-    return m ? m.slice(1) : null;
-  } catch {}
-  return null;
-}
-
-function isClaudeCommand(c) {
-  return /(^|\/|\s)claude(\s|$)/.test(c) || /\.claude\/.*\/(cli|claude)/.test(c) || /claude-code/.test(c);
-}
-
-// Walk UP from this process to the claude ancestor; return {pid, tty, cwd}.
-// Refuses loudly when the tree is opaque (spec: never guess).
-function findClaudeAncestor() {
-  let pid = process.ppid;
-  for (let hops = 0; hops < 20 && pid > 1; hops++) {
-    const command = psField(pid, 'command');
-    if (isClaudeCommand(command)) {
-      return { pid, tty: ttyPath(psField(pid, 'tty')), cwd: processCwd(pid) };
-    }
-    const up = psField(pid, 'ppid');
-    if (!up) break;
-    pid = Number(up);
-  }
-  return null;
-}
-
-// The pane lookup lives in core so the CLI and the daemon bind identically.
-function paneForTty(tty) { return core.tmuxPaneForTty(tty); }
-
-// The ONE door (spec §2, locked down): no picker, no `--session`, no pane-less
-// share. Anything that isn't "a claude ancestor, in a tmux pane" refuses with
-// the single instruction that fixes it — never a guess, never a read-only tier.
+// --- enable (a CONFIRMATION — the door is the hook) -------------------------
+//
+// This command used to BE the mechanism: it walked its own process tree up to
+// the claude process to read its tty. That is structurally broken (QA finding
+// #7 — Claude Code runs every Bash tool inside a ttyless shell wrapper whose
+// command line mentions `.claude/`, so the walk stopped there and refused on
+// every machine), and it dragged a PATH problem along (finding #8). The whole
+// walk is GONE: the daemon enables sessions from the PreToolUse hook, which
+// carries the session id authoritatively (core.parseEnableSentinel).
+//
+// What's left is a friendly confirm for a human in a bare terminal: it never
+// mints a share, and it says the one thing that does.
 async function runEnable(v) {
   if (!(await daemonAlive())) die('pidge terminal enable: the local daemon is not running — run `pidge terminal connect` (or `pidge terminal daemon` in another shell) first');
-  const approvals = v.approvals ? String(v.approvals).split(',').map((s) => s.trim()).filter(Boolean) : [];
-
-  // No claude ancestor (a bare terminal) · a claude with no controlling tty ·
-  // a tty that is not a tmux pane — three ways to be un-shareable, ONE answer.
-  const claude = findClaudeAncestor();
-  const pane = claude && claude.tty ? paneForTty(claude.tty) : null;
-  if (!pane) die(core.ENABLE_REFUSAL);
-  const target = { tty: claude.tty, cwd: claude.cwd, pane_id: pane.paneId, loc: pane.loc };
-
-  const { res, data } = await daemonCall('POST', '/enable', { ...target, approvals });
-  if (res.status !== 200) die(`pidge terminal enable: ${data && data.error ? data.error : `daemon answered ${res.status}`}`);
-  if (data.already) {
-    say(`✓ this session is already shared (${data.public_id})`);
-    return;
+  const { data } = await daemonCall('GET', '/sessions');
+  const enabled = data.enabled || [];
+  if (!enabled.length) {
+    // Loud, actionable, and NOT a share: exit 1 keeps "nothing was created".
+    die(core.ENABLE_NOT_MIRRORED);
   }
-  say(`✓ session shared → ${data.public_id}${target.loc ? ` (pane ${target.loc})` : ''}`);
-  if (data.backfilled) say(`  seeded ${data.backfilled} recent items; earlier history stays on this computer`);
+  say(`✓ ${enabled.length} session(s) mirroring from this computer — ${enabled.map((e) => `${e.sid.slice(0, 8)} (${e.status})`).join(', ')}`);
   say('  Open the Pidge app → Agents to watch and reply. `pidge terminal disable` stops sharing.');
-  if (approvals.length) say(`  approval gate ON for: ${approvals.join(', ')}`);
+  say('  (This command only reports: the PreToolUse hook is what shares a session.');
+  say('   To share ANOTHER session, paste the prompt above into it — `pidge terminal status` shows it.)');
+  if (v.approvals) {
+    say(`· --approvals is ignored here — it rides the pasted command instead: \`pidge terminal enable --approvals ${v.approvals}\``);
+  }
 }
 
 // --- status / disable / disconnect ------------------------------------------
@@ -594,9 +655,10 @@ async function runStatus() {
     say(`sessions: ${en.length} shared${en.length ? ' — ' + en.map((e) => `${e.sid.slice(0, 8)} (${e.status})`).join(', ') : ''}`);
     say(`announced: ${announced} (local only, not shared)`);
     // The announce map is diagnostics, never a picker: a session can only be
-    // shared from inside itself, so this points at the prompt, not at a list.
+    // shared from INSIDE itself, so this points at the prompt, not at a list.
     if (announced > en.length) {
-      say('          share one by telling that Claude "enable yourself on Pidge" (from inside its tmux pane)');
+      say('\n          To share one, paste this into that Claude session:');
+      say(`          ${core.ENABLE_PROMPT}\n`);
     }
   }
   let hooksLine;
@@ -629,20 +691,20 @@ async function runDisable(v) {
     sayDisabled(`${data.disabled.length} session(s)`, data.results);
     return;
   }
-  let sid = v.session || null;
-  if (!sid) {
-    const claude = findClaudeAncestor();
-    if (claude && claude.tty) {
-      const { data } = await daemonCall('GET', '/sessions');
-      const ann = (data.announces || []).find((a) => a.tty === claude.tty);
-      if (ann) sid = ann.sid;
-    }
-  }
-  if (!sid) die('pidge terminal disable: run it from inside the shared Claude session, or pass --session <sid> (`pidge terminal status` lists them) or --all');
-  // Prefix match against enabled sessions for convenience.
+  // No process introspection here either (the ancestor walk is gone): a
+  // single shared session is unambiguous, more than one needs a --session
+  // (prefix match) or --all. Never guess WHICH share to end.
   const { data } = await daemonCall('GET', '/sessions');
-  const hit = (data.enabled || []).find((e) => e.sid === sid || e.sid.startsWith(sid));
-  if (!hit) die(`pidge terminal disable: no shared session matching ${JSON.stringify(sid)}`);
+  const enabled = data.enabled || [];
+  const sid = v.session || null;
+  const hit = sid
+    ? enabled.find((e) => e.sid === sid || e.sid.startsWith(sid))
+    : (enabled.length === 1 ? enabled[0] : null);
+  if (!hit) {
+    if (sid) die(`pidge terminal disable: no shared session matching ${JSON.stringify(sid)}`);
+    if (!enabled.length) die('pidge terminal disable: nothing is being shared from this computer');
+    die(`pidge terminal disable: ${enabled.length} sessions are shared — pass --session <sid> (\`pidge terminal status\` lists them) or --all`);
+  }
   const { data: out } = await daemonCall('POST', '/disable', { sid: hit.sid });
   sayDisabled(hit.sid.slice(0, 8), out && out.results);
 }
@@ -683,5 +745,6 @@ async function runTerminal(sub, v) {
 module.exports = {
   runTerminal, installHooks, uninstallHooks, hookShimSource, PIDGE_HOOK_MARKER,
   installDaemonService, uninstallDaemonService, launchdPlistPath, systemdUnitPath,
-  ttyPath, processCwd, SYSTEMD_UNIT, LAUNCHD_LABEL,
+  copyCliToStablePath, stableCliDir, stableCliEntry, installPidgeSkill,
+  SYSTEMD_UNIT, LAUNCHD_LABEL,
 };

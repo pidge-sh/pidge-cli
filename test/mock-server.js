@@ -29,6 +29,11 @@ function createMock() {
     uploads: [],
     blobs: {},             // name → Buffer, served at GET /blobs/<name>
     claimCode: 'claim-ok',   // POST /api/v1/claim exchanges this once
+    // The channel KIND the claim reports back (server manifest v100+). null =
+    // an older server that reports NONE — the CLI must tolerate that (spec §12,
+    // QA finding #1: reading a missing field as "not a tunnel" killed 100% of
+    // `terminal connect` runs).
+    claimKind: null,
     devices: 1,
     // claim ownership + operating-contract/device_reach surfaces.
     claim: { claimed_by_label: null, claimed_by_fingerprint: null, claimed_at: null, claim_generation: 0 },
@@ -107,7 +112,8 @@ function createMock() {
         if (state.claimCode && code === state.claimCode) {
           state.claimCode = null; // single-use
           return json(res, 200, {
-            key: 'hld_minted_by_claim', channel: { id: 1, name: 'mock' },
+            key: 'hld_minted_by_claim',
+            channel: { id: 1, name: 'mock', ...(state.claimKind ? { kind: state.claimKind } : {}) },
             user: 'Ana', base_url: `http://127.0.0.1:${port}`,
           });
         }

@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.41.0 — 2026-08-03
+
+**Agent Sessions: the enable door is rebuilt, and pairing actually works.** The
+on-device QA of 0.40.0 never got past the first step; every fix below was
+reproduced on a real Mac, not deduced.
+
+- **Enable now rides the HOOK, not a process-tree walk.** The old
+  `pidge terminal enable` walked its own ancestors looking for `claude` — which
+  is structurally broken: Claude Code runs every Bash tool inside a **ttyless
+  shell wrapper** whose command line mentions `.claude/`, so the walk stopped
+  there and refused on every machine. Now the human **pastes an instruction into
+  the session they want to share**; claude runs one bash carrying the sentinel
+  `pidge terminal enable`; the **`PreToolUse` hook fires before it runs**,
+  carrying the authoritative `session_id`, and the daemon shares THAT session
+  and **denies the tool** — its denial reason IS the outcome. Consequences:
+  - the command never actually runs, so **`pidge` need not be on any PATH**;
+  - a claude that has never heard of Pidge just runs one harmless command —
+    the pasted text forbids going "online" or acking any queue;
+  - pane binding is tty-first with a **cwd fallback**, and **refuses when zero
+    or MORE THAN ONE** pane matches — it never guesses which shell to type into.
+  `pidge terminal enable` still exists as a **confirmation** (it reports what is
+  mirroring and prints the prompt to paste); the daemon's `POST /enable` is gone.
+  The approval gate rides the pasted command: `pidge terminal enable --approvals Bash,Write`.
+- **`terminal connect` tolerates a server that doesn't report `channel.kind`.**
+  Reading a missing field as "not a tunnel" refused **100%** of connects.
+- **A post-claim refusal no longer discards the rotated key** — the identity is
+  persisted before the kind is validated.
+- **`connect` refreshes the Pidge skill** (into `~/.claude/skills/pidge`), so a
+  computer prepared for Agent Sessions never leaves a stale rev behind — an old
+  skill read "enable yourself on Pidge" with its previous meaning and went
+  online on a notification channel instead. Failure warns, never blocks.
+- **The daemon service no longer points into the npx cache.** `connect` copies
+  the CLI to `~/.config/pidge/terminal/cli/` and the launchd/systemd `ExecStart`
+  runs THAT — `npm prune` of `~/.npm/_npx` can no longer kill the daemon weeks
+  later, and nothing depends on the npm prefix being in PATH.
+- **`pidge update`** — new command: installs `pidge-cli@latest` with the manager
+  that owns this copy (npm/pnpm/yarn/bun, auto-detected). `terminal connect`
+  self-checks the published version and points here when it's behind
+  (`PIDGE_NO_UPDATE_CHECK=1` opts out).
+- Skill spine → rev 19 (it teaches the new door, including that the **denial is
+  the success signal**).
+
 ## 0.40.0 — 2026-08-03
 
 **Agent Sessions hardening** — three adversarial reviews over 0.39.0 (which was
