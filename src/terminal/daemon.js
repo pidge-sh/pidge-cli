@@ -56,7 +56,17 @@ class Daemon {
     this.ws = null;              // one cable socket, N subscriptions
     this.wsGen = 0;              // identity guard for reconnects (#66)
     this.wsLastBeat = 0;
-    this.replay = new Map();     // `${publicId}|${vgen}` → last seq
+    this.replay = new Map();     // `${publicId}|${vgen}` → last seq (never pruned:
+                                 // a viewer generation must stay monotonic for the
+                                 // life of the process, including across a
+                                 // disable/re-enable of the same sid)
+    // RESERVED, deliberately empty in v1: there is no wire signal that retires a
+    // viewer generation (the spec's grow-only retired set needs one). Replay
+    // defense in v1 rests on the mandatory `he` epoch echo — which kills every
+    // pre-restart ciphertext — plus the per-vgen monotonic seq ledger above.
+    // Populating this on disable was considered and REJECTED: the app can reuse
+    // a vgen across a re-enable, and dropping a live viewer's input silently is
+    // worse than the replay window the epoch echo already closes.
     this.retiredVgens = new Set();
     this.logStream = null;
   }
