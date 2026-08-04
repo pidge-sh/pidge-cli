@@ -2173,6 +2173,57 @@ test('a mode CHANGE refreshes meta_sealed; a mode-less payload changes nothing',
   assert.ok(!apiLog.some((c) => c.method === 'PATCH' && c.body && c.body.meta_sealed));
 });
 
+test('EVERY hook event carries the mode — Notification/Stop/SessionStart refresh the chip (QA r6-5)', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  const apiLog = [];
+  d.api = async (method, p, body) => { apiLog.push({ method, p, body }); return { res: { status: 200 }, data: {} }; };
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-mode', 'pidge terminal enable', { permission_mode: 'acceptEdits' })));
+  const s = d.sessions.get('sess-mode');
+  assert.equal(s.mode, 'acceptEdits');
+  const metaMode = () => {
+    const patch = apiLog.filter((c) => c.method === 'PATCH' && c.body && c.body.meta_sealed).at(-1);
+    assert.ok(patch, 'a mode change must refresh the sealed meta');
+    return JSON.parse(core.e2eDecryptBlob(d.key, core.e2eAad(1, 'ases_sess-mode', 'agent_meta'),
+      Buffer.from(patch.body.meta_sealed, 'base64url')).toString('utf8')).mode;
+  };
+
+  // The r6-5 shape: the human goes to plan mode, and plan mode means NO tool
+  // calls — the transition arrives on a Notification, never on a PreToolUse.
+  apiLog.length = 0;
+  await hookPost(d, 'notification', {
+    session_id: 'sess-mode', message: 'Claude is waiting for your input',
+    notification_type: 'idle_prompt', permission_mode: 'plan',
+  });
+  await settle();
+  assert.equal(s.mode, 'plan');
+  assert.equal(metaMode(), 'plan', 'the phone chip refreshes even though no tool ever ran');
+  assert.ok(d.logLines.some((l) => /permission mode acceptEdits → plan/.test(l)));
+
+  // A Stop carrying a different mode refreshes too.
+  apiLog.length = 0;
+  await hookPost(d, 'stop', { session_id: 'sess-mode', permission_mode: 'default' });
+  assert.equal(s.mode, 'default');
+  assert.equal(metaMode(), 'default');
+
+  // And a SessionStart (a resume announces with the current mode).
+  apiLog.length = 0;
+  await hookPost(d, 'session-start', {
+    session_id: 'sess-mode', cwd: '/tmp/proj', transcript_path: '/tmp/none.jsonl',
+    tty: '/dev/ttys004', source: 'resume', permission_mode: 'bypassPermissions',
+  });
+  assert.equal(s.mode, 'bypassPermissions');
+  assert.equal(metaMode(), 'bypassPermissions');
+
+  // Defensive on every event: absence is never a change.
+  apiLog.length = 0;
+  await hookPost(d, 'stop', { session_id: 'sess-mode' });
+  await hookPost(d, 'notification', { session_id: 'sess-mode', message: 'hi', notification_type: 'idle_prompt' });
+  assert.equal(s.mode, 'bypassPermissions');
+  assert.ok(!apiLog.some((c) => c.method === 'PATCH' && c.body && c.body.meta_sealed));
+});
+
 // --- the tailer: backfill, restart dedup, rescan bounds ---------------------
 
 function rec(i) {

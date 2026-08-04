@@ -259,6 +259,7 @@ class Daemon {
         if (!sid) return send(200, {});
         this.announces.set(sid, { tty: tty || null, cwd: cwd || null, transcriptPath: tp || null, at: Date.now() });
         const s = this.sessions.get(sid);
+        if (s) this.notePermissionMode(s, body.permission_mode); // every hook carries the mode (r6-5)
         if (s && tp && tp !== s.file) {
           // Same-sid rotation (an in-place transcript swap): SAME AgentSession.
           this.log(`session ${sid.slice(0, 8)}: transcript rotated → ${path.basename(tp)}`);
@@ -326,6 +327,7 @@ class Daemon {
         if (s) {
           s.lastAliveAt = Date.now();
           this.setStatus(s, 'waiting');
+          this.notePermissionMode(s, body.permission_mode); // every hook carries the mode (r6-5)
           // Composer-spec Tranche A, MINIMAL cherry-pick: the Notification
           // hook fires for eight distinct reasons and carries
           // `notification_type` (permission_prompt | idle_prompt |
@@ -347,7 +349,11 @@ class Daemon {
       case 'POST /hook/stop': {
         const sid = body.session_id;
         const s = sid && this.sessions.get(sid);
-        if (s) { s.lastAliveAt = Date.now(); this.setStatus(s, 'idle'); }
+        if (s) {
+          s.lastAliveAt = Date.now();
+          this.setStatus(s, 'idle');
+          this.notePermissionMode(s, body.permission_mode); // every hook carries the mode (r6-5)
+        }
         return send(200, {});
       }
       case 'GET /sessions': {
@@ -1172,10 +1178,15 @@ class Daemon {
 
   // --- status + waiting notification (spec §9) ------------------------------
 
-  // The harness's permission mode rides every PreToolUse payload (Claude:
-  // default | plan | acceptEdits | bypassPermissions) — read DEFENSIVELY, the
-  // field can be absent on older harnesses, and absence is never a change.
-  // A change refreshes meta_sealed so viewers see the current mode; the mode
+  // The harness's permission mode rides the BASE payload of every hook event
+  // (Claude: default | plan | acceptEdits | bypassPermissions) — read
+  // DEFENSIVELY from ALL of them (SessionStart, PreToolUse, Notification,
+  // Stop), the field can be absent on older harnesses, and absence is never a
+  // change. Reading it only on PreToolUse was QA r6-5's stagnant chip: a
+  // switch INTO plan mode tends to be followed by zero tool calls (plan mode
+  // exists to not run tools), so the daemon never saw the transition and the
+  // phone showed "Accepting edits" against a pane sitting in plan mode. A
+  // change refreshes meta_sealed so viewers see the current mode; the mode
   // lives only inside the sealed blob (the server never reads it).
   notePermissionMode(s, mode) {
     if (typeof mode !== 'string' || !mode || mode === s.mode) return;
