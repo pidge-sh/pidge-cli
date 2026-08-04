@@ -104,10 +104,18 @@ async function runConnect(v) {
     // NOTE: the suggestion is --replace, deliberately NOT `disconnect` —
     // disconnect keeps the identity file (review M1), so it would send the
     // human in a circle right back to this refusal.
+    //
+    // The NON-destructive path goes first (QA r7-3): both escapes this message
+    // used to offer burn the pairing, but the real r7 case was a one-liner that
+    // stored the identity and then stalled at the consent prompt — the fix was
+    // re-running WITHOUT --code, which the guard above already allows and the
+    // text never mentioned. Sending someone to --replace for that costs them
+    // the channel they just claimed.
     die('pidge terminal connect: this computer is already connected to ' +
       `channel ${existing.channelId != null ? existing.channelId : '(unknown)'} at ${existing.base || '(unknown url)'}.\n` +
-      `Run again with --replace to switch this computer over — or delete ${core.ENV_FILE()} by hand and re-run.\n` +
-      '(Either way the OLD channel stays on the server — remove that computer in the app: Settings → Computers.)');
+      'If you are finishing a half-done install on the SAME channel, just run `pidge terminal connect` again without --code.\n' +
+      `To switch this computer to a DIFFERENT channel, run again with --replace — or delete ${core.ENV_FILE()} by hand and re-run.\n` +
+      '(On either SWITCH path the OLD channel stays on the server — remove that computer in the app: Settings → Computers.)');
   }
 
   let token = existing.token;

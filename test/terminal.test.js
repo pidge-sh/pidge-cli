@@ -734,6 +734,12 @@ test('connect: a NEW pairing over an EXISTING identity refuses LOUDLY — --repl
     assert.doesNotMatch(out.stderr, /disconnect/, 'never suggest a path that cannot clear the guard');
     assert.match(out.stderr, /terminal\/env/, 'the manual escape hatch names the actual file');
     assert.match(out.stderr, /stays on the server/, 'the orphaned-channel consequence is named');
+    // QA r7-3: the NON-destructive escape — re-running without --code, which
+    // the guard already allows — is offered, and offered BEFORE the two that
+    // cost you the channel you just claimed.
+    assert.match(out.stderr, /without --code/, 'the half-done-install path must be named');
+    assert.ok(out.stderr.indexOf('without --code') < out.stderr.indexOf('--replace'),
+      'the path that destroys nothing comes first');
     assert.equal(core.loadTerminalEnv().token, 'hld_prod_link', 'the stored identity is untouched');
     assert.ok(!mock.state.reqLog.some((r) => r.pathname === '/api/v1/claim'),
       'the refusal must come BEFORE the claim — the code is not consumed');
