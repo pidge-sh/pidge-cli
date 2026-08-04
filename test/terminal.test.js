@@ -1403,6 +1403,97 @@ test('input lane: a frame for a retired viewer generation is dropped silently', 
   assert.equal(d.replay.has('ases_t|vold'), false);
 });
 
+// --- the cable watchdog: verify + insist (QA r6-3) --------------------------
+//
+// The real outage: `cable silent 45s — forcing reconnect (watchdog)` fired
+// ONCE and the daemon then ran 4 h with zero connections — the replacement
+// socket wedged in CONNECTING, which the old tick treated as health, and every
+// recovery path hinged on socket callbacks that never fired. These tests drive
+// watchdogTick against a fake WebSocket whose callbacks WE control: attempts
+// that fail N times must each log loudly and re-arm, and the lane only counts
+// as up once the server CONFIRMS a subscription.
+
+class FakeWS {
+  constructor() {
+    FakeWS.instances.push(this);
+    this.readyState = 0; // CONNECTING
+    this.sent = [];
+    this.closed = false;
+  }
+  send(x) { this.sent.push(x); }
+  close() { this.closed = true; this.readyState = 3; }
+}
+
+async function withFakeWS(fn) {
+  const real = globalThis.WebSocket;
+  FakeWS.instances = [];
+  globalThis.WebSocket = FakeWS;
+  try { return await fn(); } finally { globalThis.WebSocket = real; }
+}
+
+test('watchdog: a reconnect that keeps failing is retried FOREVER — each failure loud, then recovery confirms', () => withFakeWS(async () => {
+  const d = makeDaemon();
+  liveSession(d, { sid: 'sess-cable' });
+  d.api = async () => ({ res: { status: 200 }, data: {} });
+
+  // Attempt 1: the socket wedges in CONNECTING (the r6-3 root cause — no
+  // close, no error, ever). The old watchdog looped no-ops here forever.
+  d.subscribeInput(d.sessions.get('sess-cable'));
+  assert.equal(FakeWS.instances.length, 1);
+  d.watchdogTick();
+  assert.equal(FakeWS.instances.length, 1, 'within the deadline a CONNECTING attempt is left to finish');
+  d.wsAttemptAt = Date.now() - 21_000; // the deadline passes
+  d.watchdogTick();
+  assert.ok(FakeWS.instances[0].closed, 'the wedged attempt is abandoned');
+  assert.ok(d.logLines.some((l) => /cable DOWN .*stuck .*CONNECTING/.test(l)), `failure 1 must log, got ${JSON.stringify(d.logLines)}`);
+  assert.equal(d.cableState().up, false);
+  assert.ok(d.cableState().down_since, 'the down-since timestamp is exposed');
+
+  // Attempt 2: the backoff window holds first (no thundering), then the retry
+  // fires and the socket dies cleanly (onclose) — loud again, armed again.
+  d.watchdogTick();
+  assert.equal(FakeWS.instances.length, 1, 'inside the backoff window no new attempt is made');
+  d.wsRetryAt = 0; // the window elapses
+  d.watchdogTick();
+  assert.equal(FakeWS.instances.length, 2, 'the watchdog re-attempts — never a one-shot');
+  FakeWS.instances[1].onclose();
+  assert.equal(d.ws, null);
+  assert.ok(d.logLines.filter((l) => /cable DOWN/.test(l)).length >= 2, 'every failure logs');
+
+  // Attempt 3: opens but the subscribe is NEVER confirmed — open ≠ up.
+  d.wsRetryAt = 0;
+  d.watchdogTick();
+  const ws3 = FakeWS.instances[2];
+  ws3.readyState = 1;
+  ws3.onopen();
+  assert.ok(ws3.sent.some((f) => /subscribe/.test(f)), 'the reconnect re-subscribes the input lanes');
+  assert.equal(d.cableState().up, false, 'an unconfirmed socket is not an input lane');
+  d.wsAttemptAt = Date.now() - 21_000;
+  d.watchdogTick();
+  assert.ok(ws3.closed, 'open-but-unconfirmed is abandoned at the deadline');
+  assert.ok(d.logLines.some((l) => /never confirmed/.test(l)));
+
+  // Attempt 4: the server confirms — the lane is UP, backoff resets, and the
+  // recovery is narrated.
+  d.wsRetryAt = 0;
+  d.watchdogTick();
+  const ws4 = FakeWS.instances[3];
+  ws4.readyState = 1;
+  ws4.onopen();
+  ws4.onmessage({ data: JSON.stringify({ type: 'confirm_subscription', identifier: d.identifierFor(d.sessions.get('sess-cable')) }) });
+  assert.equal(d.cableState().up, true);
+  assert.equal(d.cableState().down_since, null);
+  assert.equal(d.wsBackoff, 0, 'a confirmed lane resets the backoff');
+  assert.ok(d.logLines.some((l) => /cable RESTORED/.test(l)), 'recovery is loud too');
+
+  // And the silent-socket branch still forces a verified reconnect cycle.
+  d.wsLastBeat = Date.now() - 46_000;
+  d.watchdogTick();
+  assert.ok(ws4.closed);
+  assert.ok(d.logLines.some((l) => /cable silent 45s — forcing reconnect \(watchdog\)/.test(l)));
+  assert.equal(d.cableState().up, false, 'after the forced reconnect the lane is down until CONFIRMED — never assumed');
+}));
+
 test('sealMeta: the session meta seals under its own AAD field and carries the epoch', () => {
   const d = makeDaemon();
   const session = { publicId: 'ases_t', title: 'pidge-cli', cwd: '/tmp/pidge-cli', hv: '2.1.220', paneId: '%3' };

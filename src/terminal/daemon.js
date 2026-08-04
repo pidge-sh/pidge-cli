@@ -31,6 +31,17 @@ const TAIL_POLL_MS = 400;
 const FLUSH_MS = 500;
 const HEARTBEAT_MS = 30_000;
 const WATCHDOG_MS = 15_000;
+// Cable liveness (B7, REVISED per QA r6-3 — a real 4 h outage): ActionCable
+// pings every ~3 s, so 45 s of silence is a dead socket that doesn't know it.
+const CABLE_SILENT_MS = 45_000;
+// A connect attempt gets this long to reach CONFIRMED (socket open AND at
+// least one subscribe confirmation). The r6-3 root cause was a handshake that
+// never completed and never errored: readyState sat at CONNECTING forever, and
+// the old watchdog treated CONNECTING as health — every tick a no-op, for 4 h.
+// A deadline on the ATTEMPT (not on socket callbacks, which may never fire) is
+// what makes the retry loop unkillable.
+const CABLE_CONFIRM_MS = 20_000;
+const CABLE_BACKOFF_CAP_S = 60;
 const BACKFILL_ITEMS = 100;             // spec §6
 const BACKFILL_SEALED_BYTES = 512 * 1024;
 // How many recently-published uuids ride in state.json per session. The uuid
@@ -91,6 +102,16 @@ class Daemon {
     this.ws = null;              // one cable socket, N subscriptions
     this.wsGen = 0;              // identity guard for reconnects (#66)
     this.wsLastBeat = 0;
+    // Cable verification state (QA r6-3): `wsConfirmed` flips true only when
+    // the server CONFIRMS a subscription on the current socket — an open
+    // socket that never confirmed is not an input lane. `cableDownSince` is
+    // the start of the current no-input-lane period (null = confirmed up);
+    // the backoff pair paces the forever-retry the watchdog drives.
+    this.wsConfirmed = false;
+    this.wsAttemptAt = 0;        // when the current connect attempt started
+    this.wsBackoff = 0;          // seconds, exponential, capped, reset on confirm
+    this.wsRetryAt = 0;          // earliest next connect attempt
+    this.cableDownSince = null;
     this.replay = new Map();     // `${publicId}|${vgen}` → last seq (never pruned:
                                  // a viewer generation must stay monotonic for the
                                  // life of the process, including across a
@@ -1302,14 +1323,21 @@ class Daemon {
   ensureCable() {
     if (this.ws && (this.ws.readyState === 0 || this.ws.readyState === 1)) return;
     if (typeof WebSocket === 'undefined') {
+      if (!this.cableDownSince) this.cableDownSince = Date.now();
       this.log('WARNING: no native WebSocket (Node <22) — the input lane is OFF; transcripts still publish');
       return;
     }
+    if (Date.now() < this.wsRetryAt) return; // backoff window — the watchdog re-calls forever
     const gen = ++this.wsGen;
     const url = this.env.base.replace(/^http/, 'ws') + '/cable';
     const ws = new WebSocket(url, ['actioncable-v1-json', this.env.token]);
     this.ws = ws;
     this.wsLastBeat = Date.now();
+    this.wsAttemptAt = Date.now();
+    this.wsConfirmed = false;
+    // The lane is DOWN from the moment we need a (re)connect until the server
+    // confirms a subscription — an open-but-unconfirmed socket is not "up".
+    if (!this.cableDownSince) this.cableDownSince = Date.now();
     ws.onopen = () => {
       if (gen !== this.wsGen) return ws.close(); // superseded (#66)
       this.log('cable up — subscribing input lanes');
@@ -1319,7 +1347,8 @@ class Daemon {
       if (gen !== this.wsGen) return;
       this.wsLastBeat = Date.now();
       let frame; try { frame = JSON.parse(ev.data); } catch { return; }
-      if (frame.type === 'ping' || frame.type === 'welcome' || frame.type === 'confirm_subscription') return;
+      if (frame.type === 'confirm_subscription') { this.noteCableConfirmed(); return; }
+      if (frame.type === 'ping' || frame.type === 'welcome') return;
       if (frame.type === 'reject_subscription') { this.log('input subscription rejected:', frame.identifier); return; }
       if (frame.message && frame.message.type === 'input' && frame.identifier) {
         let ident; try { ident = JSON.parse(frame.identifier); } catch { return; }
@@ -1330,8 +1359,65 @@ class Daemon {
     ws.onclose = () => {
       if (gen !== this.wsGen) return; // an old socket's goodbye must not touch the live one (#66)
       this.ws = null;
+      this.cableRetry('socket closed'); // never a silent stand-down (r6-3)
     };
     ws.onerror = () => {};
+  }
+
+  // The server confirmed a subscription on the CURRENT socket — this, not
+  // onopen, is what "the cable is up" means (QA r6-3: the watchdog must VERIFY
+  // the reconnect, not fire it and assume).
+  noteCableConfirmed() {
+    if (this.wsConfirmed) return;
+    this.wsConfirmed = true;
+    const hadFailures = (this.wsBackoff || 0) > 0;
+    this.wsBackoff = 0;
+    this.wsRetryAt = 0;
+    if (this.cableDownSince) {
+      const downS = Math.round((Date.now() - this.cableDownSince) / 1000);
+      // Narrated whenever the down period was real (a failure happened or it
+      // lasted); the subsecond first-boot connect stays quiet — "cable up —
+      // subscribing input lanes" already covers it.
+      if (hadFailures || downS > 0) this.log(`cable RESTORED — input lane confirmed after ${downS}s down`);
+    }
+    this.cableDownSince = null;
+  }
+
+  // A cable attempt failed or a live socket died: mark the lane DOWN, say so
+  // LOUDLY, and arm the next attempt on an exponential backoff (capped). The
+  // watchdog tick re-calls ensureCable on its own clock, so recovery never
+  // depends on a socket callback that may never fire — the exact state the
+  // r6-3 outage wedged in (a reconnect fired once, never verified, never
+  // retried, while the read mirror kept looking healthy for 4 hours).
+  cableRetry(why) {
+    if (!this.cableDownSince) this.cableDownSince = Date.now();
+    this.wsConfirmed = false;
+    this.wsBackoff = Math.min(Math.max((this.wsBackoff || 0) * 2, 5), CABLE_BACKOFF_CAP_S);
+    this.wsRetryAt = Date.now() + this.wsBackoff * 1000;
+    const downS = Math.round((Date.now() - this.cableDownSince) / 1000);
+    this.log(`cable DOWN (${why}) — input lane dead for ${downS}s; next attempt in ≤${this.wsBackoff}s (the watchdog insists forever, never one-shot)`);
+  }
+
+  // Abandon a socket the watchdog gave up on. The gen bump makes every one of
+  // its callbacks a no-op (#66) — including a close() that never completes.
+  abandonSocket(ws, why) {
+    this.wsGen += 1;
+    try { ws.close(); } catch {}
+    if (this.ws === ws) this.ws = null;
+    this.cableRetry(why);
+    this.ensureCable(); // honors the backoff window; the next tick retries otherwise
+  }
+
+  // The input lane's honest state — surfaced on GET /health so `terminal
+  // status` can say `cable: up | DOWN since <T>` (QA r6-3: a daemon with a
+  // dead input lane may not present as healthy).
+  cableState() {
+    const up = !!(this.ws && this.ws.readyState === 1 && this.wsConfirmed);
+    return {
+      up,
+      wanted: this.sessions.size > 0,
+      down_since: up || !this.cableDownSince ? null : new Date(this.cableDownSince).toISOString(),
+    };
   }
 
   sendSubscribe(session) {
@@ -1411,17 +1497,39 @@ class Daemon {
 
   // --- watchdog (B7) --------------------------------------------------------
 
+  // REWRITTEN per QA r6-3 (the 4 h real outage). The old tick had a hole that
+  // ate the input lane: a socket stuck in CONNECTING matched NEITHER branch
+  // (`readyState > 1` false, `readyState === 1` false), so once a forced
+  // reconnect produced a handshake that never completed and never errored,
+  // every subsequent tick was a no-op — the retry machinery only re-armed from
+  // socket callbacks that never fired. Now the watchdog VERIFIES on its own
+  // clock: an attempt that has not reached CONFIRMED (open + subscribe
+  // confirmation) within its deadline is abandoned loudly and retried with
+  // backoff, forever.
   watchdogTick() {
     if (this.sessions.size === 0) return;
-    if (!this.ws || this.ws.readyState > 1) {
-      this.ensureCable();
-    } else if (this.ws.readyState === 1 && Date.now() - this.wsLastBeat > 45_000) {
+    const ws = this.ws;
+    if (!ws || ws.readyState > 1) { this.ensureCable(); return; }
+    const now = Date.now();
+    if (ws.readyState === 0) {
+      // CONNECTING is an attempt, not health — it gets a deadline.
+      if (now - this.wsAttemptAt > CABLE_CONFIRM_MS) {
+        this.abandonSocket(ws, `connect attempt stuck ${Math.round((now - this.wsAttemptAt) / 1000)}s in CONNECTING`);
+      }
+      return;
+    }
+    // readyState === 1 (open). Open without a confirmed subscription is not an
+    // input lane either — verify, don't assume (r6-3: "firing the reconnect is
+    // not the job").
+    if (!this.wsConfirmed && now - this.wsAttemptAt > CABLE_CONFIRM_MS) {
+      this.abandonSocket(ws, 'socket open but the subscribe was never confirmed');
+      return;
+    }
+    if (now - this.wsLastBeat > CABLE_SILENT_MS) {
       // ActionCable pings every ~3s; 45s of silence = a dead socket that
       // doesn't know it. Prefer a spurious reconnect over a silent stand-down.
-      this.log('cable silent 45s — forcing reconnect (watchdog)');
-      try { this.ws.close(); } catch {}
-      this.ws = null;
-      this.ensureCable();
+      this.log(`cable silent ${Math.round(CABLE_SILENT_MS / 1000)}s — forcing reconnect (watchdog)`);
+      this.abandonSocket(ws, 'silent socket');
     }
   }
 
