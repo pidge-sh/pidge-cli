@@ -140,8 +140,12 @@ function utf8Locale(env = process.env, platform = process.platform) {
 // but the daemon must not depend on being installed by a template that did.
 function tmuxExec(args, opts = {}) {
   const locale = utf8Locale();
+  // timeout: a wedged tmux server (SIGSTOP, disk hang) must not freeze the
+  // daemon's whole event loop from a synchronous heartbeat call. The throw a
+  // timeout produces is an EXEC failure — call sites must treat it as "could
+  // not ask tmux", never as "the pane is gone" (see daemon.paneAlive).
   return execFileSync('tmux', args,
-    { ...opts, env: { ...process.env, LANG: locale, LC_ALL: locale, ...(opts.env || {}) } });
+    { timeout: 5000, ...opts, env: { ...process.env, LANG: locale, LC_ALL: locale, ...(opts.env || {}) } });
 }
 
 // The list-panes field separator is a PRINTABLE, improbable delimiter on

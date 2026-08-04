@@ -1229,14 +1229,26 @@ class Daemon {
       // server's 90 s staleness never fired, and the phone read "waiting for
       // you" forever while its keys went into the void. The human had to FAIL
       // first for the system to admit it broke. One tmux call per session per
-      // 30 s buys the honest answer; a vanished tmux server reads the same way
-      // (paneAlive returns false when there are no panes to list) — with no
-      // pane there is no session either way. Ended LOUDLY, now: log + DELETE
+      // 30 s buys the honest answer; a vanished tmux SERVER reads the same way
+      // (tmux runs, answers "no server" ⇒ paneAlive false) — with no pane
+      // there is no session either way. Ended LOUDLY, now: log + DELETE
       // (disableSession), never waiting on input or staleness.
-      if (s.paneId && !this.paneAlive(s.paneId)) {
-        this.log(`${s.sid.slice(0, 8)}: bound pane ${s.paneId} is GONE — ending the session loudly (r6-6: a heartbeat must verify the pane, not re-affirm a corpse into "waiting for you" forever)`);
-        await this.disableSession(s.sid, 'pane died (heartbeat liveness check)');
-        continue;
+      //
+      // Ended ONLY on a definite `false` (PR #110 review): `null` means the
+      // EXEC failed (EAGAIN/ENOENT/wedged-tmux timeout) — the daemon could not
+      // ask, and ending N live sessions over a transient exec hiccup with a
+      // "pane is GONE" log is the #10 mis-blame family. Unknown ⇒ say so
+      // loudly, re-affirm as normal, let the next beat re-check.
+      if (s.paneId) {
+        const alive = this.paneAlive(s.paneId);
+        if (alive === false) {
+          this.log(`${s.sid.slice(0, 8)}: bound pane ${s.paneId} is GONE — ending the session loudly (r6-6: a heartbeat must verify the pane, not re-affirm a corpse into "waiting for you" forever)`);
+          await this.disableSession(s.sid, 'pane died (heartbeat liveness check)');
+          continue;
+        }
+        if (alive === null) {
+          this.log(`${s.sid.slice(0, 8)}: pane check FAILED (daemon-side — tmux could not be asked) — NOT ending the session; re-affirming status, the next beat re-checks`);
+        }
       }
       // Carry the CURRENT status, never `{}`. The transition PATCH is
       // fire-and-forget: one dropped running→waiting used to leave the server
@@ -1483,9 +1495,16 @@ class Daemon {
     this.replay.set(ledgerKey, msg.seq);
 
     if (!session.paneId) { this.log('input for a session with no bound pane — dropped'); return; }
-    if (!this.paneAlive(session.paneId)) {
+    const alive = this.paneAlive(session.paneId);
+    if (alive === false) {
       this.log(`bound pane ${session.paneId} is gone — ending session loudly (B2)`);
       this.disableSession(session.sid, 'pane died');
+      return;
+    }
+    if (alive === null) {
+      // Could not ASK tmux (daemon-side failure) — that is not a dead pane.
+      // The input cannot be delivered, so say so loudly and keep the session.
+      this.log(`input for ${session.sid.slice(0, 8)} DROPPED: pane check failed (daemon-side, tmux could not be asked) — NOT ending the session`);
       return;
     }
     if (!Array.isArray(msg.keys)) return;
@@ -1518,11 +1537,22 @@ class Daemon {
     }
   }
 
+  // Tri-state (PR #110 review): `true` = tmux answered and the pane is listed;
+  // `false` = tmux RAN and the pane provably is not there (including a
+  // non-zero exit — "no server running" means no panes exist, so the r6-6
+  // dead-pane treatment applies); `null` = the exec itself failed (ENOENT,
+  // EAGAIN, the 5 s timeout against a wedged server) — the daemon could not
+  // ASK, and an unanswerable question must never read as "the pane is gone".
+  // A transient EAGAIN ending N live sessions with a "pane is GONE" log is the
+  // mis-blame family finding #10 killed; callers end sessions ONLY on `false`.
   paneAlive(paneId) {
     try {
       const out = core.tmuxExec(['list-panes', '-a', '-F', '#{pane_id}'], { encoding: 'utf8' });
       return out.split('\n').includes(paneId);
-    } catch { return false; }
+    } catch (e) {
+      if (typeof e.status === 'number') return false; // tmux ran and answered "no" (no server ⇒ no panes)
+      return null; // spawn/timeout failure — unknown, NOT "gone"
+    }
   }
 
   // --- watchdog (B7) --------------------------------------------------------

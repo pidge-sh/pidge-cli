@@ -2802,8 +2802,20 @@ test('the heartbeat VERIFIES the pane — a dead pane ends the session loudly in
   await d.heartbeatTick();
   assert.deepEqual(calls, [{ method: 'PATCH', p: '/agent_sessions/ases_t', body: { status: 'waiting' } }]);
 
+  // An EXEC failure between two ticks (EAGAIN, wedged tmux ⇒ null) is NOT a
+  // dead pane: the session survives, the beat re-affirms, and the failure is
+  // loud — never a "pane is GONE" mis-blame (PR #110 review).
+  alive = null;
+  calls.length = 0;
+  await d.heartbeatTick();
+  assert.equal(d.sessions.has('sess-pane'), true, 'an unanswerable pane check must not end the session');
+  assert.deepEqual(calls, [{ method: 'PATCH', p: '/agent_sessions/ases_t', body: { status: 'waiting' } }],
+    'the beat still re-affirms while the check is unavailable');
+  assert.ok(d.logLines.some((l) => /pane check FAILED \(daemon-side/.test(l)), `the exec failure must be loud, got ${JSON.stringify(d.logLines)}`);
+  assert.ok(!d.logLines.some((l) => /is GONE/.test(l)), 'and never blamed on the pane');
+
   // The pane dies between two ticks (tmux kill-session — or the whole tmux
-  // server going away, which reads identically: no panes exist).
+  // server going away, which reads the same: tmux answers "no server" ⇒ false).
   alive = false;
   calls.length = 0;
   await d.heartbeatTick();
@@ -2822,6 +2834,40 @@ test('the heartbeat VERIFIES the pane — a dead pane ends the session loudly in
   calls.length = 0;
   await d.heartbeatTick();
   assert.deepEqual(calls, []);
+});
+
+test('paneAlive is tri-state: listed ⇒ true, tmux answered no ⇒ false, exec failure ⇒ null (PR #110 review)', () => {
+  const d = makeDaemon();
+  const real = core.tmuxExec;
+  try {
+    core.tmuxExec = () => '%1\n%7\n';
+    assert.equal(d.paneAlive('%7'), true);
+    assert.equal(d.paneAlive('%9'), false, 'tmux answered and the pane is not there');
+
+    // tmux RAN and exited non-zero — "no server running": no panes exist, the
+    // r6-6 dead-pane treatment applies.
+    core.tmuxExec = () => { const e = new Error('no server running'); e.status = 1; throw e; };
+    assert.equal(d.paneAlive('%7'), false);
+
+    // The exec itself failed (spawn EAGAIN/ENOENT, or the 5 s timeout against
+    // a wedged server) — the question was never answered: null, never "gone".
+    for (const code of ['EAGAIN', 'ENOENT', 'ETIMEDOUT']) {
+      core.tmuxExec = () => { const e = new Error(`spawnSync tmux ${code}`); e.code = code; throw e; };
+      assert.equal(d.paneAlive('%7'), null, `${code} must read as unknown, not as a dead pane`);
+    }
+  } finally {
+    core.tmuxExec = real;
+  }
+});
+
+test('tmuxExec carries a default 5 s timeout so a wedged tmux cannot freeze the daemon (PR #110 review)', () => {
+  // Assert on the option actually handed to execFileSync: the daemon calls
+  // tmuxExec synchronously from the heartbeat, so a SIGSTOPped tmux server
+  // without a timeout would freeze the whole event loop.
+  const src = fs.readFileSync(require.resolve('../src/terminal/core'), 'utf8');
+  const fn = src.match(/function tmuxExec[\s\S]*?\n}/)[0];
+  assert.match(fn, /timeout:\s*5000/, 'tmuxExec must pass a timeout to execFileSync');
+  assert.ok(fn.indexOf('timeout: 5000') < fn.indexOf('...opts'), 'and callers may still override it via opts');
 });
 
 test('disable is honest when the server never got the DELETE', async () => {
