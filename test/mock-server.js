@@ -14,6 +14,9 @@ function createMock() {
     sockets: new Set(),
     subscriptions: [],     // channel names confirmed, in order
     subscribeIdentifiers: [], // the FULL parsed subscribe identifier (channel + fingerprint/label params)
+    subscribeRaw: [],      // the raw identifier STRING, byte-for-byte as the client sent it
+    performs: [],          // {identifier, data} of every `command:"message"` — what a channel's
+                           // `perform` actually puts on the wire (action + params)
     reqLog: [],            // {method, pathname, fingerprint, label} per HTTP request — assert header emission
     onSubscribe: null,     // (channel, sock) => {} test hook
     waitMode: 'ok',
@@ -523,10 +526,19 @@ function createMock() {
       }, 1000);
       sock.on('message', (raw) => {
         let f; try { f = JSON.parse(raw); } catch { return; }
+        if (f.command === 'message') {
+          // Real ActionCable puts the params + `action` in a JSON STRING under
+          // `data`; the server dispatches on `action`. Recorded raw so a test
+          // can assert the exact bytes a `perform` produced.
+          let data = null; try { data = JSON.parse(f.data); } catch { data = f.data; }
+          state.performs.push({ identifier: f.identifier, data });
+          return;
+        }
         if (f.command === 'subscribe') {
           const ident = JSON.parse(f.identifier);
           const channel = ident.channel;
           state.subscriptions.push(channel);
+          state.subscribeRaw.push(f.identifier);
           state.subscribeIdentifiers.push(ident); // capture fingerprint/label params
           // Real ActionCable tags every broadcast frame with the EXACT identifier
           // string the client sent (params included) — the client matches on it.

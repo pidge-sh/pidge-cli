@@ -65,7 +65,48 @@ const INPUT_KEYS = new Set(['Enter', 'Escape', 'Up', 'Down', 'Tab', 'BTab', 'C-c
 // must NOT cost the human the share they opted into.
 const DEFINITIVE_REGISTER_STATUSES = new Set([401, 403, 404, 410]);
 
+// --- v2 (Terminals Phase A) --------------------------------------------------
+// state.json schema version. v1 keyed a share by the harness session id and
+// derived its public_id from it; v2 makes the SHARE the identity (spec §16).
+// The migration is in-place and GRANDFATHERS every existing public_id
+// byte-verbatim — it is the AAD anchor of every item already sealed.
+const STATE_VERSION = 2;
+// The computer's own cable subscription — NO params: the tunnel key IS the
+// identity (server: ComputerChannel#resolve_computer rejects anything else).
+const COMPUTER_IDENT = JSON.stringify({ channel: 'ComputerChannel' });
+// `viewer_joined` is an unsealed nudge the server emits per viewer subscribe;
+// several phones (or one phone re-subscribing) must not become a caps storm.
+const VIEWER_JOINED_DEBOUNCE_MS = 2_000;
+// The durable command lane (§17) rides the message queue. The ComputerChannel
+// carries NO "a command is waiting" frame in Phase A (verified against the
+// server file), so this interval IS the mechanism, not a fallback — see
+// drainTick. Deliberately a plain interval and never a held `?wait=` poll: a
+// queue that holds rows this daemon must NOT consume would make a long-poll
+// return instantly, forever (a hot loop).
+const DRAIN_POLL_MS = 15_000;
+// Commands whose outcome is durable on this computer (a spawned pane) must not
+// be re-run when an ack is lost (#39 is at-least-once) — the handled ids ride
+// state.json, bounded.
+const CMD_SEEN_RING = 200;
+// Occupant polling (§16) rides the existing 400 ms tail tick but is throttled:
+// one `tmux list-panes` per second answers for EVERY bound pane, and 2.5 execs
+// a second forever is a battery cost with no product gain.
+const OCCUPANT_POLL_MS = 1_000;
+// What `#{pane_current_command}` looks like when the harness is in the pane.
+// Deliberately BROAD: the set is only ever used to flip agent→term (a share
+// becomes `agent` from the SessionStart hook, never from this list), so a false
+// "still the harness" merely holds the current view one poll longer, while a
+// false "gone" would swap the renderer under a live claude.
+const HARNESS_COMMANDS = new Set(['claude', 'node', 'node.exe', 'bun', 'deno', 'npm', 'npx']);
+// The tmux session the daemon spawns panes into when the phone asks (§17).
+const SPAWN_TMUX_SESSION = 'pidge';
+
 function nowIso() { return new Date().toISOString(); }
+
+// Is the harness sitting in this pane? (see HARNESS_COMMANDS)
+function isHarnessCommand(cmd) {
+  return HARNESS_COMMANDS.has(String(cmd || '').trim().toLowerCase());
+}
 
 class Daemon {
   constructor() {
@@ -75,7 +116,17 @@ class Daemon {
     }
     this.key = core.e2eParseSecret(this.env.secret);
     this.caps = core.loadCaps();
-    this.state = core.readJson(core.STATE_FILE(), { epoch: 0, sessions: {} });
+    this.state = core.readJson(core.STATE_FILE(), { v: STATE_VERSION, epoch: 0, sessions: {} });
+    // Durable commands already executed (at-least-once ⇒ exactly-once
+    // effects). Read BEFORE the first saveState — it re-writes the ring.
+    this.handledCmdIds = new Set((this.state.cmdIds || []).map(Number).filter(Number.isFinite));
+    // v1 → v2, IN PLACE (spec §16). Everything below is additive: `publicId`
+    // is copied to `shareId` BYTE-VERBATIM (it is the AAD anchor of every item
+    // this computer already sealed — it can never change, not once, not ever)
+    // and the harness session id the share was named after becomes
+    // `currentSid`, an attribute of the CURRENT OCCUPANT. No server call, no
+    // transcript re-publish, seq continues.
+    const migrated = this.migrateState();
     // Tunnel scoping (QA finding #13): state.json used to persist sessions
     // with no channel stamp, so reconnecting this computer to a DIFFERENT
     // tunnel re-published the old tunnel's sessions there — re-sealing their
@@ -94,6 +145,9 @@ class Daemon {
     }
     this.state.epoch = (this.state.epoch || 0) + 1; // new epoch per process (B4)
     this.saveState();
+    if (migrated.length) {
+      this.log(`state.json migrated to schema v${STATE_VERSION}: ${migrated.length} share(s) kept their public_id VERBATIM (${migrated.map((m) => m.publicId).join(', ')}) — the id is the AAD anchor of everything already sealed; the harness session id moved to currentSid`);
+    }
     for (const f of foreign) {
       this.log(`session ${String(f.sid).slice(0, 8)} belongs to ${f.channelId ? `channel ${f.channelId}` : 'an UNKNOWN channel (pre-scoping state)'}, not the connected channel ${this.env.channelId} — DROPPED from state (a connect that switches tunnels inherits no sessions; metadata never re-seals under another owner's key)`);
     }
@@ -124,8 +178,39 @@ class Daemon {
     // a vgen across a re-enable, and dropping a live viewer's input silently is
     // worse than the replay window the epoch echo already closes.
     this.retiredVgens = new Set();
+    // --- the computer lane (v2 §17) ---
+    // The ComputerChannel subscription is held while the machine is CONNECTED,
+    // with zero shared panes — it is what makes the phone's online chip, the
+    // pane inventory and the capabilities frame possible at all.
+    this.computerConfirmed = false;   // the server CONFIRMED the computer subscription
+    this.computerRejected = false;    // …or rejected it (said once, loudly)
+    this.lastViewerJoinAt = 0;        // caps debounce
+    this.capsTimer = null;
+    this.viewerDebounceMs = VIEWER_JOINED_DEBOUNCE_MS; // shortened by the tests only
+    this.lastOccupantAt = 0;          // occupant poll throttle
+    this.draining = false;            // one durable-command drain at a time
+    this.drainWarnedAt = 0;
+    this.foreignMsgIds = new Set();   // queue rows that are NOT ours: logged once, never acked
     this.logStream = null;
     this.exit = (code) => process.exit(code); // injectable for tests (POST /shutdown)
+  }
+
+  // v1 → v2 state migration (spec §16). Returns the migrated entries so the
+  // constructor can narrate them; a state file already at v2 is untouched.
+  migrateState() {
+    if (Number(this.state.v || 1) >= STATE_VERSION) { this.state.v = STATE_VERSION; return []; }
+    const migrated = [];
+    for (const [sid, p] of Object.entries(this.state.sessions || {})) {
+      if (!p || typeof p !== 'object' || !p.publicId) continue;
+      // GRANDFATHERED FOREVER — never re-derive, never re-mint.
+      if (!p.shareId) p.shareId = p.publicId;
+      if (p.currentSid === undefined) p.currentSid = sid;
+      // Every v1 share was a harness session by construction.
+      if (!p.occupant) p.occupant = 'agent';
+      migrated.push({ sid, publicId: p.publicId });
+    }
+    this.state.v = STATE_VERSION;
+    return migrated;
   }
 
   log(...args) {
@@ -140,7 +225,21 @@ class Daemon {
   saveState() {
     const sessions = {};
     for (const [sid, s] of Object.entries(this.state.sessions || {})) sessions[sid] = s;
-    core.writeJson(core.STATE_FILE(), { epoch: this.state.epoch, sessions });
+    core.writeJson(core.STATE_FILE(), {
+      v: STATE_VERSION, epoch: this.state.epoch, sessions,
+      // The durable-command dedup ring: a spawn whose ack was lost must not
+      // open a second window after a restart.
+      cmdIds: [...this.handledCmdIds].slice(-CMD_SEEN_RING),
+    });
+  }
+
+  noteHandledCmd(id) {
+    this.handledCmdIds.add(Number(id));
+    if (this.handledCmdIds.size > CMD_SEEN_RING) {
+      const keep = [...this.handledCmdIds].slice(-CMD_SEEN_RING);
+      this.handledCmdIds = new Set(keep);
+    }
+    this.saveState();
   }
 
   // --- server calls ---------------------------------------------------------
@@ -183,8 +282,13 @@ class Daemon {
     const meta = {
       title: session.title,
       cwd: session.cwd,
-      sid: session.sid, // inside the sealed blob only — refreshed on /clear adoption (§6)
-      harness: 'claude',
+      // The harness session id is an attribute of the CURRENT OCCUPANT (spec
+      // §16) — it rides inside the sealed blob and is refreshed on every
+      // adoption (/clear, a claude starting in a shared terminal pane). NULL on
+      // a pane share whose occupant is a plain shell. `currentSid === undefined`
+      // is a v1-shaped record: fall back to the map key, which IS its sid.
+      sid: session.currentSid !== undefined ? session.currentSid : session.sid,
+      harness: session.harness || 'claude',
       harness_version: session.hv || null,
       tmux: { pane_id: session.paneId },
       epoch: this.state.epoch,
@@ -201,6 +305,9 @@ class Daemon {
   async registerSession(session, status) {
     const { res, data } = await this.api('POST', '/agent_sessions', {
       public_id: session.publicId, status, meta_sealed: this.sealMeta(session),
+      // The occupant (spec §16). ABSENT means unchanged server-side, so a v1
+      // record with no occupant simply doesn't send it.
+      ...(session.occupant ? { mode: session.occupant } : {}),
     });
     if (res.status !== 201) {
       // The status rides the error: the caller must tell "the session is gone"
@@ -210,6 +317,42 @@ class Daemon {
       throw err;
     }
     return (data && data.session) || {}; // {last_seq, …} — the continue-point
+  }
+
+  // --- narration (spec §11: an outcome is NEVER silent) ---------------------
+
+  noticeItem(s, preview, tag) {
+    return {
+      v: 1, uuid: `pidge-${tag}-${Date.now()}`, parent: null,
+      ts: nowIso(), role: 'system', kind: 'notice', preview,
+      truncated: false, total_bytes: adapter.byteLen(preview),
+      harness: s.harness || 'claude', hv: s.hv || null, _publicId: s.publicId,
+    };
+  }
+
+  // Seal + enqueue a seam notice onto a share's transcript. Best-effort by
+  // design (a notice that will not seal must not abort the transition it
+  // narrates), but never silent: a failure logs.
+  queueNotice(s, preview, tag) {
+    try {
+      const item = this.noticeItem(s, preview, tag);
+      const b64 = this.sealItem(item);
+      if (b64 === null) return false;
+      this.queuePush(s, item.uuid, b64);
+      return true;
+    } catch (e) {
+      this.log(`${s.publicId}: could not seal the "${preview}" notice (${e.message}) — the transition itself is unaffected`);
+      return false;
+    }
+  }
+
+  // Narrate + publish a seam notice right now (the command paths: a spawn, a
+  // capture, an occupant flip).
+  narrateShare(s, preview, tag) {
+    if (this.queueNotice(s, preview, tag)) {
+      this.persistSession(s);
+      this.flush(s).catch((e) => this.log('flush error:', e.message));
+    }
   }
 
   // --- hooks endpoint (loopback) -------------------------------------------
@@ -282,10 +425,36 @@ class Daemon {
           // would fail it). Adoption also requires a transcript_path —
           // adopting without a new file recreates the frozen-mirror bug.
           // Every other case ends the displaced session loudly (§11).
+          // v2 §16, the TERMINAL→AGENT flip: a claude that starts in a pane
+          // this computer already shares as a plain terminal (the phone
+          // spawned it, or the human ran `pidge terminal share` there) joins
+          // THAT share — consent rides the pane, the row keeps its public_id,
+          // the renderer swaps on the `mode` flip. This is checked BEFORE the
+          // /clear machinery: a term share has no sid to be a "twin" of.
+          const termShare = this.findTermShareForAnnounce({ tty: core.normalizeTty(tty), cwd });
+          if (termShare) {
+            if (tp) {
+              this.adoptSid(termShare, sid, {
+                tp, tty: core.normalizeTty(tty),
+                notice: 'claude started — agent view', tag: `agent-${sid.slice(0, 8)}`,
+                occupant: 'agent', why: 'a harness started in a shared terminal pane',
+              });
+            } else {
+              // No transcript ⇒ no adoption (the frozen-mirror rule, §6). The
+              // terminal share stays exactly what it is — never ended, never
+              // silently flipped to an agent view with nothing behind it.
+              this.log(`${termShare.publicId}: a harness announced in its pane ${termShare.paneId} with NO transcript_path — the pane stays a terminal share (adopting without a file recreates the frozen-mirror bug)`);
+            }
+            return send(200, {});
+          }
           const twin = this.findReplacedTwin(sid, { tty: core.normalizeTty(tty), cwd });
           if (twin) {
             const src = typeof source === 'string' && source ? source : null;
-            if (src === 'clear' && tp && this.adoptReplacedSid(twin, sid, { tp, tty: core.normalizeTty(tty) })) {
+            if (src === 'clear' && tp && this.adoptSid(twin, sid, {
+              tp, tty: core.normalizeTty(tty),
+              notice: 'restarted via /clear — mirror continued', tag: `clear-${sid.slice(0, 8)}`,
+              occupant: 'agent', why: 'source:"clear"',
+            })) {
               // adopted — everything narrated inside adoptReplacedSid.
             } else {
               this.log(`session ${twin.sid.slice(0, 8)}: new sid ${sid.slice(0, 8)} announced in its pane/cwd (source: ${src || 'absent'}${src === 'clear' && !tp ? ', NO transcript_path' : ''}) — no adoption; ending the old session, the new claude needs its own enable`);
@@ -363,8 +532,25 @@ class Daemon {
           .map(([sid, a]) => ({ sid, tty: a.tty, cwd: a.cwd, transcript_path: a.transcriptPath, at: a.at }));
         const enabled = [...this.sessions.values()].map((s) => ({
           sid: s.sid, public_id: s.publicId, pane_id: s.paneId, cwd: s.cwd, status: s.status,
+          // v2: what OCCUPIES the pane, and the harness sid when there is one.
+          mode: s.occupant || 'agent', current_sid: s.currentSid !== undefined ? s.currentSid : s.sid,
         }));
-        return send(200, { announces: ann, enabled });
+        return send(200, { announces: ann, enabled, grants: core.loadGrants() });
+      }
+      // v2 §17: `pidge terminal share`, typed by a human INSIDE a pane. The CLI
+      // did the tty→pane match (it has a real tty; the Claude-hook ttyless
+      // problem is not this path's) — the daemon still VERIFIES the pane and
+      // owns the binding.
+      case 'POST /share': {
+        const out = await this.shareLocalPane(body.pane_id, { by: 'pidge terminal share' });
+        return send(out.ok ? 200 : 409, out);
+      }
+      // The grants changed on this machine (`pidge terminal config`) — the
+      // phone learns within one frame instead of waiting for the next viewer.
+      case 'POST /caps': {
+        const grants = core.loadGrants();
+        const published = this.publishCaps('the grants changed on this computer');
+        return send(200, { grants, published });
       }
       case 'POST /shutdown': {
         // `connect --replace` recycles the daemon (review A2): a live process
@@ -435,6 +621,22 @@ class Daemon {
     const { pane, refusal } = this.resolvePane({ sid, tty, cwd });
     if (!pane) return deny(refusal);
 
+    // The pane may ALREADY be a share (v2 §16): the human typed `pidge terminal
+    // share` in it, or the phone spawned/captured it. Consent rides the PANE,
+    // so the harness ADOPTS the existing share row instead of minting a second
+    // one for the same pane — same public_id, seq continues, seam notice.
+    const onPane = this.shareForPaneId(pane.paneId);
+    if (onPane) {
+      if (this.adoptSid(onPane, sid, {
+        tp: file, tty,
+        notice: 'claude started — agent view', tag: `agent-${sid.slice(0, 8)}`,
+        occupant: 'agent',
+        why: `the sentinel enabled sid ${sid.slice(0, 8)} in an already-shared pane`,
+      })) return deny(core.ENABLE_OK_REASON);
+      this.log(`enable ${sid.slice(0, 8)}: pane ${pane.paneId} is shared as ${onPane.publicId} but the adoption could not take the writer lock — refusing rather than minting a second share for one pane`);
+      return deny(`Couldn't mirror this session: this computer already shares that pane and could not hand it over. Do not run other commands.`);
+    }
+
     try {
       const s = await this.enableSession({
         sid, paneId: pane.paneId, tty, cwd, file,
@@ -466,9 +668,11 @@ class Daemon {
     if (!want) return null;
     // ALL candidates in that cwd (there can be several — tty-bound enables can
     // legitimately share a cwd across panes); the pane check then affirms the
-    // ONE whose bound pane matches, never just the first cwd hit.
+    // ONE whose bound pane matches, never just the first cwd hit. TERMINAL
+    // shares are excluded: they carry no harness session to be displaced, and
+    // findTermShareForAnnounce (called first) owns that transition.
     const candidates = [...this.sessions.values()]
-      .filter((s) => String(s.cwd || '').replace(/\/+$/, '') === want);
+      .filter((s) => s.occupant !== 'term' && String(s.cwd || '').replace(/\/+$/, '') === want);
     if (!candidates.length) return null;
     const tag = `new sid ${newSid.slice(0, 8)}`;
     const opts = { onWarn: (m) => this.log(m) };
@@ -491,14 +695,43 @@ class Daemon {
     }
   }
 
-  // ADOPTION (spec §6, source-gated): the new sid joins the SAME AgentSession
-  // — tailer switches to the new transcript, meta_sealed refreshes (the new
-  // sid rides inside the sealed blob), seq stays monotonic, and a notice item
-  // marks the seam. The caller has already established source:"clear" + a
-  // positive pane+cwd match + a transcript_path. Returns false when the
-  // adoption cannot take the writer lock — the caller then ends the old
-  // session loudly.
-  adoptReplacedSid(s, newSid, { tp, tty }) {
+  // Did this SessionStart land in a pane this computer already shares as a
+  // TERMINAL? (v2 §16 — the terminal→agent flip.) Same discriminators as the
+  // /clear twin check, same refusals: an ambiguous cwd or an unreadable pane
+  // list yields NO match (loudly), never a guess. Consent is not at stake here
+  // — the pane is already shared — but binding the WRONG pane would splice a
+  // stranger's transcript into it, which is worse.
+  findTermShareForAnnounce({ tty, cwd }) {
+    const terms = [...this.sessions.values()].filter((s) => s.occupant === 'term' && s.paneId);
+    if (!terms.length) return null;
+    const opts = { onWarn: (m) => this.log(m) };
+    try {
+      if (tty) {
+        const hit = core.tmuxPaneForTty(tty, opts);
+        return (hit && terms.find((s) => s.paneId === hit.paneId)) || null;
+      }
+      const hits = core.tmuxPanesForCwd(cwd, opts);
+      if (hits.length !== 1) {
+        if (hits.length > 1) this.log(`a harness announced in ${cwd} where ${hits.length} panes sit — cannot tell which is the shared terminal; no adoption`);
+        return null;
+      }
+      return terms.find((s) => s.paneId === hits[0].paneId) || null;
+    } catch (e) {
+      this.log(`terminal-share lookup: pane list unreadable (${e.message}) — no adoption, the share is left exactly as it is`);
+      return null;
+    }
+  }
+
+  // ADOPTION — v1's source-gated `/clear` machinery (spec §6, #70), now the
+  // GENERAL case (v2 §16): same pane ⇒ same SHARE row ⇒ seq continues. The new
+  // sid becomes the share's current occupant — the tailer switches to its
+  // transcript, `meta_sealed` refreshes (the sid rides inside the sealed blob),
+  // the public_id NEVER changes, and a `notice` item marks the seam. Callers
+  // that adopt across a `/clear` have already established source:"clear" + a
+  // positive pane+cwd match + a transcript_path; the terminal→agent callers
+  // have a positive PANE match. Returns false when the writer lock cannot be
+  // taken — the caller then decides (end loudly, or refuse).
+  adoptSid(s, newSid, { tp, tty, notice, tag, occupant, why }) {
     const oldSid = s.sid;
     try {
       this.acquireWriterLock(newSid); // B3: the new sid's slot must be ours too
@@ -510,32 +743,36 @@ class Daemon {
     delete this.state.sessions[oldSid];
     this.releaseWriterLock(oldSid);
     s.sid = newSid;
+    s.currentSid = newSid;
     s.tty = tty || null;
+    if (occupant) s.occupant = occupant;
+    if (occupant === 'agent') s.harness = 'claude';
     if (tp) { s.file = tp; s.offset = 0; s.bulk = true; } // new transcript; §6 cap bounds the read, uuid dedup guards
     s.lastAliveAt = Date.now();
     this.sessions.set(newSid, s);
     // The seam, visible on the phone — never a silent splice (§11).
-    try {
-      const preview = 'restarted via /clear — mirror continued';
-      const notice = {
-        v: 1, uuid: `pidge-clear-${newSid.slice(0, 8)}-${Date.now()}`, parent: null,
-        ts: nowIso(), role: 'system', kind: 'notice', preview,
-        truncated: false, total_bytes: adapter.byteLen(preview),
-        harness: 'claude', hv: s.hv || null, _publicId: s.publicId,
-      };
-      const b64 = this.sealItem(notice);
-      if (b64 !== null) this.queuePush(s, notice.uuid, b64);
-    } catch (e) {
-      this.log(`${s.publicId}: could not seal the /clear seam notice (${e.message}) — adoption continues`);
-    }
+    this.queueNotice(s, notice, tag);
     this.persistSession(s);
-    // Refresh the sealed meta (new sid inside the blob) — best-effort; the
-    // heartbeat's status PATCH keeps flowing regardless.
-    this.api('PATCH', `/agent_sessions/${s.publicId}`, { status: s.status, meta_sealed: this.sealMeta(s) })
-      .catch((e) => this.log(`${s.publicId}: meta refresh after adoption failed (${e.message}) — retried by the next heartbeat era`));
+    // Refresh the sealed meta (new sid inside the blob) + the occupant — best-
+    // effort; the heartbeat's PATCH keeps flowing regardless.
+    this.api('PATCH', `/agent_sessions/${s.publicId}`, {
+      status: s.status, meta_sealed: this.sealMeta(s), ...(s.occupant ? { mode: s.occupant } : {}),
+    }).catch((e) => this.log(`${s.publicId}: meta refresh after adoption failed (${e.message}) — retried by the next heartbeat era`));
     this.flush(s).catch((e) => this.log('flush error:', e.message));
-    this.log(`session ${oldSid.slice(0, 8)} → ${newSid.slice(0, 8)} ADOPTED (source:"clear" in pane ${s.paneId}) — same AgentSession ${s.publicId}, seq continues, mirror unbroken`);
+    this.log(`share ${s.publicId}: ${oldSid.slice(0, 8)} → ${newSid.slice(0, 8)} ADOPTED (${why}, pane ${s.paneId}) — same share row, seq continues, mirror unbroken`);
     return true;
+  }
+
+  // The share bound to a tmux pane, if any (one pane = at most one share).
+  shareForPaneId(paneId) {
+    if (!paneId) return null;
+    return [...this.sessions.values()].find((s) => s.paneId === paneId) || null;
+  }
+
+  // The share carrying a given public_id (the `kill_share` command's target).
+  shareForPublicId(publicId) {
+    if (!publicId) return null;
+    return [...this.sessions.values()].find((s) => s.publicId === publicId) || null;
   }
 
   // End a shared session that a NEW sid replaced but could NOT be adopted (the
@@ -545,15 +782,9 @@ class Daemon {
   // that looks alive is the bug.
   async endReplacedSession(s, newSid) {
     try {
-      const preview = 'This session ended — /clear started a new one. Share the new session again to keep mirroring.';
-      const notice = {
-        v: 1, uuid: `pidge-ended-${s.sid.slice(0, 8)}-${Date.now()}`, parent: null,
-        ts: nowIso(), role: 'system', kind: 'notice', preview,
-        truncated: false, total_bytes: adapter.byteLen(preview),
-        harness: 'claude', hv: s.hv || null, _publicId: s.publicId,
-      };
-      const b64 = this.sealItem(notice);
-      if (b64 !== null) this.queuePush(s, notice.uuid, b64);
+      this.queueNotice(s,
+        'This session ended — /clear started a new one. Share the new session again to keep mirroring.',
+        `ended-${s.sid.slice(0, 8)}`);
       await this.flush(s);
       if (s.queue.length) this.log(`${s.publicId}: the ended notice did not reach the server (${s.queue.length} item(s) pending) — ending anyway, the status change is what the phone keys on`);
     } catch (e) {
@@ -619,7 +850,15 @@ class Daemon {
   async enableSessionLocked({ sid, paneId, tty, cwd, file, mode, approvals }) {
     const session = {
       sid,
-      publicId: `ases_${sid}`,
+      // The SHARE's identity (spec §16) — minted per share, kept across every
+      // occupant change. v1 derived it from the sid (`ases_<sid>`); those ids
+      // are grandfathered forever in state.json, but nothing new is minted that
+      // way: the harness session id now lives in `currentSid` (and inside
+      // meta_sealed), where an occupant attribute belongs.
+      publicId: core.mintShareId(),
+      currentSid: sid,
+      occupant: 'agent',
+      harness: 'claude',
       paneId, tty, cwd, file,
       title: path.basename(cwd || 'session'),
       mode: mode || null, // harness permission mode — sealed meta only (§4)
@@ -692,7 +931,16 @@ class Daemon {
 
   persistSession(s) {
     this.state.sessions[s.sid] = {
-      publicId: s.publicId, paneId: s.paneId, tty: s.tty, cwd: s.cwd,
+      publicId: s.publicId,
+      // v2 (spec §16): the share identity and the CURRENT occupant, side by
+      // side. `shareId` is `publicId` verbatim — the duplication is the
+      // migration contract (a grandfathered id must be readable as a share id
+      // without deriving anything).
+      shareId: s.publicId,
+      currentSid: s.currentSid !== undefined ? s.currentSid : s.sid,
+      occupant: s.occupant || 'agent',
+      harness: s.harness || 'claude',
+      paneId: s.paneId, tty: s.tty, cwd: s.cwd,
       // The tunnel that owns this session (finding #13): the load-time scope
       // check keys on it, so a reconnect to another tunnel cannot inherit it.
       channelId: this.env.channelId,
@@ -766,6 +1014,11 @@ class Daemon {
       const outbox = (p.outbox || []).filter((e) => e && typeof e.sealed === 'string');
       const session = {
         sid, publicId: p.publicId, paneId: p.paneId, tty: p.tty, cwd: p.cwd,
+        // A migrated v1 entry carries currentSid = its old sid (see
+        // migrateState); a v2 term share carries null.
+        currentSid: p.currentSid !== undefined ? p.currentSid : sid,
+        occupant: p.occupant || 'agent',
+        harness: p.harness || 'claude',
         file: p.file, offset: p.offset || 0,
         title: path.basename(p.cwd || 'session'), hv: null,
         // Restart dedup: start from the persisted ring, then rebuild the rest
@@ -974,9 +1227,13 @@ class Daemon {
 
   tailTick() {
     for (const s of this.sessions.values()) this.tailOne(s);
+    this.occupantTick(); // v2 §16 — throttled inside
   }
 
   tailOne(s) {
+    // A terminal share has no transcript to tail (v2 §16): its bytes are the
+    // mirror's business (Phase B), never a JSONL on this disk.
+    if (!s.file) return;
     let st;
     try { st = fs.statSync(s.file); } catch { return; }
     if (st.size < s.offset) {
@@ -1221,6 +1478,11 @@ class Daemon {
   }
 
   async heartbeatTick() {
+    // The computer's own presence beat (§17): `perform "heartbeat"`, no
+    // payload, on the same 30 s clock. Write-throttled server-side; it keeps
+    // the phone's online chip fresh with zero shared panes. DISPLAY-ONLY —
+    // nothing downstream may read it (invariant #3).
+    this.performComputer('heartbeat');
     for (const s of [...this.sessions.values()]) { // a copy: the pane check may end sessions mid-walk
       if (!s.registered) continue; // flushTick owns the re-register retry
       // VERIFY the pane before re-affirming (QA r6-6). A dead pane used to be
@@ -1255,7 +1517,11 @@ class Daemon {
       // (and the phone) showing `running` until the NEXT transition — a session
       // that is actually waiting for the human, displayed as busy. The beat now
       // re-asserts it, so a lost transition self-heals within one cadence.
-      await this.api('PATCH', `/agent_sessions/${s.publicId}`, { status: s.status })
+      // `mode` rides the same beat (§16): absent means unchanged server-side,
+      // so re-asserting the occupant self-heals a dropped flip exactly the way
+      // re-asserting the status self-heals a dropped transition.
+      await this.api('PATCH', `/agent_sessions/${s.publicId}`,
+        { status: s.status, ...(s.occupant ? { mode: s.occupant } : {}) })
         .then(({ data }) => this.applySessionEcho(s, data))
         .catch(() => {});
     }
@@ -1351,6 +1617,539 @@ class Daemon {
     return null;
   }
 
+  // --- pane shares (v2 §16/§17): the consent unit is a PANE -----------------
+
+  // Bind a tmux pane as a SHARE and register it. `sid`/`file` are present only
+  // when a harness already occupies the pane; a plain terminal share carries a
+  // LOCAL map key (`term-…`) that never leaves this computer — the wire
+  // identity is the minted public_id, and the sealed meta's `sid` is honestly
+  // null until a harness adopts the pane.
+  async sharePane({ paneId, cwd, loc, occupant, sid = null, file = null, why }) {
+    const existing = this.shareForPaneId(paneId);
+    if (existing) throw new Error(`pane ${paneId} is already shared as ${existing.publicId}`);
+    const key = sid || `term-${crypto.randomUUID().slice(0, 8)}`;
+    this.acquireWriterLock(key); // B3 — one writer per share slot, always
+    try {
+      const session = {
+        sid: key,
+        publicId: core.mintShareId(),
+        currentSid: sid,
+        occupant,
+        harness: occupant === 'agent' ? 'claude' : 'terminal',
+        paneId, tty: null, cwd: cwd || null, file: file || null,
+        title: path.basename(cwd || loc || 'pane'),
+        mode: null, // the HARNESS permission mode (§4) — unrelated to `occupant`
+        hv: null,
+        offset: 0,
+        seenUuids: new Set(), seenRing: [],
+        queue: [], outboxBytes: 0, nextSeq: 1,
+        status: 'idle', waitingArmed: true,
+        notifyOnWaiting: false,
+        lastAliveAt: Date.now(),
+        approvals: [],
+        flushing: false, backfilled: 0,
+        registered: true, registering: false,
+        backoff: 0, nextFlushAt: 0,
+        gen: 0,
+      };
+      const echo = await this.registerSession(session, 'idle');
+      session.nextSeq = (echo.last_seq || 0) + 1;
+      session.notifyOnWaiting = echo.notify_on_waiting === true;
+      this.sessions.set(key, session);
+      this.persistSession(session);
+      if (session.file) await this.backfill(session);
+      this.subscribeInput(session);
+      // The share opens with a legible line — a pane that appears on the phone
+      // with no explanation is exactly the silence §11 forbids.
+      this.narrateShare(session, why, `share-${session.publicId.slice(5, 13)}`);
+      this.log(`shared pane ${paneId}${loc ? ` (${loc})` : ''} as ${session.publicId} — ${why} (mode ${occupant})`);
+      return session;
+    } catch (e) {
+      const s = this.sessions.get(key);
+      if (s) { s.gen += 1; this.sessions.delete(key); }
+      delete this.state.sessions[key];
+      this.saveState();
+      this.releaseWriterLock(key);
+      throw e;
+    }
+  }
+
+  // A pane whose current command IS the harness may ALREADY have announced its
+  // session to this daemon (SessionStart fires for every session, shared or
+  // not). Binding that announcement is what makes a captured claude pane a real
+  // transcript instead of an empty agent view. Requires a fresh announce that
+  // resolves to THIS pane unambiguously — anything less is no bind (the pane is
+  // still shared, as a terminal, and says so).
+  announceForPane(pane, panes) {
+    const now = Date.now();
+    const want = String(pane.path || '').replace(/\/+$/, '');
+    const sameCwdPanes = panes.filter((p) => String(p.path || '').replace(/\/+$/, '') === want).length;
+    const hits = [...this.announces.entries()].filter(([sid, a]) => {
+      if (now - a.at >= HOOK_TTL_MS || !a.transcriptPath || this.sessions.has(sid)) return false;
+      // The announce map holds the tty exactly as the hook sent it — including
+      // the "no controlling tty" markers, which must never be read as a name.
+      const atty = core.normalizeTty(a.tty);
+      if (atty) return atty === pane.tty;
+      // ttyless (the Claude-hook reality, finding #12): cwd correlation, and
+      // ONLY when this pane is the only one sitting there.
+      return sameCwdPanes === 1 && String(a.cwd || '').replace(/\/+$/, '') === want;
+    });
+    if (hits.length !== 1) {
+      if (hits.length > 1) this.log(`pane ${pane.paneId}: ${hits.length} announced sessions match it — cannot tell which claude is in there; sharing it as a terminal`);
+      return null;
+    }
+    return { sid: hits[0][0], file: hits[0][1].transcriptPath };
+  }
+
+  // Share a pane that EXISTS on this computer, choosing the occupant from
+  // `#{pane_current_command}` (§17: harness ⇒ agent, else term). Used by both
+  // capture doors: the phone's sealed `capture` command and the human's
+  // `pidge terminal share`. Returns a plain result object — every refusal is a
+  // sentence, never a silent no-op.
+  async shareExistingPane(paneId, { by }) {
+    if (!paneId) return { ok: false, error: 'no pane_id was given' };
+    let panes;
+    try {
+      panes = core.tmuxPanes({ onWarn: (m) => this.log(m) });
+    } catch (e) {
+      // #68: an unreadable pane list is a DAEMON-side failure, never "the pane
+      // is not there".
+      return { ok: false, error: `the tmux pane list came back mangled (${e.message}) — refusing to share a pane this computer cannot read` };
+    }
+    const pane = panes.find((p) => p.paneId === paneId);
+    if (!pane) return { ok: false, error: `pane ${paneId} does not exist on this computer (it may have closed since the list was taken)` };
+    const existing = this.shareForPaneId(paneId);
+    if (existing) return { ok: false, error: `pane ${paneId} is already shared as ${existing.publicId}` };
+
+    const harness = isHarnessCommand(pane.cmd);
+    const bound = harness ? this.announceForPane(pane, panes) : null;
+    try {
+      const s = await this.sharePane({
+        paneId,
+        cwd: pane.path,
+        loc: pane.loc,
+        occupant: bound ? 'agent' : 'term',
+        sid: bound ? bound.sid : null,
+        file: bound ? bound.file : null,
+        why: bound
+          ? `shared by ${by} — claude is running here`
+          : `shared by ${by}${harness ? ` — "${pane.cmd}" is running here, but this computer holds no transcript for it yet (it becomes an agent view the moment claude announces)` : ''}`,
+      });
+      return { ok: true, public_id: s.publicId, pane_id: paneId, loc: pane.loc, mode: s.occupant };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+
+  shareLocalPane(paneId, { by }) {
+    return this.shareExistingPane(paneId, { by });
+  }
+
+  // The occupant flip (§16). The `mode` column is CLEAR and the flip rides the
+  // heartbeat PATCH the daemon already sends; every transition leaves a seam
+  // notice in the transcript, so the renderer never swaps under the human
+  // without a word.
+  setOccupant(s, occupant, narration) {
+    if (!occupant || s.occupant === occupant) return;
+    s.occupant = occupant;
+    if (occupant === 'term') { s.currentSid = null; s.harness = 'terminal'; s.file = null; }
+    this.persistSession(s);
+    this.api('PATCH', `/agent_sessions/${s.publicId}`, {
+      status: s.status, mode: occupant, meta_sealed: this.sealMeta(s),
+    }).catch((e) => this.log(`${s.publicId}: the mode PATCH failed (${e.message}) — the heartbeat re-asserts it`));
+    this.narrateShare(s, narration, `occupant-${occupant}`);
+    this.log(`${s.publicId}: occupant → ${occupant} (${narration})`);
+  }
+
+  // Poll the bound panes' current command (§16). Rides the 400 ms tail tick,
+  // throttled to one tmux call per OCCUPANT_POLL_MS for ALL bound panes.
+  occupantTick() {
+    const now = Date.now();
+    if (now - this.lastOccupantAt < OCCUPANT_POLL_MS) return;
+    const watched = [...this.sessions.values()].filter((s) => s.paneId && s.occupant === 'agent');
+    if (!watched.length) return;
+    this.lastOccupantAt = now;
+    let panes;
+    try {
+      panes = core.tmuxPanes({ onWarn: (m) => this.log(m) });
+    } catch (e) {
+      // #68 again: a mangled list is not an empty one, and it is CERTAINLY not
+      // "claude exited" on every share at once.
+      this.log(`occupant poll: pane list unreadable (${e.message}) — no mode is flipped on an unanswerable question`);
+      return;
+    }
+    const byId = new Map(panes.map((p) => [p.paneId, p]));
+    for (const s of watched) {
+      const pane = byId.get(s.paneId);
+      // A pane that is GONE is the heartbeat's job (r6-6: ended loudly, never
+      // rebound) — absence must never read as "the harness exited".
+      if (!pane) continue;
+      if (!isHarnessCommand(pane.cmd)) {
+        this.setOccupant(s, 'term', `claude exited — terminal (${pane.cmd || 'shell'})`);
+      }
+    }
+  }
+
+  // --- the computer lane (v2 §17) ------------------------------------------
+
+  computerAad(field) {
+    return core.e2eAad(this.env.channelId, core.COMPUTER_ANCHOR, field);
+  }
+
+  sealComputerFrame(obj) {
+    return core.e2eEncryptBlob(this.key, this.computerAad('computer_meta'),
+      Buffer.from(JSON.stringify(obj), 'utf8')).toString('base64url');
+  }
+
+  // An ActionCable `perform` on the computer subscription. Returns false when
+  // there is no live socket — the caller narrates; nothing here retries, because
+  // a computer_meta frame is ephemeral by contract (a lost one costs one cheap
+  // re-request).
+  performComputer(action, data = {}) {
+    if (!this.ws || this.ws.readyState !== 1 || !this.computerConfirmed) return false;
+    try {
+      this.ws.send(JSON.stringify({
+        command: 'message', identifier: COMPUTER_IDENT, data: JSON.stringify({ ...data, action }),
+      }));
+      return true;
+    } catch (e) {
+      this.log(`computer lane: perform ${action} failed (${e.message})`);
+      return false;
+    }
+  }
+
+  // Every meta frame goes through here so the SERVER'S cap (32 KB measured on
+  // the base64url string) is enforced on THIS side first — an over-cap frame is
+  // dropped by the relay in silence, which is exactly the failure #65 forbids.
+  publishMeta(payload, why) {
+    let frame;
+    try {
+      frame = this.sealComputerFrame(payload);
+    } catch (e) {
+      this.log(`computer lane: could not seal the ${payload.kind} frame (${e.message}) — ${why}`);
+      return false;
+    }
+    const bytes = Buffer.byteLength(frame, 'utf8');
+    if (bytes > core.COMPUTER_META_MAX_BYTES) {
+      this.log(`computer lane: ${payload.kind} frame is ${bytes}B > the ${core.COMPUTER_META_MAX_BYTES}B relay cap — NOT sent (${why})`);
+      return false;
+    }
+    const sent = this.performComputer('meta', { frame });
+    if (!sent) this.log(`computer lane: ${payload.kind} frame not sent — the computer subscription is not confirmed (${why})`);
+    return sent;
+  }
+
+  // The capabilities frame (PINNED shape — iOS builds against it).
+  capsPayload() {
+    const grants = core.loadGrants();
+    return {
+      kind: 'caps',
+      remote_spawn: grants.remote_spawn,
+      inventory: grants.inventory,
+      hostname: os.hostname(),
+      os: core.computerOs(),
+    };
+  }
+
+  publishCaps(why) {
+    return this.publishMeta(this.capsPayload(), why);
+  }
+
+  // A viewer_joined nudge is UNSEALED and forgeable-innocuous by design (§17):
+  // the worst it can buy is a re-published sealed frame. Debounced so N phones
+  // (or one reconnecting phone) cannot turn it into a frame storm.
+  onViewerJoined() {
+    this.lastViewerJoinAt = Date.now();
+    if (this.capsTimer) return; // a publish is already coming for this burst
+    this.capsTimer = setTimeout(() => {
+      this.capsTimer = null;
+      this.publishCaps('a viewer joined');
+    }, this.viewerDebounceMs);
+    if (this.capsTimer.unref) this.capsTimer.unref();
+  }
+
+  // viewer→daemon, sealed under the `computer_req` lane. The op set is CLOSED:
+  // Phase A has `inventory` and nothing else. Replay defense is the input
+  // lane's, verbatim (§8/B4): vgen + per-vgen monotonic seq + the mandatory
+  // epoch echo, on a COMPUTER-scoped ledger.
+  handleComputerRequest(frameB64) {
+    let msg;
+    try {
+      const sealed = Buffer.from(String(frameB64 || ''), 'base64url');
+      if (sealed.length > core.COMPUTER_REQUEST_MAX_BYTES) throw new Error(`frame is ${sealed.length}B, over the ${core.COMPUTER_REQUEST_MAX_BYTES}B cap`);
+      const plain = core.e2eDecryptBlob(this.key, this.computerAad('computer_req'), sealed);
+      msg = JSON.parse(plain.toString('utf8'));
+    } catch (e) {
+      this.log(`computer request rejected (${e.message})`);
+      return;
+    }
+    if (!msg || typeof msg.op !== 'string' || !msg.vgen || !Number.isInteger(msg.seq) || !Number.isInteger(msg.he)) {
+      this.log('computer request missing op/vgen/seq/he — dropped');
+      return;
+    }
+    if (msg.he !== this.state.epoch) {
+      this.log(`computer request from epoch ${msg.he} (current ${this.state.epoch}) — pre-restart ciphertext, dropped`);
+      return;
+    }
+    const ledgerKey = `${core.COMPUTER_ANCHOR}|${msg.vgen}`;
+    const last = this.replay.get(ledgerKey) || 0;
+    if (msg.seq <= last) { this.log(`computer request replay (seq ${msg.seq} ≤ ${last}) — dropped`); return; }
+    this.replay.set(ledgerKey, msg.seq);
+
+    if (msg.op !== 'inventory') {
+      // Degrade LOUDLY (#33): an unknown op is dropped and said out loud, never
+      // guessed at and never silently swallowed.
+      this.log(`computer request: unknown op ${JSON.stringify(msg.op)} — DROPPED (the Phase A op set is closed to "inventory"; durable commands ride the message queue, never this lane)`);
+      return;
+    }
+    this.answerInventory();
+  }
+
+  // The sealed pane inventory (§17). NEVER persisted — gathered on demand,
+  // sealed, relayed, forgotten. The grant is read at ANSWER time, so turning it
+  // off takes effect on the very next ask.
+  answerInventory() {
+    const grants = core.loadGrants();
+    if (!grants.inventory) {
+      this.log('inventory asked while the machine grant is OFF — answering with capabilities instead (the phone renders only granted affordances)');
+      this.publishCaps('inventory is not granted on this computer');
+      return;
+    }
+    let panes;
+    try {
+      panes = core.tmuxPanes({ onWarn: (m) => this.log(m) });
+    } catch (e) {
+      this.log(`inventory: the pane list came back mangled (${e.message}) — answering with capabilities, never with a false "no panes"`);
+      this.publishCaps('the pane list could not be read');
+      return;
+    }
+    const rows = panes.map((p) => ({
+      pane_id: p.paneId,
+      cwd: p.path || null,
+      loc: p.loc || null,
+      current_command: p.cmd || null,
+      shared: !!this.shareForPaneId(p.paneId),
+    }));
+    this.publishInventory(rows);
+  }
+
+  // #65 DNA: degrade INSIDE the cap BEFORE sending. The list shrinks (newest
+  // pane ids first is meaningless here — tmux order is stable, so the head is
+  // kept) and `truncated:true` tells the phone the list is partial. An
+  // over-cap frame is NEVER sent.
+  publishInventory(rows) {
+    let list = rows;
+    let truncated = false;
+    for (;;) {
+      const payload = { kind: 'inventory', panes: list, truncated };
+      let frame;
+      try {
+        frame = this.sealComputerFrame(payload);
+      } catch (e) {
+        this.log(`inventory: seal failed (${e.message}) — nothing sent`);
+        return false;
+      }
+      if (Buffer.byteLength(frame, 'utf8') <= core.COMPUTER_META_MAX_BYTES) {
+        if (truncated) this.log(`inventory: degraded to ${list.length}/${rows.length} pane(s) to fit the ${core.COMPUTER_META_MAX_BYTES}B relay cap — sent with truncated:true`);
+        const sent = this.performComputer('meta', { frame });
+        if (!sent) this.log('inventory: the computer subscription is not confirmed — frame not sent');
+        return sent;
+      }
+      if (!list.length) {
+        // Structurally impossible (an empty list seals to ~100 B) but the rule
+        // is the rule: never send over-cap, never loop.
+        this.log('inventory: even an EMPTY pane list does not fit the relay cap — nothing sent (loud)');
+        return false;
+      }
+      truncated = true;
+      list = list.slice(0, Math.floor(list.length / 2));
+    }
+  }
+
+  // Computer-level narration (§17: "every command's outcome is narrated"). Used
+  // when there is no share to carry a notice — a refusal, an unknown op, a
+  // spawn that never got as far as a pane.
+  narrateComputer(text) {
+    this.log(`computer command: ${text}`);
+    this.publishMeta({ kind: 'notice', text, at: nowIso() }, 'command narration');
+    return false;
+  }
+
+  // --- durable computer commands (§17: the message queue, lane computer_cmd) -
+
+  // Open a queue row under the `computer_cmd` lane, anchored on THAT row's cid
+  // (a consumed spawn can never replay). Returns null for anything that is not
+  // ours — a row we cannot open is never acked and never acted on.
+  openComputerCmd(row) {
+    if (!row || !row.enc || !row.correlation_id) return null;
+    const aad = core.e2eAad(this.env.channelId, row.correlation_id, 'computer_cmd');
+    const body = String(row.body || '');
+    let plain = null;
+    try {
+      // Two carriers are accepted on purpose: the message `body` is an ordinary
+      // string param, so the natural sealing is the "v1:" FIELD envelope every
+      // other string field uses; a base64url blob is tolerated because the spec
+      // pins the LANE, not the framing (see the PR notes).
+      plain = body.startsWith('v1:')
+        ? core.e2eDecryptField(this.key, aad, body)
+        : core.e2eDecryptBlob(this.key, aad, Buffer.from(body, 'base64url')).toString('utf8');
+    } catch { return null; }
+    try {
+      const obj = JSON.parse(plain);
+      return obj && typeof obj === 'object' && typeof obj.op === 'string' ? obj : null;
+    } catch { return null; }
+  }
+
+  async drainTick() {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      await this.drainOnce();
+    } catch (e) {
+      this.log(`computer command drain failed (${e.message}) — the rows stay on the queue, the next tick retries`);
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  async drainOnce() {
+    const { res, data } = await this.api('GET', '/messages');
+    if (res.status !== 200) {
+      // Throttled, but never silent: a 401 here means the tunnel key is dead.
+      if (Date.now() - this.drainWarnedAt > 300_000) {
+        this.drainWarnedAt = Date.now();
+        this.log(`computer command drain → ${res.status} — no command from the phone can arrive while this lasts`);
+      }
+      return;
+    }
+    const rows = Array.isArray(data && data.messages) ? data.messages : [];
+    const ackIds = [];
+    for (const row of rows) {
+      const cmd = this.openComputerCmd(row);
+      if (!cmd) {
+        // NOT ours. A row this daemon cannot open is left on the queue —
+        // eating a human's message to keep our own polling quiet is the
+        // trade this feature does not get to make.
+        if (!this.foreignMsgIds.has(row.id)) {
+          this.foreignMsgIds.add(row.id);
+          this.log(`queue row ${row.id} does not open under the computer_cmd lane — LEFT on the queue (not acked, not acted on)`);
+        }
+        continue;
+      }
+      if (this.handledCmdIds.has(Number(row.id))) {
+        // At-least-once (#39): a lost ack re-serves a command whose effect is
+        // already on this computer. Ack it again, run it never.
+        ackIds.push(row.id);
+        continue;
+      }
+      try {
+        await this.runComputerCommand(cmd, row);
+      } catch (e) {
+        this.narrateComputer(`"${cmd.op}" failed: ${e.message}`);
+      }
+      // Noted (and persisted) BEFORE the ack: a crash between the two costs a
+      // duplicate ack, never a duplicate spawn.
+      this.noteHandledCmd(row.id);
+      ackIds.push(row.id);
+    }
+    if (ackIds.length) {
+      const { res: ackRes } = await this.api('POST', '/messages/ack', { ids: ackIds });
+      if (ackRes.status < 200 || ackRes.status >= 300) {
+        this.log(`computer command ack → ${ackRes.status} for ${JSON.stringify(ackIds)} — the rows re-serve; the dedup ring keeps the effect once`);
+      }
+    }
+  }
+
+  async runComputerCommand(cmd, row) {
+    switch (cmd.op) {
+      case 'spawn': return this.cmdSpawn(cmd);
+      case 'capture': return this.cmdCapture(cmd);
+      case 'kill_share': return this.cmdKillShare(cmd);
+      default:
+        // Ack + a loud log (§17) — and the phone hears about it too.
+        return this.narrateComputer(`unknown op ${JSON.stringify(cmd.op)} on message ${row && row.id} — acked and ignored (this computer speaks spawn, capture, kill_share)`);
+    }
+  }
+
+  // `tmux new-window -d` in the daemon's own `pidge` session, created detached
+  // if it does not exist. `-P -F '#{pane_id}'` makes the new pane's id the
+  // command's OUTPUT — no matching, no guessing which pane was just made.
+  spawnPane(cwd) {
+    const where = cwd ? ['-c', cwd] : [];
+    let exists = true;
+    try {
+      core.tmuxExec(['has-session', '-t', SPAWN_TMUX_SESSION], { stdio: 'ignore' });
+    } catch { exists = false; }
+    const out = exists
+      ? core.tmuxExec(['new-window', '-d', '-t', `${SPAWN_TMUX_SESSION}:`, '-P', '-F', '#{pane_id}', ...where], { encoding: 'utf8' })
+      : core.tmuxExec(['new-session', '-d', '-s', SPAWN_TMUX_SESSION, '-P', '-F', '#{pane_id}', ...where], { encoding: 'utf8' });
+    return String(out || '').trim();
+  }
+
+  async cmdSpawn(cmd) {
+    const template = cmd.template === 'claude' ? 'claude' : 'shell';
+    if (!core.loadGrants().remote_spawn) {
+      // A refusal is NARRATED, never silent (§17) — and it says exactly which
+      // machine-side line opens the door.
+      return this.narrateComputer(`REFUSED a remote ${template} spawn: this computer does not grant it. Turn it on here with \`pidge terminal config remote_spawn on\`.`);
+    }
+    const cwd = typeof cmd.cwd === 'string' && cmd.cwd ? cmd.cwd : null;
+    let paneId;
+    try {
+      paneId = this.spawnPane(cwd);
+    } catch (e) {
+      return this.narrateComputer(`could not spawn a pane${cwd ? ` in ${cwd}` : ''}: ${e.message}`);
+    }
+    if (!/^%\d+$/.test(paneId)) {
+      return this.narrateComputer(`tmux did not return a pane id for the spawn (got ${JSON.stringify(paneId)}) — nothing was shared`);
+    }
+    let s;
+    try {
+      s = await this.sharePane({
+        paneId, cwd, occupant: 'term',
+        // Consent by construction: the sealed command came from the owner's
+        // phone and the server cannot forge it.
+        why: `spawned from your phone (${template})`,
+      });
+    } catch (e) {
+      return this.narrateComputer(`spawned pane ${paneId} but could not share it: ${e.message}`);
+    }
+    if (template === 'claude') {
+      try {
+        // send-keys, deliberately: the harness is NOT wrapped — its own
+        // SessionStart hook is what flips this share to `agent`.
+        this.sendLiteral(paneId, 'claude');
+        core.tmuxExec(['send-keys', '-t', paneId, 'Enter']);
+        this.narrateShare(s, 'claude is starting in this pane…', 'spawn-claude');
+      } catch (e) {
+        this.narrateShare(s, `could not start claude in this pane (${e.message}) — it stays a plain terminal`, 'spawn-failed');
+      }
+    }
+    this.narrateComputer(`spawned a ${template} pane (${paneId}) and shared it as ${s.publicId}`);
+    return s;
+  }
+
+  async cmdCapture(cmd) {
+    const paneId = typeof cmd.pane_id === 'string' ? cmd.pane_id : null;
+    const out = await this.shareExistingPane(paneId, { by: 'your phone' });
+    if (!out.ok) return this.narrateComputer(`could not capture ${paneId || '(no pane_id)'}: ${out.error}`);
+    this.narrateComputer(`captured pane ${out.pane_id}${out.loc ? ` (${out.loc})` : ''} as ${out.public_id} in ${out.mode} mode`);
+    return out;
+  }
+
+  async cmdKillShare(cmd) {
+    const publicId = typeof cmd.public_id === 'string' ? cmd.public_id : null;
+    const s = publicId && this.shareForPublicId(publicId);
+    if (!s) return this.narrateComputer(`kill_share: ${publicId || '(no public_id)'} is not shared from this computer — nothing to end`);
+    // The seam BEFORE the end: the last thing the transcript says is why it
+    // stopped (§11 — a mirror must never just go quiet).
+    this.narrateShare(s, 'sharing ended from your phone', 'kill-share');
+    try { await this.flush(s); } catch { /* the end is unconditional */ }
+    const res = await this.disableSession(s.sid, 'kill_share from the phone');
+    this.narrateComputer(`ended the share ${publicId}${res.server_ok ? '' : ` LOCALLY (the server was not told: ${res.detail || 'unreachable'})`}`);
+    return res;
+  }
+
   // --- cable input lane (spec §8) ------------------------------------------
 
   subscribeInput(session) {
@@ -1382,18 +2181,42 @@ class Daemon {
     if (!this.cableDownSince) this.cableDownSince = Date.now();
     ws.onopen = () => {
       if (gen !== this.wsGen) return ws.close(); // superseded (#66)
-      this.log('cable up — subscribing input lanes');
+      this.log('cable up — subscribing the computer lane + input lanes');
+      // The COMPUTER subscription first: it is the one this socket exists for
+      // even with zero shared panes (v2 §17, always-on).
+      this.sendComputerSubscribe();
       for (const s of this.sessions.values()) this.sendSubscribe(s);
     };
     ws.onmessage = (ev) => {
       if (gen !== this.wsGen) return;
       this.wsLastBeat = Date.now();
       let frame; try { frame = JSON.parse(ev.data); } catch { return; }
-      if (frame.type === 'confirm_subscription') { this.noteCableConfirmed(); return; }
+      if (frame.type === 'confirm_subscription') { this.noteCableConfirmed(frame.identifier); return; }
       if (frame.type === 'ping' || frame.type === 'welcome') return;
-      if (frame.type === 'reject_subscription') { this.log('input subscription rejected:', frame.identifier); return; }
-      if (frame.message && frame.message.type === 'input' && frame.identifier) {
-        let ident; try { ident = JSON.parse(frame.identifier); } catch { return; }
+      if (frame.type === 'reject_subscription') {
+        if (this.isComputerIdentifier(frame.identifier)) {
+          // Said ONCE, and said properly: the server rejects this subscription
+          // only when the channel is not a tunnel or its E2E was turned off —
+          // neither is something a retry fixes.
+          if (!this.computerRejected) {
+            this.computerRejected = true;
+            this.log('computer subscription REJECTED by the server — this key is not a tunnel with E2E on. The phone will show this computer offline and no capabilities/inventory frame can be published (transcripts and input for existing shares are unaffected).');
+          }
+          return;
+        }
+        this.log('input subscription rejected:', frame.identifier);
+        return;
+      }
+      if (!frame.message || !frame.identifier) return;
+      let ident; try { ident = JSON.parse(frame.identifier); } catch { return; }
+      if (ident && ident.channel === 'ComputerChannel') {
+        // Server → daemon on the computer lane (§17): a sealed request, or the
+        // unsealed viewer nudge. Presence frames ride the viewer side only.
+        if (frame.message.type === 'request') this.handleComputerRequest(frame.message.frame);
+        else if (frame.message.type === 'viewer_joined') this.onViewerJoined();
+        return;
+      }
+      if (frame.message.type === 'input') {
         const session = [...this.sessions.values()].find((s) => s.publicId === ident.public_id);
         if (session) this.handleInputFrame(session, frame.message.frame);
       }
@@ -1406,10 +2229,22 @@ class Daemon {
     ws.onerror = () => {};
   }
 
+  isComputerIdentifier(identifier) {
+    try { return JSON.parse(identifier).channel === 'ComputerChannel'; } catch { return false; }
+  }
+
   // The server confirmed a subscription on the CURRENT socket — this, not
   // onopen, is what "the cable is up" means (QA r6-3: the watchdog must VERIFY
   // the reconnect, not fire it and assume).
-  noteCableConfirmed() {
+  noteCableConfirmed(identifier) {
+    if (this.isComputerIdentifier(identifier) && !this.computerConfirmed) {
+      this.computerConfirmed = true;
+      this.computerRejected = false;
+      this.log('computer lane confirmed — publishing capabilities');
+      // Fresh caps on every (re)subscribe: a phone that was looking while the
+      // socket was down gets the truth without asking.
+      this.publishCaps('the computer subscription was confirmed');
+    }
     if (this.wsConfirmed) return;
     this.wsConfirmed = true;
     const hadFailures = (this.wsBackoff || 0) > 0;
@@ -1434,6 +2269,7 @@ class Daemon {
   cableRetry(why) {
     if (!this.cableDownSince) this.cableDownSince = Date.now();
     this.wsConfirmed = false;
+    this.computerConfirmed = false; // a new socket must be re-confirmed, never assumed
     this.wsBackoff = Math.min(Math.max((this.wsBackoff || 0) * 2, 5), CABLE_BACKOFF_CAP_S);
     this.wsRetryAt = Date.now() + this.wsBackoff * 1000;
     const downS = Math.round((Date.now() - this.cableDownSince) / 1000);
@@ -1457,14 +2293,30 @@ class Daemon {
     const up = !!(this.ws && this.ws.readyState === 1 && this.wsConfirmed);
     return {
       up,
-      wanted: this.sessions.size > 0,
+      // v2 §17: the socket is ALWAYS wanted while this computer is connected —
+      // the ComputerChannel subscription (presence, capabilities, inventory)
+      // does not need a single shared pane to exist.
+      wanted: true,
       down_since: up || !this.cableDownSince ? null : new Date(this.cableDownSince).toISOString(),
+      // Reported per LANE (#72): an input lane that is up while the COMPUTER
+      // subscription was rejected is a half-working computer, and saying "up"
+      // for it would be the exact class of lie that ledger exists to stop.
+      computer: !!(up && this.computerConfirmed),
     };
   }
 
   sendSubscribe(session) {
     try {
       this.ws.send(JSON.stringify({ command: 'subscribe', identifier: this.identifierFor(session) }));
+    } catch {}
+  }
+
+  // The computer's own subscription — NO params (the tunnel key IS the
+  // identity; the server rejects anything that is not a tunnel with E2E on).
+  sendComputerSubscribe() {
+    if (!this.ws || this.ws.readyState !== 1) return;
+    try {
+      this.ws.send(JSON.stringify({ command: 'subscribe', identifier: COMPUTER_IDENT }));
     } catch {}
   }
 
@@ -1567,7 +2419,9 @@ class Daemon {
   // confirmation) within its deadline is abandoned loudly and retried with
   // backoff, forever.
   watchdogTick() {
-    if (this.sessions.size === 0) return;
+    // v2 §17: no "only with ≥1 session" gate any more. While this computer is
+    // connected the socket is WANTED — it carries the ComputerChannel
+    // subscription (presence + capabilities + inventory) with zero shared panes.
     const ws = this.ws;
     if (!ws || ws.readyState > 1) { this.ensureCable(); return; }
     const now = Date.now();
@@ -1585,6 +2439,15 @@ class Daemon {
       this.abandonSocket(ws, 'socket open but the subscribe was never confirmed');
       return;
     }
+    // Same discipline for the COMPUTER subscription (v2 §17): confirmed input
+    // lanes on a socket whose computer lane never answered is not a healthy
+    // computer — verify it, don't assume it. A server that REJECTED it is a
+    // different thing (said once, above): retrying that forever would be a
+    // reconnect loop against a permanent no.
+    if (!this.computerConfirmed && !this.computerRejected && now - this.wsAttemptAt > CABLE_CONFIRM_MS) {
+      this.abandonSocket(ws, 'the computer subscription was never confirmed');
+      return;
+    }
     if (now - this.wsLastBeat > CABLE_SILENT_MS) {
       // ActionCable pings every ~3s; 45s of silence = a dead socket that
       // doesn't know it. Prefer a spurious reconnect over a silent stand-down.
@@ -1600,12 +2463,20 @@ class Daemon {
     if (!cfg || !cfg.port || !cfg.token) throw new Error('daemon.json missing — run `pidge terminal connect`');
     this.startHookServer(cfg.port, cfg.token);
     await this.rearmPersisted();
+    // ALWAYS-ON (v2 §17): the socket comes up because this computer is
+    // connected, not because something is shared.
+    this.ensureCable();
     this.timers = [
       setInterval(() => this.tailTick(), TAIL_POLL_MS),
       setInterval(() => this.flushTick(), FLUSH_MS),
       setInterval(() => this.heartbeatTick(), HEARTBEAT_MS),
       setInterval(() => this.watchdogTick(), WATCHDOG_MS),
+      // The durable command lane (§17). The ComputerChannel carries no
+      // "a command is waiting" frame, so this interval IS how a spawn from the
+      // phone arrives — see DRAIN_POLL_MS for why it is not a held poll.
+      setInterval(() => this.drainTick(), DRAIN_POLL_MS),
     ];
+    this.drainTick(); // don't make a command posted while the daemon was down wait a full tick
     const bye = async (code) => {
       this.log('daemon shutting down');
       for (const t of this.timers) clearInterval(t);

@@ -504,16 +504,19 @@ USAGE
                                           you learn what's already handled WITHOUT stealing a message.
                                           Exit 0 (printed, even if empty) · 2 error. NEVER run \`listen\`
                                           on a channel another runtime consumes (double-consume).
-  pidge terminal <sub>                    AGENT SESSIONS: mirror a Claude Code session (its
-                                          structured transcript, E2E-sealed) to the human's phone,
-                                          typed replies land in the session's input box.
+  pidge terminal <sub>                    TERMINALS: share a tmux PANE with the human's phone —
+                                          a Claude session as its structured transcript (E2E-sealed,
+                                          typed replies land in its input box) or a plain terminal.
                                           connect --code C   once per computer (paste the app's one-liner)
-                                          (sharing)          the ONLY door is the PreToolUse HOOK: paste
+                                          (claude sharing)   the ONLY door is the PreToolUse HOOK: paste
                                                              "Run exactly this one bash command and nothing
                                                              else: \`pidge terminal enable\`" INTO the session
                                                              you want mirrored. The hook fires before the
                                                              command runs, shares that session id and denies
                                                              the tool — no PATH, no picker, no sid.
+                                          share              share THIS pane (run it inside the pane)
+                                          config K on|off    what the phone may do to this computer:
+                                                             remote_spawn (default OFF) · inventory (ON)
                                           enable             a CONFIRMATION of the above (never the door)
                                           disable · status · disconnect
   pidge update                            update this CLI to the latest published pidge-cli
@@ -920,8 +923,8 @@ const HELP = {
     opts: ['timeout', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
   },
   terminal: {
-    summary: 'Agent Sessions: mirror a Claude Code session to the phone as structured, E2E-sealed conversation data; typed replies come back into the session.',
-    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon] [--replace]  ·  pidge terminal enable (confirm)  ·  pidge terminal disable [--session SID|--all] | status | disconnect',
+    summary: 'Terminals: share a tmux pane with the phone — a Claude session as structured, E2E-sealed conversation data (typed replies come back into it), or a plain terminal pane.',
+    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon] [--replace]  ·  pidge terminal share (inside a pane)  ·  pidge terminal config [remote_spawn|inventory] [on|off]  ·  pidge terminal enable (confirm)  ·  pidge terminal disable [--session SID|--all] | status | disconnect',
     body: [
       'The user runs claude inside tmux — that is their ENTIRE responsibility. `connect` (once per computer) pairs with the phone: the app\'s Settings → Computers → Connect a computer mints a tunnel channel + E2E key and shows a one-liner carrying the claim code + PIDGE_SECRET; paste it in a terminal. It asks consent, installs Claude Code hooks (tagged `# pidge-hook`, cleanly removable), refreshes the Pidge skill, copies this CLI to ~/.config/pidge/terminal/cli (so the service never points into a prunable npx cache) and installs a background daemon (launchd on macOS, `systemd --user` on Linux/WSL; a WSL without systemd gets a detached daemon + the line that makes it durable).',
       '',
@@ -929,7 +932,11 @@ const HELP = {
       '',
       'Everything shared is fully interactive: the phone renders the transcript natively (tool cards, diffs) and typed replies land in the session\'s real input box via tmux send-keys. Sessions outside tmux are not shareable in v1. When claude stops and waits, the human gets a REAL notification. The approval gate (off by default) rides the PASTED command — `pidge terminal enable --approvals Bash,Write` — and gates those tools behind an Approve/Deny push; a timeout falls open to the local prompt.',
       '',
-      'E2E is mandatory (the transcript contains everything); the server relays sealed blobs it can never read. `disable` stops one session; `disconnect` = disable --all + uninstall hooks + daemon.',
+      'THE UNIT IS A PANE, not a session. `pidge terminal share`, typed INSIDE any tmux pane, shares that pane with the phone (it matches its own tty against `#{pane_tty}` — no guessing); if claude is running there it shares as an agent view, otherwise as a terminal. When claude starts in (or exits from) a shared pane the share STAYS — same row, same history, the view just switches. The daemon holds ONE always-on socket while this computer is connected, so the phone sees it online with zero shared panes.',
+      '',
+      'WHAT THE PHONE MAY DO TO THIS COMPUTER IS GRANTED HERE, and printed in plain words by `connect` and `status`: `pidge terminal config remote_spawn on|off` (default OFF — spawn a new pane, optionally running claude, from the phone) and `pidge terminal config inventory on|off` (default ON — answer the phone\'s on-demand pane list, sealed and never stored). Bare `pidge terminal config` prints both. Typing into a pane you already shared needs no grant: the share IS the consent. Spawn and inventory create new surface with no act on this machine, so the grant lives where the risk lives.',
+      '',
+      'E2E is mandatory (the transcript contains everything); the server relays sealed blobs it can never read. `disable` stops one share; `disconnect` = disable --all + uninstall hooks + daemon.',
     ].join('\n'),
     opts: ['code', 'secret', 'session', 'approvals', 'yes', 'no-daemon', 'replace', 'url'],
   },
@@ -5224,12 +5231,16 @@ ${SKILL_END_MARKER}
       break;
     }
     case 'terminal': {
-      // Agent Sessions v1 (pidge repo docs/agent-sessions-spec.md): mirror a
-      // Claude Code session as structured conversation data — connect once per
-      // computer, enable per tmux session, E2E always. Lives in src/terminal/ (its
-      // own machine-scoped identity slot, independent of TOKEN above).
+      // Agent Sessions / Terminals (pidge repo docs/agent-sessions-spec.md):
+      // the unit is a tmux PANE — mirror a Claude session as structured
+      // conversation data, or share/spawn a plain terminal pane. connect once
+      // per computer, E2E always. Lives in src/terminal/ (its own
+      // machine-scoped identity slot, independent of TOKEN above).
       const { runTerminal } = require(path.join(__dirname, '..', 'src', 'terminal', 'commands'));
-      await runTerminal(parsed.positionals[1], v);
+      // Trailing positionals ride through for the settings verb
+      // (`pidge terminal config remote_spawn on`): a capability grant is a
+      // decision, and it should read like one.
+      await runTerminal(parsed.positionals[1], v, parsed.positionals.slice(2));
       break;
     }
     case 'bridge': {

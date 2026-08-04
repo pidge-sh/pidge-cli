@@ -226,6 +226,12 @@ async function runConnect(v) {
       say('  (survive logout: `loginctl enable-linger $USER`)');
     } else say(`· daemon logs at ${core.LOG_FILE()}`);
   }
+  // Capability grants, in plain words (v2 decision §22.2). The human learns
+  // what their phone may and may not do to this computer AT THE MOMENT they
+  // link it — never buried in a settings screen on the other device.
+  say('\nWhat your phone may do to this computer:');
+  for (const line of core.grantLines()) say(`  ${line}`);
+
   say('\nDone. This computer is linked. To share a session: start (or restart) claude');
   say('inside its own tmux pane and PASTE this into it —\n');
   say(`  ${core.ENABLE_PROMPT}\n`);
@@ -473,11 +479,9 @@ function hasSystemd() {
 }
 
 // WSL has no user service manager unless the human opted into systemd, so it
-// gets its own (actionable) fallback text.
-function isWsl() {
-  if (process.env.WSL_DISTRO_NAME) return true;
-  try { return /microsoft/i.test(fs.readFileSync('/proc/version', 'utf8')); } catch { return false; }
-}
+// gets its own (actionable) fallback text. (The detector lives in core — the
+// capabilities frame reports the same three OS values.)
+const isWsl = core.isWsl;
 
 // Where THIS process's CLI lives (bin/pidge.js) and its package root.
 function cliEntryPath() {
@@ -720,6 +724,88 @@ async function runEnable(v) {
   }
 }
 
+// --- config: the capability grants (v2 §17/§22) -----------------------------
+//
+// The grants live ON THE MACHINE because that is where the risk lives: typing
+// into a pane the human already shared is consented by the share itself, but
+// SPAWNING a pane and LISTING every pane create new surface with zero
+// machine-side act. Defaults: remote_spawn OFF, inventory ON.
+async function runConfig(args) {
+  const [key, value] = args || [];
+  if (!key) {
+    say('pidge terminal config — what your phone may do to this computer:\n');
+    for (const line of core.grantLines()) say(`  ${line}`);
+    return;
+  }
+  if (!core.GRANT_KEYS.includes(key)) {
+    die(`pidge terminal config: unknown setting ${JSON.stringify(key)} — one of: ${core.GRANT_KEYS.join(', ')}\n` +
+      `  usage: pidge terminal config [${core.GRANT_KEYS.join('|')}] [on|off]`);
+  }
+  if (value !== 'on' && value !== 'off') {
+    die(`pidge terminal config ${key}: pass \`on\` or \`off\` (got ${JSON.stringify(value || '')}).\n` +
+      `  current: ${core.grantLines()[core.GRANT_KEYS.indexOf(key)]}`);
+  }
+  core.saveGrants({ [key]: value === 'on' });
+  say(`✓ ${core.grantLines()[core.GRANT_KEYS.indexOf(key)]}`);
+  // Tell the running daemon so the phone's capabilities frame is refreshed
+  // now instead of on the next viewer join. Best-effort: the grant is already
+  // durable on disk, and the daemon re-reads it on every use.
+  try {
+    const { res } = await daemonCall('POST', '/caps', {});
+    if (res.status === 200) say('· the running daemon re-published its capabilities to your phone');
+  } catch {
+    say('· the daemon is not running — it picks this up when it starts');
+  }
+}
+
+// --- share: the terminal-side capture door (v2 §17) -------------------------
+//
+// Typed by a HUMAN inside the pane they want to share. A real shell HAS a
+// controlling tty (the ttyless problem is Claude-hook-specific, finding #7),
+// so the CLI can match its own tty against `#{pane_tty}` and hand the daemon
+// an exact pane id — no guessing, ever.
+function currentTty() {
+  try {
+    const out = execFileSync('ps', ['-o', 'tty=', '-p', String(process.pid)], { encoding: 'utf8' }).trim();
+    return core.normalizeTty(out);
+  } catch { return null; }
+}
+
+// `probe` exists for the TESTS and nothing else (the installDaemonService
+// pattern): a test runner's stdio is not a tty, so there would be no way to
+// exercise the tty→pane match at all. Production always reads the real tty.
+async function runShare(probe = {}) {
+  if (!(await daemonAlive())) die('pidge terminal share: the local daemon is not running — run `pidge terminal connect` (or `pidge terminal daemon` in another shell) first');
+  const tty = probe.tty || currentTty();
+  if (!tty) {
+    die('pidge terminal share: this shell has no controlling tty, so it cannot be matched to a tmux pane.\n' +
+      'Run it by hand INSIDE the tmux pane you want to share (it is not meant for scripts, hooks or CI).');
+  }
+  if (!process.env.TMUX) {
+    die(`pidge terminal share: you are not inside tmux (no $TMUX for tty ${tty}).\n` +
+      'Start tmux, open the pane you want on your phone, and run this there.');
+  }
+  let pane;
+  try {
+    pane = core.tmuxPaneForTty(tty, { onWarn: (m) => console.error(m) });
+  } catch (e) {
+    // #68: a pane list this computer cannot PARSE is a pidge-side failure —
+    // it must never be reported as "you are not in tmux".
+    die(`pidge terminal share: the tmux pane list came back mangled (${e.message}).\n` +
+      'That is a pidge/tmux problem on this computer, NOT your setup — see ' + core.LOG_FILE());
+  }
+  if (!pane) {
+    die(`pidge terminal share: no tmux pane owns this shell's tty (${tty}).\n` +
+      'Run it inside the pane you want to share.');
+  }
+  const { data } = await daemonCall('POST', '/share', { pane_id: pane.paneId });
+  if (!data || !data.ok) {
+    die(`pidge terminal share: ${(data && data.error) || 'the daemon refused the share'}`);
+  }
+  say(`✓ sharing pane ${data.pane_id}${data.loc ? ` (${data.loc})` : ''} → ${data.public_id} [${data.mode}]`);
+  say('  It shows up in the Pidge app under this computer. `pidge terminal disable --all` stops sharing.');
+}
+
 // --- status / disable / disconnect ------------------------------------------
 
 // The input lane, said out loud (QA r6-3.2). `daemon: up` used to be the whole
@@ -741,11 +827,19 @@ async function runStatus() {
   const health = await daemonAlive();
   say(`daemon:   ${health ? `up (epoch ${health.epoch})` : 'DOWN'}`);
   if (health && health.cable) say(`cable:    ${cableLine(health.cable)}`);
+  // Reported per LANE (#72): the input lane can be perfectly up while the
+  // COMPUTER subscription — presence, capabilities, the pane inventory — was
+  // rejected. `computer` is absent on a pre-0.43 daemon; absence prints nothing.
+  if (health && health.cable && health.cable.computer !== undefined) {
+    say(`computer: ${health.cable.computer
+      ? 'lane confirmed — your phone sees this computer'
+      : 'lane NOT confirmed — your phone shows it offline and cannot list or spawn panes'}`);
+  }
   if (health) {
     const { data } = await daemonCall('GET', '/sessions');
     const en = data.enabled || [];
     const announced = (data.announces || []).length;
-    say(`sessions: ${en.length} shared${en.length ? ' — ' + en.map((e) => `${e.sid.slice(0, 8)} (${e.status})`).join(', ') : ''}`);
+    say(`shares:   ${en.length}${en.length ? ' — ' + en.map((e) => `${e.public_id || e.sid} ${e.pane_id || ''} [${e.mode || 'agent'}] (${e.status})`).join(', ') : ''}`);
     say(`announced: ${announced} (local only, not shared)`);
     // The announce map is diagnostics, never a picker: a session can only be
     // shared from INSIDE itself, so this points at the prompt, not at a list.
@@ -764,6 +858,8 @@ async function runStatus() {
     hooksLine = 'UNKNOWN — the file is not valid JSON (pidge will not rewrite it)';
   }
   say(`hooks:    ${hooksLine} (~/.claude/settings.json)`);
+  say('grants:');
+  for (const line of core.grantLines()) say(`  ${line}`);
 }
 
 // The local stop ALWAYS happens (publishing ends, the session leaves state) —
@@ -815,13 +911,15 @@ async function runDisconnect() {
 
 // --- dispatcher --------------------------------------------------------------
 
-async function runTerminal(sub, v) {
+async function runTerminal(sub, v, args = []) {
   switch (sub) {
     case 'connect': return runConnect(v);
     case 'enable': return runEnable(v);
     case 'status': return runStatus();
     case 'disable': return runDisable(v);
     case 'disconnect': return runDisconnect();
+    case 'config': return runConfig(args);
+    case 'share': return runShare(v && v._probe ? v._probe : {});
     case 'daemon': {
       const { Daemon } = require('./daemon');
       const d = new Daemon();
@@ -831,12 +929,13 @@ async function runTerminal(sub, v) {
       // `ls` (the session picker) was REMOVED with the enable lock-down: it is
       // not deprecated-but-tolerated, it is gone — sharing happens only from
       // inside the session, so a list of other people's sessions is not a door.
-      die(`pidge terminal: unknown subcommand ${JSON.stringify(sub || '')} — one of: connect, enable, disable, status, disconnect, daemon`);
+      die(`pidge terminal: unknown subcommand ${JSON.stringify(sub || '')} — one of: connect, share, config, enable, disable, status, disconnect, daemon`);
   }
 }
 
 module.exports = {
-  runTerminal, installHooks, uninstallHooks, hookShimSource, PIDGE_HOOK_MARKER,
+  runTerminal, runConfig, runShare, currentTty,
+  installHooks, uninstallHooks, hookShimSource, PIDGE_HOOK_MARKER,
   installDaemonService, uninstallDaemonService, launchdPlistPath, systemdUnitPath,
   copyCliToStablePath, stableCliDir, stableCliEntry, installPidgeSkill,
   shutdownLocalDaemon,
