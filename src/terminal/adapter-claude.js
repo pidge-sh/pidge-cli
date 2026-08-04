@@ -48,12 +48,35 @@ function byteLen(s) { return Buffer.byteLength(s, 'utf8'); }
 // whole trimmed content is a sequence of well-formed plumbing-tag spans (plus
 // whitespace). A legitimate message that merely MENTIONS one of these tags has
 // other text around them and is kept verbatim.
-const PLUMBING_SPAN = /<(command-name|command-message|command-args|local-command-caveat|local-command-stdout)>[\s\S]*?<\/\1>/g;
+const PLUMBING_SPAN = /<(command-name|command-message|command-args|local-command-caveat|local-command-stdout)>([\s\S]*?)<\/\1>/g;
 function isSlashCommandPlumbing(text) {
   const t = String(text || '').trim();
   if (!t.startsWith('<')) return false; // cheap out — plumbing records open with a tag
   const stripped = t.replace(PLUMBING_SPAN, '');
   return stripped !== t && stripped.trim() === '';
+}
+
+// EMPTY plumbing (QA r7-2): the same scaffolding also arrives as a SYSTEM
+// record — Claude Code emits a slash command's stdout as
+//   {"type":"system","subtype":"local_command","content":"<local-command-stdout></local-command-stdout>"}
+// which fell through to the notice fallback below, so every /clear left one
+// gray line of raw XML in the transcript (r6-4 was only half-fixed: the purple
+// user bubbles went, this one stayed).
+//
+// The system branch may NOT reuse isSlashCommandPlumbing as-is. That predicate
+// drops a span whatever it wraps, which is right for USER records (the content
+// is misattributed to the human either way) and wrong here: a system record
+// carrying REAL stdout is real session content, and §7 says content never
+// vanishes silently. So the system branch drops only spans that wrap NOTHING —
+// scaffolding with zero information. '<local-command-stdout>done</…>' as a
+// system record stays a notice.
+function isEmptySlashCommandPlumbing(text) {
+  const t = String(text || '').trim();
+  if (!isSlashCommandPlumbing(t)) return false;
+  // A fresh regex per call: PLUMBING_SPAN is /g and shared, and exec/matchAll
+  // carry lastIndex across calls.
+  const spans = [...t.matchAll(new RegExp(PLUMBING_SPAN.source, 'g'))];
+  return spans.length > 0 && spans.every((m) => m[2].trim() === '');
 }
 
 // Cut a string to at most `bytes` UTF-8 bytes without splitting a code point.
@@ -104,6 +127,9 @@ function normalize(obj) {
     if (['stop_hook_summary', 'turn_duration'].includes(obj.subtype) && !obj.content) return [];
     const txt = String(obj.content || obj.stopReason || obj.subtype || '');
     if (!txt) return [];
+    // Slash-command stdout with nothing in it (QA r7-2) — see
+    // isEmptySlashCommandPlumbing: empty spans are dropped, real stdout is not.
+    if (isEmptySlashCommandPlumbing(txt)) return [];
     return [mk(base, 'system', 'notice', txt)];
   }
   if (t !== 'user' && t !== 'assistant') {

@@ -253,6 +253,37 @@ test('normalize: slash-command plumbing never becomes a user bubble — but a me
   assert.equal(adapter.normalize(echo).length, 1);
 });
 
+test('normalize: EMPTY slash-command stdout is not a gray notice — real stdout still is (QA r7-2)', () => {
+  // Verbatim from the r7 transcript: what r6-4 left behind, one line per /clear.
+  assert.deepEqual(adapter.normalize({
+    type: 'system', subtype: 'local_command', uuid: 'u-lc', timestamp: 't',
+    content: '<local-command-stdout></local-command-stdout>',
+  }), [], 'empty stdout scaffolding carries no information — it must not reach the phone');
+
+  // §7 the other way: stdout that actually SAYS something stays visible.
+  const real = adapter.normalize({
+    type: 'system', subtype: 'local_command', uuid: 'u-lc2', timestamp: 't',
+    content: '<local-command-stdout>algo real</local-command-stdout>',
+  });
+  assert.equal(real.length, 1, 'real stdout is session content, not plumbing');
+  assert.equal(real[0].kind, 'notice');
+  assert.equal(real[0].role, 'system');
+  assert.equal(real[0].preview, '<local-command-stdout>algo real</local-command-stdout>');
+
+  // Content OUTSIDE the tags is content too — never structurally plumbing.
+  const around = adapter.normalize({
+    type: 'system', subtype: 'local_command', uuid: 'u-lc3',
+    content: 'stdout follows: <local-command-stdout></local-command-stdout> (nothing)',
+  });
+  assert.equal(around.length, 1);
+  assert.equal(around[0].preview, 'stdout follows: <local-command-stdout></local-command-stdout> (nothing)');
+
+  // The r6-1 guard is untouched: an unknown content-bearing subtype is a notice.
+  const unknown = adapter.normalize({ type: 'system', subtype: 'brand_new_thing', uuid: 'u-lc4', content: 'something odd' });
+  assert.equal(unknown.length, 1);
+  assert.equal(unknown[0].preview, 'something odd');
+});
+
 test('normalize: preview is capped with honest truncated/total_bytes', () => {
   const text = 'a'.repeat(5000);
   const [item] = adapter.normalize({
