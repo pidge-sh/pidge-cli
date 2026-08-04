@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.43.0 — 2026-08-04
+
+**Terminals v2, Phase A: the unit is a PANE.** A share stops being a Claude
+session and becomes a tmux pane — when claude starts in (or exits from) a shared
+pane the share stays, same row and same history, and only the view switches.
+Requires a server at manifest v102. (0.42.0–0.42.2 shipped as QA rounds r3/r4,
+r6 and r7 with no changelog entry of their own.)
+
+- **`pidge terminal share`** — typed INSIDE any tmux pane, shares that pane with
+  the phone. It matches its own controlling tty against `#{pane_tty}`, so there
+  is no picker and no guessing; a pane list this computer cannot parse is
+  reported as a **pidge-side failure**, never as "you are not in tmux".
+- **`pidge terminal config remote_spawn|inventory on|off`** — what your phone may
+  do to this computer, granted **on the machine where the risk lives**.
+  `remote_spawn` defaults **OFF**, `inventory` **ON**; `connect` and `status`
+  print both in plain words, and they ride every capabilities frame so the app
+  renders only what was actually granted. Typing into a pane you already shared
+  needs no grant — the share IS the consent.
+- **The computer lane.** While this computer is connected the daemon holds ONE
+  always-on cable socket carrying a `ComputerChannel` subscription (presence
+  beat every 30 s, sealed capabilities + on-demand pane inventory) — your phone
+  sees the computer online with **zero shared panes**. The inventory is gathered
+  on demand, sealed end-to-end, size-capped and **never stored**.
+- **Commands from the phone** ride the durable message queue (sealed under the
+  `computer_cmd` lane, at-least-once + exactly-once effects): spawn a pane
+  (optionally running claude), capture a pane, end a share. Every outcome is
+  narrated — a refused spawn says exactly which line on this machine opens it.
+- **Per-share identity.** New shares mint `ases_<uuid>`; the harness session id
+  moves inside the sealed metadata where an occupant attribute belongs. Existing
+  shares keep their id **byte-verbatim, forever** (it is the AAD anchor of every
+  item already sealed): `state.json` migrates in place to `schema: 2` and
+  re-derives nothing.
+- `status` now reports **per lane** — `computer:` says whether your phone really
+  sees this computer, and `shares:` replaces `sessions:` with public id, pane and
+  mode.
+
 ## 0.41.0 — 2026-08-03
 
 **Agent Sessions: the enable door is rebuilt, and pairing actually works.** The
