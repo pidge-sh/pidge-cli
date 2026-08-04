@@ -81,6 +81,11 @@ function createMock() {
     // the caller asked (continuity=true). null ⇒ omitted, models an OLD server —
     // the CLI's batch/listen output is then byte-identical to before.
     continuityContexts: null,
+    // Agent sessions / pane shares (manifest v102 — see the handler below).
+    agentSessions: {},            // public_id → row
+    agentSessionWrites: [],       // {method, public_id, body} in order — assert `mode` on the wire
+    agentSessionItems: [],        // {public_id, seq, payload_sealed} in order
+    agentSessionNotifyOnWaiting: false, // the register echo a daemon learns §9 from
   };
   let server = null;
   let wss = null;
@@ -497,6 +502,90 @@ function createMock() {
     if (req.method === 'GET' && url.pathname === '/api/v1/runs/active') {
       if (!state.runsSupported) return json(res, 404, { error: 'not_found' });
       return json(res, 200, { runs: state.activeRuns || [] });
+    }
+    // --- agent sessions / PANE SHARES (server manifest v102) ----------------
+    // Modelled on the real endpoint, verb for verb: upsert by public_id,
+    // `mode` ABSENT means unchanged, the item append is
+    // strictly-monotonic-or-422(seq_regression), and an ended row answers 404.
+    // The daemon's grandfathered `ases_<sid>` ids and its freshly minted
+    // `ases_<uuid>` ones are the same thing here — which is exactly what the
+    // downgrade/grandfather cross-wire test needs to prove.
+    const asesJson = (row) => ({
+      public_id: row.public_id, status: row.status, mode: row.mode,
+      last_seen_at: new Date().toISOString(), last_seq: row.last_seq,
+      notify_on_waiting: row.notify_on_waiting, meta_sealed: row.meta_sealed,
+      created_at: row.created_at, updated_at: new Date().toISOString(),
+    });
+    const asesLive = (publicId) => {
+      const row = state.agentSessions[publicId];
+      return row && !row.ended ? row : null;
+    };
+    const readBody = (cb) => {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => { let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ } cb(p); });
+    };
+    if (req.method === 'POST' && url.pathname === '/api/v1/agent_sessions') {
+      return readBody((p) => {
+        const publicId = String(p.public_id || '');
+        if (!/^ases_[a-z0-9-]{1,64}$/.test(publicId)) {
+          return json(res, 422, { error: 'invalid public_id', code: 'invalid_public_id' });
+        }
+        if (p.mode !== undefined && !['agent', 'term'].includes(p.mode)) {
+          return json(res, 422, { error: 'invalid mode', code: 'invalid_mode' });
+        }
+        const row = state.agentSessions[publicId] || (state.agentSessions[publicId] = {
+          public_id: publicId, status: 'idle', mode: 'agent', last_seq: 0,
+          notify_on_waiting: state.agentSessionNotifyOnWaiting, meta_sealed: null,
+          created_at: new Date().toISOString(), ended: false,
+        });
+        row.ended = false; // a re-POST REVIVES (the server's documented behavior)
+        row.status = p.status || row.status;
+        if (p.meta_sealed) row.meta_sealed = p.meta_sealed;
+        if (p.mode !== undefined) row.mode = p.mode; // absent ⇒ unchanged
+        state.agentSessionWrites.push({ method: 'POST', public_id: publicId, body: p });
+        return json(res, 201, { session: asesJson(row) });
+      });
+    }
+    const asesMatch = url.pathname.match(/^\/api\/v1\/agent_sessions\/([^/]+)(\/items)?$/);
+    if (asesMatch) {
+      const publicId = decodeURIComponent(asesMatch[1]);
+      if (req.method === 'PATCH' && !asesMatch[2]) {
+        return readBody((p) => {
+          state.agentSessionWrites.push({ method: 'PATCH', public_id: publicId, body: p });
+          const row = asesLive(publicId);
+          if (!row) return json(res, 404, { error: 'not_found' });
+          if (p.mode !== undefined && !['agent', 'term'].includes(p.mode)) {
+            return json(res, 422, { error: 'invalid mode', code: 'invalid_mode' });
+          }
+          if (p.status) row.status = p.status;
+          if (p.meta_sealed) row.meta_sealed = p.meta_sealed;
+          if (p.mode !== undefined) row.mode = p.mode;
+          return json(res, 200, { session: asesJson(row) });
+        });
+      }
+      if (req.method === 'POST' && asesMatch[2]) {
+        return readBody((p) => {
+          const row = asesLive(publicId);
+          if (!row) return json(res, 404, { error: 'not_found' });
+          const items = Array.isArray(p.items) ? p.items : [];
+          if (!items.length) return json(res, 422, { error: 'invalid items', code: 'invalid_items' });
+          if (items[0].seq <= row.last_seq) {
+            return json(res, 422, { error: `seq must be strictly above ${row.last_seq}`, code: 'seq_regression' });
+          }
+          for (const it of items) state.agentSessionItems.push({ public_id: publicId, ...it });
+          row.last_seq = items[items.length - 1].seq;
+          return json(res, 201, { accepted: items.length, last_seq: row.last_seq });
+        });
+      }
+      if (req.method === 'DELETE' && !asesMatch[2]) {
+        const row = state.agentSessions[publicId];
+        state.agentSessionWrites.push({ method: 'DELETE', public_id: publicId, body: null });
+        if (!row) return json(res, 404, { error: 'not_found' });
+        row.ended = true;
+        row.status = 'ended';
+        return json(res, 200, { ended: true, public_id: publicId });
+      }
     }
     const stMatch = url.pathname.match(/^\/api\/v1\/selftest\/(\d+)$/);
     if (req.method === 'GET' && stMatch) {

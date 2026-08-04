@@ -29,7 +29,12 @@ const adapter = require('./adapter-claude');
 const HOOK_TTL_MS = 24 * 3600 * 1000;   // announce map entries age out (spec §2)
 const TAIL_POLL_MS = 400;
 const FLUSH_MS = 500;
-const HEARTBEAT_MS = 30_000;
+// One clock for both beats: the per-session heartbeat AND the computer presence
+// beat §17 pins at 30 s (the server's effective-online window is 90 s and its
+// write throttle 15 s — three beats of headroom). core.COMPUTER_HEARTBEAT_MS is
+// the same number stated where the wire contract lives; a test asserts they
+// never drift apart.
+const HEARTBEAT_MS = core.COMPUTER_HEARTBEAT_MS;
 const WATCHDOG_MS = 15_000;
 // Cable liveness (B7, REVISED per QA r6-3 — a real 4 h outage): ActionCable
 // pings every ~3 s, so 45 s of silence is a dead socket that doesn't know it.
@@ -66,10 +71,19 @@ const INPUT_KEYS = new Set(['Enter', 'Escape', 'Up', 'Down', 'Tab', 'BTab', 'C-c
 const DEFINITIVE_REGISTER_STATUSES = new Set([401, 403, 404, 410]);
 
 // --- v2 (Terminals Phase A) --------------------------------------------------
-// state.json schema version. v1 keyed a share by the harness session id and
-// derived its public_id from it; v2 makes the SHARE the identity (spec §16).
-// The migration is in-place and GRANDFATHERS every existing public_id
-// byte-verbatim — it is the AAD anchor of every item already sealed.
+// state.json schema version, stamped as `schema`. v1 (no stamp) keyed a share
+// by the harness session id and derived its public_id from it; v2 makes the
+// SHARE the identity (spec §16). The migration is in-place, ONE-WAY and
+// GRANDFATHERS every existing public_id byte-verbatim — it is the AAD anchor of
+// every item already sealed.
+//
+// DOWNGRADE (measured, not assumed — see the test "a 0.42.x CLI re-opening a
+// schema:2 state file"): a v1 daemon reading this file does NOT refuse. It
+// ignores the keys it does not know (`schema`, `share_id`, `current_sid`,
+// `occupant`, `cmdIds`) and re-arms each entry from `publicId` exactly as
+// before. That is WHY every v1 key stays spelled the way v1 spells it and why
+// `publicId` is still written next to `share_id`: the old code path is a real
+// consumer of this file, and it must find what it reads.
 const STATE_VERSION = 2;
 // The computer's own cable subscription — NO params: the tunnel key IS the
 // identity (server: ComputerChannel#resolve_computer rejects anything else).
@@ -84,6 +98,10 @@ const VIEWER_JOINED_DEBOUNCE_MS = 2_000;
 // queue that holds rows this daemon must NOT consume would make a long-poll
 // return instantly, forever (a hot loop).
 const DRAIN_POLL_MS = 15_000;
+// …and the floor between cable-triggered drains (today: a viewer joining). The
+// nudge that triggers one is UNSEALED and forgeable-innocuous by contract, so
+// the worst a hostile relay may buy with it is one GET /messages per floor.
+const DRAIN_KICK_FLOOR_MS = 2_000;
 // Commands whose outcome is durable on this computer (a spawned pane) must not
 // be re-run when an ack is lost (#39 is at-least-once) — the handled ids ride
 // state.json, bounded.
@@ -116,15 +134,15 @@ class Daemon {
     }
     this.key = core.e2eParseSecret(this.env.secret);
     this.caps = core.loadCaps();
-    this.state = core.readJson(core.STATE_FILE(), { v: STATE_VERSION, epoch: 0, sessions: {} });
+    this.state = core.readJson(core.STATE_FILE(), { schema: STATE_VERSION, epoch: 0, sessions: {} });
     // Durable commands already executed (at-least-once ⇒ exactly-once
     // effects). Read BEFORE the first saveState — it re-writes the ring.
     this.handledCmdIds = new Set((this.state.cmdIds || []).map(Number).filter(Number.isFinite));
     // v1 → v2, IN PLACE (spec §16). Everything below is additive: `publicId`
-    // is copied to `shareId` BYTE-VERBATIM (it is the AAD anchor of every item
+    // is copied to `share_id` BYTE-VERBATIM (it is the AAD anchor of every item
     // this computer already sealed — it can never change, not once, not ever)
     // and the harness session id the share was named after becomes
-    // `currentSid`, an attribute of the CURRENT OCCUPANT. No server call, no
+    // `current_sid`, an attribute of the CURRENT OCCUPANT. No server call, no
     // transcript re-publish, seq continues.
     const migrated = this.migrateState();
     // Tunnel scoping (QA finding #13): state.json used to persist sessions
@@ -146,7 +164,7 @@ class Daemon {
     this.state.epoch = (this.state.epoch || 0) + 1; // new epoch per process (B4)
     this.saveState();
     if (migrated.length) {
-      this.log(`state.json migrated to schema v${STATE_VERSION}: ${migrated.length} share(s) kept their public_id VERBATIM (${migrated.map((m) => m.publicId).join(', ')}) — the id is the AAD anchor of everything already sealed; the harness session id moved to currentSid`);
+      this.log(`state.json migrated to schema ${STATE_VERSION}: ${migrated.length} share(s) kept their public_id VERBATIM (${migrated.map((m) => m.publicId).join(', ')}) — the id is the AAD anchor of everything already sealed; the harness session id moved to current_sid`);
     }
     for (const f of foreign) {
       this.log(`session ${String(f.sid).slice(0, 8)} belongs to ${f.channelId ? `channel ${f.channelId}` : 'an UNKNOWN channel (pre-scoping state)'}, not the connected channel ${this.env.channelId} — DROPPED from state (a connect that switches tunnels inherits no sessions; metadata never re-seals under another owner's key)`);
@@ -190,26 +208,34 @@ class Daemon {
     this.lastOccupantAt = 0;          // occupant poll throttle
     this.draining = false;            // one durable-command drain at a time
     this.drainWarnedAt = 0;
+    this.lastKickAt = 0;              // floor between cable-triggered drains
     this.foreignMsgIds = new Set();   // queue rows that are NOT ours: logged once, never acked
     this.logStream = null;
     this.exit = (code) => process.exit(code); // injectable for tests (POST /shutdown)
   }
 
-  // v1 → v2 state migration (spec §16). Returns the migrated entries so the
-  // constructor can narrate them; a state file already at v2 is untouched.
+  // v1 → v2 state migration (spec §16), ONE-WAY and in place: the constructor's
+  // saveState() below writes it back through the same writeFileAtomic every
+  // other state write uses. Returns the migrated entries so the constructor can
+  // narrate them; a file already stamped `schema: 2` is untouched.
+  //
+  // The two new per-entry keys are spelled the way the WIRE spells things
+  // (`share_id`, `current_sid`) while every v1 key keeps its v1 spelling
+  // forever — a downgraded 0.42.x daemon still reads `publicId`/`paneId`/… out
+  // of this exact file (see STATE_VERSION).
   migrateState() {
-    if (Number(this.state.v || 1) >= STATE_VERSION) { this.state.v = STATE_VERSION; return []; }
+    if (Number(this.state.schema || 1) >= STATE_VERSION) { this.state.schema = STATE_VERSION; return []; }
     const migrated = [];
     for (const [sid, p] of Object.entries(this.state.sessions || {})) {
       if (!p || typeof p !== 'object' || !p.publicId) continue;
       // GRANDFATHERED FOREVER — never re-derive, never re-mint.
-      if (!p.shareId) p.shareId = p.publicId;
-      if (p.currentSid === undefined) p.currentSid = sid;
+      if (!p.share_id) p.share_id = p.publicId;
+      if (p.current_sid === undefined) p.current_sid = sid;
       // Every v1 share was a harness session by construction.
       if (!p.occupant) p.occupant = 'agent';
       migrated.push({ sid, publicId: p.publicId });
     }
-    this.state.v = STATE_VERSION;
+    this.state.schema = STATE_VERSION;
     return migrated;
   }
 
@@ -226,7 +252,7 @@ class Daemon {
     const sessions = {};
     for (const [sid, s] of Object.entries(this.state.sessions || {})) sessions[sid] = s;
     core.writeJson(core.STATE_FILE(), {
-      v: STATE_VERSION, epoch: this.state.epoch, sessions,
+      schema: STATE_VERSION, epoch: this.state.epoch, sessions,
       // The durable-command dedup ring: a spawn whose ack was lost must not
       // open a second window after a restart.
       cmdIds: [...this.handledCmdIds].slice(-CMD_SEEN_RING),
@@ -931,13 +957,15 @@ class Daemon {
 
   persistSession(s) {
     this.state.sessions[s.sid] = {
+      // v1's key, kept forever: a downgraded 0.42.x daemon re-arms from THIS
+      // field (see STATE_VERSION — the downgrade is silent, not a refusal).
       publicId: s.publicId,
       // v2 (spec §16): the share identity and the CURRENT occupant, side by
-      // side. `shareId` is `publicId` verbatim — the duplication is the
+      // side. `share_id` is `publicId` verbatim — the duplication is the
       // migration contract (a grandfathered id must be readable as a share id
       // without deriving anything).
-      shareId: s.publicId,
-      currentSid: s.currentSid !== undefined ? s.currentSid : s.sid,
+      share_id: s.publicId,
+      current_sid: s.currentSid !== undefined ? s.currentSid : s.sid,
       occupant: s.occupant || 'agent',
       harness: s.harness || 'claude',
       paneId: s.paneId, tty: s.tty, cwd: s.cwd,
@@ -1014,9 +1042,9 @@ class Daemon {
       const outbox = (p.outbox || []).filter((e) => e && typeof e.sealed === 'string');
       const session = {
         sid, publicId: p.publicId, paneId: p.paneId, tty: p.tty, cwd: p.cwd,
-        // A migrated v1 entry carries currentSid = its old sid (see
+        // A migrated v1 entry carries current_sid = its old sid (see
         // migrateState); a v2 term share carries null.
-        currentSid: p.currentSid !== undefined ? p.currentSid : sid,
+        currentSid: p.current_sid !== undefined ? p.current_sid : sid,
         occupant: p.occupant || 'agent',
         harness: p.harness || 'claude',
         file: p.file, offset: p.offset || 0,
@@ -1839,11 +1867,20 @@ class Daemon {
     return sent;
   }
 
-  // The capabilities frame (PINNED shape — iOS builds against it).
+  // The capabilities frame (PINNED shape — iOS builds against it, spec §17):
+  // {kind:"caps", epoch, remote_spawn, inventory, hostname, os}.
+  //
+  // `epoch` is MANDATORY and it is the reason this frame is re-published on
+  // every viewer_joined: with ZERO shared panes there is no agent_meta anywhere
+  // for the viewer to learn the daemon epoch from, and "paired computer, zero
+  // panes, spawn from bed" is the Phase-A target flow. The caps frame IS the
+  // viewer's epoch source, so a fresh one must always precede the first sealed
+  // computer_req (whose `he` this daemon checks against exactly this number).
   capsPayload() {
     const grants = core.loadGrants();
     return {
       kind: 'caps',
+      epoch: this.state.epoch,
       remote_spawn: grants.remote_spawn,
       inventory: grants.inventory,
       hostname: os.hostname(),
@@ -1860,12 +1897,30 @@ class Daemon {
   // (or one reconnecting phone) cannot turn it into a frame storm.
   onViewerJoined() {
     this.lastViewerJoinAt = Date.now();
+    // A viewer is LOOKING: anything it queued while this daemon was busy (or
+    // down) should not wait out the poll interval. The cable is the wake-up,
+    // the queue stays the ledger (#39) — see kickDrain.
+    this.kickDrain('a viewer joined');
     if (this.capsTimer) return; // a publish is already coming for this burst
     this.capsTimer = setTimeout(() => {
       this.capsTimer = null;
       this.publishCaps('a viewer joined');
     }, this.viewerDebounceMs);
     if (this.capsTimer.unref) this.capsTimer.unref();
+  }
+
+  // The only wake-up the Phase-A wire offers. The ComputerChannel carries NO
+  // "a command is waiting" frame (verified against
+  // server/app/channels/computer_channel.rb — it relays request/meta and
+  // touches presence, nothing else), so DRAIN_POLL_MS remains the mechanism;
+  // this just makes the daemon hot exactly while a human is interacting with
+  // it. Floored so a nudge storm can never become a GET /messages storm.
+  kickDrain(why) {
+    const now = Date.now();
+    if (now - (this.lastKickAt || 0) < DRAIN_KICK_FLOOR_MS) return;
+    this.lastKickAt = now;
+    this.log(`draining the command queue now — ${why}`);
+    this.drainTick();
   }
 
   // viewer→daemon, sealed under the `computer_req` lane. The op set is CLOSED:
@@ -1923,13 +1978,19 @@ class Daemon {
       this.publishCaps('the pane list could not be read');
       return;
     }
-    const rows = panes.map((p) => ({
-      pane_id: p.paneId,
-      cwd: p.path || null,
-      loc: p.loc || null,
-      current_command: p.cmd || null,
-      shared: !!this.shareForPaneId(p.paneId),
-    }));
+    // `shared` is the share's PUBLIC_ID or null (§17) — never a bool: the
+    // picker gets "already shared → open that pane" deep-linking for free, and
+    // a bool would make the phone ask a second question to do anything with it.
+    const rows = panes.map((p) => {
+      const share = this.shareForPaneId(p.paneId);
+      return {
+        pane_id: p.paneId,
+        cwd: p.path || null,
+        loc: p.loc || null,
+        current_command: p.cmd || null,
+        shared: share ? share.publicId : null,
+      };
+    });
     this.publishInventory(rows);
   }
 
@@ -2496,4 +2557,6 @@ function stripPrivate(item) {
   return rest;
 }
 
-module.exports = { Daemon };
+// The cadences are exported for the tests: §17 pins the presence beat at 30 s
+// and the server's online window at 90 s, so a drift here is a wire bug.
+module.exports = { Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_KICK_FLOOR_MS };

@@ -29,7 +29,7 @@ if (os.homedir() !== process.env.HOME || os.homedir() === REAL_HOME) {
 const core = require('../src/terminal/core');
 const adapter = require('../src/terminal/adapter-claude');
 const commands = require('../src/terminal/commands');
-const { Daemon } = require('../src/terminal/daemon');
+const { Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_KICK_FLOOR_MS } = require('../src/terminal/daemon');
 
 // A fresh config slot per test that writes one — terminalDir() reads the env
 // at call time, so reassigning is enough.
@@ -1930,8 +1930,8 @@ test('sentinel: the PreToolUse hook enables the announced session and DENIES the
   assert.equal(s.occupant, 'agent');
   const persisted = core.readJson(core.STATE_FILE(), {}).sessions['sess-hook'];
   assert.ok(persisted, 'and persisted, like any share');
-  assert.equal(persisted.shareId, s.publicId);
-  assert.equal(persisted.currentSid, 'sess-hook');
+  assert.equal(persisted.share_id, s.publicId);
+  assert.equal(persisted.current_sid, 'sess-hook');
 
   // …and the tool is DENIED, carrying the outcome as its reason: the bash never
   // runs, so `pidge` need not exist on this machine (QA finding #8).
@@ -3042,8 +3042,31 @@ async function withTmuxAsync({ panes = [], exec }, fn) {
   }
 }
 const pane = (id, over = {}) => ({ paneId: id, tty: `/dev/ttys00${id.slice(1)}`, path: '/tmp/proj', cmd: 'zsh', loc: `main:0.${id.slice(1)}`, ...over });
+// Wait for a condition instead of a fixed sleep — the fire-and-forget PATCHes
+// and the cable round trips are asynchronous by design.
+async function waitFor(cond, ms = 3000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (cond()) return true;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return false;
+}
 
 // --- the state migration: a grandfathered id is FOREVER --------------------
+
+// The constructor narrates the migration BEFORE a test can swap `log`, so the
+// only way to assert on it is to capture console.log across the construction.
+function newDaemonCapturingLog() {
+  const lines = [];
+  const real = console.log;
+  console.log = (m) => lines.push(String(m));
+  let d;
+  try { d = new Daemon(); } finally { console.log = real; }
+  d.logLines = lines;
+  d.log = (...a) => { d.logLines.push(a.join(' ')); };
+  return d;
+}
 
 test('state v1 → v2 migrates IN PLACE and keeps every public_id byte-verbatim', () => {
   freshXdg();
@@ -3061,16 +3084,15 @@ test('state v1 → v2 migrates IN PLACE and keeps every public_id byte-verbatim'
     },
   });
 
-  const d = new Daemon();
-  d.logLines = [];
-  d.log = (...a) => { d.logLines.push(a.join(' ')); };
+  const d = newDaemonCapturingLog();
+  assert.ok(d.logLines.some((l) => /migrated to schema 2/.test(l)), JSON.stringify(d.logLines));
   const st = core.readJson(core.STATE_FILE(), {});
   const row = st.sessions['sess-legacy-1'];
 
-  assert.equal(st.v, 2, 'the schema version is bumped');
+  assert.equal(st.schema, 2, 'the schema version is stamped');
   assert.equal(row.publicId, 'ases_sess-legacy-1', 'the id the transcript was sealed under NEVER changes');
-  assert.equal(row.shareId, 'ases_sess-legacy-1', 'share_id is the SAME string, not a re-mint');
-  assert.equal(row.currentSid, 'sess-legacy-1', 'the harness sid becomes an attribute of the occupant');
+  assert.equal(row.share_id, 'ases_sess-legacy-1', 'share_id is the SAME string, not a re-mint');
+  assert.equal(row.current_sid, 'sess-legacy-1', 'the harness sid becomes an attribute of the occupant');
   assert.equal(row.occupant, 'agent', 'every v1 share was a harness session by construction');
   assert.equal(row.nextSeq, 9, 'seq continues — the migration touches no counter');
   assert.equal(row.offset, 12);
@@ -3083,11 +3105,73 @@ test('state v1 → v2 migrates IN PLACE and keeps every public_id byte-verbatim'
   assert.equal(meta.sid, 'sess-legacy-1', 'the sid still rides INSIDE the sealed blob');
 
   // Re-opening an already-migrated file is a no-op, not a second migration.
-  const d2 = new Daemon();
-  d2.logLines = [];
-  d2.log = (...a) => { d2.logLines.push(a.join(' ')); };
+  const d2 = newDaemonCapturingLog();
   assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-legacy-1'].publicId, 'ases_sess-legacy-1');
   assert.ok(!d2.logLines.some((l) => /migrated to schema/.test(l)), 'a v2 file is not migrated twice');
+});
+
+// What a 0.42.x daemon DOES with a schema:2 file. Copied verbatim from
+// `git show 0a637f4:src/terminal/daemon.js` — the constructor's state read +
+// tunnel-scope drop + epoch bump + saveState, and rearmPersisted's per-entry
+// field reads. It is a replica on purpose: the point is to measure the OLD
+// code's behavior, and the old code is one commit away, not in this tree.
+function v1DaemonPass(channelId) {
+  const state = core.readJson(core.STATE_FILE(), { epoch: 0, sessions: {} });
+  const armed = [];
+  for (const [sid, p] of Object.entries(state.sessions || {})) {
+    if (!p || p.channelId !== channelId) { delete state.sessions[sid]; continue; }
+  }
+  state.epoch = (state.epoch || 0) + 1;
+  // v1's saveState: {epoch, sessions} and NOTHING else — no schema, no cmdIds.
+  const sessions = {};
+  for (const [sid, s] of Object.entries(state.sessions || {})) sessions[sid] = s;
+  core.writeJson(core.STATE_FILE(), { epoch: state.epoch, sessions });
+  for (const [sid, p] of Object.entries(state.sessions || {})) {
+    const outbox = (p.outbox || []).filter((e) => e && typeof e.sealed === 'string');
+    armed.push({
+      sid, publicId: p.publicId, paneId: p.paneId, tty: p.tty, cwd: p.cwd,
+      file: p.file, offset: p.offset || 0,
+      seen: [...(p.seen || [])], queue: outbox, nextSeq: p.nextSeq || 1,
+      approvals: p.approvals || [], lastAliveAt: p.lastAliveAt || 0, mode: p.mode || null,
+    });
+  }
+  return { state, armed };
+}
+
+test('DOWNGRADE: a 0.42.x CLI re-opening a schema:2 state file keeps every share — it tolerates, it does not refuse', async () => {
+  const d = readyDaemon(); // writes a schema:2 file for THIS channel
+  d.hookToken = 'local-test-token';
+  await withPanes({ byTty: () => ({ paneId: '%5' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-down', 'pidge terminal enable')));
+  const minted = d.sessions.get('sess-down').publicId;
+  const before = core.readJson(core.STATE_FILE(), {});
+  assert.equal(before.schema, 2);
+
+  // THE MEASUREMENT (this is why `publicId` is still written next to
+  // `share_id`): the old loader does NOT refuse a file from the future. It
+  // ignores the keys it does not know and re-arms from `publicId` — so the
+  // grandfathering rule is load-bearing in BOTH directions, and a v2 write
+  // that dropped `publicId` would silently un-share every pane on a downgrade.
+  let old;
+  assert.doesNotThrow(() => { old = v1DaemonPass(1); }, 'a v1 daemon must not choke on the newer file');
+  assert.equal(old.armed.length, 1, 'the share survives the downgrade');
+  assert.equal(old.armed[0].publicId, minted, 'byte-verbatim — it is the AAD anchor of every item already sealed');
+  assert.equal(old.armed[0].paneId, '%5');
+  assert.equal(old.armed[0].sid, 'sess-down');
+
+  // …and what the old daemon writes BACK: its saveState knows nothing about
+  // `schema`/`cmdIds`, so they are dropped. Re-upgrading therefore migrates a
+  // second time — which is safe precisely because the migration re-derives
+  // share_id from the SAME publicId instead of minting anything.
+  const rewritten = core.readJson(core.STATE_FILE(), {});
+  assert.equal(rewritten.schema, undefined, 'the old writer drops the stamp (measured, not assumed)');
+  assert.equal(rewritten.sessions['sess-down'].publicId, minted);
+
+  const up = newDaemonCapturingLog();
+  const remigrated = core.readJson(core.STATE_FILE(), {});
+  assert.equal(remigrated.schema, 2, 'the re-upgrade re-stamps');
+  assert.equal(remigrated.sessions['sess-down'].share_id, minted, 'and re-derives the SAME id — never a re-mint');
+  assert.ok(up.logLines.some((l) => /migrated to schema 2/.test(l)));
 });
 
 test('a NEW share mints its own uuid — two shares never collide, and the sid is not in the id', async () => {
@@ -3333,6 +3417,9 @@ test('the socket comes up with ZERO shared panes, and the FIRST subscribe is the
     .map((f) => openMetaFrame(d, JSON.parse(f.data).frame));
   assert.equal(caps.length, 1);
   assert.equal(caps[0].kind, 'caps');
+  // With zero shared panes this frame is the ONLY place a viewer can learn the
+  // epoch its first sealed request must echo.
+  assert.equal(caps[0].epoch, d.state.epoch);
 }));
 
 test('the watchdog insists on the COMPUTER subscription too — open+confirmed input is not a confirmed computer', () => withFakeWS(async () => {
@@ -3370,6 +3457,11 @@ test('the watchdog insists on the COMPUTER subscription too — open+confirmed i
 test('the daemon beats the computer presence every heartbeat — no payload, and never on a dead lane', async () => {
   const d = computerDaemon();
   d.api = async () => ({ res: { status: 200 }, data: {} });
+  // The CADENCE is the contract (§17): 30 s, against a 90 s effective-online
+  // window and a 15 s server-side write throttle. Beating slower would blink
+  // the phone's chip offline on a perfectly healthy computer.
+  assert.equal(HEARTBEAT_MS, 30_000);
+  assert.equal(HEARTBEAT_MS, core.COMPUTER_HEARTBEAT_MS, 'one number, stated in one place');
   await d.heartbeatTick();
   const beats = performsOf(d).filter((p) => p.data.action === 'heartbeat');
   assert.equal(beats.length, 1);
@@ -3384,12 +3476,20 @@ test('the daemon beats the computer presence every heartbeat — no payload, and
   assert.equal(performsOf(d).length, 0, 'an unconfirmed lane is never written to');
 });
 
-test('caps ride every capabilities frame and report the machine grants + os', () => {
+test('caps ride every capabilities frame and report the epoch, the machine grants + os', () => {
   const d = computerDaemon();
   assert.deepEqual(core.loadGrants(), { remote_spawn: false, inventory: true }, 'spawn OFF, inventory ON by default');
   d.publishCaps('test');
   const [caps] = metaFrames(d);
+  // The PINNED shape (§17) — iOS builds against exactly these keys.
+  assert.deepEqual(Object.keys(caps).sort(),
+    ['epoch', 'hostname', 'inventory', 'kind', 'os', 'remote_spawn']);
   assert.equal(caps.kind, 'caps');
+  // MANDATORY: with zero shared panes there is no agent_meta anywhere, so this
+  // frame is the viewer's ONLY source for the `he` its first computer_req must
+  // echo — and a request carrying any other number is dropped below.
+  assert.equal(caps.epoch, d.state.epoch);
+  assert.ok(Number.isInteger(caps.epoch) && caps.epoch > 0);
   assert.equal(caps.remote_spawn, false);
   assert.equal(caps.inventory, true);
   assert.equal(typeof caps.hostname, 'string');
@@ -3403,6 +3503,25 @@ test('caps ride every capabilities frame and report the machine grants + os', ()
   assert.equal(caps2.inventory, false);
 });
 
+test('a viewer joining also KICKS the command drain once — the cable is the wake-up, the queue stays the ledger', async () => {
+  const d = computerDaemon();
+  d.viewerDebounceMs = 20;
+  let drains = 0;
+  d.drainTick = () => { drains += 1; };
+  // The poll is the mechanism (the ComputerChannel carries no "a command is
+  // waiting" frame in Phase A); the nudge only makes the daemon hot while a
+  // human is actually looking.
+  assert.equal(DRAIN_POLL_MS, 15_000);
+  d.onViewerJoined();
+  assert.equal(drains, 1);
+  d.onViewerJoined();
+  d.onViewerJoined();
+  assert.equal(drains, 1, `a nudge burst is floored to one drain per ${DRAIN_KICK_FLOOR_MS}ms`);
+  d.lastKickAt = Date.now() - DRAIN_KICK_FLOOR_MS - 1;
+  d.onViewerJoined();
+  assert.equal(drains, 2, 'and past the floor it drains again');
+});
+
 test('a viewer_joined nudge republishes caps ONCE per burst (debounced)', async () => {
   const d = computerDaemon();
   d.viewerDebounceMs = 20;
@@ -3414,6 +3533,7 @@ test('a viewer_joined nudge republishes caps ONCE per burst (debounced)', async 
   const frames = metaFrames(d);
   assert.equal(frames.length, 1, `three nudges ⇒ one caps frame, got ${frames.length}`);
   assert.equal(frames[0].kind, 'caps');
+  assert.equal(frames[0].epoch, d.state.epoch, 'a fresh epoch always precedes the viewer\'s first request');
 });
 
 test('computer_req: a sealed inventory ask is answered with a sealed inventory frame', async () => {
@@ -3429,10 +3549,13 @@ test('computer_req: a sealed inventory ask is answered with a sealed inventory f
   const [inv] = metaFrames(d);
   assert.equal(inv.kind, 'inventory');
   assert.equal(inv.truncated, false);
+  // `shared` is the share's PUBLIC_ID or null — not a bool (§17): that is what
+  // gives the picker "already shared → open it" without a second round trip.
   assert.deepEqual(inv.panes, [
-    { pane_id: '%1', cwd: '/tmp/proj', loc: 'main:0.1', current_command: 'node', shared: true },
-    { pane_id: '%2', cwd: '/tmp/other', loc: 'main:1.0', current_command: 'zsh', shared: false },
+    { pane_id: '%1', cwd: '/tmp/proj', loc: 'main:0.1', current_command: 'node', shared: s.public_id },
+    { pane_id: '%2', cwd: '/tmp/other', loc: 'main:1.0', current_command: 'zsh', shared: null },
   ]);
+  assert.match(inv.panes[0].shared, /^ases_[0-9a-f-]{36}$/, 'a deep-linkable id, never a true');
   // Ephemeral by contract: nothing about the inventory may touch the disk.
   assert.ok(!JSON.stringify(core.readJson(core.STATE_FILE(), {})).includes('/tmp/other'),
     'the inventory is never persisted, not even incidentally');
@@ -3668,7 +3791,9 @@ test('the computer lane crosses the real cable: subscribe shape, request in, met
     assert.ok(metas.length >= 1, `expected a caps frame on the wire, got ${JSON.stringify(mock.state.performs)}`);
     assert.deepEqual(Object.keys(metas[0].data).sort(), ['action', 'frame']);
     assert.equal(metas[0].identifier, '{"channel":"ComputerChannel"}');
-    assert.equal(openMetaFrame(d, metas[0].data.frame).kind, 'caps');
+    const wireCaps = openMetaFrame(d, metas[0].data.frame);
+    assert.equal(wireCaps.kind, 'caps');
+    assert.equal(wireCaps.epoch, d.state.epoch, 'the epoch a viewer must echo, on the real wire');
     assert.ok(Buffer.byteLength(metas[0].data.frame, 'utf8') <= core.COMPUTER_META_MAX_BYTES);
 
     // Viewer → daemon, over the wire the server broadcasts on: {type:"request",
@@ -3691,6 +3816,86 @@ test('the computer lane crosses the real cable: subscribe shape, request in, met
     'a viewer joining gets a fresh capabilities frame');
   } finally {
     core.tmuxPanes = realPanes;
+    if (d.ws) { d.wsGen += 1; try { d.ws.close(); } catch { /* gone */ } }
+    await mock.stop();
+  }
+});
+
+// The upgrade nobody gets to redo: a share minted by 0.42.x (`ases_<sid>`)
+// against the v102 server. Its public_id is the AAD anchor of every item
+// already sealed AND the wire id the phone holds, so it must keep working with
+// no re-enable, no re-mint and no second registration under a new id.
+test('GRANDFATHERED across the wire: a v1 share keeps publishing items and taking input on the v102 server', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  freshXdg();
+  core.saveTerminalEnv({ base: `http://127.0.0.1:${port}`, token: 'hld_x', secret: SECRET, channelId: 1 });
+  core.writeJson(core.DAEMON_FILE(), { port: 41717, token: 'local-test-token' });
+  const file = path.join(tmp('pidge-term-jsonl-'), 'legacy.jsonl');
+  writeJsonl(file, [rec(1)]);
+  // Byte for byte what a 0.42.x daemon left behind — no schema stamp, the
+  // public_id derived from the harness session id.
+  core.writeJson(core.STATE_FILE(), {
+    epoch: 4,
+    sessions: {
+      'sess-old': {
+        publicId: 'ases_sess-old', paneId: '%7', tty: null, cwd: '/tmp/proj', channelId: 1,
+        file, offset: 0, nextSeq: 1, approvals: [], seen: [], outbox: [],
+      },
+    },
+  });
+  const d = newDaemonCapturingLog();
+  try {
+    await d.rearmPersisted();
+    const s = d.sessions.get('sess-old');
+    assert.ok(s, 'the share re-arms');
+    assert.equal(s.publicId, 'ases_sess-old', 'the id is NEVER re-minted');
+
+    // ONE register, under the grandfathered id, carrying the migrated occupant.
+    const posts = mock.state.agentSessionWrites.filter((w) => w.method === 'POST');
+    assert.deepEqual(posts.map((p) => p.public_id), ['ases_sess-old'],
+      'no second registration under a fresh ases_<uuid>');
+    assert.equal(posts[0].body.mode, 'agent', 'the v102 `mode` param rides the register');
+    assert.ok(mock.state.agentSessions['ases_sess-old'], 'the server row is the OLD row');
+
+    // Publishing: the transcript item is sealed under the grandfathered anchor
+    // and the v102 items endpoint accepts it.
+    await d.backfill(s);
+    await d.flush(s);
+    const items = mock.state.agentSessionItems.filter((i) => i.public_id === 'ases_sess-old');
+    assert.equal(items.length, 1, `expected one item on the wire, got ${JSON.stringify(mock.state.agentSessionItems)}`);
+    assert.equal(openItem(d, items[0].payload_sealed, 'ases_sess-old').uuid, 'u-1',
+      'it opens with the AAD anchored on the OLD public_id — re-minting would have made every stored item unreadable');
+    assert.equal(mock.state.agentSessions['ases_sess-old'].last_seq, items[0].seq);
+
+    // The occupant flip on the same row: a real PATCH the mock validates as
+    // v102 does (`mode` ∈ {agent, term}, absent = unchanged).
+    await withTmuxAsync({ panes: [pane('%7', { cmd: 'zsh' })], exec: () => '%7\n' }, async () => {
+      d.occupantTick();
+      await waitFor(() => mock.state.agentSessionWrites.some((w) => w.method === 'PATCH'));
+    });
+    const patches = mock.state.agentSessionWrites.filter((w) => w.method === 'PATCH');
+    assert.ok(patches.length >= 1, 'the flip PATCHes');
+    assert.equal(patches.at(-1).public_id, 'ases_sess-old');
+    assert.equal(patches.at(-1).body.mode, 'term', 'claude left the pane — the mode says so on the wire');
+    assert.equal(mock.state.agentSessions['ases_sess-old'].mode, 'term', 'and the server took it');
+
+    // Input: the cable subscribe carries the grandfathered public_id, and a
+    // frame sealed under it reaches the pane.
+    d.ensureCable();
+    await waitFor(() => mock.state.subscribeRaw.includes('{"channel":"AgentSessionChannel","public_id":"ases_sess-old"}'));
+    assert.ok(mock.state.subscribeRaw.includes('{"channel":"AgentSessionChannel","public_id":"ases_sess-old"}'),
+      `subscribed with ${JSON.stringify(mock.state.subscribeRaw)}`);
+    const frame = core.e2eEncryptBlob(d.key, core.e2eAad(1, 'ases_sess-old', 'agent_input'),
+      Buffer.from(JSON.stringify({ t: 'i', vgen: 'wire', seq: 1, he: d.state.epoch, keys: [{ lit: 'oi' }, { key: 'Enter' }] }))).toString('base64url');
+    const { calls } = await withTmuxAsync({ panes: [pane('%7')], exec: () => '%7\n' }, async (seen) => {
+      mock.broadcast('AgentSessionChannel', { type: 'input', frame });
+      await waitFor(() => seen.some((a) => a[0] === 'send-keys'));
+    });
+    assert.ok(calls.some((a) => a[0] === 'send-keys' && a.includes('%7') && a.includes('oi')),
+      `the keystroke never reached the pane: ${JSON.stringify(calls)}`);
+    assert.equal(d.replay.get('ases_sess-old|wire'), 1, 'and it went through the ledger under the OLD anchor');
+  } finally {
     if (d.ws) { d.wsGen += 1; try { d.ws.close(); } catch { /* gone */ } }
     await mock.stop();
   }
