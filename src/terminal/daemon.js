@@ -249,7 +249,11 @@ class Daemon {
 
     switch (`${req.method} ${url.pathname}`) {
       case 'GET /health':
-        return send(200, { ok: true, epoch: this.state.epoch, enabled: [...this.sessions.keys()] });
+        // `cable` is what lets `terminal status` refuse to present a daemon
+        // with a dead input lane as healthy (QA r6-3.2): the publish path is
+        // plain HTTPS POSTs, so the mirror reads fine precisely while the
+        // human's words evaporate — the cable state must be said out loud.
+        return send(200, { ok: true, epoch: this.state.epoch, enabled: [...this.sessions.keys()], cable: this.cableState() });
       case 'POST /hook/session-start': {
         const { session_id: sid, cwd, transcript_path: tp, tty, source } = body;
         if (!sid) return send(200, {});

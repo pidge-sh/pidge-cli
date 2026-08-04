@@ -714,11 +714,25 @@ async function runEnable(v) {
 
 // --- status / disable / disconnect ------------------------------------------
 
+// The input lane, said out loud (QA r6-3.2). `daemon: up` used to be the whole
+// health story while the cable — the ONLY path phone input travels — was dead
+// for hours: publishing is plain HTTPS POSTs, so the mirror kept reading fine
+// precisely while the human's words evaporated. A daemon with a dead input
+// lane may not present as healthy.
+function cableLine(cable) {
+  if (cable.up) return 'up';
+  if (cable.wanted) {
+    return `DOWN since ${cable.down_since || 'daemon start'} — phone input does NOT reach this computer (the daemon is retrying; transcripts still publish)`;
+  }
+  return 'idle (no shared sessions — it connects on the first share)';
+}
+
 async function runStatus() {
   const env = core.loadTerminalEnv();
   say(`tunnel:   ${env.token ? `connected (channel ${env.channelId}, ${env.base})` : 'NOT connected'}`);
   const health = await daemonAlive();
   say(`daemon:   ${health ? `up (epoch ${health.epoch})` : 'DOWN'}`);
+  if (health && health.cable) say(`cable:    ${cableLine(health.cable)}`);
   if (health) {
     const { data } = await daemonCall('GET', '/sessions');
     const en = data.enabled || [];

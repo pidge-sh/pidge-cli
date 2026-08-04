@@ -1494,6 +1494,72 @@ test('watchdog: a reconnect that keeps failing is retried FOREVER — each failu
   assert.equal(d.cableState().up, false, 'after the forced reconnect the lane is down until CONFIRMED — never assumed');
 }));
 
+test('GET /health exposes the cable state — up only when a subscribe was CONFIRMED (QA r6-3.2)', async () => {
+  const d = makeDaemon();
+  d.hookToken = 'local-test-token';
+  const getHealth = async () => {
+    let out = null;
+    const req = { method: 'GET', url: '/health', headers: { authorization: 'Bearer local-test-token' }, on() {}, destroy() {} };
+    await d.handleHttp(req, { writeHead() {}, end(p) { out = JSON.parse(p); } });
+    return out;
+  };
+
+  // No sessions: the lane is not wanted — absence of a socket is not an outage.
+  assert.deepEqual((await getHealth()).cable, { up: false, wanted: false, down_since: null });
+
+  // A session with a confirmed socket: up.
+  liveSession(d, { sid: 'sess-health' });
+  d.ws = { readyState: 1 };
+  d.wsConfirmed = true;
+  d.cableDownSince = null;
+  assert.deepEqual((await getHealth()).cable, { up: true, wanted: true, down_since: null });
+
+  // The lane dies: DOWN, with the honest since-timestamp the status renders.
+  d.wsConfirmed = false;
+  d.cableDownSince = Date.parse('2026-08-04T01:04:23.000Z');
+  const cable = (await getHealth()).cable;
+  assert.equal(cable.up, false);
+  assert.equal(cable.wanted, true);
+  assert.equal(cable.down_since, '2026-08-04T01:04:23.000Z');
+});
+
+test('terminal status renders the cable line in all three states (QA r6-3.2)', async () => {
+  const http = require('node:http');
+  freshXdg();
+  core.saveTerminalEnv({ base: 'http://127.0.0.1:9', token: 'hld_x', secret: SECRET43(), channelId: 1 });
+  let cable = { up: true, wanted: true, down_since: null };
+  const srv = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/health') return res.end(JSON.stringify({ ok: true, epoch: 3, enabled: [], cable }));
+    if (req.url === '/sessions') return res.end(JSON.stringify({ announces: [], enabled: [] }));
+    res.end('{}');
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  core.writeJson(core.DAEMON_FILE(), { port: srv.address().port, token: 'local-test-token' });
+  const lines = [];
+  const realLog = console.log;
+  console.log = (m) => lines.push(String(m));
+  try {
+    await commands.runTerminal('status', {});
+    assert.ok(lines.some((l) => /^cable: {4}up$/.test(l)), `expected 'cable: up', got ${JSON.stringify(lines)}`);
+
+    lines.length = 0;
+    cable = { up: false, wanted: true, down_since: '2026-08-04T01:04:23.000Z' };
+    await commands.runTerminal('status', {});
+    const down = lines.find((l) => /^cable:/.test(l));
+    assert.match(down, /DOWN since 2026-08-04T01:04:23\.000Z/, 'a dead input lane must not present as healthy');
+    assert.match(down, /phone input does NOT reach this computer/, 'and it says what the outage MEANS');
+
+    lines.length = 0;
+    cable = { up: false, wanted: false, down_since: null };
+    await commands.runTerminal('status', {});
+    assert.ok(lines.some((l) => /^cable: {4}idle \(no shared sessions/.test(l)), 'no sessions ⇒ idle, never a false DOWN alarm');
+  } finally {
+    console.log = realLog;
+    srv.close();
+  }
+});
+
 test('sealMeta: the session meta seals under its own AAD field and carries the epoch', () => {
   const d = makeDaemon();
   const session = { publicId: 'ases_t', title: 'pidge-cli', cwd: '/tmp/pidge-cli', hv: '2.1.220', paneId: '%3' };
