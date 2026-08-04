@@ -183,6 +183,28 @@ test('normalize: snapshot system records are dropped, plain ones become notices'
   assert.equal(items[0].preview, 'compacted');
 });
 
+test('normalize: turn bookkeeping (stop_hook_summary / turn_duration) is dropped, not an orphan notice (QA r6-1)', () => {
+  // The real shapes (verbatim fields from live transcripts): content-less
+  // system records whose subtype leaked to the phone as two gray orphan words.
+  assert.deepEqual(adapter.normalize({
+    type: 'system', subtype: 'stop_hook_summary', uuid: 'u-shs', timestamp: 't',
+    hookCount: 4, hookInfos: [{ command: 'notify.sh', durationMs: 11 }],
+  }), []);
+  assert.deepEqual(adapter.normalize({
+    type: 'system', subtype: 'turn_duration', uuid: 'u-td', timestamp: 't',
+    durationMs: 68605, messageCount: 42,
+  }), []);
+
+  // The §7 principle holds both ways: bookkeeping that someday CARRIES content
+  // still surfaces, and an unknown content-bearing subtype stays a notice.
+  const withContent = adapter.normalize({ type: 'system', subtype: 'turn_duration', uuid: 'u-td2', content: 'took 68s' });
+  assert.equal(withContent.length, 1);
+  assert.equal(withContent[0].preview, 'took 68s');
+  const unknown = adapter.normalize({ type: 'system', subtype: 'brand_new_thing', uuid: 'u-nx', content: 'something odd' });
+  assert.equal(unknown.length, 1);
+  assert.equal(unknown[0].preview, 'something odd');
+});
+
 test('normalize: the thinking SIGNATURE never reaches the item', () => {
   const items = adapter.normalize({
     type: 'assistant',

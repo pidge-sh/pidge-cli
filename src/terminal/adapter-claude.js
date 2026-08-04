@@ -94,6 +94,14 @@ function normalize(obj) {
   if (!base.uuid) return []; // uuid is the dedup key — a record without one is untailable
   if (t === 'system') {
     if (obj.isSnapshotUpdate) return [];
+    // Turn bookkeeping (QA r6-1): system records whose subtype is pure
+    // accounting — hook timings, turn duration — carry no conversational
+    // content, so the notice fallback below rendered the bare subtype as two
+    // orphan gray words in the transcript. Known noise, dropped (like
+    // snapshots and queue-ops). Guarded on the ABSENCE of content: a future
+    // harness that puts real content under these subtypes still surfaces (§7 —
+    // drift appears, it never vanishes silently).
+    if (['stop_hook_summary', 'turn_duration'].includes(obj.subtype) && !obj.content) return [];
     const txt = String(obj.content || obj.stopReason || obj.subtype || '');
     if (!txt) return [];
     return [mk(base, 'system', 'notice', txt)];
