@@ -253,6 +253,37 @@ test('normalize: slash-command plumbing never becomes a user bubble — but a me
   assert.equal(adapter.normalize(echo).length, 1);
 });
 
+test('normalize: EMPTY slash-command stdout is not a gray notice — real stdout still is (QA r7-2)', () => {
+  // Verbatim from the r7 transcript: what r6-4 left behind, one line per /clear.
+  assert.deepEqual(adapter.normalize({
+    type: 'system', subtype: 'local_command', uuid: 'u-lc', timestamp: 't',
+    content: '<local-command-stdout></local-command-stdout>',
+  }), [], 'empty stdout scaffolding carries no information — it must not reach the phone');
+
+  // §7 the other way: stdout that actually SAYS something stays visible.
+  const real = adapter.normalize({
+    type: 'system', subtype: 'local_command', uuid: 'u-lc2', timestamp: 't',
+    content: '<local-command-stdout>algo real</local-command-stdout>',
+  });
+  assert.equal(real.length, 1, 'real stdout is session content, not plumbing');
+  assert.equal(real[0].kind, 'notice');
+  assert.equal(real[0].role, 'system');
+  assert.equal(real[0].preview, '<local-command-stdout>algo real</local-command-stdout>');
+
+  // Content OUTSIDE the tags is content too — never structurally plumbing.
+  const around = adapter.normalize({
+    type: 'system', subtype: 'local_command', uuid: 'u-lc3',
+    content: 'stdout follows: <local-command-stdout></local-command-stdout> (nothing)',
+  });
+  assert.equal(around.length, 1);
+  assert.equal(around[0].preview, 'stdout follows: <local-command-stdout></local-command-stdout> (nothing)');
+
+  // The r6-1 guard is untouched: an unknown content-bearing subtype is a notice.
+  const unknown = adapter.normalize({ type: 'system', subtype: 'brand_new_thing', uuid: 'u-lc4', content: 'something odd' });
+  assert.equal(unknown.length, 1);
+  assert.equal(unknown[0].preview, 'something odd');
+});
+
 test('normalize: preview is capped with honest truncated/total_bytes', () => {
   const text = 'a'.repeat(5000);
   const [item] = adapter.normalize({
@@ -703,6 +734,12 @@ test('connect: a NEW pairing over an EXISTING identity refuses LOUDLY — --repl
     assert.doesNotMatch(out.stderr, /disconnect/, 'never suggest a path that cannot clear the guard');
     assert.match(out.stderr, /terminal\/env/, 'the manual escape hatch names the actual file');
     assert.match(out.stderr, /stays on the server/, 'the orphaned-channel consequence is named');
+    // QA r7-3: the NON-destructive escape — re-running without --code, which
+    // the guard already allows — is offered, and offered BEFORE the two that
+    // cost you the channel you just claimed.
+    assert.match(out.stderr, /without --code/, 'the half-done-install path must be named');
+    assert.ok(out.stderr.indexOf('without --code') < out.stderr.indexOf('--replace'),
+      'the path that destroys nothing comes first');
     assert.equal(core.loadTerminalEnv().token, 'hld_prod_link', 'the stored identity is untouched');
     assert.ok(!mock.state.reqLog.some((r) => r.pathname === '/api/v1/claim'),
       'the refusal must come BEFORE the claim — the code is not consumed');
