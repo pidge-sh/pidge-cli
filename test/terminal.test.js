@@ -29,7 +29,9 @@ if (os.homedir() !== process.env.HOME || os.homedir() === REAL_HOME) {
 const core = require('../src/terminal/core');
 const adapter = require('../src/terminal/adapter-claude');
 const commands = require('../src/terminal/commands');
-const { Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_KICK_FLOOR_MS } = require('../src/terminal/daemon');
+const {
+  Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_POLL_FAST_MS, DRAIN_KICK_FLOOR_MS, VIEWER_ACTIVE_WINDOW_MS,
+} = require('../src/terminal/daemon');
 
 // A fresh config slot per test that writes one — terminalDir() reads the env
 // at call time, so reassigning is enough.
@@ -3520,6 +3522,104 @@ test('a viewer joining also KICKS the command drain once — the cable is the wa
   d.lastKickAt = Date.now() - DRAIN_KICK_FLOOR_MS - 1;
   d.onViewerJoined();
   assert.equal(drains, 2, 'and past the floor it drains again');
+});
+
+// --- the adaptive drain cadence --------------------------------------------
+//
+// The kick above covers what is ALREADY on the queue when a viewer joins; these
+// cover the command posted a few seconds LATER, which used to wait out a full
+// 15 s poll. There is no viewer-left frame on the wire, so "present" is a
+// decaying window fed by viewer_joined AND by every computer_req.
+
+test('the drain cadence is ADAPTIVE: fast while a viewer is present, idle again when the window lapses', async () => {
+  const d = computerDaemon();
+  d.viewerDebounceMs = 20;
+  d.drainTick = () => {}; // the kick itself is asserted above; this is about cadence
+  // The real values, asserted — a drift in any of the three is felt as latency
+  // on a tap (or as a phone-less computer polling forever).
+  assert.equal(DRAIN_POLL_MS, 15_000);
+  assert.equal(DRAIN_POLL_FAST_MS, 2_000);
+  assert.equal(DRAIN_POLL_FAST_MS, DRAIN_KICK_FLOOR_MS, 'the hot cadence IS the kick floor, deliberately');
+  assert.equal(VIEWER_ACTIVE_WINDOW_MS, 180_000);
+
+  assert.equal(d.drainIntervalMs(), DRAIN_POLL_MS, 'a computer nobody is looking at polls idle');
+  d.onViewerJoined();
+  assert.equal(d.drainIntervalMs(), DRAIN_POLL_FAST_MS, 'a viewer joined ⇒ the follow-up command waits 2 s, not 15');
+  // Still hot most of the way through the window…
+  d.lastViewerActivityAt = Date.now() - (VIEWER_ACTIVE_WINDOW_MS - 1_000);
+  assert.equal(d.drainIntervalMs(), DRAIN_POLL_FAST_MS);
+  // …and cold again on its own once it lapses — no viewer-left frame exists.
+  d.lastViewerActivityAt = Date.now() - VIEWER_ACTIVE_WINDOW_MS - 1;
+  assert.equal(d.drainIntervalMs(), DRAIN_POLL_MS, 'the window decays without anything telling the daemon "gone"');
+});
+
+test('a computer_req frame refreshes the viewer window too — the daemon stays hot while the phone is asking', async () => {
+  const d = computerDaemon();
+  assert.equal(d.drainIntervalMs(), DRAIN_POLL_MS);
+  await withTmuxAsync({ panes: [pane('%1')] }, async () => {
+    d.handleComputerRequest(sealReq(d, { op: 'inventory', vgen: 'vhot', seq: 1, he: d.state.epoch }));
+  });
+  assert.equal(metaFrames(d).length, 1, 'a real request, answered — not a stub');
+  assert.equal(d.drainIntervalMs(), DRAIN_POLL_FAST_MS);
+
+  // Even a frame the daemon DROPS keeps the window alive: a viewer replaying a
+  // seq is still a viewer with this computer on screen.
+  d.lastViewerActivityAt = Date.now() - VIEWER_ACTIVE_WINDOW_MS - 1;
+  assert.equal(d.drainIntervalMs(), DRAIN_POLL_MS);
+  d.handleComputerRequest(sealReq(d, { op: 'inventory', vgen: 'vhot', seq: 1, he: d.state.epoch }));
+  assert.ok(d.logLines.some((l) => /computer request replay/.test(l)));
+  assert.equal(d.drainIntervalMs(), DRAIN_POLL_FAST_MS);
+});
+
+test('going hot RE-ARMS the drain in flight, and a stream of viewer frames cannot starve it', async () => {
+  const d = computerDaemon();
+  d.viewerDebounceMs = 20;
+  d.drainTick = async () => {};
+  d.armDrain();
+  try {
+    assert.equal(d.drainArmedMs, DRAIN_POLL_MS);
+    const idleTimer = d.drainTimer;
+    d.onViewerJoined();
+    // THE fix: the 15 s timer already armed is replaced, not waited out.
+    assert.equal(d.drainArmedMs, DRAIN_POLL_FAST_MS);
+    assert.notEqual(d.drainTimer, idleTimer);
+    const hotTimer = d.drainTimer;
+    d.onViewerJoined();
+    d.noteViewerActivity();
+    assert.equal(d.drainTimer, hotTimer,
+      'already hot ⇒ no re-arm: viewer frames must never keep pushing the next drain out');
+  } finally { d.stopDrainLoop(); }
+});
+
+test('the drain loop reschedules itself: it keeps ticking, it never overlaps, and it stops when asked', async () => {
+  const d = computerDaemon();
+  let inFlight = 0; let maxInFlight = 0; let drains = 0;
+  d.drainOnce = async () => {
+    drains += 1; inFlight += 1; maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((r) => setTimeout(r, 30));
+    inFlight -= 1;
+  };
+  d.drainIntervalMs = () => 10; // the real cadences are asserted above; this drives the LOOP
+  d.armDrain();
+  d.kickDrain('a viewer joined mid-drain'); // enters drainTick from OUTSIDE the loop
+  await new Promise((r) => setTimeout(r, 300));
+  d.stopDrainLoop();
+  assert.ok(drains >= 3, `the loop keeps ticking on its own (${drains} drains in 300ms)`);
+  assert.equal(maxInFlight, 1, 'one drain at a time, always — including against a cable kick');
+  assert.equal(d.drainTimer, null, 'a stopped loop leaves no timer behind');
+  const settled = drains;
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(drains, settled, 'and it stays stopped');
+
+  // Re-arming REPLACES the timer — five arms leave one live timer, not five.
+  const d2 = computerDaemon();
+  let ticks = 0;
+  d2.drainOnce = async () => { ticks += 1; };
+  d2.drainIntervalMs = () => 20;
+  for (let i = 0; i < 5; i += 1) d2.armDrain();
+  await new Promise((r) => setTimeout(r, 110));
+  d2.stopDrainLoop();
+  assert.ok(ticks >= 3 && ticks <= 7, `five re-arms ⇒ ONE live timer (got ${ticks} drains in ~110ms)`);
 });
 
 test('a viewer_joined nudge republishes caps ONCE per burst (debounced)', async () => {

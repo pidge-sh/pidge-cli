@@ -102,6 +102,16 @@ const DRAIN_POLL_MS = 15_000;
 // nudge that triggers one is UNSEALED and forgeable-innocuous by contract, so
 // the worst a hostile relay may buy with it is one GET /messages per floor.
 const DRAIN_KICK_FLOOR_MS = 2_000;
+// The drain cadence WHILE a viewer is present — the same 2 s as the kick floor,
+// deliberately: the floor is already the answer to "how often may a nudge make
+// this daemon hit /messages", and a hot poll faster than the floor would buy
+// nothing the kick doesn't already buy.
+const DRAIN_POLL_FAST_MS = DRAIN_KICK_FLOOR_MS;
+// How long a sign of viewer life keeps the daemon hot. There is NO viewer-left
+// frame on the Phase-A wire, so "a viewer is present" can only ever be a
+// decaying window: 3 minutes covers "joined, looked around, tapped spawn, then
+// tapped again" without leaving a phone-less computer polling at 2 s forever.
+const VIEWER_ACTIVE_WINDOW_MS = 180_000;
 // Commands whose outcome is durable on this computer (a spawned pane) must not
 // be re-run when an ack is lost (#39 is at-least-once) — the handled ids ride
 // state.json, bounded.
@@ -209,6 +219,11 @@ class Daemon {
     this.draining = false;            // one durable-command drain at a time
     this.drainWarnedAt = 0;
     this.lastKickAt = 0;              // floor between cable-triggered drains
+    this.lastViewerActivityAt = 0;    // last sign of viewer life (see drainIntervalMs)
+    this.viewerActiveWindowMs = VIEWER_ACTIVE_WINDOW_MS; // shortened by the tests only
+    this.drainTimer = null;           // the self-rescheduling drain loop (armDrain)
+    this.drainArmedMs = 0;            // …and the interval it is currently armed with
+    this.drainStopped = false;        // set on shutdown: the loop must not re-arm
     this.foreignMsgIds = new Set();   // queue rows that are NOT ours: logged once, never acked
     this.logStream = null;
     this.exit = (code) => process.exit(code); // injectable for tests (POST /shutdown)
@@ -1899,7 +1914,10 @@ class Daemon {
     this.lastViewerJoinAt = Date.now();
     // A viewer is LOOKING: anything it queued while this daemon was busy (or
     // down) should not wait out the poll interval. The cable is the wake-up,
-    // the queue stays the ledger (#39) — see kickDrain.
+    // the queue stays the ledger (#39) — see kickDrain. The kick covers what is
+    // ALREADY on the queue; noteViewerActivity covers what this viewer is about
+    // to post (see drainIntervalMs).
+    this.noteViewerActivity();
     this.kickDrain('a viewer joined');
     if (this.capsTimer) return; // a publish is already coming for this burst
     this.capsTimer = setTimeout(() => {
@@ -1923,11 +1941,72 @@ class Daemon {
     this.drainTick();
   }
 
+  // A sign that a human is looking at this computer RIGHT NOW. Two frames say
+  // it: the unsealed viewer_joined nudge, and any computer_req that reaches
+  // this daemon (even one dropped as a replay — a viewer that replays is still
+  // a viewer). There is no viewer-LEFT frame on the Phase-A wire, so presence
+  // is a decaying window and never a flag; see VIEWER_ACTIVE_WINDOW_MS.
+  noteViewerActivity() {
+    this.lastViewerActivityAt = Date.now();
+    // Going hot must take effect NOW, not at the next tick: the gap this closes
+    // is the spawn posted seconds AFTER the viewer joined, and a loop already
+    // armed with the idle interval would still make it wait one of those.
+    // Re-armed ONLY on the cold→hot edge (the armed interval differs), so a
+    // stream of requests can never keep pushing the next drain out — the
+    // hot→cold edge needs no help, it is at most one fast tick away.
+    if (this.drainTimer && this.drainArmedMs !== this.drainIntervalMs()) this.armDrain();
+  }
+
+  // The one place the drain cadence is decided: FAST while a viewer is present,
+  // idle otherwise.
+  //
+  // REJECTED alternative — subscribing ConversationChannel on the tunnel would
+  // give the daemon an instant "a message arrived" wake-up with zero server
+  // change. It is forbidden here: that subscription stamps CORE conversation
+  // presence (listening / ConsumerPresence) on a channel that is not a
+  // conversation, i.e. a daemon polling for commands would start reading, to
+  // the rest of the product, as a human present in a chat — a cross-feature
+  // semantic leak the isolation mandate rules out. This lane stays CLI-only:
+  // the client changes its own polling, the server learns nothing new.
+  drainIntervalMs() {
+    const hot = Date.now() - (this.lastViewerActivityAt || 0) < this.viewerActiveWindowMs;
+    return hot ? DRAIN_POLL_FAST_MS : DRAIN_POLL_MS;
+  }
+
+  // The drain loop, self-rescheduling instead of a setInterval: the interval
+  // itself changes between ticks (drainIntervalMs), and re-arming a fixed
+  // interval means either a second live timer or a torn-down/rebuilt one on
+  // every tick. The next tick is armed only AFTER the current drain settles, so
+  // a slow drain cannot stack ticks behind itself — the `draining` guard inside
+  // drainTick stays anyway, because kickDrain enters from outside this loop.
+  armDrain() {
+    if (this.drainTimer) { clearTimeout(this.drainTimer); this.drainTimer = null; }
+    if (this.drainStopped) return;
+    const ms = this.drainIntervalMs();
+    this.drainArmedMs = ms;
+    this.drainTimer = setTimeout(async () => {
+      this.drainTimer = null;
+      try { await this.drainTick(); } finally { this.armDrain(); }
+    }, ms);
+    if (this.drainTimer.unref) this.drainTimer.unref();
+  }
+
+  stopDrainLoop() {
+    this.drainStopped = true;
+    if (this.drainTimer) { clearTimeout(this.drainTimer); this.drainTimer = null; }
+  }
+
   // viewer→daemon, sealed under the `computer_req` lane. The op set is CLOSED:
   // Phase A has `inventory` and nothing else. Replay defense is the input
   // lane's, verbatim (§8/B4): vgen + per-vgen monotonic seq + the mandatory
   // epoch echo, on a COMPUTER-scoped ledger.
   handleComputerRequest(frameB64) {
+    // A request on this lane means a viewer is interacting with this computer,
+    // whatever the frame turns out to say — mark it before the frame is judged,
+    // exactly like the (unsealed, forgeable) nudge above. The worst a hostile
+    // relay buys is the same bounded thing: one GET /messages per
+    // DRAIN_POLL_FAST_MS, for one window.
+    this.noteViewerActivity();
     let msg;
     try {
       const sealed = Buffer.from(String(frameB64 || ''), 'base64url');
@@ -2532,15 +2611,17 @@ class Daemon {
       setInterval(() => this.flushTick(), FLUSH_MS),
       setInterval(() => this.heartbeatTick(), HEARTBEAT_MS),
       setInterval(() => this.watchdogTick(), WATCHDOG_MS),
-      // The durable command lane (§17). The ComputerChannel carries no
-      // "a command is waiting" frame, so this interval IS how a spawn from the
-      // phone arrives — see DRAIN_POLL_MS for why it is not a held poll.
-      setInterval(() => this.drainTick(), DRAIN_POLL_MS),
     ];
+    // The durable command lane (§17). The ComputerChannel carries no "a command
+    // is waiting" frame, so this loop IS how a spawn from the phone arrives —
+    // see DRAIN_POLL_MS for why it is not a held poll, and drainIntervalMs for
+    // why it is not a fixed interval either.
+    this.armDrain();
     this.drainTick(); // don't make a command posted while the daemon was down wait a full tick
     const bye = async (code) => {
       this.log('daemon shutting down');
       for (const t of this.timers) clearInterval(t);
+      this.stopDrainLoop();
       // Sessions stay ENABLED in state (they re-arm on the next boot); the
       // server shows them offline via staleness — honest without a teardown race.
       process.exit(code);
@@ -2558,5 +2639,9 @@ function stripPrivate(item) {
 }
 
 // The cadences are exported for the tests: §17 pins the presence beat at 30 s
-// and the server's online window at 90 s, so a drift here is a wire bug.
-module.exports = { Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_KICK_FLOOR_MS };
+// and the server's online window at 90 s, so a drift here is a wire bug — and
+// the drain trio (idle / fast / how long "a viewer is present" lasts) is the
+// felt latency of a command posted from the phone.
+module.exports = {
+  Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_POLL_FAST_MS, DRAIN_KICK_FLOOR_MS, VIEWER_ACTIVE_WINDOW_MS,
+};
