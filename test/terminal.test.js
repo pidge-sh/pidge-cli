@@ -2551,6 +2551,7 @@ test('re-arm DROPS a session only when the server refuses it definitively', asyn
 
 test('waiting notify is OFF by default and opt-in per session — learned from the server echo (QA #16)', async () => {
   const d = makeDaemon();
+  d.paneAlive = () => true; // the heartbeat's r6-6 pane check must not shell to tmux here
   const s = liveSession(d, { sid: 'sess-optin' });
   s.registered = false;
   let echoField; // undefined = the field is ABSENT (an old server)
@@ -2659,6 +2660,7 @@ test('a waiting notification that does not land stays ARMED for the next signal'
 
 test('the heartbeat re-asserts the CURRENT status, so a dropped transition self-heals', async () => {
   const d = makeDaemon();
+  d.paneAlive = () => true; // the r6-6 pane check is exercised in its own test
   const s = liveSession(d);
   const patches = [];
   d.api = async (method, p, body) => {
@@ -2675,6 +2677,41 @@ test('the heartbeat re-asserts the CURRENT status, so a dropped transition self-
   s.registered = false; // not registered yet: the register retry owns it
   await d.heartbeatTick();
   assert.deepEqual(patches, []);
+});
+
+test('the heartbeat VERIFIES the pane — a dead pane ends the session loudly instead of beating forever (QA r6-6)', async () => {
+  const d = makeDaemon();
+  const s = liveSession(d, { sid: 'sess-pane' });
+  s.status = 'waiting';
+  const calls = [];
+  d.api = async (method, p, body) => { calls.push({ method, p, body }); return { res: { status: 200 }, data: {} }; };
+
+  // Tick 1: the pane is alive — a normal heartbeat re-asserts the status.
+  let alive = true;
+  d.paneAlive = (paneId) => { assert.equal(paneId, '%1'); return alive; };
+  await d.heartbeatTick();
+  assert.deepEqual(calls, [{ method: 'PATCH', p: '/agent_sessions/ases_t', body: { status: 'waiting' } }]);
+
+  // The pane dies between two ticks (tmux kill-session — or the whole tmux
+  // server going away, which reads identically: no panes exist).
+  alive = false;
+  calls.length = 0;
+  await d.heartbeatTick();
+
+  // Tick 2 must NOT re-affirm: last_seen_at advancing was exactly what kept
+  // the server's 90 s staleness from ever firing — "waiting for you" forever.
+  assert.equal(calls.some((c) => c.method === 'PATCH'), false, 'a dead pane must never be re-affirmed as alive');
+  // Ended ALTO: log + DELETE, immediately — input delivery is a second
+  // detector, never the only one.
+  assert.deepEqual(calls, [{ method: 'DELETE', p: '/agent_sessions/ases_t', body: undefined }]);
+  assert.ok(d.logLines.some((l) => /pane %1 is GONE/.test(l)), `expected a loud end, got ${JSON.stringify(d.logLines)}`);
+  assert.equal(d.sessions.has('sess-pane'), false, 'the session is gone locally');
+  assert.equal(core.readJson(core.STATE_FILE(), {}).sessions['sess-pane'], undefined, 'and from persisted state');
+
+  // And the tick after that is silent — nothing left to beat for.
+  calls.length = 0;
+  await d.heartbeatTick();
+  assert.deepEqual(calls, []);
 });
 
 test('disable is honest when the server never got the DELETE', async () => {

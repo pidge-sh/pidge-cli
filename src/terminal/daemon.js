@@ -1210,8 +1210,23 @@ class Daemon {
   }
 
   async heartbeatTick() {
-    for (const s of this.sessions.values()) {
+    for (const s of [...this.sessions.values()]) { // a copy: the pane check may end sessions mid-walk
       if (!s.registered) continue; // flushTick owns the re-register retry
+      // VERIFY the pane before re-affirming (QA r6-6). A dead pane used to be
+      // detected only on input delivery, so the heartbeat kept PATCHing status
+      // for a session whose pane was gone — last_seen_at stayed fresh, the
+      // server's 90 s staleness never fired, and the phone read "waiting for
+      // you" forever while its keys went into the void. The human had to FAIL
+      // first for the system to admit it broke. One tmux call per session per
+      // 30 s buys the honest answer; a vanished tmux server reads the same way
+      // (paneAlive returns false when there are no panes to list) — with no
+      // pane there is no session either way. Ended LOUDLY, now: log + DELETE
+      // (disableSession), never waiting on input or staleness.
+      if (s.paneId && !this.paneAlive(s.paneId)) {
+        this.log(`${s.sid.slice(0, 8)}: bound pane ${s.paneId} is GONE — ending the session loudly (r6-6: a heartbeat must verify the pane, not re-affirm a corpse into "waiting for you" forever)`);
+        await this.disableSession(s.sid, 'pane died (heartbeat liveness check)');
+        continue;
+      }
       // Carry the CURRENT status, never `{}`. The transition PATCH is
       // fire-and-forget: one dropped running→waiting used to leave the server
       // (and the phone) showing `running` until the NEXT transition — a session
