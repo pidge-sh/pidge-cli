@@ -31,6 +31,31 @@ function textOf(block) {
 
 function byteLen(s) { return Buffer.byteLength(s, 'utf8'); }
 
+// Slash-command plumbing (QA r6-4): Claude Code writes the internals of a
+// slash command into the transcript as USER records whose entire content is
+// XML-ish scaffolding — after a /clear the phone showed the human "saying"
+// <command-name>/clear</command-name>, <local-command-caveat>…</local-command-caveat>
+// and <local-command-stdout></local-command-stdout> as purple user bubbles.
+// Real shapes (verified in live transcripts):
+//   '<command-name>/login</command-name>\n  <command-message>login</command-message>\n  <command-args></command-args>'
+//   '<local-command-caveat>Caveat: …</local-command-caveat>'
+//   '<local-command-stdout>Login successful</local-command-stdout>'
+// These are dropped as known noise. For the /clear seam specifically, the
+// daemon's adoption notice ('restarted via /clear — mirror continued') already
+// marks it — emitting a substitute here would duplicate that.
+//
+// The check is STRUCTURAL and conservative: a record is plumbing only when its
+// whole trimmed content is a sequence of well-formed plumbing-tag spans (plus
+// whitespace). A legitimate message that merely MENTIONS one of these tags has
+// other text around them and is kept verbatim.
+const PLUMBING_SPAN = /<(command-name|command-message|command-args|local-command-caveat|local-command-stdout)>[\s\S]*?<\/\1>/g;
+function isSlashCommandPlumbing(text) {
+  const t = String(text || '').trim();
+  if (!t.startsWith('<')) return false; // cheap out — plumbing records open with a tag
+  const stripped = t.replace(PLUMBING_SPAN, '');
+  return stripped !== t && stripped.trim() === '';
+}
+
 // Cut a string to at most `bytes` UTF-8 bytes without splitting a code point.
 function byteSlice(s, bytes) {
   if (byteLen(s) <= bytes) return s;
@@ -69,6 +94,14 @@ function normalize(obj) {
   if (!base.uuid) return []; // uuid is the dedup key — a record without one is untailable
   if (t === 'system') {
     if (obj.isSnapshotUpdate) return [];
+    // Turn bookkeeping (QA r6-1): system records whose subtype is pure
+    // accounting — hook timings, turn duration — carry no conversational
+    // content, so the notice fallback below rendered the bare subtype as two
+    // orphan gray words in the transcript. Known noise, dropped (like
+    // snapshots and queue-ops). Guarded on the ABSENCE of content: a future
+    // harness that puts real content under these subtypes still surfaces (§7 —
+    // drift appears, it never vanishes silently).
+    if (['stop_hook_summary', 'turn_duration'].includes(obj.subtype) && !obj.content) return [];
     const txt = String(obj.content || obj.stopReason || obj.subtype || '');
     if (!txt) return [];
     return [mk(base, 'system', 'notice', txt)];
@@ -87,7 +120,7 @@ function normalize(obj) {
     out.push(item);
   };
   if (typeof content === 'string') {
-    if (content) push(mk(base, role, 'text', content));
+    if (content && !(role === 'user' && isSlashCommandPlumbing(content))) push(mk(base, role, 'text', content));
     return out;
   }
   if (!Array.isArray(content)) return out;
@@ -98,7 +131,7 @@ function normalize(obj) {
       if (txt) push(mk(base, role, 'thinking', txt));
     } else if (b.type === 'text') {
       const txt = textOf(b);
-      if (txt) push(mk(base, role, 'text', txt));
+      if (txt && !(role === 'user' && isSlashCommandPlumbing(txt))) push(mk(base, role, 'text', txt));
     } else if (b.type === 'tool_use') {
       const item = mk(base, role, 'tool_use', textOf(b));
       item.tool = b.name || null;

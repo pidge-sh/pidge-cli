@@ -31,6 +31,17 @@ const TAIL_POLL_MS = 400;
 const FLUSH_MS = 500;
 const HEARTBEAT_MS = 30_000;
 const WATCHDOG_MS = 15_000;
+// Cable liveness (B7, REVISED per QA r6-3 — a real 4 h outage): ActionCable
+// pings every ~3 s, so 45 s of silence is a dead socket that doesn't know it.
+const CABLE_SILENT_MS = 45_000;
+// A connect attempt gets this long to reach CONFIRMED (socket open AND at
+// least one subscribe confirmation). The r6-3 root cause was a handshake that
+// never completed and never errored: readyState sat at CONNECTING forever, and
+// the old watchdog treated CONNECTING as health — every tick a no-op, for 4 h.
+// A deadline on the ATTEMPT (not on socket callbacks, which may never fire) is
+// what makes the retry loop unkillable.
+const CABLE_CONFIRM_MS = 20_000;
+const CABLE_BACKOFF_CAP_S = 60;
 const BACKFILL_ITEMS = 100;             // spec §6
 const BACKFILL_SEALED_BYTES = 512 * 1024;
 // How many recently-published uuids ride in state.json per session. The uuid
@@ -91,6 +102,16 @@ class Daemon {
     this.ws = null;              // one cable socket, N subscriptions
     this.wsGen = 0;              // identity guard for reconnects (#66)
     this.wsLastBeat = 0;
+    // Cable verification state (QA r6-3): `wsConfirmed` flips true only when
+    // the server CONFIRMS a subscription on the current socket — an open
+    // socket that never confirmed is not an input lane. `cableDownSince` is
+    // the start of the current no-input-lane period (null = confirmed up);
+    // the backoff pair paces the forever-retry the watchdog drives.
+    this.wsConfirmed = false;
+    this.wsAttemptAt = 0;        // when the current connect attempt started
+    this.wsBackoff = 0;          // seconds, exponential, capped, reset on confirm
+    this.wsRetryAt = 0;          // earliest next connect attempt
+    this.cableDownSince = null;
     this.replay = new Map();     // `${publicId}|${vgen}` → last seq (never pruned:
                                  // a viewer generation must stay monotonic for the
                                  // life of the process, including across a
@@ -228,12 +249,17 @@ class Daemon {
 
     switch (`${req.method} ${url.pathname}`) {
       case 'GET /health':
-        return send(200, { ok: true, epoch: this.state.epoch, enabled: [...this.sessions.keys()] });
+        // `cable` is what lets `terminal status` refuse to present a daemon
+        // with a dead input lane as healthy (QA r6-3.2): the publish path is
+        // plain HTTPS POSTs, so the mirror reads fine precisely while the
+        // human's words evaporate — the cable state must be said out loud.
+        return send(200, { ok: true, epoch: this.state.epoch, enabled: [...this.sessions.keys()], cable: this.cableState() });
       case 'POST /hook/session-start': {
         const { session_id: sid, cwd, transcript_path: tp, tty, source } = body;
         if (!sid) return send(200, {});
         this.announces.set(sid, { tty: tty || null, cwd: cwd || null, transcriptPath: tp || null, at: Date.now() });
         const s = this.sessions.get(sid);
+        if (s) this.notePermissionMode(s, body.permission_mode); // every hook carries the mode (r6-5)
         if (s && tp && tp !== s.file) {
           // Same-sid rotation (an in-place transcript swap): SAME AgentSession.
           this.log(`session ${sid.slice(0, 8)}: transcript rotated → ${path.basename(tp)}`);
@@ -301,6 +327,7 @@ class Daemon {
         if (s) {
           s.lastAliveAt = Date.now();
           this.setStatus(s, 'waiting');
+          this.notePermissionMode(s, body.permission_mode); // every hook carries the mode (r6-5)
           // Composer-spec Tranche A, MINIMAL cherry-pick: the Notification
           // hook fires for eight distinct reasons and carries
           // `notification_type` (permission_prompt | idle_prompt |
@@ -322,7 +349,11 @@ class Daemon {
       case 'POST /hook/stop': {
         const sid = body.session_id;
         const s = sid && this.sessions.get(sid);
-        if (s) { s.lastAliveAt = Date.now(); this.setStatus(s, 'idle'); }
+        if (s) {
+          s.lastAliveAt = Date.now();
+          this.setStatus(s, 'idle');
+          this.notePermissionMode(s, body.permission_mode); // every hook carries the mode (r6-5)
+        }
         return send(200, {});
       }
       case 'GET /sessions': {
@@ -1147,10 +1178,15 @@ class Daemon {
 
   // --- status + waiting notification (spec §9) ------------------------------
 
-  // The harness's permission mode rides every PreToolUse payload (Claude:
-  // default | plan | acceptEdits | bypassPermissions) — read DEFENSIVELY, the
-  // field can be absent on older harnesses, and absence is never a change.
-  // A change refreshes meta_sealed so viewers see the current mode; the mode
+  // The harness's permission mode rides the BASE payload of every hook event
+  // (Claude: default | plan | acceptEdits | bypassPermissions) — read
+  // DEFENSIVELY from ALL of them (SessionStart, PreToolUse, Notification,
+  // Stop), the field can be absent on older harnesses, and absence is never a
+  // change. Reading it only on PreToolUse was QA r6-5's stagnant chip: a
+  // switch INTO plan mode tends to be followed by zero tool calls (plan mode
+  // exists to not run tools), so the daemon never saw the transition and the
+  // phone showed "Accepting edits" against a pane sitting in plan mode. A
+  // change refreshes meta_sealed so viewers see the current mode; the mode
   // lives only inside the sealed blob (the server never reads it).
   notePermissionMode(s, mode) {
     if (typeof mode !== 'string' || !mode || mode === s.mode) return;
@@ -1185,8 +1221,35 @@ class Daemon {
   }
 
   async heartbeatTick() {
-    for (const s of this.sessions.values()) {
+    for (const s of [...this.sessions.values()]) { // a copy: the pane check may end sessions mid-walk
       if (!s.registered) continue; // flushTick owns the re-register retry
+      // VERIFY the pane before re-affirming (QA r6-6). A dead pane used to be
+      // detected only on input delivery, so the heartbeat kept PATCHing status
+      // for a session whose pane was gone — last_seen_at stayed fresh, the
+      // server's 90 s staleness never fired, and the phone read "waiting for
+      // you" forever while its keys went into the void. The human had to FAIL
+      // first for the system to admit it broke. One tmux call per session per
+      // 30 s buys the honest answer; a vanished tmux SERVER reads the same way
+      // (tmux runs, answers "no server" ⇒ paneAlive false) — with no pane
+      // there is no session either way. Ended LOUDLY, now: log + DELETE
+      // (disableSession), never waiting on input or staleness.
+      //
+      // Ended ONLY on a definite `false` (PR #110 review): `null` means the
+      // EXEC failed (EAGAIN/ENOENT/wedged-tmux timeout) — the daemon could not
+      // ask, and ending N live sessions over a transient exec hiccup with a
+      // "pane is GONE" log is the #10 mis-blame family. Unknown ⇒ say so
+      // loudly, re-affirm as normal, let the next beat re-check.
+      if (s.paneId) {
+        const alive = this.paneAlive(s.paneId);
+        if (alive === false) {
+          this.log(`${s.sid.slice(0, 8)}: bound pane ${s.paneId} is GONE — ending the session loudly (r6-6: a heartbeat must verify the pane, not re-affirm a corpse into "waiting for you" forever)`);
+          await this.disableSession(s.sid, 'pane died (heartbeat liveness check)');
+          continue;
+        }
+        if (alive === null) {
+          this.log(`${s.sid.slice(0, 8)}: pane check FAILED (daemon-side — tmux could not be asked) — NOT ending the session; re-affirming status, the next beat re-checks`);
+        }
+      }
       // Carry the CURRENT status, never `{}`. The transition PATCH is
       // fire-and-forget: one dropped running→waiting used to leave the server
       // (and the phone) showing `running` until the NEXT transition — a session
@@ -1302,14 +1365,21 @@ class Daemon {
   ensureCable() {
     if (this.ws && (this.ws.readyState === 0 || this.ws.readyState === 1)) return;
     if (typeof WebSocket === 'undefined') {
+      if (!this.cableDownSince) this.cableDownSince = Date.now();
       this.log('WARNING: no native WebSocket (Node <22) — the input lane is OFF; transcripts still publish');
       return;
     }
+    if (Date.now() < this.wsRetryAt) return; // backoff window — the watchdog re-calls forever
     const gen = ++this.wsGen;
     const url = this.env.base.replace(/^http/, 'ws') + '/cable';
     const ws = new WebSocket(url, ['actioncable-v1-json', this.env.token]);
     this.ws = ws;
     this.wsLastBeat = Date.now();
+    this.wsAttemptAt = Date.now();
+    this.wsConfirmed = false;
+    // The lane is DOWN from the moment we need a (re)connect until the server
+    // confirms a subscription — an open-but-unconfirmed socket is not "up".
+    if (!this.cableDownSince) this.cableDownSince = Date.now();
     ws.onopen = () => {
       if (gen !== this.wsGen) return ws.close(); // superseded (#66)
       this.log('cable up — subscribing input lanes');
@@ -1319,7 +1389,8 @@ class Daemon {
       if (gen !== this.wsGen) return;
       this.wsLastBeat = Date.now();
       let frame; try { frame = JSON.parse(ev.data); } catch { return; }
-      if (frame.type === 'ping' || frame.type === 'welcome' || frame.type === 'confirm_subscription') return;
+      if (frame.type === 'confirm_subscription') { this.noteCableConfirmed(); return; }
+      if (frame.type === 'ping' || frame.type === 'welcome') return;
       if (frame.type === 'reject_subscription') { this.log('input subscription rejected:', frame.identifier); return; }
       if (frame.message && frame.message.type === 'input' && frame.identifier) {
         let ident; try { ident = JSON.parse(frame.identifier); } catch { return; }
@@ -1330,8 +1401,65 @@ class Daemon {
     ws.onclose = () => {
       if (gen !== this.wsGen) return; // an old socket's goodbye must not touch the live one (#66)
       this.ws = null;
+      this.cableRetry('socket closed'); // never a silent stand-down (r6-3)
     };
     ws.onerror = () => {};
+  }
+
+  // The server confirmed a subscription on the CURRENT socket — this, not
+  // onopen, is what "the cable is up" means (QA r6-3: the watchdog must VERIFY
+  // the reconnect, not fire it and assume).
+  noteCableConfirmed() {
+    if (this.wsConfirmed) return;
+    this.wsConfirmed = true;
+    const hadFailures = (this.wsBackoff || 0) > 0;
+    this.wsBackoff = 0;
+    this.wsRetryAt = 0;
+    if (this.cableDownSince) {
+      const downS = Math.round((Date.now() - this.cableDownSince) / 1000);
+      // Narrated whenever the down period was real (a failure happened or it
+      // lasted); the subsecond first-boot connect stays quiet — "cable up —
+      // subscribing input lanes" already covers it.
+      if (hadFailures || downS > 0) this.log(`cable RESTORED — input lane confirmed after ${downS}s down`);
+    }
+    this.cableDownSince = null;
+  }
+
+  // A cable attempt failed or a live socket died: mark the lane DOWN, say so
+  // LOUDLY, and arm the next attempt on an exponential backoff (capped). The
+  // watchdog tick re-calls ensureCable on its own clock, so recovery never
+  // depends on a socket callback that may never fire — the exact state the
+  // r6-3 outage wedged in (a reconnect fired once, never verified, never
+  // retried, while the read mirror kept looking healthy for 4 hours).
+  cableRetry(why) {
+    if (!this.cableDownSince) this.cableDownSince = Date.now();
+    this.wsConfirmed = false;
+    this.wsBackoff = Math.min(Math.max((this.wsBackoff || 0) * 2, 5), CABLE_BACKOFF_CAP_S);
+    this.wsRetryAt = Date.now() + this.wsBackoff * 1000;
+    const downS = Math.round((Date.now() - this.cableDownSince) / 1000);
+    this.log(`cable DOWN (${why}) — input lane dead for ${downS}s; next attempt in ≤${this.wsBackoff}s (the watchdog insists forever, never one-shot)`);
+  }
+
+  // Abandon a socket the watchdog gave up on. The gen bump makes every one of
+  // its callbacks a no-op (#66) — including a close() that never completes.
+  abandonSocket(ws, why) {
+    this.wsGen += 1;
+    try { ws.close(); } catch {}
+    if (this.ws === ws) this.ws = null;
+    this.cableRetry(why);
+    this.ensureCable(); // honors the backoff window; the next tick retries otherwise
+  }
+
+  // The input lane's honest state — surfaced on GET /health so `terminal
+  // status` can say `cable: up | DOWN since <T>` (QA r6-3: a daemon with a
+  // dead input lane may not present as healthy).
+  cableState() {
+    const up = !!(this.ws && this.ws.readyState === 1 && this.wsConfirmed);
+    return {
+      up,
+      wanted: this.sessions.size > 0,
+      down_since: up || !this.cableDownSince ? null : new Date(this.cableDownSince).toISOString(),
+    };
   }
 
   sendSubscribe(session) {
@@ -1367,9 +1495,16 @@ class Daemon {
     this.replay.set(ledgerKey, msg.seq);
 
     if (!session.paneId) { this.log('input for a session with no bound pane — dropped'); return; }
-    if (!this.paneAlive(session.paneId)) {
+    const alive = this.paneAlive(session.paneId);
+    if (alive === false) {
       this.log(`bound pane ${session.paneId} is gone — ending session loudly (B2)`);
       this.disableSession(session.sid, 'pane died');
+      return;
+    }
+    if (alive === null) {
+      // Could not ASK tmux (daemon-side failure) — that is not a dead pane.
+      // The input cannot be delivered, so say so loudly and keep the session.
+      this.log(`input for ${session.sid.slice(0, 8)} DROPPED: pane check failed (daemon-side, tmux could not be asked) — NOT ending the session`);
       return;
     }
     if (!Array.isArray(msg.keys)) return;
@@ -1402,26 +1537,59 @@ class Daemon {
     }
   }
 
+  // Tri-state (PR #110 review): `true` = tmux answered and the pane is listed;
+  // `false` = tmux RAN and the pane provably is not there (including a
+  // non-zero exit — "no server running" means no panes exist, so the r6-6
+  // dead-pane treatment applies); `null` = the exec itself failed (ENOENT,
+  // EAGAIN, the 5 s timeout against a wedged server) — the daemon could not
+  // ASK, and an unanswerable question must never read as "the pane is gone".
+  // A transient EAGAIN ending N live sessions with a "pane is GONE" log is the
+  // mis-blame family finding #10 killed; callers end sessions ONLY on `false`.
   paneAlive(paneId) {
     try {
       const out = core.tmuxExec(['list-panes', '-a', '-F', '#{pane_id}'], { encoding: 'utf8' });
       return out.split('\n').includes(paneId);
-    } catch { return false; }
+    } catch (e) {
+      if (typeof e.status === 'number') return false; // tmux ran and answered "no" (no server ⇒ no panes)
+      return null; // spawn/timeout failure — unknown, NOT "gone"
+    }
   }
 
   // --- watchdog (B7) --------------------------------------------------------
 
+  // REWRITTEN per QA r6-3 (the 4 h real outage). The old tick had a hole that
+  // ate the input lane: a socket stuck in CONNECTING matched NEITHER branch
+  // (`readyState > 1` false, `readyState === 1` false), so once a forced
+  // reconnect produced a handshake that never completed and never errored,
+  // every subsequent tick was a no-op — the retry machinery only re-armed from
+  // socket callbacks that never fired. Now the watchdog VERIFIES on its own
+  // clock: an attempt that has not reached CONFIRMED (open + subscribe
+  // confirmation) within its deadline is abandoned loudly and retried with
+  // backoff, forever.
   watchdogTick() {
     if (this.sessions.size === 0) return;
-    if (!this.ws || this.ws.readyState > 1) {
-      this.ensureCable();
-    } else if (this.ws.readyState === 1 && Date.now() - this.wsLastBeat > 45_000) {
+    const ws = this.ws;
+    if (!ws || ws.readyState > 1) { this.ensureCable(); return; }
+    const now = Date.now();
+    if (ws.readyState === 0) {
+      // CONNECTING is an attempt, not health — it gets a deadline.
+      if (now - this.wsAttemptAt > CABLE_CONFIRM_MS) {
+        this.abandonSocket(ws, `connect attempt stuck ${Math.round((now - this.wsAttemptAt) / 1000)}s in CONNECTING`);
+      }
+      return;
+    }
+    // readyState === 1 (open). Open without a confirmed subscription is not an
+    // input lane either — verify, don't assume (r6-3: "firing the reconnect is
+    // not the job").
+    if (!this.wsConfirmed && now - this.wsAttemptAt > CABLE_CONFIRM_MS) {
+      this.abandonSocket(ws, 'socket open but the subscribe was never confirmed');
+      return;
+    }
+    if (now - this.wsLastBeat > CABLE_SILENT_MS) {
       // ActionCable pings every ~3s; 45s of silence = a dead socket that
       // doesn't know it. Prefer a spurious reconnect over a silent stand-down.
-      this.log('cable silent 45s — forcing reconnect (watchdog)');
-      try { this.ws.close(); } catch {}
-      this.ws = null;
-      this.ensureCable();
+      this.log(`cable silent ${Math.round(CABLE_SILENT_MS / 1000)}s — forcing reconnect (watchdog)`);
+      this.abandonSocket(ws, 'silent socket');
     }
   }
 
