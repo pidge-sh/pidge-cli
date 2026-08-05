@@ -322,6 +322,83 @@ const E2E_NEVER_SEAL_LABEL_IDS = new Set([
   'dismiss', 'acknowledge', 'seen',
 ]);
 
+// ── bridge outage triage (pure helpers — exported for tests) ────────────────
+// The bridge's "channel looks broken" desktop alert used to fire on ANY 5
+// consecutive poll failures — which on a laptop means EVERY sleep/wake cycle
+// (a dark-wake polls with a dead network, fails 5 times, alerts, recovers,
+// re-arms; one night = 30 alerts, all of them the Mac napping). These helpers
+// make the alert sleep-aware: classify each failure as LOCAL (this machine /
+// its network) vs SERVER-shaped, detect system sleep from wall-clock gaps
+// (the OS freezes timers while asleep), and only wake the human for a
+// server-shaped streak that persisted through real awake time — with a
+// cool-down so one bad night is one alert, not thirty.
+
+// Errno classes that mean THIS machine (or its LAN) lost the network: DNS
+// dead/unreachable, interface down, no route to anywhere. They back off like
+// any failure but must never pop the desktop alert. ECONNREFUSED is
+// deliberately NOT here: refused on a working network means the SERVER's port
+// is closed (alertable); refused with no route is caught by !hasNetwork.
+const BRIDGE_LOCAL_ERRNOS = new Set([
+  'ENOTFOUND', 'EAI_AGAIN', 'ENETDOWN', 'ENETUNREACH', 'EHOSTUNREACH', 'EHOSTDOWN', 'ENONET',
+]);
+
+// One poll failure → 'local' | 'server'.
+//   status     — HTTP status when a response arrived (an answer PROVES the path works)
+//   code       — errno off the network error (undici rides it on e.cause.code)
+//   hasNetwork — cheap corroboration: does the machine have any non-internal interface?
+//   justWoke   — a system sleep was detected moments ago (stale-socket aborts on wake)
+function classifyBridgeFailure({ status = null, code = null, hasNetwork = true, justWoke = false } = {}) {
+  if (status !== null && status !== undefined) return 'server'; // an HTTP answer reached us
+  if (code && BRIDGE_LOCAL_ERRNOS.has(code)) return 'local';
+  if (justWoke) return 'local';    // abort/timeout right after a detected sleep = wake turbulence
+  if (!hasNetwork) return 'local'; // no interface has an address — offline, not the server
+  return 'server';                 // the network looks fine and the server didn't answer
+}
+
+// Did the machine SLEEP through this wait? The OS suspends timers during
+// system sleep, so an await that returns wildly past its deadline measured the
+// lid closing, not slowness. Threshold: 2× the expected wait plus 30 s of
+// slack — generous enough that a busy event loop never false-positives.
+function sleptThrough(expectedMs, actualMs) {
+  return actualMs > expectedMs * 2 + 30000;
+}
+
+// The alert-policy ledger for the "channel looks broken" DESKTOP alert. The
+// stderr log narrates every failure regardless — this gates only the popup:
+//   · only SERVER-shaped failures count (local/offline never alert);
+//   · the streak must persist ≥ minStreakMs of AWAKE wall-clock;
+//   · at most one alert per outage, and one per cooldownMs across outages;
+//   · a detected sleep resets the streak (sleptReset) but never the cool-down.
+function createBridgeAlertPolicy({ brokenAfter = 5, minStreakMs = 600000, cooldownMs = 14400000 } = {}) {
+  let serverFails = 0;        // consecutive server-shaped failures this outage
+  let streakStartedAt = null; // when the current server-shaped streak began (awake clock)
+  let lastAlertAt = null;     // cool-down anchor — survives outages AND sleeps
+  let alerted = false;        // the alert fired for THIS outage
+  return {
+    // Record one failure; returns { awakeMs } when the desktop alert should fire.
+    fail(shape, now) {
+      if (shape !== 'server') return null;
+      serverFails++;
+      if (streakStartedAt === null) streakStartedAt = now;
+      const awakeMs = now - streakStartedAt;
+      if (serverFails < brokenAfter || alerted || awakeMs < minStreakMs) return null;
+      if (lastAlertAt !== null && now - lastAlertAt < cooldownMs) return null;
+      alerted = true; lastAlertAt = now;
+      return { awakeMs };
+    },
+    // The machine slept: whatever streak was building is stale evidence.
+    sleptReset() { serverFails = 0; streakStartedAt = null; },
+    // Healthy round-trip: close the outage. True ⇒ the alert HAD fired (the
+    // caller emits the quiet "recovered" notice so the human isn't left hanging).
+    recovered() {
+      const had = alerted;
+      serverFails = 0; streakStartedAt = null; alerted = false;
+      return had;
+    },
+    get alerted() { return alerted; },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Test seam: require()ing this file exposes the pure e2e helpers and stops
 // HERE — none of the CLI machinery below (parseArgs, the TOKEN check, command
@@ -336,6 +413,8 @@ module.exports = {
   E2E_NEVER_SEAL_LABEL_IDS, e2ePinKeyFor,
   // sealed media — the pure halves (gate decision + filename hygiene).
   e2eMediaSealDecision, sanitizeAttachmentName,
+  // bridge outage triage — the pure halves of the sleep-aware alert policy.
+  classifyBridgeFailure, sleptThrough, createBridgeAlertPolicy, BRIDGE_LOCAL_ERRNOS,
 };
 if (require.main !== module) return;
 
@@ -3421,6 +3500,19 @@ function localAlert(title, msg) {
   } catch { /* the stderr line above is the alert of record */ }
 }
 
+// Cheap local-connectivity corroboration for classifyBridgeFailure: no
+// non-internal interface with an address ⇒ this machine is offline (Wi-Fi
+// down / airplane mode / mid-wake) — a failure then is LOCAL by definition.
+// A probe error answers "network looks fine" so a real server outage is never
+// suppressed by a broken probe.
+function hasNonInternalNetwork() {
+  try {
+    for (const addrs of Object.values(os.networkInterfaces()))
+      for (const a of addrs || []) if (!a.internal) return true;
+    return false;
+  } catch { return true; }
+}
+
 // ── execution attribution (runs) ────────────────────────────────────────────
 // A run is a server-issued, per-execution SIGNATURE — attribution, never a
 // credential (the channel key still authenticates; the run token only stamps who
@@ -3644,10 +3736,38 @@ async function runBridge() {
   }
 
   let firstBatch = true;      // history_hint rides the first batch post-restart
-  let transportFails = 0;     // consecutive network/5xx failures
+  let transportFails = 0;     // consecutive network/5xx failures (drives the backoff ladder)
   let handlerFails = 0;       // consecutive non-zero handler exits
   let alerted401 = false;     // ONE local alert per outage, not one per retry
-  let alertedBroken = false;
+  // The "channel looks broken" DESKTOP alert is sleep-aware (the stderr log
+  // still narrates every failure): only server-shaped streaks that persisted
+  // ≥10 min of awake wall-clock alert, at most once per 4 h — a laptop's
+  // sleep/wake cycle must never buzz the human. The 401 alert stays immediate
+  // (only a human can fix a rotated key). Env knobs are test hooks.
+  const alertPolicy = createBridgeAlertPolicy({
+    brokenAfter: BROKEN_AFTER,
+    minStreakMs: parseInt(process.env.PIDGE_BRIDGE_ALERT_STREAK || '', 10) || 600000,    // 10 min
+    cooldownMs: parseInt(process.env.PIDGE_BRIDGE_ALERT_COOLDOWN || '', 10) || 14400000, // 4 h
+  });
+  let lastSleepAt = 0;        // when the wall-clock gap detector last said "the machine slept"
+  // A detected system sleep makes the failure streak stale evidence: reset it
+  // and stamp lastSleepAt so the next failures classify as wake turbulence.
+  const detectSleep = (expectedMs, actualMs) => {
+    if (!sleptThrough(expectedMs, actualMs)) return false;
+    lastSleepAt = Date.now();
+    if (transportFails > 0)
+      console.error(`pidge: bridge — wall-clock gap (~${Math.round((actualMs - expectedMs) / 1000)}s past schedule) says the machine SLEPT — failure streak reset (a sleeping laptop is not a broken channel)`);
+    transportFails = 0;
+    alertPolicy.sleptReset();
+    return true;
+  };
+  // Every retry/idle nap measures itself: waking far past the deadline means
+  // the OS suspended our timers mid-nap (sleep), never that the nap was slow.
+  const napDetectingSleep = async (ms) => {
+    const t0 = Date.now();
+    await sleepInterruptible(ms);
+    detectSleep(ms, Date.now() - t0);
+  };
 
   // Execution attribution — the bridge mints ONE run per handler invocation so
   // each spawned handler signs the messages it answers. A server that predates
@@ -3780,7 +3900,7 @@ async function runBridge() {
       }
     }
 
-    let res = null, data = null, failWhat = null;
+    let res = null, data = null, failWhat = null, failCode = null;
     const waitS = 25;
     const askedAt = Date.now();
     try {
@@ -3792,6 +3912,7 @@ async function runBridge() {
       await checkManifestNews(res);
     } catch (e) {
       failWhat = `network: ${e.message}`;
+      failCode = (e && (e.code || (e.cause && e.cause.code))) || null; // undici rides the errno on cause
     }
     if (shuttingDown) return;
 
@@ -3815,27 +3936,50 @@ async function runBridge() {
     }
 
     if (failWhat) {
-      transportFails++;
-      // The exit-4 class (a channel with NO healthy round-trip) becomes, in a
-      // daemon, "local alert + LONG backoff" — never a blind hot re-loop and
-      // never a silent death.
-      if (transportFails >= BROKEN_AFTER) {
-        if (!alertedBroken) {
-          alertedBroken = true;
-          localAlert('channel looks broken', `${transportFails} consecutive failures reaching ${BASE} (latest: ${failWhat}) — server or network, not the human. The bridge keeps retrying with long backoff.`);
-        }
-        await sleepInterruptible(jitter(BACKOFF_MAX_MS));
-      } else {
-        console.error(`pidge: bridge — ${failWhat} (${transportFails} consecutive) — backing off`);
-        await sleepInterruptible(jitter(Math.min(BACKOFF_BASE_MS * 2 ** (transportFails - 1), BACKOFF_MAX_MS)));
+      // Sleep detection FIRST: a long-poll that comes back hours past its own
+      // timeout measured the lid closing, not the server — that failure is not
+      // evidence of anything and must not count toward any streak.
+      if (detectSleep((waitS + 10) * 1000, Date.now() - askedAt)) {
+        console.error(`pidge: bridge — poll interrupted by system sleep (${failWhat}) — not counted; retrying fresh`);
+        await napDetectingSleep(jitter(BACKOFF_BASE_MS));
+        continue;
       }
+      transportFails++;
+      const shape = classifyBridgeFailure({
+        status: res ? res.status : null,
+        code: failCode,
+        hasNetwork: hasNonInternalNetwork(),
+        justWoke: Date.now() - lastSleepAt < 60000,
+      });
+      // The exit-4 class (a channel with NO healthy round-trip) becomes, in a
+      // daemon, "long backoff + (at most) ONE local alert" — never a blind hot
+      // re-loop and never a silent death. The DESKTOP alert is gated by the
+      // sleep-aware policy (server-shaped + ≥10 min awake + 4 h cool-down);
+      // local/offline failures only ever narrate to stderr.
+      const verdict = alertPolicy.fail(shape, Date.now());
+      if (verdict) {
+        localAlert('channel looks broken', `${transportFails} consecutive failures reaching ${BASE} over ~${Math.max(1, Math.round(verdict.awakeMs / 60000))} min while the local network looks fine (latest: ${failWhat}) — server or path, not the human. The bridge keeps retrying with long backoff.`);
+      } else {
+        console.error(`pidge: bridge — ${failWhat} (${transportFails} consecutive, looks ${shape === 'local' ? 'LOCAL — this machine/network, no desktop alert' : 'server-shaped'}) — backing off`);
+      }
+      await napDetectingSleep(jitter(transportFails >= BROKEN_AFTER
+        ? BACKOFF_MAX_MS
+        : Math.min(BACKOFF_BASE_MS * 2 ** (transportFails - 1), BACKOFF_MAX_MS)));
       continue;
     }
 
+    // A successful poll can still have SLEPT mid-hold (long-poll + lid close):
+    // stamp the wake so a stale-socket failure right after classifies as local.
+    if (sleptThrough((waitS + 10) * 1000, Date.now() - askedAt)) lastSleepAt = Date.now();
+
     // A healthy round-trip: narrate recovery once, reset the failure ledgers.
-    if (transportFails > 0 || alerted401 || alertedBroken) {
+    const hadBrokenAlert = alertPolicy.recovered(); // closes the outage; true ⇒ the desktop alert HAD fired
+    if (transportFails > 0 || alerted401 || hadBrokenAlert) {
       console.error(`pidge: bridge — channel recovered${transportFails ? ` after ${transportFails} consecutive failure(s)` : ''}`);
-      transportFails = 0; alerted401 = false; alertedBroken = false;
+      // Quiet closure ONLY when the loud alert fired — the human who was told
+      // "broken" deserves the "it healed"; nobody else needs a popup.
+      if (hadBrokenAlert) localAlert('channel recovered', `the round-trip to ${BASE} is healthy again — the earlier "channel looks broken" alert is resolved.`);
+      transportFails = 0; alerted401 = false;
     }
     warnStalePriorClaim(data); // newer servers serve the flag on this GET too
     warnConsumerConflict(data); // the consume GET flags a live sibling
@@ -3857,8 +4001,9 @@ async function runBridge() {
     const msgs = allMsgs.filter((m) => !gatedRows.includes(m));
     if (msgs.length === 0) {
       // The long-poll hold IS the pacing; only a fast empty return sleeps (a
-      // server that doesn't hold ?wait= must not become a hot loop).
-      if (Date.now() - askedAt < 2000) await sleepInterruptible(jitter(intervalS * 1000));
+      // server that doesn't hold ?wait= must not become a hot loop). The
+      // sleep-detecting nap stamps a wake if the machine dozed off mid-idle.
+      if (Date.now() - askedAt < 2000) await napDetectingSleep(jitter(intervalS * 1000));
       continue;
     }
 

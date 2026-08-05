@@ -6,7 +6,10 @@
 //   · the per-channel lock (hash(token)) refuses a second instance, recovers a
 //     STALE lock (dead pid — crashed bridge), and `listen` refuses under it;
 //   · SIGTERM with a batch in flight: no ack, lock released, exit 0;
-//   · 401 = narrate + LOCAL alert + LONG jittered backoff, never a hot loop.
+//   · 401 = narrate + LOCAL alert + LONG jittered backoff, never a hot loop;
+//   · the "channel looks broken" DESKTOP alert is sleep-aware: local/offline
+//     failures and sleep/wake gaps never pop it — only a server-shaped streak
+//     that persisted awake, once per outage, with a cool-down.
 // Plus: stale_from_prior_claim surfaced on listen/catchup/doctor/bridge.
 const { test } = require('node:test');
 const assert = require('node:assert');
@@ -699,4 +702,134 @@ test('bridge: the per-batch run is minted with a SHORT sliding TTL (never the 24
     assert.equal(s.body.ttl_seconds, 3600,
       'default --handler-timeout (1800s) ⇒ ttl max(3600, 2×timeout) = 3600 — a dead handler expires in ~1h, not 24h');
   }
+});
+
+// ── sleep-aware "channel looks broken" triage (issue: one sleep/wake cycle per
+// desktop alert — 30 alerts in a night, all of them the Mac napping). The pure
+// halves ride the CLI's test seam; the wiring is exercised end-to-end below.
+const { classifyBridgeFailure, sleptThrough, createBridgeAlertPolicy } = require(CLI);
+
+test('triage: failure classification — local errnos / offline / just-woke are LOCAL; HTTP answers and clean-network failures are SERVER-shaped', () => {
+  // an errno that means THIS machine's network is gone → local, regardless of the rest
+  for (const code of ['ENOTFOUND', 'EAI_AGAIN', 'ENETDOWN', 'ENETUNREACH', 'EHOSTUNREACH'])
+    assert.equal(classifyBridgeFailure({ code, hasNetwork: true }), 'local', code);
+  // ANY HTTP answer proves the path — even a 502 is the server's problem
+  assert.equal(classifyBridgeFailure({ status: 502 }), 'server');
+  assert.equal(classifyBridgeFailure({ status: 500, hasNetwork: false }), 'server');
+  // ECONNREFUSED on a working network = the server's port is closed → alertable
+  assert.equal(classifyBridgeFailure({ code: 'ECONNREFUSED', hasNetwork: true }), 'server');
+  // …but with no route at all it's this machine, not the server
+  assert.equal(classifyBridgeFailure({ code: 'ECONNREFUSED', hasNetwork: false }), 'local');
+  // an abort/timeout right after a detected sleep = wake turbulence
+  assert.equal(classifyBridgeFailure({ code: null, hasNetwork: true, justWoke: true }), 'local');
+  // a bare timeout with the network up and no recent sleep → server-shaped
+  assert.equal(classifyBridgeFailure({ code: null, hasNetwork: true, justWoke: false }), 'server');
+  // no non-internal interface ⇒ offline, whatever the error looked like
+  assert.equal(classifyBridgeFailure({ code: 'ETIMEDOUT', hasNetwork: false }), 'local');
+});
+
+test('triage: sleptThrough — 2× the expected wait plus 30s of slack', () => {
+  const POLL = 35000; // the bridge's long-poll ceiling (wait=25 + 10s grace)
+  assert.equal(sleptThrough(POLL, POLL + 5000), false, 'a slow poll is not a sleep');
+  assert.equal(sleptThrough(POLL, 2 * POLL + 30000), false, 'exactly at the threshold: not yet');
+  assert.equal(sleptThrough(POLL, 2 * POLL + 30001), true, 'past it: the machine slept');
+  assert.equal(sleptThrough(2000, 40000), true, 'a 2s backoff that took 40s measured a sleep');
+  assert.equal(sleptThrough(2000, 30000), false, 'a 2s backoff 28s late is ugly but awake');
+});
+
+test('triage: alert policy — local never pops; server needs streak + awake persistence; one per outage + cool-down; sleep resets the streak', () => {
+  const MIN = 60000;
+  const p = createBridgeAlertPolicy({ brokenAfter: 5, minStreakMs: 10 * MIN, cooldownMs: 240 * MIN });
+  let now = 1000000;
+
+  // LOCAL failures never alert, no matter how many or how long
+  for (let i = 0; i < 50; i++) assert.equal(p.fail('local', now += MIN), null);
+  assert.equal(p.recovered(), false, 'no alert fired ⇒ no recovered notice');
+
+  // 5 quick server-shaped failures: streak yes, awake persistence no → quiet
+  for (let i = 0; i < 5; i++) assert.equal(p.fail('server', now += 1000), null);
+  // …the SAME outage persisting past 10 awake minutes → exactly ONE alert
+  const verdict = p.fail('server', now += 10 * MIN);
+  assert.ok(verdict && verdict.awakeMs >= 10 * MIN, 'alert fires with the streak age');
+  assert.equal(p.fail('server', now += MIN), null, 'latched: one alert per outage');
+  assert.equal(p.alerted, true);
+
+  // recovery closes the outage and reports the alert had fired (→ quiet closure)
+  assert.equal(p.recovered(), true);
+  assert.equal(p.recovered(), false, 'the report is one-shot');
+
+  // a NEW long outage inside the 4h cool-down stays quiet…
+  for (let i = 0; i < 20; i++) assert.equal(p.fail('server', now += MIN), null);
+  assert.equal(p.recovered(), false);
+  // …and past the cool-down a persistent outage alerts again
+  now += 241 * MIN;
+  for (let i = 0; i < 4; i++) assert.equal(p.fail('server', now += MIN), null);
+  assert.ok(p.fail('server', now += 10 * MIN), 'cool-down elapsed + persistent streak ⇒ alert');
+  p.recovered();
+
+  // a detected sleep resets the streak: post-wake failures restart the clock
+  const q = createBridgeAlertPolicy({ brokenAfter: 2, minStreakMs: 10 * MIN, cooldownMs: 240 * MIN });
+  let t = 5000000;
+  q.fail('server', t += MIN); q.fail('server', t += MIN); // streak building
+  q.sleptReset();
+  assert.equal(q.fail('server', t += 12 * MIN), null, 'first failure after the sleep restarts the streak');
+  assert.equal(q.fail('server', t += MIN), null, 'streak count restarted too');
+  assert.ok(q.fail('server', t += 10 * MIN), 'only a fresh 10-awake-minute streak alerts');
+});
+
+test('bridge: server-shaped outage — desktop alert only after the awake-persistence window, ONE per outage, quiet closure on recovery', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messagesStatus = 500; // server answers = server-shaped, no 401 path
+
+  const { child, result, out } = runCli(
+    ['bridge', '--exec', 'true', '--no-realtime'],
+    port, {
+      PIDGE_BRIDGE_ALERT_STREAK: '1200',  // test-fast "10 minutes"
+      PIDGE_BRIDGE_BACKOFF_BASE: '50',
+      PIDGE_BRIDGE_BACKOFF_MAX: '150',
+    },
+  );
+
+  // The streak reaches 5 well before 1.2s — narrated as server-shaped, NO alert yet.
+  assert.ok(await waitFor(() => /listen error 500 \(5 consecutive, looks server-shaped\)/.test(out.stderr)),
+    `stderr:\n${out.stderr}`);
+  // …and once the streak has persisted past the window, exactly one alert fires.
+  assert.ok(await waitFor(() => /LOCAL ALERT: channel looks broken/.test(out.stderr)), `stderr:\n${out.stderr}`);
+  const alertsAt = (out.stderr.match(/LOCAL ALERT: channel looks broken/g) || []).length;
+  assert.equal(alertsAt, 1, 'one alert per outage');
+  const before = out.stderr;
+  assert.ok(/over ~\d+ min/.test(before), 'the alert states how long the outage persisted');
+
+  // Recovery: healthy polls resume → narrated recovery + the quiet closure notice.
+  mock.state.messagesStatus = 200;
+  assert.ok(await waitFor(() => /channel recovered after \d+ consecutive/.test(out.stderr)), `stderr:\n${out.stderr}`);
+  assert.ok(await waitFor(() => /LOCAL ALERT: channel recovered/.test(out.stderr)), `stderr:\n${out.stderr}`);
+  assert.equal((out.stderr.match(/LOCAL ALERT: channel looks broken/g) || []).length, 1,
+    'recovery must not re-arm a second alert for the same outage');
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
+});
+
+test('bridge: below the persistence window a server-shaped streak backs off LOUDLY on stderr but never pops the desktop alert', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messagesStatus = 502;
+
+  const { child, result, out } = runCli(
+    ['bridge', '--exec', 'true', '--no-realtime'],
+    port, { PIDGE_BRIDGE_BACKOFF_BASE: '50', PIDGE_BRIDGE_BACKOFF_MAX: '120' }, // default 10-min window stays
+  );
+
+  // Way past the old BROKEN_AFTER=5 threshold…
+  assert.ok(await waitFor(() => /\(8 consecutive, looks server-shaped\)/.test(out.stderr)), `stderr:\n${out.stderr}`);
+  // …the stderr log is loud, the desktop stays silent (the outage is seconds old, not 10 minutes).
+  assert.ok(!/LOCAL ALERT: channel looks broken/.test(out.stderr),
+    'a seconds-old outage (every deploy blip, every wake) must not buzz the human');
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
 });

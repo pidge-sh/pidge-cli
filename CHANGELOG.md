@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.43.2 — 2026-08-05
+
+- **The bridge's "channel looks broken" desktop alert is now sleep-aware.** On a
+  laptop the old rule (any 5 consecutive poll failures) fired on every
+  sleep/wake cycle — 30 alerts in one night, all of them the Mac napping.
+  Failures are now classified LOCAL (this machine/its network: ENOTFOUND,
+  ENETDOWN/UNREACH, EHOSTUNREACH, no non-internal interface, aborts right after
+  a wake) vs SERVER-shaped (HTTP 5xx, or network errors while local
+  connectivity looks fine); system sleep is detected from wall-clock gaps
+  (timers freeze while the OS sleeps) and resets the failure streak. The
+  desktop alert pops only for a server-shaped streak that persisted **≥10
+  awake minutes**, at most once per outage and once per **4 h** — and when an
+  alerted outage heals, a quiet "channel recovered" notice closes the loop.
+  Every failure still narrates to stderr and still backs off exactly as
+  before; the immediate 401 (rotated key) alert is unchanged, and
+  `PIDGE_BRIDGE_ALERT=0` still disables desktop notifications entirely.
+
 ## 0.43.1 — 2026-08-05
 
 **A live agent is an agent.** 0.43.0 decided whether a shared pane held an agent
