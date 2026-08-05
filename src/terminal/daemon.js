@@ -120,11 +120,12 @@ const CMD_SEEN_RING = 200;
 // one `tmux list-panes` per second answers for EVERY bound pane, and 2.5 execs
 // a second forever is a battery cost with no product gain.
 const OCCUPANT_POLL_MS = 1_000;
-// What `#{pane_current_command}` looks like when the harness is in the pane.
-// Deliberately BROAD: the set is only ever used to flip agent→term (a share
-// becomes `agent` from the SessionStart hook, never from this list), so a false
-// "still the harness" merely holds the current view one poll longer, while a
-// false "gone" would swap the renderer under a live claude.
+// What `#{pane_current_command}` MAY look like when the harness is in the pane.
+// ADVISORY ONLY, and that is now structural (0.43.1, gotcha #75): this set can
+// suggest "a harness is here", it may NEVER be what concludes "the harness is
+// gone". Absence from a closed list is not evidence — it is ignorance, and
+// Claude Code v2.1.222 proved it by reporting its VERSION (`2.1.222`) here.
+// The retire decision lives in `core.isShellCommand` + `core.paneHasLiveHarness`.
 const HARNESS_COMMANDS = new Set(['claude', 'node', 'node.exe', 'bun', 'deno', 'npm', 'npx']);
 // The tmux session the daemon spawns panes into when the phone asks (§17).
 const SPAWN_TMUX_SESSION = 'pidge';
@@ -261,6 +262,22 @@ class Daemon {
       this.logStream ||= fs.createWriteStream(core.LOG_FILE(), { flags: 'a' });
       this.logStream.write(line + '\n');
     } catch {}
+  }
+
+  // Say a thing ONCE per distinct fact. The occupant poll runs every second, so
+  // "I am keeping this mode because I do not recognise the command" is true on
+  // every tick and useful exactly once — a log that repeats 86 400 times a day
+  // is a log nobody reads, and this one has to be readable: it is the trail
+  // that would have made gotcha #75 visible in an afternoon.
+  noteOnce(key, message) {
+    this.notedOnce ||= new Set();
+    if (this.notedOnce.has(key)) return;
+    // Bounded: keys carry a pane command, which is attacker-ish input in the
+    // sense that a busy machine could mint many. Forget the oldest rather than
+    // grow forever.
+    if (this.notedOnce.size >= 200) this.notedOnce.delete(this.notedOnce.values().next().value);
+    this.notedOnce.add(key);
+    this.log(message);
   }
 
   saveState() {
@@ -1764,7 +1781,11 @@ class Daemon {
     const existing = this.shareForPaneId(paneId);
     if (existing) return { ok: false, error: `pane ${paneId} is already shared as ${existing.publicId}` };
 
-    const harness = isHarnessCommand(pane.cmd);
+    // Same invariant as the poll (§16, gotcha #75): the name is a HINT, the
+    // process tree is the evidence. `pidge terminal share` on a pane running
+    // Claude Code v2.1.222 used to classify it `term` — a live agent shared as
+    // a plain terminal, at the very moment consent was given.
+    const harness = isHarnessCommand(pane.cmd) || core.paneHasLiveHarness(pane.pid) === true;
     const bound = harness ? this.announceForPane(pane, panes) : null;
     try {
       const s = await this.sharePane({
@@ -1827,9 +1848,25 @@ class Daemon {
       // A pane that is GONE is the heartbeat's job (r6-6: ended loudly, never
       // rebound) — absence must never read as "the harness exited".
       if (!pane) continue;
-      if (!isHarnessCommand(pane.cmd)) {
-        this.setOccupant(s, 'term', `claude exited — terminal (${pane.cmd || 'shell'})`);
+      // THE INVARIANT (§16, gotcha #75): `term` is a POSITIVE assertion. Both
+      // halves must say so before a live transcript is retired —
+      //   (1) the pane's current command IS a shell we recognise, and
+      //   (2) no harness process is alive under the pane's process tree.
+      // Anything else — an unfamiliar command, a vendor string we have never
+      // seen, a `ps` that failed — KEEPS the current mode. `null` from the
+      // descendant probe means UNKNOWN and must never act like `false`.
+      if (!core.isShellCommand(pane.cmd)) {
+        this.noteOnce(`occupant:${s.publicId}:${pane.cmd}`,
+          `${s.publicId}: ${JSON.stringify(pane.cmd)} is not a shell this computer recognises — KEEPING mode ${s.occupant} (doubt shows the transcript, §16)`);
+        continue;
       }
+      const harnessAlive = core.paneHasLiveHarness(pane.pid);
+      if (harnessAlive !== false) {
+        this.noteOnce(`occupant-tree:${s.publicId}:${harnessAlive}`,
+          `${s.publicId}: pane shows ${JSON.stringify(pane.cmd)} but the process tree says ${harnessAlive === true ? 'a harness is STILL ALIVE' : 'nothing readable (ps failed)'} — KEEPING mode ${s.occupant}`);
+        continue;
+      }
+      this.setOccupant(s, 'term', `claude exited — terminal (${pane.cmd || 'shell'})`);
     }
   }
 
@@ -2215,7 +2252,15 @@ class Daemon {
   // if it does not exist. `-P -F '#{pane_id}'` makes the new pane's id the
   // command's OUTPUT — no matching, no guessing which pane was just made.
   spawnPane(cwd) {
-    const where = cwd ? ['-c', cwd] : [];
+    // #572 mitigation: with no `-c`, tmux inherits the DAEMON's cwd — and the
+    // daemon runs under launchd/systemd, whose cwd is `/`. A `claude` spawned
+    // at the filesystem root meets its own trust gate, never announces, and the
+    // pane dead-ends (a `term` pane has no composer, so the phone cannot answer
+    // it). The home directory is the only default that is both a real place and
+    // one the harness already trusts on a working machine. This does NOT decide
+    // where a spawn may go — that is the phone's, under the `remote_spawn`
+    // grant (#566).
+    const where = ['-c', cwd || os.homedir()];
     let exists = true;
     try {
       core.tmuxExec(['has-session', '-t', SPAWN_TMUX_SESSION], { stdio: 'ignore' });

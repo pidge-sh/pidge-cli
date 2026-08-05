@@ -909,6 +909,79 @@ async function runDisconnect() {
   say('· tunnel identity kept at ' + core.ENV_FILE() + ' — delete it (and the tunnel in the app) to fully unlink');
 }
 
+// `pidge terminal doctor` — THE ACCEPTANCE TEST AGAINST THE REAL BINARY.
+//
+// Gate A (2026-08-05) shipped a field whose only job is to choose which screen
+// the human sees. It went through an adversarial review and two green suites,
+// and it was wrong on first contact with a real machine: Claude Code v2.1.222
+// answers `#{pane_current_command}` with its VERSION, and a closed harness
+// allowlist read that as "claude exited". No mock could have caught it, because
+// the whole bug lived in what the installed binary calls itself.
+//
+// So this exists to be RUN, on the machine, against whatever is actually
+// installed: it prints the raw string tmux gives for every pane, what each half
+// of the §16 ladder concludes, and the mode that follows. If a live claude does
+// not read `mode=agent ✓` here, the renderer is lying — whatever the tests say.
+// (gotcha #75: every field that governs RENDERING gets a step like this.)
+async function runDoctor() {
+  say('pidge terminal doctor — occupant detection, against the binaries actually installed here.\n');
+  let panes;
+  try {
+    panes = core.tmuxPanes({ onWarn: (m) => say(`  ! ${m}`) });
+  } catch (e) {
+    die(`pidge terminal doctor: the tmux pane list came back mangled (${e.message}) — a pidge/tmux mismatch, not a user error`, 2);
+  }
+  if (!panes.length) {
+    say('No tmux panes on this computer — start one (with a claude inside it) and run this again.');
+    return;
+  }
+
+  // Bound panes come from the daemon when it is up; without it the probe still
+  // works and simply has no live mode to compare against.
+  const bound = new Map();
+  if (await daemonAlive()) {
+    try {
+      const { data } = await daemonCall('GET', '/sessions');
+      for (const e of data.enabled || []) if (e.pane_id) bound.set(e.pane_id, e);
+    } catch { /* the probe below is the point — a daemon hiccup must not kill it */ }
+  } else {
+    say('(daemon DOWN — showing what the detection WOULD conclude; there are no live modes to compare against)\n');
+  }
+
+  let liveAgents = 0; let wrong = 0;
+  for (const p of panes) {
+    const shell = core.isShellCommand(p.cmd);
+    const alive = core.paneHasLiveHarness(p.pid);
+    const verdict = !shell
+      ? 'KEEP (not a shell we recognise — doubt shows the transcript)'
+      : alive === true ? 'KEEP (a harness is alive in the process tree)'
+        : alive === null ? 'KEEP (ps unreadable — unknown never retires a live view)'
+          : 'may flip to term (a known shell AND no harness in the tree)';
+    const share = bound.get(p.paneId);
+    say(`${p.paneId}  ${p.loc}`);
+    say(`  pane_current_command = ${JSON.stringify(p.cmd)}   (raw, exactly as tmux said it)`);
+    say(`  is a known shell?      ${shell ? 'yes' : 'no'}`);
+    say(`  harness in the tree?   ${alive === true ? 'YES (claude)' : alive === false ? 'no' : 'UNKNOWN (ps failed)'}   [pane_pid ${p.pid || '?'}]`);
+    say(`  the §16 ladder says:   ${verdict}`);
+    if (share) {
+      const ok = !(alive === true && (share.mode || 'agent') === 'term');
+      if (alive === true) { liveAgents += 1; if (!ok) wrong += 1; }
+      say(`  shared as:             ${share.public_id} mode=${share.mode || 'agent'} ${ok ? '✓' : '✗  A LIVE HARNESS IS PUBLISHED AS A TERMINAL — the gotcha #75 failure'}`);
+    }
+    say('');
+  }
+
+  if (!bound.size) {
+    say('No pane is shared right now, so there is no mode to check. Share the pane a claude runs in and re-run — THAT is the acceptance test.');
+  } else if (!liveAgents) {
+    say('No shared pane currently has a live harness in its tree. Start a claude inside a shared pane and re-run.');
+  } else if (wrong) {
+    die(`pidge terminal doctor: ${wrong} shared pane(s) hold a LIVE harness but are published as \`term\` — the phone is showing a terminal placeholder instead of the transcript.`, 2);
+  } else {
+    say(`✓ ${liveAgents} shared pane(s) hold a live harness and are published as mode=agent. Occupant detection agrees with reality on this machine.`);
+  }
+}
+
 // --- dispatcher --------------------------------------------------------------
 
 async function runTerminal(sub, v, args = []) {
@@ -916,6 +989,7 @@ async function runTerminal(sub, v, args = []) {
     case 'connect': return runConnect(v);
     case 'enable': return runEnable(v);
     case 'status': return runStatus();
+    case 'doctor': return runDoctor();
     case 'disable': return runDisable(v);
     case 'disconnect': return runDisconnect();
     case 'config': return runConfig(args);
@@ -929,7 +1003,7 @@ async function runTerminal(sub, v, args = []) {
       // `ls` (the session picker) was REMOVED with the enable lock-down: it is
       // not deprecated-but-tolerated, it is gone — sharing happens only from
       // inside the session, so a list of other people's sessions is not a door.
-      die(`pidge terminal: unknown subcommand ${JSON.stringify(sub || '')} — one of: connect, share, config, enable, disable, status, disconnect, daemon`);
+      die(`pidge terminal: unknown subcommand ${JSON.stringify(sub || '')} — one of: connect, share, config, enable, disable, status, doctor, disconnect, daemon`);
   }
 }
 

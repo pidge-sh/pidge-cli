@@ -518,6 +518,8 @@ USAGE
                                           config K on|off    what the phone may do to this computer:
                                                              remote_spawn (default OFF) · inventory (ON)
                                           enable             a CONFIRMATION of the above (never the door)
+                                          doctor             does this computer read a LIVE agent AS an
+                                                             agent? run it on the machine, with claude up
                                           disable · status · disconnect
   pidge update                            update this CLI to the latest published pidge-cli
                                           (npm/pnpm/yarn/bun auto-detected; \`terminal connect\` nudges you here)
@@ -924,7 +926,7 @@ const HELP = {
   },
   terminal: {
     summary: 'Terminals: share a tmux pane with the phone — a Claude session as structured, E2E-sealed conversation data (typed replies come back into it), or a plain terminal pane.',
-    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon] [--replace]  ·  pidge terminal share (inside a pane)  ·  pidge terminal config [remote_spawn|inventory] [on|off]  ·  pidge terminal enable (confirm)  ·  pidge terminal disable [--session SID|--all] | status | disconnect',
+    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon] [--replace]  ·  pidge terminal share (inside a pane)  ·  pidge terminal config [remote_spawn|inventory] [on|off]  ·  pidge terminal enable (confirm)  ·  pidge terminal disable [--session SID|--all] | status | doctor | disconnect',
     body: [
       'The user runs claude inside tmux — that is their ENTIRE responsibility. `connect` (once per computer) pairs with the phone: the app\'s Settings → Computers → Connect a computer mints a tunnel channel + E2E key and shows a one-liner carrying the claim code + PIDGE_SECRET; paste it in a terminal. It asks consent, installs Claude Code hooks (tagged `# pidge-hook`, cleanly removable), refreshes the Pidge skill, copies this CLI to ~/.config/pidge/terminal/cli (so the service never points into a prunable npx cache) and installs a background daemon (launchd on macOS, `systemd --user` on Linux/WSL; a WSL without systemd gets a detached daemon + the line that makes it durable).',
       '',

@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.43.1 — 2026-08-05
+
+**A live agent is an agent.** 0.43.0 decided whether a shared pane held an agent
+or a plain terminal by matching `#{pane_current_command}` against a closed list
+of harness names. Claude Code v2.1.222 reports its **version** there (`2.1.222`,
+while `ps` still says `claude`), so the daemon concluded "claude exited" and
+retired the live transcript within a second — the phone showed the terminal
+placeholder, with no composer, for a session that was in fact waiting for its
+human. Nothing errored, because a wrong renderer hint errors nowhere.
+
+- **`term` is now a POSITIVE assertion; doubt shows the transcript.** A live
+  transcript is only retired when BOTH halves agree: the pane's current command
+  is a shell this CLI recognises (`sh`/`bash`/`zsh`/`fish`/`dash`/…) **and** no
+  harness process is alive under the pane's process tree. Anything else — an
+  unfamiliar command, a vendor string never seen before, a `ps` that failed —
+  keeps the current view and says so once in the log. The list that DECIDES is
+  the shell one, because it is ours and it is stable; a closed list of someone
+  else's process names cannot say "I do not recognise this", only "absent", and
+  absent is not evidence.
+- The same rule applies when a pane is FIRST shared: `pidge terminal share` on a
+  pane running a harness it cannot name now still looks for that pane's
+  transcript instead of publishing a live agent as a terminal.
+- **`pidge terminal doctor`** — a new command that answers, on the machine and
+  against the binaries actually installed there, "does this computer read a live
+  agent AS an agent?". It prints the raw `#{pane_current_command}` for every
+  pane, what each half of the rule concludes, and the mode each shared pane is
+  published with; a live harness published as `term` exits non-zero.
+- **A spawn with no directory now opens in your HOME**, not in whatever the
+  daemon inherited. Under launchd/systemd that was `/`, where a spawned claude
+  meets its own trust prompt, never announces, and leaves a pane the phone
+  cannot answer. An explicit directory is still honoured verbatim.
+
 ## 0.43.0 — 2026-08-04
 
 **Terminals v2, Phase A: the unit is a PANE.** A share stops being a Claude
