@@ -966,29 +966,34 @@ test('parseTmuxPanes: the REAL sanitized (no-locale) output is unparsable, never
   // #{pane_current_command} — the occupant signal (§16) — BEFORE the location,
   // so loc stays the LAST field (the rejoin below depends on that).
   const good = [
-    ['%0', '/dev/ttys006', '/private/tmp/pidge-qa-proj', 'node', 'probe:0.0'].join(core.TMUX_FIELD_SEP),
-    ['%12', '/dev/pts/3', '/home/u/proj', 'zsh', 'main:1.2'].join(core.TMUX_FIELD_SEP),
+    ['%0', '/dev/ttys006', '/private/tmp/pidge-qa-proj', 'node', '4242', 'probe:0.0'].join(core.TMUX_FIELD_SEP),
+    ['%12', '/dev/pts/3', '/home/u/proj', 'zsh', '4243', 'main:1.2'].join(core.TMUX_FIELD_SEP),
   ].join('\n');
   const ok = core.parseTmuxPanes(good);
   assert.deepEqual(ok.unparsable, []);
   assert.deepEqual(ok.panes, [
-    { paneId: '%0', tty: '/dev/ttys006', path: '/private/tmp/pidge-qa-proj', cmd: 'node', loc: 'probe:0.0' },
-    { paneId: '%12', tty: '/dev/pts/3', path: '/home/u/proj', cmd: 'zsh', loc: 'main:1.2' },
+    { paneId: '%0', tty: '/dev/ttys006', path: '/private/tmp/pidge-qa-proj', cmd: 'node', pid: '4242', loc: 'probe:0.0' },
+    { paneId: '%12', tty: '/dev/pts/3', path: '/home/u/proj', cmd: 'zsh', pid: '4243', loc: 'main:1.2' },
   ]);
 
   // A session NAME containing the separator itself (review B2): the tail is
   // rejoined into loc — a perfectly identifiable pane is never dropped.
-  const weird = ['%7', '/dev/ttys009', '/tmp/w', 'zsh', 'my:::odd:::name:0.0'].join(core.TMUX_FIELD_SEP);
+  const weird = ['%7', '/dev/ttys009', '/tmp/w', 'zsh', '4244', 'my:::odd:::name:0.0'].join(core.TMUX_FIELD_SEP);
   const parsed = core.parseTmuxPanes(weird);
   assert.deepEqual(parsed.unparsable, []);
   assert.deepEqual(parsed.panes, [
-    { paneId: '%7', tty: '/dev/ttys009', path: '/tmp/w', cmd: 'zsh', loc: 'my:::odd:::name:0.0' },
+    { paneId: '%7', tty: '/dev/ttys009', path: '/tmp/w', cmd: 'zsh', pid: '4244', loc: 'my:::odd:::name:0.0' },
   ]);
 
-  // A v1-shaped line (4 fields, no current_command) is UNPARSABLE, never
-  // half-read as a pane whose LOCATION is its command — an impossible line is
-  // loud, it is never quietly reinterpreted into a plausible-looking pane.
+  // A SHORT line (any older field count — v1's 4, or 0.43.0's 5 without
+  // #{pane_pid}) is UNPARSABLE, never half-read as a pane whose LOCATION is its
+  // pid — an impossible line is loud, never quietly reinterpreted into a
+  // plausible-looking pane.
   const v1line = ['%3', '/dev/ttys004', '/tmp/old', 'main:0.0'].join(core.TMUX_FIELD_SEP);
+  assert.deepEqual(core.parseTmuxPanes(v1line).panes, []);
+  const v43line = ['%4', '/dev/ttys005', '/tmp/old', 'zsh', 'main:0.1'].join(core.TMUX_FIELD_SEP);
+  assert.deepEqual(core.parseTmuxPanes(v43line).panes, []);
+  assert.deepEqual(core.parseTmuxPanes(v43line).unparsable, [v43line]);
   const old = core.parseTmuxPanes(v1line);
   assert.deepEqual(old.panes, []);
   assert.deepEqual(old.unparsable, [v1line]);
@@ -1006,10 +1011,10 @@ test('tmuxPanes: ALL lines mangled ⇒ a loud throw; a stray bad line warns but 
   assert.match(warns[0], /not a user error/);
 
   // Mixed output: the parsable pane survives, the bad line is warned about.
-  const mixed = ['%1', '/dev/ttys001', '/tmp/a', 'zsh', 's:0.0'].join(core.TMUX_FIELD_SEP) + '\ngarbage-line\n';
+  const mixed = ['%1', '/dev/ttys001', '/tmp/a', 'zsh', '4245', 's:0.0'].join(core.TMUX_FIELD_SEP) + '\ngarbage-line\n';
   const warns2 = [];
   const panes = core.tmuxPanes({ exec: () => mixed, onWarn: (m) => warns2.push(m) });
-  assert.deepEqual(panes, [{ paneId: '%1', tty: '/dev/ttys001', path: '/tmp/a', cmd: 'zsh', loc: 's:0.0' }]);
+  assert.deepEqual(panes, [{ paneId: '%1', tty: '/dev/ttys001', path: '/tmp/a', cmd: 'zsh', pid: '4245', loc: 's:0.0' }]);
   assert.equal(warns2.length, 1);
 
   // tmux itself absent/failing is still a quiet [] — genuinely no panes.
@@ -3043,7 +3048,16 @@ async function withTmuxAsync({ panes = [], exec }, fn) {
     core.tmuxExec = realExec;
   }
 }
-const pane = (id, over = {}) => ({ paneId: id, tty: `/dev/ttys00${id.slice(1)}`, path: '/tmp/proj', cmd: 'zsh', loc: `main:0.${id.slice(1)}`, ...over });
+const pane = (id, over = {}) => ({ paneId: id, tty: `/dev/ttys00${id.slice(1)}`, path: '/tmp/proj', cmd: 'zsh', pid: `90${id.slice(1)}`, loc: `main:0.${id.slice(1)}`, ...over });
+// The second half of the §16 ladder (0.43.1): "is a harness ALIVE under this
+// pane?". `true` = definitely · `false` = definitely not · `null` = UNKNOWN.
+// Only `false` may help retire a live transcript, so every occupant test has to
+// say which of the three the machine would answer.
+async function withHarnessTree(answer, fn) {
+  const real = core.paneHasLiveHarness;
+  core.paneHasLiveHarness = () => answer;
+  try { return await fn(); } finally { core.paneHasLiveHarness = real; }
+}
 // Wait for a condition instead of a fixed sleep — the fire-and-forget PATCHes
 // and the cable round trips are asynchronous by design.
 async function waitFor(cond, ms = 3000) {
@@ -3208,12 +3222,14 @@ test('a claude that exits flips the share to term: the PATCH carries mode, the t
   assert.equal(s.occupant, 'agent');
   apiLog.length = 0;
 
-  // The pane is still there, but the harness is gone: `zsh` is the occupant.
-  await withTmuxAsync({ panes: [pane('%3', { cmd: 'zsh' })] }, async () => {
+  // The pane is still there, but the harness is REALLY gone: a shell is the
+  // occupant AND nothing harness-shaped is alive under the pane (§16 — both
+  // halves must agree before a live transcript is retired).
+  await withHarnessTree(false, () => withTmuxAsync({ panes: [pane('%3', { cmd: 'zsh' })] }, async () => {
     d.lastOccupantAt = 0;
     d.occupantTick();
     await settle();
-  });
+  }));
 
   assert.equal(s.occupant, 'term');
   assert.equal(s.currentSid, null, 'no harness ⇒ no session id inside the sealed meta');
@@ -3248,9 +3264,144 @@ test('the occupant poll never flips on an absent pane or an unreadable list', as
   assert.equal(s.occupant, 'agent');
   assert.ok(d.logLines.some((l) => /pane list unreadable/.test(l) && /no mode is flipped/.test(l)));
 
-  // And the harness still running keeps the agent view (the broad command set).
-  await withTmuxAsync({ panes: [pane('%3', { cmd: 'node' })] }, async () => { d.lastOccupantAt = 0; d.occupantTick(); });
+  // And a command that is not a shell keeps the agent view — whatever it is.
+  await withHarnessTree(false, () => withTmuxAsync({ panes: [pane('%3', { cmd: 'node' })] }, async () => { d.lastOccupantAt = 0; d.occupantTick(); }));
   assert.equal(s.occupant, 'agent');
+});
+
+// --- gotcha #75: `term` is a POSITIVE assertion --------------------------
+// The Gate A defect, pinned to the literal bytes that caused it. Claude Code
+// v2.1.222 answers `#{pane_current_command}` with its VERSION, so the old
+// closed harness allowlist concluded "claude exited" and swapped the renderer
+// under a LIVE session — silently, because a wrong `mode` errors nowhere.
+
+test('gotcha #75: a live claude reporting its VERSION as the pane command NEVER flips to term', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  d.api = async () => ({ res: { status: 200 }, data: {} });
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-222', 'pidge terminal enable')));
+  const s = d.sessions.get('sess-222');
+  assert.equal(s.occupant, 'agent');
+
+  // THE byte the Gate A machine produced. Not a shell ⇒ the ladder stops at
+  // step one and never even asks the process tree.
+  await withHarnessTree(null, () => withTmuxAsync({ panes: [pane('%3', { cmd: '2.1.222' })] }, async () => {
+    d.lastOccupantAt = 0; d.occupantTick(); await settle();
+  }));
+  assert.equal(s.occupant, 'agent', 'a version string is not evidence that claude exited');
+  assert.ok(d.logLines.some((l) => /2\.1\.222/.test(l) && /KEEPING mode agent/.test(l)),
+    'and it says so ONCE, in words a human can act on');
+
+  // Repeat ticks must not repeat the line — this poll runs every second.
+  const before = d.logLines.filter((l) => /KEEPING mode agent/.test(l)).length;
+  await withHarnessTree(null, () => withTmuxAsync({ panes: [pane('%3', { cmd: '2.1.222' })] }, async () => {
+    for (let i = 0; i < 5; i += 1) { d.lastOccupantAt = 0; d.occupantTick(); }
+    await settle();
+  }));
+  assert.equal(d.logLines.filter((l) => /KEEPING mode agent/.test(l)).length, before,
+    'noteOnce: a fact that is true every tick is worth saying exactly once');
+});
+
+test('gotcha #75: a KNOWN SHELL still keeps agent while a harness lives in the pane tree, and when ps fails', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  d.api = async () => ({ res: { status: 200 }, data: {} });
+  await withPanes({ byTty: () => ({ paneId: '%3' }) },
+    () => hookPost(d, 'pre-tool-use', preToolUse('sess-tree', 'pidge terminal enable')));
+  const s = d.sessions.get('sess-tree');
+
+  // `zsh` at the top (claude launched from it) but claude is ALIVE underneath:
+  // the second half of the ladder saves the transcript.
+  await withHarnessTree(true, () => withTmuxAsync({ panes: [pane('%3', { cmd: 'zsh' })] }, async () => {
+    d.lastOccupantAt = 0; d.occupantTick(); await settle();
+  }));
+  assert.equal(s.occupant, 'agent', 'a harness alive in the tree outranks the pane command');
+
+  // `ps` unreadable ⇒ UNKNOWN, and unknown must never behave like "no".
+  await withHarnessTree(null, () => withTmuxAsync({ panes: [pane('%3', { cmd: 'zsh' })] }, async () => {
+    d.lastOccupantAt = 0; d.occupantTick(); await settle();
+  }));
+  assert.equal(s.occupant, 'agent', 'a failed probe is ignorance, not evidence of an exit');
+});
+
+test('gotcha #75: sharing a pane whose command is a version string still LOOKS for its transcript', async () => {
+  const d = readyDaemon();
+  d.hookToken = 'local-test-token';
+  d.api = async (method, p) => (/\/items$/.test(p)
+    ? { res: { status: 201 }, data: { last_seq: 1 } }
+    : { res: { status: 200 }, data: {} });
+  // An unbound pane is honestly `term` (§16 ladder, step 3 — there is nothing
+  // to transcribe). What regressed at Gate A is EARLIER: with `2.1.222` in the
+  // pane the old classifier decided "not a harness" and therefore never even
+  // asked whether this pane had announced a session. A claude that HAD
+  // announced was published as a plain terminal.
+  const asked = [];
+  const realAnnounce = d.announceForPane.bind(d);
+  d.announceForPane = (p, panes) => { asked.push(p.paneId); return realAnnounce(p, panes); };
+  const seen = [];
+  const realShare = d.sharePane.bind(d);
+  d.sharePane = async (args) => { seen.push(args); return realShare(args); };
+
+  await withHarnessTree(true, () => withTmuxAsync({ panes: [pane('%9', { cmd: '2.1.222' })] }, async () => {
+    await d.shareExistingPane('%9', { by: 'test' });
+    await settle();
+  }));
+  assert.deepEqual(asked, ['%9'],
+    'a live harness in the tree must send the share down the transcript path, whatever the pane calls itself');
+  assert.equal(seen.length, 1);
+
+  // And with a genuinely empty pane — a shell, nothing underneath — the share
+  // stays `term`, positively and honestly.
+  await withHarnessTree(false, () => withTmuxAsync({ panes: [pane('%8', { cmd: 'zsh' })] }, async () => {
+    await d.shareExistingPane('%8', { by: 'test' });
+    await settle();
+  }));
+  assert.equal(seen.at(-1).occupant, 'term', 'an empty shell pane IS a terminal — that answer is not a guess');
+});
+
+test('a spawn with no cwd lands in the HOME directory, never the daemon inherited /', async () => {
+  const d = readyDaemon();
+  const { calls } = await withTmuxAsync({ panes: [], exec: () => '%42' }, async () => {
+    d.spawnPane(null);
+  });
+  const spawn = calls.find((a) => a.includes('new-session') || a.includes('new-window'));
+  assert.ok(spawn, `expected a tmux spawn, got ${JSON.stringify(calls)}`);
+  const i = spawn.indexOf('-c');
+  assert.ok(i >= 0, 'the spawn must always pin a directory — inheriting launchd’s `/` is the #572 dead end');
+  assert.equal(spawn[i + 1], require('node:os').homedir());
+
+  // An explicit cwd is still honoured verbatim (the phone may name a place).
+  const { calls: c2 } = await withTmuxAsync({ panes: [], exec: () => '%43' }, async () => {
+    d.spawnPane('/tmp/somewhere');
+  });
+  const spawn2 = c2.find((a) => a.includes('new-session') || a.includes('new-window'));
+  assert.equal(spawn2[spawn2.indexOf('-c') + 1], '/tmp/somewhere');
+});
+
+test('paneHasLiveHarness: three-way answer — alive, definitely not, and UNKNOWN', () => {
+  // A tiny process table: pane shell 100 → node 101 → claude 102.
+  const table = ['  100    1 -zsh', '  101  100 /usr/local/bin/node', '  102  101 /opt/claude/2.1.222/claude', '  200    1 /bin/zsh'].join('\n');
+  assert.equal(core.paneHasLiveHarness(100, { exec: () => table }), true, 'a claude anywhere under the pane is ALIVE');
+  assert.equal(core.paneHasLiveHarness(200, { exec: () => table }), false, 'a lone shell has no harness');
+  assert.equal(core.paneHasLiveHarness(100, { exec: () => { throw new Error('ps: boom'); } }), null, 'a failed ps is UNKNOWN');
+  assert.equal(core.paneHasLiveHarness(100, { exec: () => '' }), null, 'a silent ps is not an empty process table');
+  assert.equal(core.paneHasLiveHarness(undefined, { exec: () => table }), null, 'no pid is UNKNOWN, never "no"');
+  // The name is matched on the BASENAME, dash-stripped — macOS `ps -o comm=`
+  // prints a full path and a login shell wears a leading `-`.
+  assert.equal(core.psCommName('/opt/claude/2.1.222/claude'), 'claude');
+  assert.equal(core.psCommName('-zsh'), 'zsh');
+});
+
+test('the shell allowlist is OURS and closed; the harness list may never decide an exit', () => {
+  for (const sh of ['sh', 'bash', 'zsh', 'fish', 'dash', '-zsh', 'ZSH']) {
+    assert.ok(core.isShellCommand(sh), `${sh} is a shell`);
+  }
+  // The whole point: things that are NOT shells never authorise a flip —
+  // whatever they are, known harness or vendor string nobody has seen.
+  for (const other of ['2.1.222', 'claude', 'node', 'vim', '', undefined, 'some-future-harness']) {
+    assert.ok(!core.isShellCommand(other), `${JSON.stringify(other)} must not authorise retiring a transcript`);
+  }
 });
 
 test('a claude starting in a SHARED TERMINAL pane adopts it: same share, seq continues, mode flips', async () => {

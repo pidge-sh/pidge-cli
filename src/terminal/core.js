@@ -159,10 +159,14 @@ const TMUX_FIELD_SEP = ':::';
 // `current_command` column of the sealed pane inventory (§17). It goes BEFORE
 // the location on purpose: loc must stay the LAST field so the "a session name
 // may contain the separator" rejoin below keeps working.
+// 0.43.1 adds `#{pane_pid}` — the root of the pane's process tree, which is how
+// the occupant check answers "is a harness ALIVE in here?" without trusting a
+// name the vendor owns (§16 invariant; gotcha #75). Both new fields sit BEFORE
+// the location: loc must stay LAST for the rejoin below.
 const TMUX_PANE_FORMAT =
-  ['#{pane_id}', '#{pane_tty}', '#{pane_current_path}', '#{pane_current_command}',
+  ['#{pane_id}', '#{pane_tty}', '#{pane_current_path}', '#{pane_current_command}', '#{pane_pid}',
     '#{session_name}:#{window_index}.#{pane_index}'].join(TMUX_FIELD_SEP);
-const TMUX_PANE_FIELDS = 5;
+const TMUX_PANE_FIELDS = 6;
 
 // Pure parser for `tmux list-panes -F TMUX_PANE_FORMAT` output. A line that
 // does not yield the expected fields goes to `unparsable` — the caller decides
@@ -174,11 +178,11 @@ function parseTmuxPanes(out) {
     if (!line.trim()) continue;
     const parts = line.split(TMUX_FIELD_SEP);
     if (parts.length >= TMUX_PANE_FIELDS && /^%\d+$/.test(parts[0]) && parts[1]) {
-      // >5 parts: the separator appeared inside the LAST field (a tmux session
-      // name may contain ':::') — rejoin the tail into loc instead of dropping
-      // a perfectly identifiable pane (review B2).
+      // Extra parts: the separator appeared inside the LAST field (a tmux
+      // session name may contain ':::') — rejoin the tail into loc instead of
+      // dropping a perfectly identifiable pane (review B2).
       panes.push({
-        paneId: parts[0], tty: parts[1], path: parts[2], cmd: parts[3],
+        paneId: parts[0], tty: parts[1], path: parts[2], cmd: parts[3], pid: parts[4],
         loc: parts.slice(TMUX_PANE_FIELDS - 1).join(TMUX_FIELD_SEP),
       });
     } else {
@@ -188,7 +192,74 @@ function parseTmuxPanes(out) {
   return { panes, unparsable };
 }
 
-// Every tmux pane on this computer: {paneId, tty, path, cmd, loc}.
+// --- The `mode` authority ladder (spec §16, gotcha #75) ---------------------
+// `term` IS A POSITIVE ASSERTION; DOUBT SHOWS THE TRANSCRIPT. The set that
+// DECIDES the agent→term flip is this one — SHELLS — because it is OURS and it
+// is stable. It is deliberately NOT the harness set: a closed list of harness
+// names cannot say "I do not recognise this", only "absent", and absent read as
+// "gone" is what turned every live Claude Code v2.1.222 pane into a terminal
+// placeholder at Gate A (tmux answers `2.1.222` — the harness's VERSION — for
+// `#{pane_current_command}`, while `ps` still says `claude`).
+const SHELL_COMMANDS = new Set(['sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'tcsh', 'csh']);
+function isShellCommand(cmd) {
+  // A login shell shows up as `-zsh`; that is still a shell.
+  return SHELL_COMMANDS.has(String(cmd || '').trim().toLowerCase().replace(/^-/, ''));
+}
+
+// Process names that mean "a harness is alive in this pane's tree". Unlike the
+// shell set above this one is ADVISORY — it can only ever say "definitely
+// alive", never "definitely gone", so a name we have not seen costs nothing.
+const HARNESS_PROCESS_NAMES = new Set(['claude']);
+
+// `comm` from `ps` is a full path on macOS and may carry the login-shell dash.
+function psCommName(comm) {
+  const raw = String(comm || '').trim();
+  if (!raw) return '';
+  return raw.replace(/^-/, '').split('/').pop().toLowerCase();
+}
+
+// Is a harness process alive anywhere under this pane's process tree?
+//   true  — yes, definitely (a descendant's `comm` is a known harness)
+//   false — no, definitely (the tree was read and holds none)
+//   null  — UNKNOWN (no pid, `ps` failed, or it returned nothing usable)
+// The three-way answer is the whole point: `null` must never collapse into
+// `false`, because only `false` is allowed to help retire a live view.
+function paneHasLiveHarness(panePid, opts = {}) {
+  const root = Number(panePid);
+  if (!Number.isInteger(root) || root <= 0) return null;
+  const exec = opts.exec || ((args) => require('node:child_process')
+    .execFileSync('ps', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }));
+  let out;
+  try { out = exec(['-Ao', 'pid=,ppid=,comm=']); } catch { return null; }
+  const children = new Map();
+  const nameOf = new Map();
+  let rows = 0;
+  for (const line of String(out || '').split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+    if (!m) continue;
+    rows += 1;
+    const pid = Number(m[1]); const ppid = Number(m[2]);
+    nameOf.set(pid, psCommName(m[3]));
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
+  }
+  if (!rows) return null; // a silent `ps` is not an empty process table
+  // Breadth-first from the pane's own process, with a visited set: a corrupt
+  // table must not spin us (a pid can never legitimately be its own ancestor,
+  // but this code may not assume the table is sane).
+  const seen = new Set([root]);
+  const queue = [root];
+  while (queue.length) {
+    const pid = queue.shift();
+    if (HARNESS_PROCESS_NAMES.has(nameOf.get(pid) || '')) return true;
+    for (const kid of children.get(pid) || []) {
+      if (!seen.has(kid)) { seen.add(kid); queue.push(kid); }
+    }
+  }
+  return false;
+}
+
+// Every tmux pane on this computer: {paneId, tty, path, cmd, pid, loc}.
 // `opts.exec`/`opts.onWarn` exist for tests and for the daemon's logger.
 function tmuxPanes(opts = {}) {
   const exec = opts.exec || ((args) => tmuxExec(args, { encoding: 'utf8' }));
@@ -488,6 +559,7 @@ module.exports = {
   CONFIG_FILE,
   tmuxPanes, tmuxPaneForTty, tmuxPanesForCwd, normalizeTty,
   parseTmuxPanes, tmuxExec, utf8Locale, TMUX_FIELD_SEP, TMUX_PANE_FORMAT, TMUX_PANE_FIELDS,
+  SHELL_COMMANDS, isShellCommand, HARNESS_PROCESS_NAMES, psCommName, paneHasLiveHarness,
   parseEnableSentinel, ENABLE_SENTINEL, ENABLE_PROMPT, ENABLE_NOT_MIRRORED,
   ENABLE_OK_REASON, ENABLE_NO_PANE_REASON, ENABLE_NO_TRANSCRIPT_REASON,
   ENABLE_PANE_LOOKUP_FAILED_REASON,
