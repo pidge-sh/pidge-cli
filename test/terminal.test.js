@@ -3046,10 +3046,7 @@ async function withTmuxAsync({ panes = [], exec }, fn) {
 const pane = (id, over = {}) => ({ paneId: id, tty: `/dev/ttys00${id.slice(1)}`, path: '/tmp/proj', cmd: 'zsh', loc: `main:0.${id.slice(1)}`, ...over });
 // Wait for a condition instead of a fixed sleep — the fire-and-forget PATCHes
 // and the cable round trips are asynchronous by design.
-// 8000 to match continuity/bridge/runs: 3000 was enough on a Mac but not on a
-// loaded CI runner, where the two cross-wire cable tests at the end of this file
-// failed with `subscribed with []` — the ws simply had not connected yet.
-async function waitFor(cond, ms = 8000) {
+async function waitFor(cond, ms = 3000) {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) {
     if (cond()) return true;
@@ -3867,7 +3864,18 @@ test('the drain leaves rows it cannot open ALONE, and runs a re-served command e
 
 // --- cross-wire: the REAL ActionCable protocol, end to end -----------------
 
-test('the computer lane crosses the real cable: subscribe shape, request in, meta out', async () => {
+// These two drive a REAL ws round trip, so they need the runtime the input lane
+// needs. `Daemon.ensureCable()` returns early — by design, loudly — when there is
+// no native WebSocket (Node <22): transcripts still publish, the input lane is
+// just OFF. Without this guard the assertions can only ever read `subscribed
+// with []` on the 18 and 20 legs of the matrix, which is exactly how they were
+// red on main from the day Phase A landed.
+const NO_NATIVE_WS = typeof WebSocket === 'undefined';
+const cableSkip = NO_NATIVE_WS
+  ? `no native WebSocket on Node ${process.versions.node} — the input lane is off below 22`
+  : false;
+
+test('the computer lane crosses the real cable: subscribe shape, request in, meta out', { skip: cableSkip }, async () => {
   const mock = createMock();
   const port = await mock.start();
   freshXdg();
@@ -3928,7 +3936,7 @@ test('the computer lane crosses the real cable: subscribe shape, request in, met
 // against the v102 server. Its public_id is the AAD anchor of every item
 // already sealed AND the wire id the phone holds, so it must keep working with
 // no re-enable, no re-mint and no second registration under a new id.
-test('GRANDFATHERED across the wire: a v1 share keeps publishing items and taking input on the v102 server', async () => {
+test('GRANDFATHERED across the wire: a v1 share keeps publishing items and taking input on the v102 server', { skip: cableSkip }, async () => {
   const mock = createMock();
   const port = await mock.start();
   freshXdg();
