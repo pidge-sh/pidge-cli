@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.43.2 — 2026-08-05
 
 - **The bridge's "channel looks broken" desktop alert is now sleep-aware.** On a
   laptop the old rule (any 5 consecutive poll failures) fired on every
