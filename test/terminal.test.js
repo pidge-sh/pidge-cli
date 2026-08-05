@@ -3046,7 +3046,10 @@ async function withTmuxAsync({ panes = [], exec }, fn) {
 const pane = (id, over = {}) => ({ paneId: id, tty: `/dev/ttys00${id.slice(1)}`, path: '/tmp/proj', cmd: 'zsh', loc: `main:0.${id.slice(1)}`, ...over });
 // Wait for a condition instead of a fixed sleep — the fire-and-forget PATCHes
 // and the cable round trips are asynchronous by design.
-async function waitFor(cond, ms = 3000) {
+// 8000 to match continuity/bridge/runs: 3000 was enough on a Mac but not on a
+// loaded CI runner, where the two cross-wire cable tests at the end of this file
+// failed with `subscribed with []` — the ws simply had not connected yet.
+async function waitFor(cond, ms = 8000) {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) {
     if (cond()) return true;
@@ -3877,7 +3880,7 @@ test('the computer lane crosses the real cable: subscribe shape, request in, met
   core.tmuxPanes = () => [pane('%1'), pane('%2')];
   try {
     d.ensureCable();
-    await new Promise((r) => setTimeout(r, 400));
+    await waitFor(() => mock.state.subscribeRaw.includes('{"channel":"ComputerChannel"}'));
     // The daemon subscribed with EXACTLY the identifier the server resolves on
     // — no params, because the tunnel key IS the identity.
     assert.ok(mock.state.subscribeRaw.includes('{"channel":"ComputerChannel"}'),
