@@ -33,6 +33,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/thiagoc7/pidge-cli.git"
+    "url": "git+https://github.com/pidge-sh/pidge-cli.git"
   }
 }
