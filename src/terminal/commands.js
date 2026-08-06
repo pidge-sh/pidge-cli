@@ -96,6 +96,9 @@ async function askYesNo(question) {
 function claimFingerprint() {
   return crypto.createHash('sha256').update(`pidge-terminal:${os.hostname()}:${core.terminalDir()}`).digest('base64url').slice(0, 32);
 }
+// THROWS on a network failure (the caller decides: --code dies one-shot, the
+// --qr loop narrates and reprompts). Non-404 HTTP failures come back as
+// { httpStatus } for the same split — only 2xx carries the identity.
 async function claimExchange(base, code) {
   const res = await core.fetchT(`${base}/api/v1/claim`, {
     method: 'POST',
@@ -103,7 +106,7 @@ async function claimExchange(base, code) {
     body: JSON.stringify({ code }),
   });
   if (res.status === 404) return { notFound: true };
-  if (!res.ok) die(`pidge terminal connect: claim exchange failed (${res.status})`);
+  if (!res.ok) return { httpStatus: res.status };
   const data = await res.json();
   return {
     token: data.key,
@@ -113,44 +116,99 @@ async function claimExchange(base, code) {
   };
 }
 
-// §24.2.4 — the blocking prompt of `connect --qr`. ONE readline interface for
-// the whole loop (a fresh interface per attempt would eat buffered piped
-// stdin between attempts). A 404 is uniform by design (#52: unknown = expired
-// = mistyped) and REPROMPTS — each attempt is harmless; ctrl-C or a closed
-// stdin dies with nothing stored on this machine.
-async function promptClaimLoop(base) {
+// --- the interactive prompt session (connect --qr) ---------------------------
+//
+// ONE readline interface for the WHOLE interactive connect: the claim loop AND
+// the consent prompt read from it. Two interfaces in sequence lose lines
+// buffered between them (a pasted "code\ny\n" left the consent hanging
+// forever), and a question pending on an ENDED stdin dissolves silently — the
+// event loop empties and node exits 0 MID-FLOW, a half install wearing a
+// success code. Here end-of-input is an EXPLICIT die at every read point.
+//
+// Lines are COLLECTED continuously, never read with rl.question() (question()
+// drops a line that arrives while an await is in flight), and the buffer is
+// BOUNDED: a 300-line paste must not become 300 claim POSTs.
+const PROMPT_PENDING_MAX = 32;
+
+function makePromptSession() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  // Lines are COLLECTED continuously, not read with rl.question(): a line that
-  // arrives while the previous attempt's claim exchange is still in flight
-  // would be dropped by question() (it only listens between calls) — a pasted
-  // "wrong\nright\n" would then hang the prompt forever.
   const pending = [];
   let ended = false;
   let wake = null;
   const kick = () => { if (wake) { const w = wake; wake = null; w(); } };
-  rl.on('line', (l) => { pending.push(l); kick(); });
+  rl.on('line', (l) => { if (pending.length < PROMPT_PENDING_MAX) pending.push(l); kick(); });
   rl.on('close', () => { ended = true; kick(); });
   // ctrl-C on a TTY reaches the interface, not the process — same contract
-  // either way: nothing was persisted, so exiting is residue-free.
+  // either way: every reader sees the end and dies explicitly.
   rl.on('SIGINT', () => { ended = true; kick(); });
-  try {
-    for (;;) {
-      process.stdout.write('Enter the code shown on your phone: ');
+  return {
+    /// → the next line, or null when input ENDED (the caller dies explicitly,
+    /// with a message that fits what was or wasn't persisted at that point).
+    async nextLine(prompt) {
+      process.stdout.write(prompt);
       while (!pending.length && !ended) await new Promise((resolve) => { wake = resolve; });
-      if (!pending.length) die('pidge terminal connect: input ended before a code was typed — nothing was stored on this machine', 130);
-      // Strip ASCII whitespace ONLY: the app groups the code with spaces for
-      // typing, and claim codes legitimately contain `-`/`_` — any other
-      // normalization would corrupt a valid code (spec §24.2).
-      const code = String(pending.shift()).replace(/[\t\n\v\f\r ]+/g, '');
-      if (!code) continue;
-      const res = await claimExchange(base, code);
-      if (res.notFound) {
-        console.error("That code is unknown, expired or mistyped — check the phone's screen and try again (the app re-mints with one tap).");
-        continue;
-      }
-      return res;
+      return pending.length ? pending.shift() : null;
+    },
+    close() { rl.close(); },
+  };
+}
+
+// §24.2.4 — the blocking prompt of `connect --qr`. A 404 is uniform by design
+// (#52: unknown = expired = mistyped) and REPROMPTS; a network fumble or a
+// non-404 HTTP failure ALSO reprompts (every retry is idempotent per #52's
+// fingerprint binding — and an unhandled throw here would take K down with a
+// raw stack). Attempts are CAPPED: past that, the honest exit is a fresh
+// pairing, not more guessing.
+const CLAIM_PROMPT_MAX_ATTEMPTS = 20;
+
+async function promptClaimLoop(base, session) {
+  let attempts = 0;
+  for (;;) {
+    const answer = await session.nextLine('Enter the code shown on your phone: ');
+    if (answer === null) {
+      die('pidge terminal connect: input ended before a code was typed — nothing was stored on this machine.\n' +
+        "On your phone, tap 'Cancel this pairing'; when you retry, scan the FRESH QR (this one's key died with this process).", 130);
     }
-  } finally { rl.close(); }
+    // Strip ASCII whitespace ONLY: the app groups the code with spaces for
+    // typing, and claim codes legitimately contain `-`/`_` — any other
+    // normalization would corrupt a valid code (spec §24.2).
+    const code = String(answer).replace(/[\t\n\v\f\r ]+/g, '');
+    if (!code) continue;
+    attempts += 1;
+    if (attempts > CLAIM_PROMPT_MAX_ATTEMPTS) {
+      die("pidge terminal connect: too many failed attempts.\nOn your phone, tap 'Cancel this pairing' and re-run `pidge terminal connect --qr` for a fresh QR and a fresh code.", 2);
+    }
+    say('  checking the code…');
+    let res;
+    try {
+      res = await claimExchange(base, code);
+    } catch (e) {
+      console.error(`That didn't reach the server (${e.message}) — check the network and type the code again.`);
+      continue;
+    }
+    if (res.notFound) {
+      console.error("That code is unknown, expired or mistyped — check the phone's screen and try again (the app re-mints with one tap).");
+      continue;
+    }
+    if (res.httpStatus) {
+      console.error(`The server answered ${res.httpStatus} — wait a moment and type the code again.`);
+      continue;
+    }
+    return res;
+  }
+}
+
+// The consent prompt when a session exists (the --qr flow): reading from the
+// SAME session keeps pre-pasted answers alive, and an ended stdin here is a
+// distinct, honest exit — the identity IS stored by now (the claim already
+// rotated the key), so the message names the documented finish-install path.
+async function askYesNoViaSession(session, question) {
+  const answer = await session.nextLine(`${question} [y/N] `);
+  if (answer === null) {
+    die('pidge terminal connect: input ended at the consent prompt — the tunnel identity IS stored.\n' +
+      'Re-run `pidge terminal connect` (no flags) in an interactive terminal to finish the hooks/skill/daemon install.', 130);
+  }
+  return /^y(es)?$/i.test(answer.trim());
 }
 
 async function runConnect(v) {
@@ -207,7 +265,17 @@ async function runConnect(v) {
   // away. Retry-safety (gotcha #52) covered it; the order was still wrong.
   let serverKind = null;
   let qrKf = null;
+  let promptSession = null;
   if (v.qr) {
+    // §24.4 — the QR must only ever meet a REAL terminal. Piped/redirected
+    // stdout persists K wherever the pipe goes (a log, a CI transcript — or,
+    // the acute case, an agent's Bash tool inside a SHARED session, whose
+    // output is published into the mirrored transcript as re-decodable block
+    // art). The env override exists for the integration suite ONLY, which
+    // drives this flow through pipes by construction — never set it by hand.
+    if (!process.stdout.isTTY && !process.env.PIDGE_QR_ALLOW_NO_TTY) {
+      die('pidge terminal connect --qr: a QR is only useful on a real terminal — run it directly, not through a pipe, a redirect or an agent tool (the QR carries the computer key).');
+    }
     // §24.2 — the computer-first door. Mint K locally (the BYOK generator
     // class: 32 bytes of CSPRNG), show it ONLY as a QR — K leaves this machine
     // by CAMERA, never by clipboard or wire — then block on the code the
@@ -228,15 +296,25 @@ async function runConnect(v) {
     say(`\n  key fingerprint: ${qrKf}   (the app must show these SAME six characters)`);
     say('  ⚠ this QR carries the computer key — do not share your screen while it is visible');
     say("  (QR doesn't fit? zoom the terminal out — ⌘− / ctrl−− — or enlarge the window)\n");
-    const claim = await promptClaimLoop(base);
+    // ONE session carries every remaining prompt (claim code + consent) —
+    // see makePromptSession for why two interfaces lose lines and why EOF
+    // must die explicitly instead of letting node exit 0 mid-install.
+    promptSession = makePromptSession();
+    const claim = await promptClaimLoop(base, promptSession);
     token = claim.token;
     channelId = claim.channelId;
     effectiveBase = claim.effectiveBase;
     serverKind = claim.serverKind;
     secret = key.toString('base64url');
   } else if (code) {
-    const res = await claimExchange(base, code);
+    let res;
+    try {
+      res = await claimExchange(base, code);
+    } catch (e) {
+      die(`pidge terminal connect: claim failed (network): ${e.message} — is the server URL right? (${base})`, 2);
+    }
     if (res.notFound) die('pidge terminal connect: that code is unknown, expired or already used by another machine — mint a fresh one in the app (Settings → Computers → Connect a computer)');
+    if (res.httpStatus) die(`pidge terminal connect: claim exchange failed (${res.httpStatus})`);
     token = res.token;
     channelId = res.channelId;
     effectiveBase = res.effectiveBase;
@@ -273,10 +351,17 @@ async function runConnect(v) {
   } catch { say('· manifest unreachable — using default limits (refreshed on next connect)'); }
 
   // Consent prompt — VERBATIM from the spec (§2). Hooks are local-only by
-  // construction; nothing is shared until a per-session enable.
-  const consent = v.yes || await askYesNo(
+  // construction; nothing is shared until a per-session enable. The --qr flow
+  // reads it from the SAME session as the claim prompt (a second readline
+  // would drop a pre-pasted answer, and an ended stdin must die loudly here
+  // — with the identity stored, the finish-install path is the honest exit).
+  const consentQuestion =
     'Install Claude Code hooks so sessions can announce themselves to the local Pidge daemon?\n' +
-    'Hooks talk only to this computer; nothing is shared until you enable a session.');
+    'Hooks talk only to this computer; nothing is shared until you enable a session.';
+  const consent = v.yes
+    || (promptSession ? await askYesNoViaSession(promptSession, consentQuestion)
+                      : await askYesNo(consentQuestion));
+  if (promptSession) { promptSession.close(); promptSession = null; }
   if (consent) {
     writeHookShim();
     // A malformed ~/.claude/settings.json aborts the install LOUDLY: we never

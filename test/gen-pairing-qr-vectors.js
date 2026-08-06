@@ -90,6 +90,17 @@ function buildFixture() {
         payload: encode(fields({ base_url: 'http://api.pidge.sh' })),
         note: 'base_url must be https:// — an http QR is refused outright (and a mismatching https one is refused naming both urls)',
       },
+      duplicate_key: {
+        // Hand-built JSON (stringify cannot emit duplicates): "k" appears
+        // TWICE — first a WRONG key, then the right one. A parser that
+        // "resolved" instead of refusing would bind different keys per
+        // implementation (Swift's Decodable keeps the FIRST, JSON.parse the
+        // LAST) — which is exactly why duplicates are refused, never resolved.
+        payload: PAIR_QR_PREFIX + Buffer.from(
+          `{"k":"${WRONG_KEY.toString('base64url')}",` + JSON.stringify(fields()).slice(1),
+          'utf8').toString('base64url'),
+        note: 'the same JSON key twice (k: a wrong key first, the right one second) — parsers disagree on duplicate resolution, so ANY duplicated key is a typed refusal, never resolved',
+      },
     },
   };
 }

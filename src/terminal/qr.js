@@ -326,9 +326,12 @@ function qrEncodeText(text, { ecl = 'L', mask = -1 } = {}) {
 }
 
 // Render for a terminal: one char per module horizontally, two modules per
-// char vertically (▀/▄/█), dark modules as the FOREGROUND color. On a dark
-// terminal theme that displays as a light-on-dark ("inverted") QR — which
-// iOS's scanner reads fine, and is what every terminal QR in the wild does.
+// char vertically (▀/▄/█). POLARITY IS PINNED per line with ANSI colors —
+// black foreground on a white background — so a dark terminal theme cannot
+// invert the symbol: dark modules render BLACK and the quiet zone WHITE on
+// every theme (AVFoundation's detector is historically the one most hostile
+// to inverted symbols, and the polarity of a security pairing must not
+// depend on the human's color scheme).
 // Quiet zone: 2 modules on every side (the ISO asks 4; 2 is what terminal
 // renderers ship and scanners accept at screen distances).
 function qrRenderTerminal(qr, { quiet = 2 } = {}) {
@@ -347,7 +350,8 @@ function qrRenderTerminal(qr, { quiet = 2 } = {}) {
       const bottom = y + 1 < dim ? at(x, y + 1) : 0;
       line += top ? (bottom ? '█' : '▀') : (bottom ? '▄' : ' ');
     }
-    lines.push(line);
+    // Per-line reset so a partial copy/scrollback never bleeds the colors.
+    lines.push(`\x1b[30;47m${line}\x1b[0m`);
   }
   return lines.join('\n');
 }

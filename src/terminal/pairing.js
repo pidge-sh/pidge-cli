@@ -21,12 +21,30 @@ function pairingBaseUrlOk(baseUrl) {
   return /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(baseUrl);
 }
 
+// The parser side (§24.1) refuses host/os that are not DISPLAY-SAFE (>64
+// chars, control/newline/bidi scalars — the confirm screen is the security
+// boundary). This side simply never emits what that side refuses: strip the
+// unsafe scalars, cap the length. A hostname that needed this was broken
+// anyway; a QR that the phone is guaranteed to refuse must not be printed.
+function displaySafe(text) {
+  return Array.from(String(text))
+    .filter((ch) => {
+      const cp = ch.codePointAt(0);
+      if (cp < 0x20 || cp === 0x7f) return false;                  // control
+      if (cp >= 0x202a && cp <= 0x202e) return false;              // bidi embed/override
+      if (cp >= 0x2066 && cp <= 0x2069) return false;              // bidi isolates
+      return cp !== 0x200e && cp !== 0x200f && cp !== 0x061c;      // LRM/RLM/ALM
+    })
+    .slice(0, 64)
+    .join('');
+}
+
 // → the exact `pidge-pair:v1:…` string. Field order (k, kf, host, os,
 // base_url) is pinned by the fixture: iOS parses JSON and never cares, but
 // the byte-for-byte fixture assertion needs ONE canonical serialization.
 function buildPairingPayload({ key, host, os, baseUrl }) {
   if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('pairing payload needs the 32-byte computer key');
-  const h = String(host || '').trim();
+  const h = displaySafe(String(host || '').trim()).trim();
   if (!h) throw new Error('pairing payload needs a non-empty host');
   if (!os) throw new Error('pairing payload needs an os');
   const base = String(baseUrl || '').replace(/\/$/, '');

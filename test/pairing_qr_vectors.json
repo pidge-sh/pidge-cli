@@ -41,6 +41,10 @@
     "http_base_url": {
       "payload": "pidge-pair:v1:eyJrIjoiVzZCR0NjV0dYdHRtSkg2MktKVUdvSlhleXpGMXRfY0JHMHNxNVhMN05tTSIsImtmIjoidjhpS0RnIiwiaG9zdCI6InN0dWRpby5sb2NhbCIsIm9zIjoibWFjb3MiLCJiYXNlX3VybCI6Imh0dHA6Ly9hcGkucGlkZ2Uuc2gifQ",
       "note": "base_url must be https:// — an http QR is refused outright (and a mismatching https one is refused naming both urls)"
+    },
+    "duplicate_key": {
+      "payload": "pidge-pair:v1:eyJrIjoiM2tJTlR3Q1ZCc3FsNGNvalJpbjltenZ2dnVaVGxDSlpqUXEwTE4yVGpKbyIsImsiOiJXNkJHQ2NXR1h0dG1KSDYyS0pVR29KWGV5ekYxdF9jQkcwc3E1WEw3Tm1NIiwia2YiOiJ2OGlLRGciLCJob3N0Ijoic3R1ZGlvLmxvY2FsIiwib3MiOiJtYWNvcyIsImJhc2VfdXJsIjoiaHR0cHM6Ly9hcGkucGlkZ2Uuc2gifQ",
+      "note": "the same JSON key twice (k: a wrong key first, the right one second) — parsers disagree on duplicate resolution, so ANY duplicated key is a typed refusal, never resolved"
     }
   }
 }

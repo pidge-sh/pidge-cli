@@ -77,6 +77,12 @@ test('fixture failure cases are what their notes claim (the fixture cannot lie t
   assert.ok(Buffer.from(std.k, 'base64').equals(KEY), 'same 32 bytes, wrong alphabet');
   const http = parse(f.http_base_url.payload);
   assert.match(http.base_url, /^http:\/\//);
+  // duplicate_key: "k" really appears twice, and the two resolution behaviors
+  // really diverge — JSON.parse keeps the LAST (the right key), a keeps-first
+  // parser would bind the WRONG one. Refusal is the only safe answer.
+  const dupRaw = Buffer.from(f.duplicate_key.payload.slice(PAIR_QR_PREFIX.length), 'base64url').toString('utf8');
+  assert.equal((dupRaw.match(/"k":/g) || []).length, 2, 'the k key appears twice');
+  assert.equal(JSON.parse(dupRaw).k, FIXTURE.key_b64url, 'keeps-last resolution binds the RIGHT key — keeps-first would not');
   // And the additive-evolution case parses fine with an ignorable extra key.
   const extra = parse(FIXTURE.unknown_extra_key_payload);
   assert.equal(extra.color, 'teal');
@@ -102,11 +108,28 @@ test('QR of the fixture payload: deterministic, sane size, renders with a quiet 
   assert.ok(q.version <= 12, `a pairing payload stays a scannable size (got v${q.version})`);
   const render = qrRenderTerminal(q);
   const lines = render.split('\n');
-  assert.ok(lines.every((l) => [...l].length === q.size + 4), 'every line = size + 2×2 quiet modules wide');
+  const bare = (l) => l.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.ok(lines.every((l) => [...bare(l)].length === q.size + 4), 'every line = size + 2×2 quiet modules wide');
   assert.equal(lines.length, Math.ceil((q.size + 4) / 2), 'two modules per character row');
   assert.match(render, /[█▀▄]/, 'half-block rendering');
   const again = qrRenderTerminal(qrEncodeText(FIXTURE.payload));
   assert.equal(render, again, 'same payload ⇒ the same QR, always');
+});
+
+test('render golden — the fixture payload renders byte-identically, polarity PINNED black-on-white', () => {
+  // A ▀↔▄ mutation in the renderer flips modules while every structural
+  // assertion above still passes — only a byte golden catches it. Regenerate
+  // deliberately (node -e …qrRenderTerminal…) on a renderer change, never by
+  // copying a failing actual.
+  const golden = fs.readFileSync(path.join(__dirname, 'qr_render_golden.txt'), 'utf8');
+  assert.equal(qrRenderTerminal(qrEncodeText(FIXTURE.payload)) + '\n', golden,
+    'the rendered QR drifted from the committed golden');
+  // Polarity: every line paints black-on-white and resets — a dark terminal
+  // theme must not be able to invert the symbol (scanners hate inversion).
+  for (const line of golden.trimEnd().split('\n')) {
+    assert.ok(line.startsWith('\x1b[30;47m') && line.endsWith('\x1b[0m'),
+      'each line pins fg black / bg white and resets');
+  }
 });
 
 test('QR encoder guardrails: unknown EC level and oversize payloads die with named errors', () => {

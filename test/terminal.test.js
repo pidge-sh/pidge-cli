@@ -777,17 +777,21 @@ test('connect: re-running WITHOUT --code on an existing identity still works (th
 // --qr prompt loop holds ONE readline for its whole life, so lines written
 // after the first prompt are consumed one per attempt, in order.
 
-function runConnectQr(port, { extra = [], input = null, env = {}, onPrompt = null } = {}) {
+function runConnectQr(port, { extra = [], input = null, env = {}, onPrompt = null, yes = true, endInput = false } = {}) {
   const bin = path.join(__dirname, '..', 'bin', 'pidge.js');
   const child = spawn(process.execPath,
     [bin, 'terminal', 'connect', '--qr',
-      ...(port ? ['--url', `http://127.0.0.1:${port}`] : []), '--yes', '--no-daemon', ...extra],
+      ...(port ? ['--url', `http://127.0.0.1:${port}`] : []),
+      ...(yes ? ['--yes'] : []), '--no-daemon', ...extra],
     {
       env: {
         ...process.env,
         PIDGE_SECRET: '',
         PIDGE_NO_UPDATE_CHECK: '1',
         PIDGE_QUIET_NAG: '1',
+        // The suite drives the flow through PIPES by construction — the
+        // non-TTY refusal (§24.4) has its own dedicated test below.
+        PIDGE_QR_ALLOW_NO_TTY: '1',
         ...env,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -799,6 +803,7 @@ function runConnectQr(port, { extra = [], input = null, env = {}, onPrompt = nul
     if (!sawPrompt && out.stdout.includes('Enter the code shown on your phone:')) {
       sawPrompt = true;
       if (input !== null) child.stdin.write(input);
+      if (endInput) child.stdin.end(); // EOF after the scripted lines
       if (onPrompt) onPrompt(child);
     }
   });
@@ -901,6 +906,91 @@ test('connect --qr dies on a non-loopback http --url BEFORE printing any QR (the
   assert.match(out.stderr, /https/);
   assert.doesNotMatch(out.stdout, /[█▀▄]/, 'no QR is ever born invalid');
   assert.ok(!fs.existsSync(core.ENV_FILE()));
+});
+
+test('connect --qr REFUSES a non-TTY stdout — K must never land in a pipe, a log or a mirrored transcript (§24.4)', async () => {
+  freshHome();
+  freshXdg();
+  const out = await runConnectQr(null, { env: { PIDGE_QR_ALLOW_NO_TTY: '' } });
+  assert.equal(out.code, 1);
+  assert.match(out.stderr, /only useful on a real terminal/);
+  assert.match(out.stderr, /the QR carries the computer key/);
+  assert.doesNotMatch(out.stdout, /[█▀▄]/, 'no QR reached the pipe');
+  assert.ok(!fs.existsSync(core.ENV_FILE()), 'nothing was stored');
+});
+
+test('connect --qr: stdin ending AFTER the claim dies EXPLICITLY (130) — never exit 0 with a half install', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    // No --yes: after the claim succeeds, the consent prompt reads from the
+    // SAME session and finds stdin ENDED. The old shape (a second readline on
+    // an ended stdin) dissolved the pending question and node exited 0 with
+    // the identity stored but no hooks, no daemon, no "Done".
+    const out = await runConnectQr(port, { yes: false, input: 'claim-ok\n', endInput: true });
+    assert.equal(out.code, 130, `an interrupted install is NOT a success: ${out.stderr}`);
+    assert.match(out.stderr, /input ended at the consent prompt/);
+    assert.match(out.stderr, /identity IS stored/);
+    assert.match(out.stderr, /re-run `pidge terminal connect` \(no flags\)/i,
+      'the exit names the documented finish-install path');
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim', 'the claimed identity survives');
+    assert.ok(!fs.existsSync(path.join(process.env.HOME, '.claude', 'settings.json')), 'no hooks were installed');
+  } finally { await mock.stop(); }
+});
+
+test('connect --qr: a pasted "code\\ny\\n" carries the CONSENT too — one session spans both prompts', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    // The old two-interface shape closed the claim readline WITH the 'y' still
+    // buffered inside it — the consent prompt then hung forever.
+    const out = await runConnectQr(port, { yes: false, input: 'claim-ok\ny\n' });
+    assert.equal(out.code, 0, `the pre-pasted consent must be honored: ${out.stderr}`);
+    assert.match(out.stdout, /✓ hooks installed/, 'the y reached the consent prompt');
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim');
+  } finally { await mock.stop(); }
+});
+
+test('connect --qr: a 5xx from the claim REPROMPTS with an honest line — never an unhandled stack', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  mock.state.claimFailStatuses = [500, 429];
+  try {
+    const out = await runConnectQr(port, { input: 'claim-ok\nclaim-ok\nclaim-ok\n' });
+    assert.equal(out.code, 0, `the loop must survive transient server failures: ${out.stderr}`);
+    assert.match(out.stderr, /The server answered 500/);
+    assert.match(out.stderr, /The server answered 429/);
+    assert.doesNotMatch(out.stderr, /at process|UnhandledPromiseRejection|Error:/,
+      'no raw stack ever reaches the human');
+    assert.match(out.stdout, /checking the code…/, 'the wait between Enter and the answer is narrated');
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim');
+  } finally { await mock.stop(); }
+});
+
+test('connect --qr: attempts are CAPPED — a flood of wrong codes dies with the fresh-pairing recipe', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    const out = await runConnectQr(port, { input: Array(25).fill('wrong-code').join('\n') + '\n' });
+    assert.notEqual(out.code, 0);
+    assert.match(out.stderr, /too many failed attempts/);
+    assert.match(out.stderr, /Cancel this pairing/, "the recovery names the phone's cancel + a fresh QR");
+    const claims = mock.state.reqLog.filter((r) => r.pathname === '/api/v1/claim').length;
+    assert.ok(claims <= 20, `the cap bounds the POSTs (saw ${claims})`);
+    assert.ok(!fs.existsSync(core.ENV_FILE()), 'nothing was stored');
+  } finally { await mock.stop(); }
 });
 
 // ===========================================================================
