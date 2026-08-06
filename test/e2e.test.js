@@ -105,7 +105,14 @@ test('derivation (§20): hkdfSync reproduces every committed vector byte-for-byt
     assert.equal(derived.toString('base64url'), v.derived_key_b64url, `${v.name}: derivation must be byte-identical`);
     assert.equal(e2e.e2eKeyFingerprint(derived), v.derived_kf, `${v.name}: derived kf`);
     assert.notEqual(v.derived_key_b64url, d.computer_key_b64url, `${v.name}: a derived key never equals its parent`);
+    // And the PRODUCTION helper (`setup --from-computer` path) emits the same bytes.
+    assert.equal(e2e.e2eDeriveChannelKey(ikm, v.channel_id).toString('base64url'),
+      v.derived_key_b64url, `${v.name}: e2eDeriveChannelKey must match the fixture`);
   }
+  // The classic-mistake guard is structural: a 43-byte STRING buffer is not a key.
+  assert.throws(() => e2e.e2eDeriveChannelKey(Buffer.from(d.computer_key_b64url, 'utf8'), 42),
+    /32-byte Buffer/, 'the base64url STRING as IKM must be unrepresentable');
+  assert.throws(() => e2e.e2eDeriveChannelKey(ikm, 'ch42'), /public integer id/);
   // The mistake someone WILL make: feeding HKDF the 43-char base64url STRING
   // instead of the 32 raw bytes. The fixture pins the WRONG result so every
   // implementation can assert its own output does NOT equal it.

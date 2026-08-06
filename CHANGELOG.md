@@ -33,6 +33,16 @@ camera**.
   payload string the CLI emits, plus the failure cases (unknown version, kf mismatch, short key,
   standard-base64 key, http base_url) the iOS parser must refuse with typed
   errors.
+- **`pidge setup --claim CODE --from-computer` — the channel secret by
+  DERIVATION.** On a machine already paired as a computer, setup can now
+  derive `PIDGE_SECRET` from the computer key instead of receiving it:
+  `HKDF-SHA256(computer_key, salt empty, info "pidge-derive:v1:ch<id>", 32)`
+  — the app derives the SAME key on the phone side, so no secret travels at
+  all (no one-liner, no clipboard, no chat). One-way: no channel key ever
+  reveals the computer key. Refuses loudly before any network on an unpaired
+  machine, and refuses an ambient `PIDGE_SECRET` alongside the flag (two
+  secret sources never half-mix). The derivation is byte-asserted against the
+  shared fixture's `derivation` suite.
 - **E2E fixture caught up to the shared canonical copy**: the `derivation`
   suite (per-channel key derivation — HKDF-SHA256, empty salt, raw-bytes IKM,
   `pidge-derive:v1:ch<id>`, including the IKM-as-string failure case) and the
