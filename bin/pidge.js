@@ -476,6 +476,7 @@ const OPTIONS = {
   claim: { type: 'string' },                   // setup --claim <single-use code>
   // Agent Sessions (`pidge terminal …`) — see src/terminal/
   code: { type: 'string' },                    // terminal connect: the Connect-a-computer claim code
+  qr: { type: 'boolean' },                     // terminal connect: computer-first pairing — mint K here, print a QR, type back the app's code
   secret: { type: 'string' },                  // terminal connect: PIDGE_SECRET fallback (env var preferred)
   session: { type: 'string' },                 // terminal disable: explicit session id (else ancestor-walk)
   approvals: { type: 'string' },               // terminal enable: comma tool list for the approval gate (off by default)
@@ -587,6 +588,9 @@ USAGE
                                           a Claude session as its structured transcript (E2E-sealed,
                                           typed replies land in its input box) or a plain terminal.
                                           connect --code C   once per computer (paste the app's one-liner)
+                                          connect --qr       computer-first pairing: prints a QR the app
+                                                             scans, you type back the code it shows
+                                                             (no one-liner, no secret in any clipboard)
                                           (claude sharing)   the ONLY door is the PreToolUse HOOK: paste
                                                              "Run exactly this one bash command and nothing
                                                              else: \`pidge terminal enable\`" INTO the session
@@ -795,6 +799,7 @@ const OPTION_DOCS = {
   target: '--target T               skill install: claude (default) → .claude/skills/pidge/SKILL.md · agents → AGENTS.md · gemini → GEMINI.md',
   claim: '--claim CODE             the single-use setup code (the human copies it from the Pidge app)',
   code: '--code CODE              terminal connect: the Connect-a-computer claim code (from the app\'s one-liner)',
+  qr: '--qr                     terminal connect: computer-first pairing — mints the key HERE, prints a QR for the app to scan, then asks for the code the app shows (never combined with --code/PIDGE_SECRET)',
   secret: '--secret S               terminal connect: PIDGE_SECRET fallback (prefer the env var — keeps it out of argv)',
   session: '--session SID            terminal disable: a session id from `pidge terminal status` (optional when exactly one session is shared). `enable` takes no sid — the hook that catches the pasted command knows it.',
   approvals: '--approvals T1,T2        gate these tools behind an Approve/Deny push (off by default). It rides the PASTED command (`pidge terminal enable --approvals Bash,Write`) — the hook reads it there.',

@@ -16,6 +16,8 @@ const crypto = require('crypto');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 const core = require('./core');
+const { buildPairingPayload } = require('./pairing');
+const { qrEncodeText, qrRenderTerminal } = require('./qr');
 
 const PIDGE_HOOK_MARKER = '# pidge-hook';
 const DAEMON_PORT = 41717;
@@ -87,11 +89,83 @@ async function askYesNo(question) {
   return /^y(es)?$/i.test(answer.trim());
 }
 
+// The claim exchange (retry-safe per fingerprint — the pidge server's #52
+// contract): a network fumble re-runs to the SAME key, never a rotation. The
+// SAME fingerprint also makes the --qr reprompt loop harmless: every retyped
+// attempt is one more idempotent try, never a second identity.
+function claimFingerprint() {
+  return crypto.createHash('sha256').update(`pidge-terminal:${os.hostname()}:${core.terminalDir()}`).digest('base64url').slice(0, 32);
+}
+async function claimExchange(base, code) {
+  const res = await core.fetchT(`${base}/api/v1/claim`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-pidge-fingerprint': claimFingerprint() },
+    body: JSON.stringify({ code }),
+  });
+  if (res.status === 404) return { notFound: true };
+  if (!res.ok) die(`pidge terminal connect: claim exchange failed (${res.status})`);
+  const data = await res.json();
+  return {
+    token: data.key,
+    channelId: data.channel && data.channel.id,
+    effectiveBase: (data.base_url || base).replace(/\/$/, ''),
+    serverKind: (data.channel && data.channel.kind) || null,
+  };
+}
+
+// §24.2.4 — the blocking prompt of `connect --qr`. ONE readline interface for
+// the whole loop (a fresh interface per attempt would eat buffered piped
+// stdin between attempts). A 404 is uniform by design (#52: unknown = expired
+// = mistyped) and REPROMPTS — each attempt is harmless; ctrl-C or a closed
+// stdin dies with nothing stored on this machine.
+async function promptClaimLoop(base) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  // Lines are COLLECTED continuously, not read with rl.question(): a line that
+  // arrives while the previous attempt's claim exchange is still in flight
+  // would be dropped by question() (it only listens between calls) — a pasted
+  // "wrong\nright\n" would then hang the prompt forever.
+  const pending = [];
+  let ended = false;
+  let wake = null;
+  const kick = () => { if (wake) { const w = wake; wake = null; w(); } };
+  rl.on('line', (l) => { pending.push(l); kick(); });
+  rl.on('close', () => { ended = true; kick(); });
+  // ctrl-C on a TTY reaches the interface, not the process — same contract
+  // either way: nothing was persisted, so exiting is residue-free.
+  rl.on('SIGINT', () => { ended = true; kick(); });
+  try {
+    for (;;) {
+      process.stdout.write('Enter the code shown on your phone: ');
+      while (!pending.length && !ended) await new Promise((resolve) => { wake = resolve; });
+      if (!pending.length) die('pidge terminal connect: input ended before a code was typed — nothing was stored on this machine', 130);
+      // Strip ASCII whitespace ONLY: the app groups the code with spaces for
+      // typing, and claim codes legitimately contain `-`/`_` — any other
+      // normalization would corrupt a valid code (spec §24.2).
+      const code = String(pending.shift()).replace(/[\t\n\v\f\r ]+/g, '');
+      if (!code) continue;
+      const res = await claimExchange(base, code);
+      if (res.notFound) {
+        console.error("That code is unknown, expired or mistyped — check the phone's screen and try again (the app re-mints with one tap).");
+        continue;
+      }
+      return res;
+    }
+  } finally { rl.close(); }
+}
+
 async function runConnect(v) {
   const code = v.code || null;
   const base = (v.url || 'https://api.pidge.sh').replace(/\/$/, '');
   const secretRaw = process.env.PIDGE_SECRET || v.secret || null;
   const existing = core.loadTerminalEnv();
+
+  // §24.2.1 — the two pairing doors must not half-mix: --qr mints its own key
+  // and takes its code from the phone's screen, so a --code or a PIDGE_SECRET
+  // alongside it is a confused invocation, not a preference.
+  if (v.qr && (code || secretRaw)) {
+    die('pidge terminal connect: --qr mints its own key and takes the code from the phone — do not combine it with --code or PIDGE_SECRET.\n' +
+      'Use EITHER the app one-liner (phone-first) OR `pidge terminal connect --qr` (computer-first).');
+  }
 
   // A NEW pairing over an EXISTING identity refuses LOUDLY (QA finding #9):
   // connect used to overwrite the slot in silence, leaving the old channel
@@ -100,7 +174,8 @@ async function runConnect(v) {
   // reports again (Thiago has three of those). The slot being unique is
   // right — one computer, one identity; the SWITCH must be consented.
   // Re-running WITHOUT --code (finishing a half-done install) stays allowed.
-  if (code && existing.token && !v.replace) {
+  // --qr is a NEW pairing by definition, so it takes the same guard verbatim.
+  if ((code || v.qr) && existing.token && !v.replace) {
     // NOTE: the suggestion is --replace, deliberately NOT `disconnect` —
     // disconnect keeps the identity file (review M1), so it would send the
     // human in a circle right back to this refusal.
@@ -131,22 +206,41 @@ async function runConnect(v) {
   // already rotated the key server-side, and dying here used to throw that key
   // away. Retry-safety (gotcha #52) covered it; the order was still wrong.
   let serverKind = null;
-  if (code) {
-    // The claim exchange (retry-safe per fingerprint — the pidge server's #52
-    // contract): a network fumble re-runs to the SAME key, never a rotation.
-    const fp = crypto.createHash('sha256').update(`pidge-terminal:${os.hostname()}:${core.terminalDir()}`).digest('base64url').slice(0, 32);
-    const res = await core.fetchT(`${base}/api/v1/claim`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-pidge-fingerprint': fp },
-      body: JSON.stringify({ code }),
-    });
-    if (res.status === 404) die('pidge terminal connect: that code is unknown, expired or already used by another machine — mint a fresh one in the app (Settings → Computers → Connect a computer)');
-    if (!res.ok) die(`pidge terminal connect: claim exchange failed (${res.status})`);
-    const data = await res.json();
-    token = data.key;
-    channelId = data.channel && data.channel.id;
-    effectiveBase = (data.base_url || base).replace(/\/$/, '');
-    serverKind = (data.channel && data.channel.kind) || null;
+  let qrKf = null;
+  if (v.qr) {
+    // §24.2 — the computer-first door. Mint K locally (the BYOK generator
+    // class: 32 bytes of CSPRNG), show it ONLY as a QR — K leaves this machine
+    // by CAMERA, never by clipboard or wire — then block on the code the
+    // phone displays. NOTHING persists until the claim succeeds: abandoning
+    // at the prompt (ctrl-C) leaves zero residue, K dies with the process.
+    const key = crypto.randomBytes(32);
+    qrKf = core.e2eKeyFingerprint(key);
+    let payload;
+    try {
+      payload = buildPairingPayload({
+        key, host: os.hostname().trim() || 'computer', os: core.computerOs(), baseUrl: base,
+      });
+    } catch (e) { die(`pidge terminal connect: ${e.message}`); }
+    // The renderer receives ONLY the payload string (§24.5); the payload is a
+    // secret and is never logged or printed as text.
+    say('\nScan this QR with the Pidge app — Settings → Computers → Connect a computer → "From the computer":\n');
+    say(qrRenderTerminal(qrEncodeText(payload)));
+    say(`\n  key fingerprint: ${qrKf}   (the app must show these SAME six characters)`);
+    say('  ⚠ this QR carries the computer key — do not share your screen while it is visible');
+    say("  (QR doesn't fit? zoom the terminal out — ⌘− / ctrl−− — or enlarge the window)\n");
+    const claim = await promptClaimLoop(base);
+    token = claim.token;
+    channelId = claim.channelId;
+    effectiveBase = claim.effectiveBase;
+    serverKind = claim.serverKind;
+    secret = key.toString('base64url');
+  } else if (code) {
+    const res = await claimExchange(base, code);
+    if (res.notFound) die('pidge terminal connect: that code is unknown, expired or already used by another machine — mint a fresh one in the app (Settings → Computers → Connect a computer)');
+    token = res.token;
+    channelId = res.channelId;
+    effectiveBase = res.effectiveBase;
+    serverKind = res.serverKind;
   }
   if (!token) die('pidge terminal connect: no stored identity and no --code — paste the one-liner from the app (Settings → Computers → Connect a computer)');
   if (!secret) die('pidge terminal connect: PIDGE_SECRET missing — the app\'s Connect-a-computer one-liner carries it (E2E is mandatory on tunnels; there is no clear mode)');
@@ -154,6 +248,11 @@ async function runConnect(v) {
 
   core.saveTerminalEnv({ base: effectiveBase, token, secret, channelId });
   say(`✓ tunnel identity stored (${core.ENV_FILE()}, 0600)`);
+  // §24.2.5 — kf at success, so eyes can compare against the app. Equality
+  // needs no ceremony: the phone stored the K it scanned, this machine holds
+  // the K it minted — the same bytes by construction, never via the server.
+  // The first sealed publish proves it end-to-end.
+  if (qrKf) say(`✓ computer key kept locally — fingerprint ${qrKf} (compare with the app's Computer screen)`);
 
   // Only refuse when the server ACTUALLY says a different kind. A server that
   // does not report `kind` at all (every deploy before manifest v100) is not
