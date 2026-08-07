@@ -1011,11 +1011,20 @@ function captureSay(fn) {
   try { return { value: fn(), lines }; } finally { console.log = real; }
 }
 
-// A recorder for the OS commands the installer would run.
+// A recorder for the OS commands the installer would run. `query` is the
+// CAPTURING runner the label guard uses to ask the OS which config slot the
+// installed service serves; '' is "nothing is installed", the state every
+// test below starts from (freshHome/freshXdg). Injecting it keeps the promise
+// at the top of this file: no launchctl, no systemctl, ever.
 function recorder() {
   const calls = [];
-  return { calls, run: (cmd, args) => { calls.push([cmd, ...args].join(' ')); } };
+  return {
+    calls,
+    run: (cmd, args) => { calls.push([cmd, ...args].join(' ')); },
+    query: () => '',
+  };
 }
+const noQuery = () => '';
 
 function withPlatform(platform, fn) {
   const prev = process.env.PIDGE_TERMINAL_PLATFORM;
@@ -1030,7 +1039,7 @@ test('darwin: installDaemonService writes the launchd plist and loads it (never 
   freshHome();
   freshXdg();
   const rec = recorder();
-  const svc = withPlatform('darwin', () => commands.installDaemonService({ run: rec.run }));
+  const svc = withPlatform('darwin', () => commands.installDaemonService({ run: rec.run, query: rec.query }));
 
   assert.equal(svc.kind, 'launchd');
   assert.equal(svc.file, commands.launchdPlistPath());
@@ -1049,7 +1058,7 @@ test('linux + systemd: a --user unit is written and enabled (launchctl is never 
   freshHome();
   freshXdg();
   const rec = recorder();
-  const svc = withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec.run }));
+  const svc = withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec.run, query: rec.query }));
 
   assert.equal(svc.kind, 'systemd');
   assert.equal(svc.label, 'pidge-terminal.service');
@@ -1119,7 +1128,7 @@ test('uninstallDaemonService removes the right thing per platform', () => {
   freshHome();
   freshXdg();
   const install = recorder();
-  withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: install.run }));
+  withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: install.run, query: install.query }));
   const unit = commands.systemdUnitPath();
   assert.ok(fs.existsSync(unit));
 
@@ -1136,7 +1145,7 @@ test('uninstallDaemonService removes the right thing per platform', () => {
   // darwin side: the plist goes, and a second pass is honest about finding nothing.
   freshHome();
   const mac = recorder();
-  withPlatform('darwin', () => commands.installDaemonService({ run: mac.run }));
+  withPlatform('darwin', () => commands.installDaemonService({ run: mac.run, query: mac.query }));
   const plist = commands.launchdPlistPath();
   assert.ok(fs.existsSync(plist));
   const rec2 = recorder();
@@ -1145,6 +1154,216 @@ test('uninstallDaemonService removes the right thing per platform', () => {
   assert.ok(!fs.existsSync(plist));
   assert.deepEqual(withPlatform('darwin', () => commands.uninstallDaemonService({ run: rec2.run })),
     { kind: 'launchd', removed: false }, 'a second teardown reports nothing removed instead of throwing');
+});
+
+// ===========================================================================
+// 3c. the service must SERVE the slot that installed it — and must never take
+//     the shared label from a slot that is not ours
+// ===========================================================================
+//
+// The bug this section pins, in one sentence: the label (`sh.pidge.terminal`,
+// `pidge-terminal.service`) is one name per user ACCOUNT, but the config slot
+// is resolved from HOME/XDG_CONFIG_HOME at run time — so a connect from a
+// custom env installed a service that read someone else's config, and took the
+// running daemon's name while doing it.
+
+// Run a fn that is expected to die(): capture the message, don't exit the
+// test runner.
+function captureDie(fn) {
+  const errs = [];
+  const realErr = console.error;
+  const realExit = process.exit;
+  console.error = (...a) => errs.push(a.join(' '));
+  process.exit = (code) => { const e = new Error('__exit__'); e.exitCode = code; throw e; };
+  try {
+    fn();
+    return { died: false, message: errs.join('\n') };
+  } catch (e) {
+    if (e.message !== '__exit__') throw e;
+    return { died: true, code: e.exitCode, message: errs.join('\n') };
+  } finally { console.error = realErr; process.exit = realExit; }
+}
+
+test('darwin: the plist PINS HOME/XDG_CONFIG_HOME — the daemon serves the slot that installed it', () => {
+  const home = freshHome();
+  const xdg = freshXdg();
+  const rec = recorder();
+  const svc = withPlatform('darwin', () => commands.installDaemonService({ run: rec.run, query: rec.query }));
+
+  const plist = fs.readFileSync(svc.file, 'utf8');
+  assert.match(plist, new RegExp(`<key>HOME</key><string>${home}</string>`),
+    'without a pinned HOME launchd starts the daemon with the LOGIN account home');
+  assert.match(plist, new RegExp(`<key>XDG_CONFIG_HOME</key><string>${xdg}</string>`),
+    'the config slot connect just wrote to is the slot the service must read');
+  // The pin and the log path must agree — that agreement IS the fix.
+  assert.equal(commands.serviceTerminalDir(plist), core.terminalDir());
+});
+
+test('darwin: XDG_CONFIG_HOME is pinned only when the human set one', () => {
+  freshHome();
+  const prev = process.env.XDG_CONFIG_HOME;
+  delete process.env.XDG_CONFIG_HOME;
+  try {
+    const rec = recorder();
+    const svc = withPlatform('darwin', () => commands.installDaemonService({ run: rec.run, query: rec.query }));
+    const plist = fs.readFileSync(svc.file, 'utf8');
+    assert.match(plist, /<key>HOME<\/key>/, 'HOME is always pinned — it is the address of the default slot');
+    assert.ok(!/XDG_CONFIG_HOME/.test(plist),
+      'inventing an XDG_CONFIG_HOME would relocate the config of everything the daemon spawns');
+  } finally { process.env.XDG_CONFIG_HOME = prev; }
+});
+
+test('linux: the unit pins HOME too — XDG_CONFIG_HOME alone was half an address', () => {
+  const home = freshHome();
+  const xdg = freshXdg();
+  const rec = recorder();
+  const svc = withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec.run, query: rec.query }));
+  const unit = fs.readFileSync(svc.file, 'utf8');
+  assert.match(unit, new RegExp(`^Environment="HOME=${home}"$`, 'm'));
+  assert.match(unit, new RegExp(`^Environment="XDG_CONFIG_HOME=${xdg}"$`, 'm'));
+  assert.equal(commands.serviceTerminalDir(unit), core.terminalDir());
+});
+
+test('serviceTerminalDir reads the slot out of every shape we ship, including pre-fix installs', () => {
+  // A 0.44.0 plist: no pinned env at all — the log path is still the giveaway,
+  // which is what lets the guard protect installs made BEFORE this fix.
+  const old = `<dict>
+  <key>Label</key><string>sh.pidge.terminal</string>
+  <key>ProgramArguments</key><array><string>/n/node</string><string>/tmp/qa/.config/pidge/terminal/cli/bin/pidge.js</string></array>
+  <key>StandardOutPath</key><string>/tmp/qa/.config/pidge/terminal/terminal.log</string>
+</dict>`;
+  assert.equal(commands.serviceTerminalDir(old), '/tmp/qa/.config/pidge/terminal');
+  // `launchctl print` prose (the only source when the plist itself is gone —
+  // the QA case: the loaded job's plist lived in /tmp).
+  assert.equal(commands.serviceTerminalDir([
+    'gui/501/sh.pidge.terminal = {', '\tpath = /tmp/qa/Library/LaunchAgents/sh.pidge.terminal.plist',
+    '\tstdout path = /real/.config/pidge/terminal/terminal.log', '}',
+  ].join('\n')), '/real/.config/pidge/terminal');
+  // No log path anywhere: the CLI copy the service runs still names the slot.
+  assert.equal(commands.serviceTerminalDir('ExecStart="/n/node" "/x/.config/pidge/terminal/cli/bin/pidge.js" terminal daemon'),
+    '/x/.config/pidge/terminal');
+  assert.equal(commands.serviceTerminalDir(''), null);
+  assert.equal(commands.serviceTerminalDir(null), null);
+});
+
+test('darwin: a loaded job serving ANOTHER slot is refused, naming both dirs and the way out', () => {
+  freshHome();
+  freshXdg();
+  // The stranger: a real, still-existing config slot that is not ours.
+  const otherCfg = tmp('pidge-other-xdg-');
+  const otherDir = path.join(otherCfg, 'pidge', 'terminal');
+  fs.mkdirSync(otherDir, { recursive: true });
+  const loaded = `gui/501/sh.pidge.terminal = {\n\tstate = running\n\tstdout path = ${path.join(otherDir, 'terminal.log')}\n}`;
+
+  const rec = recorder();
+  const out = captureDie(() => withPlatform('darwin', () => commands.installDaemonService({
+    run: rec.run,
+    query: (cmd) => (cmd === 'launchctl' ? loaded : ''),
+  })));
+
+  assert.ok(out.died, 'taking the label from a live stranger must STOP the install, not warn');
+  assert.match(out.message, new RegExp(otherDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'the message names the slot already installed');
+  assert.match(out.message, new RegExp(core.terminalDir().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'and the slot this run would have used');
+  assert.match(out.message, new RegExp(`XDG_CONFIG_HOME=${otherCfg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} pidge terminal disconnect`),
+    'the way out is a command the human can paste, pointed at the OTHER slot');
+  assert.deepEqual(rec.calls, [], 'nothing was loaded or unloaded');
+  assert.ok(!fs.existsSync(commands.launchdPlistPath()), 'and no plist was written');
+});
+
+test('the escape hatch addresses the OTHER slot with an env that reaches all of it', () => {
+  // `disconnect` reads the config through XDG_CONFIG_HOME but the launchd
+  // plist through os.homedir(). For a slot under a plain `.config` the two
+  // halves only line up under HOME — an XDG-only prefix would read the right
+  // config and unload the WRONG plist, breaking a third daemon.
+  freshHome();
+  freshXdg();
+  const homeish = tmp('pidge-otherhome-');
+  const dirA = path.join(homeish, '.config', 'pidge', 'terminal');
+  fs.mkdirSync(dirA, { recursive: true });
+  const msgA = captureDie(() => withPlatform('darwin', () => commands.installDaemonService({
+    run: () => {}, query: (cmd) => (cmd === 'launchctl' ? `\tstdout path = ${path.join(dirA, 'terminal.log')}` : ''),
+  }))).message;
+  assert.ok(msgA.includes(`HOME=${homeish} pidge terminal disconnect`), msgA);
+  assert.ok(!msgA.includes('XDG_CONFIG_HOME='), 'HOME already carries both halves — do not offer a half-address');
+
+  // A genuinely relocated config dir has no HOME that would find it: name XDG.
+  const odd = tmp('pidge-oddcfg-');
+  const dirB = path.join(odd, 'pidge', 'terminal');
+  fs.mkdirSync(dirB, { recursive: true });
+  const msgB = captureDie(() => withPlatform('darwin', () => commands.installDaemonService({
+    run: () => {}, query: (cmd) => (cmd === 'launchctl' ? `\tstdout path = ${path.join(dirB, 'terminal.log')}` : ''),
+  }))).message;
+  assert.ok(msgB.includes(`XDG_CONFIG_HOME=${odd} pidge terminal disconnect`), msgB);
+});
+
+test('darwin: the SAME slot is a normal restart — the guard must not block reconnecting', () => {
+  freshHome();
+  freshXdg();
+  const rec = recorder();
+  const loaded = `gui/501/sh.pidge.terminal = {\n\tstdout path = ${core.LOG_FILE()}\n}`;
+  const svc = withPlatform('darwin', () => commands.installDaemonService({
+    run: rec.run, query: (cmd) => (cmd === 'launchctl' ? loaded : ''),
+  }));
+  assert.equal(svc.kind, 'launchd');
+  assert.ok(rec.calls.some((c) => c.startsWith('launchctl load -w')), 'the ordinary reinstall still happens');
+});
+
+test('darwin: a plist on disk pointing elsewhere is caught even when nothing is loaded', () => {
+  freshHome();
+  freshXdg();
+  const otherDir = path.join(tmp('pidge-other-xdg-'), 'pidge', 'terminal');
+  fs.mkdirSync(otherDir, { recursive: true });
+  const file = commands.launchdPlistPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `<dict><key>StandardOutPath</key><string>${path.join(otherDir, 'terminal.log')}</string></dict>`);
+
+  const rec = recorder();
+  const out = captureDie(() => withPlatform('darwin', () => commands.installDaemonService({ run: rec.run, query: noQuery })));
+  assert.ok(out.died);
+  assert.match(out.message, /already runs a pidge daemon for a DIFFERENT config slot/);
+});
+
+test('a stranger whose config slot no longer EXISTS is rubble, not an identity — replace it', () => {
+  freshHome();
+  freshXdg();
+  // /tmp evaporates on reboot; the plist that survives points at nothing. If
+  // that refused, the human would be locked out of their own machine.
+  const gone = path.join(tmp('pidge-gone-'), 'vanished', 'pidge', 'terminal');
+  const rec = recorder();
+  const loaded = `gui/501/sh.pidge.terminal = {\n\tstdout path = ${path.join(gone, 'terminal.log')}\n}`;
+  const svc = withPlatform('darwin', () => commands.installDaemonService({
+    run: rec.run, query: (cmd) => (cmd === 'launchctl' ? loaded : ''),
+  }));
+  assert.equal(svc.kind, 'launchd');
+  assert.ok(rec.calls.some((c) => c.startsWith('launchctl load -w')));
+});
+
+test('linux: the same refusal on systemd, read out of the installed unit FragmentPath', () => {
+  freshHome();
+  freshXdg();
+  const otherCfg = tmp('pidge-other-xdg-');
+  const otherDir = path.join(otherCfg, 'pidge', 'terminal');
+  fs.mkdirSync(otherDir, { recursive: true });
+  const frag = path.join(otherCfg, 'systemd', 'user', 'pidge-terminal.service');
+  fs.mkdirSync(path.dirname(frag), { recursive: true });
+  fs.writeFileSync(frag, `[Service]\nStandardOutput=append:${path.join(otherDir, 'terminal.log')}\n`);
+
+  const rec = recorder();
+  const out = captureDie(() => withPlatform('linux', () => commands.installDaemonService({
+    systemd: true, run: rec.run, query: (cmd, args) => (cmd === 'systemctl' && args.includes('FragmentPath') ? `${frag}\n` : ''),
+  })));
+  assert.ok(out.died, 'systemctl --user enable would have restarted the STRANGER, not this unit');
+  assert.match(out.message, /DIFFERENT config slot/);
+  assert.deepEqual(rec.calls, [], 'no daemon-reload, no enable');
+  assert.ok(!fs.existsSync(commands.systemdUnitPath()));
+});
+
+test('linux: with no service manager there is no shared label — the detached fallback is never blocked', () => {
+  freshHome();
+  freshXdg();
+  const otherDir = path.join(tmp('pidge-other-xdg-'), 'pidge', 'terminal');
+  fs.mkdirSync(otherDir, { recursive: true });
+  assert.equal(commands.foreignDaemonConfig({ platform: 'linux', systemd: false, query: noQuery }), null);
 });
 
 test('normalizeTty turns a short tty name into the path tmux reports — on BOTH ps flavors', () => {
@@ -1270,14 +1489,14 @@ test('both service templates carry a UTF-8 locale (launchd and systemd hand the 
   freshHome();
   freshXdg();
   const rec = recorder();
-  const mac = withPlatform('darwin', () => commands.installDaemonService({ run: rec.run }));
+  const mac = withPlatform('darwin', () => commands.installDaemonService({ run: rec.run, query: rec.query }));
   const plist = fs.readFileSync(mac.file, 'utf8');
   assert.match(plist, /<key>LANG<\/key><string>[^<]*(UTF-8|utf8)<\/string>/i);
   assert.match(plist, /<key>LC_ALL<\/key><string>[^<]*(UTF-8|utf8)<\/string>/i);
 
   freshHome();
   freshXdg();
-  const lin = withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: recorder().run }));
+  const lin = withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: recorder().run, query: noQuery }));
   const unit = fs.readFileSync(lin.file, 'utf8');
   assert.match(unit, /^Environment="LANG=[^"]*(UTF-8|utf8)"$/im);
   assert.match(unit, /^Environment="LC_ALL=[^"]*(UTF-8|utf8)"$/im);
@@ -1352,7 +1571,7 @@ test('installDaemonService(recycle): systemd RESTARTS the unit — enable --now 
   freshHome();
   freshXdg();
   const rec = recorder();
-  withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec.run, recycle: true }));
+  withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec.run, recycle: true, query: rec.query }));
   assert.deepEqual(rec.calls, [
     'systemctl --user daemon-reload',
     'systemctl --user enable --now pidge-terminal.service',
@@ -1360,7 +1579,7 @@ test('installDaemonService(recycle): systemd RESTARTS the unit — enable --now 
   ], 'the restart is what actually cycles an already-active unit onto the new identity');
 
   const rec2 = recorder();
-  withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec2.run }));
+  withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec2.run, query: rec2.query }));
   assert.ok(!rec2.calls.some((c) => /restart/.test(c)), 'a plain connect does not restart — fresh installs are already fresh');
 });
 
@@ -1429,7 +1648,7 @@ test('installing the service COPIES the CLI to a stable path and points ExecStar
   freshHome();
   freshXdg();
   const rec = recorder();
-  const svc = withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec.run }));
+  const svc = withPlatform('linux', () => commands.installDaemonService({ systemd: true, run: rec.run, query: rec.query }));
   const unit = fs.readFileSync(svc.file, 'utf8');
   const exec = unit.split('\n').find((l) => l.startsWith('ExecStart='));
 
@@ -1448,7 +1667,7 @@ test('installing the service COPIES the CLI to a stable path and points ExecStar
   freshHome();
   freshXdg();
   const mac = recorder();
-  const macSvc = withPlatform('darwin', () => commands.installDaemonService({ run: mac.run }));
+  const macSvc = withPlatform('darwin', () => commands.installDaemonService({ run: mac.run, query: mac.query }));
   const plist = fs.readFileSync(macSvc.file, 'utf8');
   assert.ok(plist.includes(commands.stableCliEntry()));
   assert.ok(!/_npx/.test(plist));

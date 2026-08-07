@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.44.1 — 2026-08-07
+
+**The installed daemon now serves the config slot that installed it — and
+refuses to take the service name from one that isn't its own.** Two halves of
+the same hole, found in guided QA of `connect --qr` on a machine that already
+had a paired daemon.
+
+- **The service template pins `HOME` (and `XDG_CONFIG_HOME`, when you set
+  one).** `sh.pidge.terminal` / `pidge-terminal.service` resolved the config
+  slot from the environment the SUPERVISOR handed them — the login account's
+  `HOME`, never the shell's. So a `connect` run under a custom `HOME` or
+  `XDG_CONFIG_HOME` (routine on Linux, and the only way to test a pairing in
+  isolation) installed a daemon that read a *different* config than the one
+  `connect` had just written: the freshly paired identity never came online,
+  while the binary quietly served someone else's. The launchd plist now
+  carries `HOME`/`XDG_CONFIG_HOME` in `EnvironmentVariables` and the systemd
+  unit carries `Environment=HOME=…` alongside the `XDG_CONFIG_HOME` it already
+  had. `XDG_CONFIG_HOME` is pinned only when you actually set one — inventing
+  a value would relocate the config of everything the daemon spawns.
+- **A second `connect` from a different config slot is now REFUSED, not
+  granted in silence.** The service name is one per user account, so
+  bootstrapping a new one booted the running daemon out and took its place —
+  no warning, no consent, and the displaced computer went offline without
+  saying so. Install now asks the OS which slot the existing service serves
+  (`launchctl print` / the unit's `FragmentPath`, plus the template on disk)
+  and stops with both directories named and two pasteable ways forward: re-run
+  in the existing slot's environment, or retire it first. The check runs
+  BEFORE the claim too, so a doomed `connect` can no longer burn a pairing
+  code and leave the phone spinning on a computer that will never connect.
+  Replacing stays silent when it is the same slot — that is an ordinary
+  restart. A slot whose directory no longer exists is treated as rubble and
+  replaced: a plist that outlived its `/tmp` config must never lock you out of
+  your own machine.
+- Recognising an existing install reads the service's log path, which every
+  version we ever shipped writes — so the refusal also protects daemons
+  installed **before** this release, which carry no pinned environment at all.
+
 ## 0.44.0 — 2026-08-06
 
 **Pairing v2 — `pidge terminal connect --qr`, the computer-first door.**
