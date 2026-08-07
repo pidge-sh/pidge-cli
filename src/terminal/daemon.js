@@ -25,6 +25,10 @@ const http = require('http');
 const crypto = require('crypto');
 const core = require('./core');
 const adapter = require('./adapter-claude');
+const wire = require('./wire');
+const settings = require('./settings');
+const { ControlHub } = require('./control');
+const { createMirror } = require('./mirror');
 
 const HOOK_TTL_MS = 24 * 3600 * 1000;   // announce map entries age out (spec §2)
 const TAIL_POLL_MS = 400;
@@ -63,7 +67,17 @@ const OUTBOX_MAX_BYTES = 4 * 1024 * 1024;
 const LIVE_READ_MAX_BYTES = 4 * 1024 * 1024;   // per live tick (the next tick continues)
 const TAIL_WINDOW_BYTES = 8 * 1024 * 1024;     // enable backfill + restart dedup reseed
 const RESCAN_MAX_BYTES = 64 * 1024 * 1024;     // a whole-file bulk re-read, hard-clamped
-const INPUT_KEYS = new Set(['Enter', 'Escape', 'Up', 'Down', 'Tab', 'BTab', 'C-c']);
+// Phase B (spec §19): the key allowlist is now PER MODE — `agent` keeps the §8
+// seven, `term` gets the old arc's proven shell set. wire.keysForMode is the
+// one authority; INPUT_KEYS stays as the agent-mode alias the tests name.
+const INPUT_KEYS = wire.AGENT_KEYS;
+// The frame types a viewer may put on the `agent_input` lane. `reseed`/`resize`
+// are ADDITIVE (§19): a v1 daemon ignored them by §12, this one mirrors on them.
+const INPUT_FRAME_TYPES = new Set(['i', 'reseed', 'resize']);
+// Fallback for the relay's per-frame ceiling when the cached manifest predates
+// v104 (`agent_sessions.limits.pane_output_frame_max_bytes`). Never the
+// authority — core.loadCaps() is (the manifest is the contract).
+const PANE_OUTPUT_FRAME_MAX_BYTES = 65_536;
 // A register the server refused for a reason RETRYING cannot fix (the session
 // is gone, the key was rotated, the tunnel is not ours). Everything else — a
 // network error, a 5xx, a 402 while a subscription lapses — is transient and
@@ -207,6 +221,16 @@ class Daemon {
     // a vgen across a re-enable, and dropping a live viewer's input silently is
     // worse than the replay window the epoch echo already closes.
     this.retiredVgens = new Set();
+    // --- the pane mirror (Phase B, spec §19) ---
+    // ONE control-mode client per tmux SESSION (the hub refcounts panes on it);
+    // ONE mirror per ACTIVE share (a term pane with a viewer, or an agent pane
+    // whose raw peek is open). Both are built lazily and stood down on the
+    // idle window — nothing here costs a process until a human looks.
+    const knobs = settings.loadSettings(core.baseDir());
+    this.mirrorSettings = knobs.settings;
+    this.mirrorWarnings = knobs.warnings;
+    this.hub = new ControlHub({ narrate: (m) => this.log(m) });
+    this.mirrors = new Map();   // sid → { mirror, release, tmuxSession, paneId }
     // --- the computer lane (v2 §17) ---
     // The ComputerChannel subscription is held while the machine is CONNECTED,
     // with zero shared panes — it is what makes the phone's online chip, the
@@ -595,6 +619,16 @@ class Daemon {
         }));
         return send(200, { announces: ann, enabled, grants: core.loadGrants() });
       }
+      // Phase B (§19): what the mirror is doing right now — read-only, and the
+      // reason `pidge terminal doctor` can answer "is the byte view alive?"
+      // without guessing from the outside.
+      case 'GET /mirror':
+        return send(200, this.mirrorReport());
+      // …and the ACCEPTANCE probe (§12's real-binary rule): attach for real,
+      // force one reseed against the installed tmux, report the seed the
+      // ladder produced. The doctor fails the machine if it does not fit.
+      case 'POST /mirror/probe':
+        return send(200, await this.probeMirror(body.public_id || null));
       // v2 §17: `pidge terminal share`, typed by a human INSIDE a pane. The CLI
       // did the tty→pane match (it has a real tty; the Claude-hook ttyless
       // problem is not this path's) — the daemon still VERIFIES the pane and
@@ -1036,6 +1070,7 @@ class Daemon {
     const s = this.sessions.get(sid);
     if (!s) { delete this.state.sessions[sid]; this.saveState(); return { sid, server_ok: true, detail: null }; }
     s.gen += 1; // invalidate every outstanding async callback (#66)
+    this.stopMirror(sid, 'the share ended'); // the tap dies with the consent that opened it
     this.sessions.delete(sid);
     delete this.state.sessions[sid];
     this.saveState();
@@ -1956,6 +1991,9 @@ class Daemon {
     // to post (see drainIntervalMs).
     this.noteViewerActivity();
     this.kickDrain('a viewer joined');
+    // Phase B (§19 / design §2): warm the tap for every shared `term` pane —
+    // eager attach, emission still gated at viewers=0 until a reseed arrives.
+    this.warmTermMirrors('a viewer joined this computer');
     if (this.capsTimer) return; // a publish is already coming for this burst
     this.capsTimer = setTimeout(() => {
       this.capsTimer = null;
@@ -2404,6 +2442,18 @@ class Daemon {
       if (frame.message.type === 'input') {
         const session = [...this.sessions.values()].find((s) => s.publicId === ident.public_id);
         if (session) this.handleInputFrame(session, frame.message.frame);
+        return;
+      }
+      // Phase B (§19): the relay's drop notice, transmitted to the SENDER only
+      // — it never reaches a viewer, so this is the daemon's one honest signal
+      // that a pane_output frame did not land. `rate_limited` earns a penalty
+      // (flush 4× slower briefly); both reasons self-heal via reseed, so
+      // nothing is ever retried.
+      if (frame.message.type === 'frame_dropped') {
+        const session = [...this.sessions.values()].find((s) => s.publicId === ident.public_id);
+        const entry = session && this.mirrors.get(session.sid);
+        if (entry) entry.mirror.noteDrop(String(frame.message.reason || 'unknown'));
+        else this.log(`pane_output frame dropped by the relay (${frame.message.reason}) for a share with no live mirror`);
       }
     };
     ws.onclose = () => {
@@ -2443,6 +2493,10 @@ class Daemon {
       if (hadFailures || downS > 0) this.log(`cable RESTORED — input lane confirmed after ${downS}s down`);
     }
     this.cableDownSince = null;
+    // Phase B: repaint anyone still watching. Their gap detector may never fire
+    // — nothing moved in the pane while we were away — so the seed is what
+    // proves the view is live again (§19: every gap ends in a reseed).
+    for (const entry of this.mirrors.values()) entry.mirror.onRelayUp();
   }
 
   // A cable attempt failed or a live socket died: mark the lane DOWN, say so
@@ -2517,7 +2571,10 @@ class Daemon {
       return;
     }
     // Replay ledger (B4): vgen + per-vgen monotonic seq + mandatory epoch echo.
-    if (msg.t !== 'i' || !msg.vgen || !Number.isInteger(msg.seq) || !Number.isInteger(msg.he)) {
+    // Phase B adds `reseed`/`resize` as ADDITIVE types on THIS lane (§19) —
+    // same ledger, same mandatory vgen/he, no second replay machinery. An
+    // unknown `t` is still ignored by contract (§12).
+    if (!INPUT_FRAME_TYPES.has(msg.t) || !msg.vgen || !Number.isInteger(msg.seq) || !Number.isInteger(msg.he)) {
       this.log('input frame missing t/vgen/seq/he — dropped');
       return;
     }
@@ -2544,14 +2601,45 @@ class Daemon {
       this.log(`input for ${session.sid.slice(0, 8)} DROPPED: pane check failed (daemon-side, tmux could not be asked) — NOT ending the session`);
       return;
     }
+    // ANY inbound frame is pane-level presence evidence — it is what keeps this
+    // share's mirror alive (there is no viewer-left event to lean on).
+    const liveMirror = this.mirrors.get(session.sid);
+    if (liveMirror) liveMirror.mirror.noteInbound();
+
+    // Phase B control frames (§19). A reseed is the ONE thing that attaches an
+    // `agent` pane's mirror: it is the raw-peek toggle opening, and it is also
+    // the universal gap cure — every path ends in a seed.
+    if (msg.t === 'reseed') {
+      const mirror = this.ensureMirror(session, 'a viewer asked for a reseed');
+      if (!mirror) { this.log(`${session.publicId}: reseed asked for, but no mirror could attach — the viewer will ask again`); return; }
+      mirror.reseed();
+      return;
+    }
+    if (msg.t === 'resize') {
+      // A resize needs a live tap to act on. For a `term` share the viewer is
+      // provably present, so it may attach; for an `agent` share only a reseed
+      // (the raw toggle) opens the mirror — a resize alone must not.
+      const mirror = (session.occupant || 'agent') === 'term'
+        ? this.ensureMirror(session, 'a viewer resized this pane')
+        : (liveMirror && liveMirror.mirror) || null;
+      if (!mirror) return; // no raw view open on this agent pane — nothing to resize for
+      mirror.resize(msg.cols, msg.rows);
+      return;
+    }
+
     if (!Array.isArray(msg.keys)) return;
     session.lastAliveAt = Date.now(); // delivered input = mirror life (diagnostic)
+    // THE KEY SET IS DECIDED BY THE SHARE'S CURRENT `mode` (§19): a shell needs
+    // line editing, paging and job control; a transcript does not. A raw peek
+    // at an agent pane does NOT widen it — the composer stays the one surface,
+    // and a wrong mode is the §16 ladder's problem to fix, not the key set's.
+    const allowed = wire.keysForMode(session.occupant || 'agent');
     for (const k of msg.keys.slice(0, 16)) {
       try {
         if (k && typeof k.lit === 'string' && k.lit.length) {
           this.sendLiteral(session.paneId, k.lit);
           session.waitingArmed = true; // input resets the waiting episode (spec §9)
-        } else if (k && typeof k.key === 'string' && INPUT_KEYS.has(k.key)) {
+        } else if (k && typeof k.key === 'string' && allowed.has(k.key)) {
           core.tmuxExec(['send-keys', '-t', session.paneId, k.key]);
         }
         // anything else: dropped whole (deliberately tiny allowlist)
@@ -2590,6 +2678,216 @@ class Daemon {
       if (typeof e.status === 'number') return false; // tmux ran and answered "no" (no server ⇒ no panes)
       return null; // spawn/timeout failure — unknown, NOT "gone"
     }
+  }
+
+  // --- the pane mirror (Phase B, spec §19) ----------------------------------
+  //
+  // The byte view returns, scoped to the pane that is shared. Three facts shape
+  // everything below:
+  //
+  //  1. THE ONLY SERVER CHANGE IS ONE PERFORM. Output rides the share's
+  //     EXISTING AgentSessionChannel subscription as `frame` — sealed on the
+  //     new `pane_output` lane, relayed verbatim, NEVER persisted. There is no
+  //     catch-up: a viewer that sees an (epoch,seq) gap asks for a reseed, and
+  //     the reseed is what makes every drop safe (#7's DNA — the WS is not a
+  //     ledger).
+  //  2. THERE IS NO PER-PANE "VIEWER LEFT" ON THIS WIRE. ComputerChannel emits
+  //     viewer_joined on subscribe and NOTHING on unsubscribe (verified against
+  //     server/app/channels/computer_channel.rb). So presence is a decaying
+  //     WINDOW, never a flag: a mirror stands down once no inbound frame has
+  //     touched its share for `mirror_idle_ms` AND this computer has seen no
+  //     viewer activity for the drain window. Standing down early is safe by
+  //     construction — re-attaching costs one tmux process and the next reseed
+  //     repaints everything.
+  //  3. ATTACH POLICY FOLLOWS `mode` (§19). A `term` pane attaches EAGERLY on
+  //     viewer_joined — the tap is warm so the first paint is instant — but
+  //     EMISSION IS GATED: viewers starts at 0 and output is dropped at zero
+  //     cost until the first `t:"reseed"` arrives. An `agent` pane attaches
+  //     ONLY on that reseed (the raw peek toggle opening), because its default
+  //     surface is the transcript and a mirror nobody opened is pure cost.
+
+  frameCap() {
+    return Number(this.caps.pane_output_frame_max_bytes) || PANE_OUTPUT_FRAME_MAX_BYTES;
+  }
+
+  // The lane's AAD: `ch<id>:<the pane share's public_id>:pane_output`. The
+  // anchor is the SAME public_id agent_transcript uses, so the field name is
+  // the ONLY thing separating a raw byte frame from a transcript item — which
+  // is exactly what the `pane_output_cross_lane` fixture case proves must fail.
+  sealPaneFrame(session, frame) {
+    return core.e2eEncryptBlob(this.key,
+      core.e2eAad(this.env.channelId, session.publicId, wire.PANE_OUTPUT_FIELD),
+      Buffer.from(JSON.stringify(frame), 'utf8')).toString('base64url');
+  }
+
+  // perform "frame" on the share's own subscription. Returns false when the
+  // cable is not up — the mirror treats that as "not sent" and the next reseed
+  // heals the gap; nothing is queued (an ephemeral lane must never grow a
+  // ledger). The relay's cap is enforced on THIS side first, for the same
+  // reason publishMeta does it: a frame the server drops in silence is exactly
+  // the failure #65 forbids, and here it would also cost a wasted budget slot.
+  sendPaneFrame(session, sealed) {
+    const cap = this.frameCap();
+    if (Buffer.byteLength(sealed, 'utf8') > cap) {
+      this.noteOnce(`pane-frame-cap:${session.publicId}`,
+        `${session.publicId}: a pane_output frame is over the ${cap}B relay cap — NOT sent (the seed ladder degrades inside the cap; a live-output chunk over it means the manifest limits shrank under us)`);
+      return false;
+    }
+    if (!this.ws || this.ws.readyState !== 1 || !this.wsConfirmed) return false;
+    try {
+      this.ws.send(JSON.stringify({
+        command: 'message',
+        identifier: this.identifierFor(session),
+        data: JSON.stringify({ action: 'frame', frame: sealed }),
+      }));
+      return true;
+    } catch (e) {
+      this.log(`${session.publicId}: pane_output frame not sent (${e.message})`);
+      return false;
+    }
+  }
+
+  // The attach target is the tmux SESSION NAME (`tmux -C attach -t <name>`),
+  // resolved FRESH from the stable pane id every time — a session rename kills
+  // the hub's client on purpose (old-arc finding #10: after a rename the old
+  // `-t` target silently addresses nothing), and this is how it comes back.
+  tmuxSessionForPane(paneId) {
+    try {
+      const out = core.tmuxExec(['display-message', '-p', '-t', paneId, '#{session_name}'], { encoding: 'utf8' });
+      const name = String(out).split('\n')[0].trim();
+      return name || null;
+    } catch {
+      return null; // tmux could not be asked — NOT "the pane is gone" (#68)
+    }
+  }
+
+  // Build (or reuse) the mirror for one share. Returns null when the tap could
+  // not be opened — always with a sentence, never a silent no-op (§11).
+  ensureMirror(session, why) {
+    const live = this.mirrors.get(session.sid);
+    if (live && live.mirror.attached) return live.mirror;
+    if (live) this.stopMirror(session, 'the tmux tap died — re-attaching'); // stale, re-resolve below
+    if (!session.paneId) return null;
+
+    const tmuxSession = this.tmuxSessionForPane(session.paneId);
+    if (!tmuxSession) {
+      this.noteOnce(`mirror-resolve:${session.publicId}`,
+        `${session.publicId}: could not resolve the tmux session for pane ${session.paneId} — no mirror (the next reseed asks again)`);
+      return null;
+    }
+
+    const handle = this.hub.attach(tmuxSession, session.paneId, {
+      onOutput: (bytes) => {
+        const entry = this.mirrors.get(session.sid);
+        if (entry) entry.mirror.onOutput(bytes); // identity-guarded by the map itself
+      },
+      onLost: (reason) => {
+        const entry = this.mirrors.get(session.sid);
+        if (entry) entry.mirror.onHubLost(reason);
+      },
+    });
+
+    const mirror = createMirror({
+      control: handle.control,
+      target: session.paneId,
+      epoch: this.state.epoch,
+      seal: (frame) => this.sealPaneFrame(session, frame),
+      sendFrame: (sealed) => this.sendPaneFrame(session, sealed),
+      narrate: (m) => this.log(`${session.publicId}: ${m}`),
+      frameCap: this.frameCap(),
+      nudgeMs: this.mirrorSettings.nudge_ms,
+    });
+    this.mirrors.set(session.sid, { mirror, release: handle.release, tmuxSession, paneId: session.paneId });
+    this.log(`${session.publicId}: mirror attached to pane ${session.paneId} on tmux session ${JSON.stringify(tmuxSession)} — ${why}`);
+    return mirror;
+  }
+
+  stopMirror(sessionOrSid, why) {
+    const sid = typeof sessionOrSid === 'string' ? sessionOrSid : sessionOrSid.sid;
+    const entry = this.mirrors.get(sid);
+    if (!entry) return false;
+    this.mirrors.delete(sid);
+    try { entry.mirror.stop(); } catch {}
+    try { entry.release(); } catch {}
+    this.log(`mirror for pane ${entry.paneId} stood down — ${why}`);
+    return true;
+  }
+
+  // A viewer arrived on this COMPUTER (the unsealed nudge). Warm the tap for
+  // every shared `term` pane: emission stays gated at viewers=0, so this costs
+  // one tmux process per session with a term share and ZERO cable traffic —
+  // and it buys an instant first paint when the human opens the pane screen.
+  warmTermMirrors(why) {
+    for (const s of this.sessions.values()) {
+      if ((s.occupant || 'agent') !== 'term' || !s.paneId) continue;
+      const m = this.ensureMirror(s, why);
+      if (m) m.noteInbound(); // the join restarts this share's idle window
+    }
+  }
+
+  // The stand-down sweep (rides the watchdog). Two conditions, both required:
+  // no inbound frame for this SHARE within mirror_idle_ms (pane-level presence,
+  // the strong signal — "someone is on THIS screen"), and no viewer activity on
+  // this COMPUTER within the drain window (the same decaying window the Phase-A
+  // command lane already uses). Either one alone would be wrong: a human
+  // reading a still screen sends nothing for minutes, and a viewer looking at
+  // ANOTHER pane says nothing about this one.
+  mirrorTick() {
+    if (!this.mirrors.size) return;
+    const now = Date.now();
+    const idleMs = this.mirrorSettings.mirror_idle_ms;
+    const computerCold = now - (this.lastViewerActivityAt || 0) >= this.viewerActiveWindowMs;
+    for (const [sid, entry] of [...this.mirrors]) {
+      if (now - entry.mirror.lastInboundAt < idleMs) continue;
+      if (!computerCold) continue;
+      this.stopMirror(sid, `no viewer frame for ${Math.round(idleMs / 1000)}s and no viewer on this computer — standing down (a reseed re-attaches)`);
+    }
+  }
+
+  mirrorReport() {
+    const shares = [];
+    for (const [sid, entry] of this.mirrors) {
+      const s = this.sessions.get(sid);
+      shares.push({
+        sid, public_id: s ? s.publicId : null, mode: s ? (s.occupant || 'agent') : null,
+        tmux_session: entry.tmuxSession, ...entry.mirror.stats(),
+      });
+    }
+    return {
+      ok: true,
+      epoch: this.state.epoch,
+      frame_cap: this.frameCap(),
+      settings: this.mirrorSettings,
+      warnings: this.mirrorWarnings,
+      hub: this.hub.stats(),
+      shares,
+    };
+  }
+
+  // `pidge terminal doctor`'s mirror probe (spec §19's real-binary acceptance
+  // rule / gotcha #75): attach for real, force ONE reseed against the tmux that
+  // is actually installed, and report what the seed ladder produced. It opens
+  // the emission gate for that share (a reseed proves a watcher — here the
+  // watcher is the doctor), which the idle window closes again on its own.
+  async probeMirror(publicId) {
+    const targets = [...this.sessions.values()]
+      .filter((s) => s.paneId && (!publicId || s.publicId === publicId));
+    const probes = [];
+    for (const s of targets) {
+      const mirror = this.ensureMirror(s, 'pidge terminal doctor probed this share');
+      if (!mirror) {
+        probes.push({ public_id: s.publicId, pane_id: s.paneId, mode: s.occupant || 'agent', attached: false, seed: null });
+        continue;
+      }
+      await mirror.reseed();
+      const st = mirror.stats();
+      probes.push({
+        public_id: s.publicId, pane_id: s.paneId, mode: s.occupant || 'agent',
+        attached: st.attached, seed: st.last_seed, frame_cap: st.frame_cap,
+        stripper_hits: st.stripper_hits, frames_sent: st.frames_sent, frames_per_s: st.frames_per_s,
+      });
+    }
+    return { ok: true, frame_cap: this.frameCap(), probes };
   }
 
   // --- watchdog (B7) --------------------------------------------------------
@@ -2656,7 +2954,12 @@ class Daemon {
       setInterval(() => this.flushTick(), FLUSH_MS),
       setInterval(() => this.heartbeatTick(), HEARTBEAT_MS),
       setInterval(() => this.watchdogTick(), WATCHDOG_MS),
+      // Phase B: the mirror stand-down sweep. Its own timer (not folded into
+      // the watchdog) because the watchdog returns EARLY on every cable fault
+      // — and a cable outage is exactly when the idle windows keep running.
+      setInterval(() => this.mirrorTick(), WATCHDOG_MS),
     ];
+    for (const w of this.mirrorWarnings) this.log(`terminal.toml: ${w}`);
     // The durable command lane (§17). The ComputerChannel carries no "a command
     // is waiting" frame, so this loop IS how a spawn from the phone arrives —
     // see DRAIN_POLL_MS for why it is not a held poll, and drainIntervalMs for
@@ -2667,6 +2970,10 @@ class Daemon {
       this.log('daemon shutting down');
       for (const t of this.timers) clearInterval(t);
       this.stopDrainLoop();
+      // Every control client detaches deliberately (a leaked `tmux -C attach`
+      // is a client the window-size arithmetic keeps counting forever).
+      for (const sid of [...this.mirrors.keys()]) this.stopMirror(sid, 'the daemon is shutting down');
+      this.hub.stopAll();
       // Sessions stay ENABLED in state (they re-arm on the next boot); the
       // server shows them offline via staleness — honest without a teardown race.
       process.exit(code);
