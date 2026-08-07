@@ -251,6 +251,13 @@ async function runConnect(v) {
       '(On either SWITCH path the OLD channel stays on the server — remove that computer in the app: Settings → Computers.)');
   }
 
+  // Checked BEFORE the claim: if the service install at the end is going
+  // to refuse, refusing here costs nothing — refusing after the claim burns a
+  // pairing code and leaves the phone spinning on a computer that will never
+  // connect (exactly the QA sequence). --no-daemon installs no service, so it
+  // has no label to take.
+  if (!v['no-daemon']) assertNoForeignDaemon();
+
   let token = existing.token;
   let channelId = existing.channelId;
   let effectiveBase = existing.base || base;
@@ -624,6 +631,11 @@ function xmlEscape(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
+function xmlUnescape(s) {
+  return String(s).replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+}
+
 // systemd unit-file quoting: double quotes with backslash escapes, PLUS the
 // unit-file expansions ('$$' = literal $, '%%' = literal %) — a node path or a
 // PATH entry containing either must arrive verbatim.
@@ -648,6 +660,124 @@ function systemdUnitPath() {
 // (same shape as the bridge installer's PIDGE_BRIDGE_PLATFORM).
 function daemonPlatform(probe = {}) {
   return probe.platform || process.env.PIDGE_TERMINAL_PLATFORM || process.platform;
+}
+
+// --- the label is per-USER, the config slot is per-ENV ----------------------
+//
+// `sh.pidge.terminal` / `pidge-terminal.service` are ONE name per user account,
+// but the config slot they serve is resolved from HOME/XDG_CONFIG_HOME at run
+// time. Connect from a shell with a custom env therefore installs a service
+// under the SAME label as the machine's real daemon — and bootstrapping it
+// boots the real one out, silently, in favour of an identity the human never
+// meant to replace. Observed in QA: an isolated install took the label, launchd
+// started it with the REAL $HOME, and the freshly paired identity never
+// connected while the real one silently went dark.
+//
+// So before writing any template we ask the OS which config slot the existing
+// service serves, and refuse to take the label from a stranger.
+
+// The terminal dir a service template (or a `launchctl print` dump) SERVES,
+// recovered from its own text. The log path is the reliable giveaway across
+// every version we ever shipped — it is always `<terminalDir>/terminal.log` —
+// so this reads pre-0.44.1 installs, which carry no pinned env, just as well.
+function serviceTerminalDir(text) {
+  const s = String(text || '');
+  let m = s.match(/<key>StandardOutPath<\/key>\s*<string>([^<]*)<\/string>/); // launchd plist
+  if (m) return path.dirname(xmlUnescape(m[1]).trim());
+  m = s.match(/^StandardOutput=append:(.+)$/m); // systemd unit
+  if (m) return path.dirname(m[1].trim());
+  m = s.match(/^\s*stdout path\s*=\s*(.+)$/m); // `launchctl print` prose
+  if (m) return path.dirname(m[1].trim());
+  // Last resort: the CLI copy a service runs lives at <terminalDir>/cli/bin/pidge.js.
+  m = s.match(/([^\s"'<>]*)\/cli\/bin\/pidge\.js/);
+  return m && m[1] ? xmlUnescape(m[1]) : null;
+}
+
+// Same directory, allowing for symlinked prefixes (/tmp → /private/tmp on
+// macOS would otherwise read as a stranger and refuse a legitimate restart).
+function sameDir(a, b) {
+  const norm = (p) => path.resolve(String(p)).replace(/\/+$/, '');
+  if (norm(a) === norm(b)) return true;
+  const real = (p) => { try { return fs.realpathSync(norm(p)); } catch { return norm(p); } };
+  return real(a) === real(b);
+}
+
+// A capturing runner — deliberately NOT `probe.run`, which is stdio:'ignore'.
+function serviceQuery(probe = {}) {
+  return probe.query || ((cmd, args) => {
+    try { return execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
+    catch { return ''; }
+  });
+}
+
+function readIfFile(file) {
+  try { return fs.readFileSync(file, 'utf8'); } catch { return null; }
+}
+
+// The config slot an ALREADY installed service serves, when that is not the one
+// this process would install. Returns null when there is nothing installed, or
+// when it is ours (the normal restart), or when the slot it names no longer
+// exists on disk — rubble holds no identity, and refusing over it would leave
+// a human with a dead plist and no way forward.
+function foreignDaemonConfig(probe = {}) {
+  const mine = core.terminalDir();
+  const query = serviceQuery(probe);
+  const found = [];
+  if (daemonPlatform(probe) === 'darwin') {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+    const dir = serviceTerminalDir(query('launchctl', ['print', `gui/${uid}/${LAUNCHD_LABEL}`]));
+    if (dir) found.push({ dir, where: `the launchd job already loaded as ${LAUNCHD_LABEL}` });
+    const file = launchdPlistPath();
+    const onDisk = serviceTerminalDir(readIfFile(file));
+    if (onDisk) found.push({ dir: onDisk, where: file });
+  } else {
+    const systemd = probe.systemd !== undefined ? probe.systemd : hasSystemd();
+    if (!systemd) return null; // no service manager ⇒ no shared label to take
+    const frag = String(query('systemctl', ['--user', 'show', '-p', 'FragmentPath', '--value', SYSTEMD_UNIT]) || '').trim();
+    if (frag) {
+      const dir = serviceTerminalDir(readIfFile(frag));
+      if (dir) found.push({ dir, where: `the unit ${SYSTEMD_UNIT} already installed at ${frag}` });
+    }
+    const file = systemdUnitPath();
+    const onDisk = serviceTerminalDir(readIfFile(file));
+    if (onDisk) found.push({ dir: onDisk, where: file });
+  }
+  for (const f of found) {
+    if (sameDir(f.dir, mine)) continue;
+    if (!fs.existsSync(f.dir)) continue;
+    return { dir: f.dir, where: f.where, mine };
+  }
+  return null;
+}
+
+// Refuse the hijack, naming BOTH slots and the two ways out. Never guesses for
+// the human: which identity survives is their call, not the installer's.
+function assertNoForeignDaemon(probe = {}) {
+  const foreign = foreignDaemonConfig(probe);
+  if (!foreign) return null;
+  // <configHome>/pidge/terminal → the env that reaches that slot again. HOME is
+  // preferred whenever the slot sits in a plain `.config`, because it addresses
+  // BOTH halves: `disconnect` resolves the config through XDG_CONFIG_HOME but
+  // the launchd plist through os.homedir(), so an XDG-only prefix would read
+  // the right config and then unload the WRONG plist — advice that breaks a
+  // third daemon while retiring the second.
+  const configHome = path.dirname(path.dirname(foreign.dir));
+  const env = path.basename(configHome) === '.config'
+    ? `HOME=${path.dirname(configHome)}`
+    : `XDG_CONFIG_HOME=${configHome}`;
+  die('pidge terminal connect: this computer already runs a pidge daemon for a DIFFERENT config slot.\n' +
+    `  already installed:  ${foreign.dir}\n` +
+    `                      (${foreign.where})\n` +
+    `  this run would use: ${foreign.mine}\n` +
+    '\n' +
+    'Both want the same per-user service name, so installing this one would boot the\n' +
+    'other daemon out — silently, taking its identity offline. Refusing.\n' +
+    'Pick one:\n' +
+    '  · connect the EXISTING slot instead — re-run with its environment:\n' +
+    `      ${env} pidge terminal connect\n` +
+    '  · or retire it first, then re-run this connect:\n' +
+    `      ${env} pidge terminal disconnect`);
+  return null;
 }
 
 // A user service manager we can actually talk to. `/run/systemd/system` is the
@@ -728,19 +858,29 @@ function daemonExec() {
 function installDaemonService(probe = {}) {
   const run = probe.run || ((cmd, args) => execFileSync(cmd, args, { stdio: 'ignore' }));
   return daemonPlatform(probe) === 'darwin'
-    ? installLaunchd(run)
+    ? installLaunchd(run, probe)
     : installSystemdUser(probe, run);
 }
 
-function installLaunchd(run) {
+function installLaunchd(run, probe = {}) {
+  assertNoForeignDaemon(probe); // never take the label from another config slot
   const { nodeBin, cli } = daemonExec();
   // launchd hands a service NO locale — and without a UTF-8 locale tmux
   // SANITIZES control characters in its -F output, which is how the pane
   // parser found "0 panes" with the pane right there (QA finding #10). The
   // daemon also forces the locale on every tmux call (core.tmuxExec); setting
   // it here too is deliberate defense in depth, per platform template.
+  // HOME/XDG_CONFIG_HOME: launchd hands an agent the LOGIN account's HOME, not
+  // the one this process resolved its config from — so a daemon installed from
+  // a custom env used to read a DIFFERENT config slot than the one connect had
+  // just written to: the installed binary served the real machine's identity
+  // while the fresh pairing never connected. The service must serve the
+  // slot that installed it, so the slot is PINNED here rather than re-derived.
+  // XDG_CONFIG_HOME is pinned only when the human actually set it — inventing
+  // one would also relocate the config of everything the daemon spawns.
   const locale = core.utf8Locale();
-  const envPairs = { LANG: locale, LC_ALL: locale };
+  const envPairs = { LANG: locale, LC_ALL: locale, HOME: os.homedir() };
+  if (process.env.XDG_CONFIG_HOME) envPairs.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
   if (process.env.PATH) envPairs.PATH = process.env.PATH;
   const envEntries = Object.entries(envPairs)
     .map(([k, val]) => `    <key>${xmlEscape(k)}</key><string>${xmlEscape(val)}</string>`).join('\n');
@@ -785,6 +925,7 @@ ${envBlock}  <key>StandardOutPath</key><string>${xmlEscape(core.LOG_FILE())}</st
 function installSystemdUser(probe, run) {
   const systemd = probe.systemd !== undefined ? probe.systemd : hasSystemd();
   if (!systemd) return startDetachedDaemon(probe);
+  assertNoForeignDaemon(probe); // never take the unit name from another config slot
 
   const { nodeBin, cli } = daemonExec();
   // launchd/systemd hand a service a MINIMAL PATH — and this daemon SHELLS OUT
@@ -793,8 +934,11 @@ function installSystemdUser(probe, run) {
   // working fine in the shell the human just tested from.
   // LANG/LC_ALL: same story as the launchd template — no locale in the service
   // env makes tmux sanitize control characters in -F output (QA finding #10).
+  // HOME: `systemd --user` sets HOME from the account, so a connect run under a
+  // custom HOME produced a unit that resolved a DIFFERENT config slot.
+  // XDG_CONFIG_HOME was already pinned; HOME is the other half of that address.
   const locale = core.utf8Locale();
-  const envPairs = { LANG: locale, LC_ALL: locale };
+  const envPairs = { LANG: locale, LC_ALL: locale, HOME: os.homedir() };
   if (process.env.PATH) envPairs.PATH = process.env.PATH;
   if (process.env.XDG_CONFIG_HOME) envPairs.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
   const envLines = Object.entries(envPairs)
@@ -1271,6 +1415,6 @@ module.exports = {
   installHooks, uninstallHooks, hookShimSource, PIDGE_HOOK_MARKER,
   installDaemonService, uninstallDaemonService, launchdPlistPath, systemdUnitPath,
   copyCliToStablePath, stableCliDir, stableCliEntry, installPidgeSkill,
-  shutdownLocalDaemon,
+  shutdownLocalDaemon, serviceTerminalDir, foreignDaemonConfig,
   SYSTEMD_UNIT, LAUNCHD_LABEL,
 };
