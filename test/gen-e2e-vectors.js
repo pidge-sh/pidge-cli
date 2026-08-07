@@ -77,6 +77,45 @@ const COMPUTER_BLOBS = [
 ];
 const COMPUTER_ANCHOR = 'computer';
 
+// Terminals v2 Phase B (spec Part II §19, media-e2e-spec §2): the pane_output
+// lane (daemon→viewers terminal byte/seed frames) anchors on the pane share's
+// public_id (ases_…) — follows the fixture's c0ffee sequence. reseed/resize are
+// ADDITIVE frame types on the EXISTING agent_input lane (no new lane), same
+// anchor, same vgen/he replay machinery — frames missing vgen/he are dropped,
+// so the vectors carry them.
+const PANE_ANCHOR = 'ases_c0ffee01-e2e0-4010-8010-000000000010';
+
+// seed screen: RIS FIRST (the atomic-seed contract, §19 / old-arc #64), then a
+// small ANSI screen — SGR color, box-drawing, a UTF-8 emoji. Deterministic.
+const PANE_SEED_SCREEN = Buffer.concat([
+  Buffer.from('\x1bc', 'latin1'),          // RIS — the seed is atomic
+  Buffer.from('\x1b[2J\x1b[H', 'latin1'),  // clear + home
+  Buffer.from('\x1b[1;32m┌──────────────┐\x1b[0m\r\n', 'utf8'),
+  Buffer.from('\x1b[1;32m│\x1b[0m pidge ✅ ok \x1b[1;32m│\x1b[0m\r\n', 'utf8'),
+  Buffer.from('\x1b[1;32m└──────────────┘\x1b[0m\r\n', 'utf8'),
+  Buffer.from('$ ', 'utf8'),
+]);
+
+// output frame bytes: UTF-8 mixed with the FULL raw 0x80–0xFF range (the tmux
+// control-mode latin1+octal path) — NOT valid UTF-8 as a whole, on purpose:
+// the vector proves the pipeline is binary-clean end to end.
+const PANE_O_BYTES = Buffer.concat([
+  Buffer.from('café ⚙️ → ', 'utf8'),
+  Buffer.from(Array.from({ length: 128 }, (_, i) => 0x80 + i)),
+  Buffer.from('\r\nfim\r\n', 'utf8'),
+]);
+
+const PANE_BLOBS = [
+  { name: 'pane-output-seed', field_name: 'pane_output',
+    plaintext: JSON.stringify({ t: 'seed', epoch: 7, seq: 1, cols: 80, rows: 24, data: PANE_SEED_SCREEN.toString('base64') }) },
+  { name: 'pane-output-o', field_name: 'pane_output',
+    plaintext: JSON.stringify({ t: 'o', epoch: 7, seq: 2, data: PANE_O_BYTES.toString('base64') }) },
+  { name: 'agent-input-reseed', field_name: 'agent_input',
+    plaintext: JSON.stringify({ t: 'reseed', vgen: 'Vg3nT3st', seq: 2, he: 7 }) },
+  { name: 'agent-input-resize', field_name: 'agent_input',
+    plaintext: JSON.stringify({ t: 'resize', cols: 120, rows: 40, vgen: 'Vg3nT3st', seq: 3, he: 7 }) },
+];
+
 // Phase C (spec Part II §20, Track S W2): per-channel key DERIVATION from the
 // computer key. Full parameter pin — HKDF-SHA256 (RFC 5869), extract-then-
 // expand, salt = EMPTY (RFC 5869 §2.2: HashLen zero bytes — the default of
@@ -170,6 +209,24 @@ function buildVectors() {
     });
   }
 
+  for (const b of PANE_BLOBS) {
+    const aad = e2eAad(CHANNEL_ID, PANE_ANCHOR, b.field_name);
+    const nonce = nonceFor(b.name);
+    const plain = Buffer.from(b.plaintext, 'utf8');
+    blob_vectors.push({
+      name: b.name,
+      channel_id: CHANNEL_ID,
+      correlation_id: PANE_ANCHOR,
+      field_name: b.field_name,
+      aad,
+      nonce_b64url: nonce.toString('base64url'),
+      plaintext_b64url: plain.toString('base64url'),
+      plaintext_sha256_hex: crypto.createHash('sha256').update(plain).digest('hex'),
+      plaintext_utf8: b.plaintext,
+      framed_b64url: e2eEncryptBlob(KEY, aad, plain, nonce).toString('base64url'),
+    });
+  }
+
   // Failure cases derive from the short-field vector so every implementation
   // rejects the SAME bytes for the SAME reason.
   const base = field_vectors[0];
@@ -180,6 +237,7 @@ function buildVectors() {
   blobBadVersion[0] = 0x09;
   const metaCaps = blob_vectors.find((v) => v.name === 'computer-meta-caps');
   const cmdSpawn = field_vectors.find((v) => v.name === 'computer-cmd-spawn');
+  const paneO = blob_vectors.find((v) => v.name === 'pane-output-o');
   const failure_cases = {
     wrong_aad: {
       envelope: base.envelope,
@@ -222,6 +280,14 @@ function buildVectors() {
       aad: e2eAad(CHANNEL_ID, 'c0ffee01-e2e0-4009-8009-000000000009', 'computer_cmd'),
       note: 'the computer-cmd-spawn envelope presented under a DIFFERENT message cid — must FAIL (a consumed command can never replay)',
     },
+    // Phase B — the pane-share anchor symmetry: pane_output and
+    // agent_transcript share one ases_ anchor, so the ONLY separator is the
+    // field name. A raw byte frame must never validate as a transcript item.
+    pane_output_cross_lane: {
+      framed_b64url: paneO.framed_b64url,
+      aad: e2eAad(CHANNEL_ID, PANE_ANCHOR, 'agent_transcript'),
+      note: 'a pane_output byte frame presented under the agent_transcript AAD (same channel, same pane-share anchor, wrong lane) — must FAIL (raw bytes can never validate as a transcript item)',
+    },
   };
 
   return {
@@ -237,6 +303,7 @@ function buildVectors() {
       'field_vectors/blob_vectors round-trip both ways; failure_cases MUST throw/fail in every implementation.',
       'computer_* vectors (Terminals v2 Phase A, #567): meta/req anchor on the LITERAL "computer", cmd on the message cid (media-e2e-spec §2).',
       'derivation (Phase C, spec Part II §20): K_ch = HKDF-SHA256(K_computer, salt empty, info "pidge-derive:v1:ch<id>", L 32) — vectors + the IKM-as-string failure case.',
+      'pane_output (Terminals v2 Phase B, spec Part II §19): byte/seed frames anchor on the pane share\'s public_id (ases_…); reseed/resize are ADDITIVE frame types on the existing agent_input lane (same anchor, same vgen/he machinery).',
     ],
     suite: 'pidge-e2e-v1',
     algorithm: 'AES-256-GCM',
