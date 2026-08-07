@@ -35,7 +35,8 @@ const core = require('../src/terminal/core');
 const wire = require('../src/terminal/wire');
 const settings = require('../src/terminal/settings');
 const { ControlHub } = require('../src/terminal/control');
-const { createMirror, BUFFER_DROP_BYTES } = require('../src/terminal/mirror');
+const { createMirror, BUFFER_DROP_BYTES, RATE_MIN_SPAN_MS,
+  formatFrameActivity } = require('../src/terminal/mirror');
 const { Daemon } = require('../src/terminal/daemon');
 
 const FIXTURE = JSON.parse(fs.readFileSync(path.join(__dirname, 'e2e_vectors.json'), 'utf8'));
@@ -397,6 +398,50 @@ test('frame_dropped rate_limited ⇒ the flush slows 4× for the penalty window;
   assert.equal(st.drops.rate_limited, 1);
   assert.equal(st.drops.frame_too_large, 1);
   assert.ok(logs.some((l) => /self-heals via reseed/.test(l)), 'a drop is narrated once, honestly');
+});
+
+// --- the doctor's frame line: a count is not a rate -------------------------
+
+test('one frame is reported as a COUNT — a seed-only pane never renders as a rate', async () => {
+  // The whole point of the mirror section is to be trusted. A pane that had
+  // sent exactly the seed used to read "1000 frames/s" against a 30/s budget,
+  // because a 0 ms span was clamped to 1 ms and divided into. There is no rate
+  // to render there, so none is rendered.
+  const { mirror, frames } = harness();
+  await mirror.reseed();
+  assert.equal(frames.length, 1);
+  const st = mirror.stats();
+  assert.equal(st.frames_sent, 1);
+  assert.equal(st.frames_span_ms, 0, 'one frame spans nothing — measured, never clamped');
+  assert.equal(st.frames_per_s, null, 'no sample, no number');
+  const line = formatFrameActivity(st);
+  assert.match(line, /^1 frame in 0 ms/);
+  assert.ok(!/\/s/.test(line), `a rate leaked into the line: ${line}`);
+});
+
+test('a short burst is still a count — the rate needs a full second of sample', async () => {
+  // Two frames 3 ms apart are not "666 per second", they are two frames. This
+  // is the same defect as the seed-only case, just less obvious.
+  const { mirror } = harness();
+  await mirror.reseed();
+  mirror.onOutput(Buffer.from('a bit of output'));
+  await sleep(30);
+  const st = mirror.stats();
+  assert.ok(st.frames_sent >= 2);
+  assert.ok(st.frames_span_ms < RATE_MIN_SPAN_MS);
+  assert.equal(st.frames_per_s, null);
+  assert.match(formatFrameActivity(st), /too short a sample for a rate/);
+});
+
+test('the rate prints once the sample can carry it, and an empty pane says so plainly', () => {
+  assert.equal(formatFrameActivity({ frames_sent: 60, frames_span_ms: 2000, frames_per_s: 30 }),
+    '60 frames · 30/s');
+  assert.equal(formatFrameActivity({ frames_sent: 0, frames_span_ms: 0, frames_per_s: null }),
+    '0 frames sent');
+  // An older daemon on the wire reports no span at all: print its rate rather
+  // than invent a span it never measured.
+  assert.equal(formatFrameActivity({ frames_sent: 9, frames_per_s: 4.5 }), '9 frames · 4.5/s');
+  assert.match(formatFrameActivity({ frames_sent: 9 }), /9 frames in an unmeasured span/);
 });
 
 test('a cable that is DOWN loses the frame silently and the reconnect repaints — nothing is ever queued', async () => {
