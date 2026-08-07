@@ -62,6 +62,33 @@ test('the builder refuses what the phone would refuse — no QR is ever born inv
   assert.ok(!pairingBaseUrlOk('http://evil.com/127.0.0.1'), 'loopback must be the HOST, not a path');
 });
 
+test('the loopback carve-out knows all three spellings of the same machine', () => {
+  // Scheme and host are case-INSENSITIVE components: these name the very same
+  // local server as the documented `http://localhost:3000`, and refusing them
+  // only ever cost a developer their afternoon.
+  assert.ok(pairingBaseUrlOk('http://LOCALHOST:3000'), 'the host is case-insensitive');
+  assert.ok(pairingBaseUrlOk('HTTP://localhost:3000'), 'so is the scheme');
+  assert.ok(pairingBaseUrlOk('HtTp://LocalHost'), 'both at once, no port');
+  assert.ok(pairingBaseUrlOk('http://[::1]:3000'), 'IPv6 loopback');
+  assert.ok(pairingBaseUrlOk('http://[::1]'), 'IPv6 loopback, no port');
+  assert.ok(pairingBaseUrlOk('HTTP://[::FFFF:127.0.0.1]:3000'), 'the IPv4-mapped spelling too');
+  assert.ok(pairingBaseUrlOk('http://127.0.0.1:3000/'), 'a trailing slash is still the same host');
+  assert.ok(pairingBaseUrlOk('HTTPS://api.pidge.sh'), 'the https scheme folds case as well');
+
+  // …and the rule stays STRUCTURAL: only literal loopback hosts, never a name
+  // that merely resolves to one, and never a spelling that smuggles a host in.
+  assert.ok(!pairingBaseUrlOk('http://localhost.evil.example:3000'), 'a suffixed name is not loopback');
+  assert.ok(!pairingBaseUrlOk('http://localhost@evil.example/'), 'userinfo must not read as the host');
+  assert.ok(!pairingBaseUrlOk('http://[::1]@evil.example/'), 'the same trick in IPv6 dress');
+  assert.ok(!pairingBaseUrlOk('http://[::2]:3000'), 'a NON-loopback IPv6 literal');
+  assert.ok(!pairingBaseUrlOk('http://127.0.0.1:notaport'), 'a junk port is a junk authority');
+  assert.ok(!pairingBaseUrlOk('http://[::1:3000'), 'an unclosed bracket refuses');
+  assert.ok(!pairingBaseUrlOk('ftp://localhost:3000'), 'the carve-out is for http, not every scheme');
+  assert.ok(!pairingBaseUrlOk('http://localhost:3000 '), 'whitespace refuses, as it always did');
+  assert.ok(!pairingBaseUrlOk(''), 'and so does nothing at all');
+  assert.ok(!pairingBaseUrlOk('localhost:3000'), 'a schemeless string is not a base url');
+});
+
 test('fixture failure cases are what their notes claim (the fixture cannot lie to iOS)', () => {
   const f = FIXTURE.failure_cases;
   assert.ok(f.unknown_version.payload.startsWith('pidge-pair:v9:'), 'unknown version, same base64');
