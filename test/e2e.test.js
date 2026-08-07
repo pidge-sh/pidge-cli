@@ -91,6 +91,34 @@ test('computer lanes: cross-lane and cid-replay presentations fail the tag', () 
     /failed to authenticate/, 'a computer_cmd envelope replayed under a different cid must fail');
 });
 
+test('pane_output (Phase B): the byte lane and the transcript lane share an anchor — only the field name separates them', () => {
+  const f = FIXTURE.failure_cases;
+  // pane_output and agent_transcript BOTH anchor on the pane share's public_id
+  // (§19 / media-e2e-spec §2), so a raw byte frame presented as a transcript
+  // item is the exact mistake this row exists to catch. It must fail the tag —
+  // if it ever opened, terminal bytes would render as a conversation item.
+  assert.throws(() => e2e.e2eDecryptBlob(KEY, f.pane_output_cross_lane.aad,
+    Buffer.from(f.pane_output_cross_lane.framed_b64url, 'base64url')),
+  /failed to authenticate/, 'a pane_output frame under the agent_transcript AAD must fail (anti cross-lane)');
+
+  // And what the two lane rows actually pin: the seed carries RIS FIRST (the
+  // atomic-seed contract — the viewer resets its emulator on it) and the `o`
+  // frame is binary-clean across the FULL 0x80–0xFF range (the tmux
+  // control-mode latin1+octal path never has to be valid UTF-8).
+  const seed = FIXTURE.blob_vectors.find((v) => v.name === 'pane-output-seed');
+  const o = FIXTURE.blob_vectors.find((v) => v.name === 'pane-output-o');
+  assert.equal(seed.field_name, 'pane_output');
+  assert.equal(o.correlation_id, seed.correlation_id, 'both anchor on the pane share public_id');
+  const seedFrame = JSON.parse(seed.plaintext_utf8);
+  assert.equal(seedFrame.t, 'seed');
+  assert.ok(Buffer.from(seedFrame.data, 'base64').subarray(0, 2).equals(Buffer.from('\x1bc', 'latin1')),
+    'the seed data must start with RIS');
+  const oBytes = Buffer.from(JSON.parse(o.plaintext_utf8).data, 'base64');
+  for (let b = 0x80; b <= 0xff; b++) {
+    assert.ok(oBytes.includes(b), `the o-frame vector must carry byte 0x${b.toString(16)} (binary-clean pipeline)`);
+  }
+});
+
 test('derivation (§20): hkdfSync reproduces every committed vector byte-for-byte', () => {
   const crypto = require('node:crypto');
   const d = FIXTURE.derivation;

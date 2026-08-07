@@ -10,7 +10,8 @@
     "Regenerate only on a contract change: node test/gen-e2e-vectors.js",
     "field_vectors/blob_vectors round-trip both ways; failure_cases MUST throw/fail in every implementation.",
     "computer_* vectors (Terminals v2 Phase A, #567): meta/req anchor on the LITERAL \"computer\", cmd on the message cid (media-e2e-spec §2).",
-    "derivation (Phase C, spec Part II §20): K_ch = HKDF-SHA256(K_computer, salt empty, info \"pidge-derive:v1:ch<id>\", L 32) — vectors + the IKM-as-string failure case."
+    "derivation (Phase C, spec Part II §20): K_ch = HKDF-SHA256(K_computer, salt empty, info \"pidge-derive:v1:ch<id>\", L 32) — vectors + the IKM-as-string failure case.",
+    "pane_output (Terminals v2 Phase B, spec Part II §19): byte/seed frames anchor on the pane share's public_id (ases_…); reseed/resize are ADDITIVE frame types on the existing agent_input lane (same anchor, same vgen/he machinery)."
   ],
   "suite": "pidge-e2e-v1",
   "algorithm": "AES-256-GCM",
@@ -137,6 +138,54 @@
       "plaintext_sha256_hex": "dc5da684fc34f11aeef5dc0d64f8345050fdc241f73416e981879e4094fa09ef",
       "plaintext_utf8": "{\"op\":\"inventory\",\"vgen\":\"Vg3nT3st\",\"seq\":1,\"he\":7}",
       "framed_b64url": "AT6fUJ6NaFePA3CWPoDJlSyI-gtSapLfFFtmb2ZaaDab6_eq1aVGhA8UiMdk03rSzcz3YL6ZDbWqJaNNo04t1eLMYPutB6xYJp5OL_gO8Os"
+    },
+    {
+      "name": "pane-output-seed",
+      "channel_id": 42,
+      "correlation_id": "ases_c0ffee01-e2e0-4010-8010-000000000010",
+      "field_name": "pane_output",
+      "aad": "ch42:ases_c0ffee01-e2e0-4010-8010-000000000010:pane_output",
+      "nonce_b64url": "wx_6tEDMX-ncfzk2",
+      "plaintext_b64url": "eyJ0Ijoic2VlZCIsImVwb2NoIjo3LCJzZXEiOjEsImNvbHMiOjgwLCJyb3dzIjoyNCwiZGF0YSI6IkcyTWJXekpLRzF0SUcxc3hPek15YmVLVWpPS1VnT0tVZ09LVWdPS1VnT0tVZ09LVWdPS1VnT0tVZ09LVWdPS1VnT0tVZ09LVWdPS1VnT0tVZ09LVWtCdGJNRzBOQ2h0Yk1Uc3pNbTNpbElJYld6QnRJSEJwWkdkbElPS2NoU0J2YXlBYld6RTdNekp0NHBTQ0cxc3diUTBLRzFzeE96TXliZUtVbE9LVWdPS1VnT0tVZ09LVWdPS1VnT0tVZ09LVWdPS1VnT0tVZ09LVWdPS1VnT0tVZ09LVWdPS1VnT0tVbUJ0Yk1HME5DaVFnIn0",
+      "plaintext_sha256_hex": "eeafbfbc52f79f94d3c86656bc184fa5d27d5488b1eca3e5bdb2e45883f49cf6",
+      "plaintext_utf8": "{\"t\":\"seed\",\"epoch\":7,\"seq\":1,\"cols\":80,\"rows\":24,\"data\":\"G2MbWzJKG1tIG1sxOzMybeKUjOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUkBtbMG0NChtbMTszMm3ilIIbWzBtIHBpZGdlIOKchSBvayAbWzE7MzJt4pSCG1swbQ0KG1sxOzMybeKUlOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUmBtbMG0NCiQg\"}",
+      "framed_b64url": "AcMf-rRAzF_p3H85NiOhVDmsK1Un1na6Ct3dkgSqKcRCrMspyUxHrtVgbDJHZxFIHnAad7J8aA6Wcv_A0dshHXuecJ9gGJ8RtuS_IuL8ftMvVoR9jXAZLjow2YnIJq7bNWNHa46N8saHVG4bp_cVPXBDABdjOrK5sJwl6KvDPJXi3Kwn7YBZKjORTpzDrm1Rlao-Z8FM7tOkhCJSLTCW7mfUmtWbMHyEmN0_AGRhUkvlhLHw-qAyYWJ9rb5LFEu3axGx_7i1RV1fwIzDu8yDEwakHWTbuhOFjOjv3ZQDlGuvnDWNJw7P66wfa0aTWa1LY3n-863YbOGKLlhzeXQwtVFvW6JlmJ15Ty_WB5Hqo_0-8vZOUQLv9MWl9uOSBvpfW74DLkpZFZus1NKEEN1sv9okqDfMDNIiXUjEAIrQEEi9OS_1YA"
+    },
+    {
+      "name": "pane-output-o",
+      "channel_id": 42,
+      "correlation_id": "ases_c0ffee01-e2e0-4010-8010-000000000010",
+      "field_name": "pane_output",
+      "aad": "ch42:ases_c0ffee01-e2e0-4010-8010-000000000010:pane_output",
+      "nonce_b64url": "vNu8y1YQxHC3mhg3",
+      "plaintext_b64url": "eyJ0IjoibyIsImVwb2NoIjo3LCJzZXEiOjIsImRhdGEiOiJZMkZtdzZrZzRwcVo3N2lQSU9LR2tpQ0FnWUtEaElXR2g0aUppb3VNalk2UGtKR1NrNVNWbHBlWW1acWJuSjJlbjZDaG9xT2twYWFucUttcXE2eXRycSt3c2JLenRMVzJ0N2k1dXJ1OHZiNi93TUhDdzhURnhzZkl5Y3JMek0zT3o5RFIwdFBVMWRiWDJObmEyOXpkM3QvZzRlTGo1T1htNStqcDZ1dnM3ZTd2OFBIeTgvVDE5dmY0K2ZyNy9QMysvdzBLWm1sdERRbz0ifQ",
+      "plaintext_sha256_hex": "b5c2ddc540ab55dd0c5e4645b553de92c9ef2a3e9b88d8b4be10faa16fe915cb",
+      "plaintext_utf8": "{\"t\":\"o\",\"epoch\":7,\"seq\":2,\"data\":\"Y2Fmw6kg4pqZ77iPIOKGkiCAgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w0KZmltDQo=\"}",
+      "framed_b64url": "AbzbvMtWEMRwt5oYN5upHzlALghOas3N2_I4w7GHYl29yqOSTNzIJ4Ih9HlkDAz5IpKeRHTXc5D1aXV_nyLEkNqk0uUkoO0W-sSMRMHHoHQb3sl3dAJ1kHiIILfnLWcE51DNMEmFzoUGeC8Ymqfjt0X5Th-JB55pd0hnQ9EBNdkwnRGKETqToef5IV410YXgt5bGdaE4zKrKfqlDC48eQ0LKKKeF8pAsO2GwMpjGyGp66S0Gm9NqbwvS88IW1nFZAQWDO_QUZXjB5Xz9ziKY65XGgK46fI4TPBseTnTVbYHxBv1QhYmwwJxo7dnVkg1NymzaUvu9IMhkdN7NHYAoQ8gHkM6qwLNxW63mKEy-"
+    },
+    {
+      "name": "agent-input-reseed",
+      "channel_id": 42,
+      "correlation_id": "ases_c0ffee01-e2e0-4010-8010-000000000010",
+      "field_name": "agent_input",
+      "aad": "ch42:ases_c0ffee01-e2e0-4010-8010-000000000010:agent_input",
+      "nonce_b64url": "F2mMceEWmllugHYk",
+      "plaintext_b64url": "eyJ0IjoicmVzZWVkIiwidmdlbiI6IlZnM25UM3N0Iiwic2VxIjoyLCJoZSI6N30",
+      "plaintext_sha256_hex": "f152eae8a479a06be634f936323b33830398eb61173b73427b72d284f3e5b95f",
+      "plaintext_utf8": "{\"t\":\"reseed\",\"vgen\":\"Vg3nT3st\",\"seq\":2,\"he\":7}",
+      "framed_b64url": "ARdpjHHhFppZboB2JIJ-cc_on_6GOsXGQUoFLZSJON6InV8K6ChnzH_ludrmPAkTro2Vs_fr9ukfyKLzjFQmQku3-KRBCFlQHt4FhA"
+    },
+    {
+      "name": "agent-input-resize",
+      "channel_id": 42,
+      "correlation_id": "ases_c0ffee01-e2e0-4010-8010-000000000010",
+      "field_name": "agent_input",
+      "aad": "ch42:ases_c0ffee01-e2e0-4010-8010-000000000010:agent_input",
+      "nonce_b64url": "p8yzOyUkFH469sgI",
+      "plaintext_b64url": "eyJ0IjoicmVzaXplIiwiY29scyI6MTIwLCJyb3dzIjo0MCwidmdlbiI6IlZnM25UM3N0Iiwic2VxIjozLCJoZSI6N30",
+      "plaintext_sha256_hex": "7c8ef234e78f84d620ea8e144391383363525dfdd773b5ce2b71fb5718c8fd1e",
+      "plaintext_utf8": "{\"t\":\"resize\",\"cols\":120,\"rows\":40,\"vgen\":\"Vg3nT3st\",\"seq\":3,\"he\":7}",
+      "framed_b64url": "AafMszslJBR-OvbICENpq0Ly-bIltl8v-lw_79Msgdukt84Za6t-_92DcxPZg7LLRmKTtPGKNco3umHguSJ8B4oeVKnuM8RM9S9FfxBiOxUA-pxvqmLYZILA95f2cY-KHQ"
     }
   ],
   "failure_cases": {
@@ -174,6 +223,11 @@
       "envelope": "v1:boVsgfHHDrtNAWJZ5X2NUz-9TWvMVtPolI4hK_IkLeqKeQPcmiGXGuBoTx_AuccIeu7RJR_wsMQeRPiCw-7iiElEKc9X48qbwZoszVnC2WzGEhkZ6OOWseA",
       "aad": "ch42:c0ffee01-e2e0-4009-8009-000000000009:computer_cmd",
       "note": "the computer-cmd-spawn envelope presented under a DIFFERENT message cid — must FAIL (a consumed command can never replay)"
+    },
+    "pane_output_cross_lane": {
+      "framed_b64url": "AbzbvMtWEMRwt5oYN5upHzlALghOas3N2_I4w7GHYl29yqOSTNzIJ4Ih9HlkDAz5IpKeRHTXc5D1aXV_nyLEkNqk0uUkoO0W-sSMRMHHoHQb3sl3dAJ1kHiIILfnLWcE51DNMEmFzoUGeC8Ymqfjt0X5Th-JB55pd0hnQ9EBNdkwnRGKETqToef5IV410YXgt5bGdaE4zKrKfqlDC48eQ0LKKKeF8pAsO2GwMpjGyGp66S0Gm9NqbwvS88IW1nFZAQWDO_QUZXjB5Xz9ziKY65XGgK46fI4TPBseTnTVbYHxBv1QhYmwwJxo7dnVkg1NymzaUvu9IMhkdN7NHYAoQ8gHkM6qwLNxW63mKEy-",
+      "aad": "ch42:ases_c0ffee01-e2e0-4010-8010-000000000010:agent_transcript",
+      "note": "a pane_output byte frame presented under the agent_transcript AAD (same channel, same pane-share anchor, wrong lane) — must FAIL (raw bytes can never validate as a transcript item)"
     }
   },
   "derivation": {

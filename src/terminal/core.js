@@ -535,7 +535,7 @@ async function fetchT(url, opts = {}, timeoutMs = 30000) {
   } finally { clearTimeout(t); }
 }
 
-// Server caps (agent-sessions manifest section). Defaults match manifest v98;
+// Server caps (agent-sessions manifest section). Defaults match manifest v104;
 // connect refreshes them from GET /manifest and caches — never hardcode
 // anywhere else (the manifest is the contract).
 const DEFAULT_CAPS = {
@@ -545,6 +545,10 @@ const DEFAULT_CAPS = {
   heartbeat_seconds: 30,
   offline_after_seconds: 90,
   input_frame_max_bytes: 8192,
+  // Phase B (spec §19, manifest v104): the pane_output relay's per-frame
+  // ceiling, in WIRE bytes (the base64url string). It is what the seed ladder
+  // degrades against — a seed over it is the one loss a reseed cannot heal.
+  pane_output_frame_max_bytes: 65536,
 };
 function loadCaps() {
   const cached = readJson(path.join(terminalDir(), 'caps.json'), null);
