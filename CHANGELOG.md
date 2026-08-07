@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.45.0 — 2026-08-07
+
+**Terminals Phase B, part 1: the raw byte view returns, scoped to the pane you
+shared.** A shared pane can now stream its actual terminal bytes to the phone —
+a `term` pane by default, an `agent` pane on demand when you open the raw view.
+The mirror is the code that already earned its lessons in the retired arc,
+ported rather than rewritten: the 80 ms coalescer, the seed ladder that degrades
+inside the relay's frame cap instead of looping, the stateful `ESC k` stripper,
+the post-resize repaint jiggle (never `C-l` — it clears the transcript a human
+is supervising), the identity-guarded teardown.
+
+- **New lane `pane_output`** (daemon→viewers), sealed on the pane share's own
+  `public_id`, relayed by the server's one new `frame` action and never
+  persisted. Frames are `{t:"o",epoch,seq,data}` and
+  `{t:"seed",epoch,seq,cols,rows,data}`; a viewer that sees an (epoch,seq) gap
+  asks for a reseed — there is no server-side buffer and never will be.
+- **`reseed` and `resize` join the EXISTING `agent_input` lane** as additive
+  frame types (same anchor, same vgen/`he` replay machinery). No new lane, no
+  second ledger. Older daemons ignored them by contract; this one mirrors.
+- **Term-mode key set**: a `term` pane now accepts `Left Right Home End PageUp
+  PageDown DC BSpace C-d C-u C-r C-z C-l` on top of the existing seven — a
+  shell needs more than a transcript does. An `agent` pane does NOT get them,
+  raw view open or not. Anything outside the set is still dropped whole.
+- **Attach policy**: one `tmux -C attach` per tmux SESSION (shared by every
+  pane of it — two clients would fight over the window geometry), warmed
+  eagerly for `term` panes when a viewer arrives but emitting nothing until the
+  first reseed, opened for `agent` panes only by that reseed. Stand-down is a
+  sliding window: no viewer frame for this share within `mirror_idle_ms` AND no
+  viewer on this computer. Standing down early is safe — a reseed re-attaches.
+- **`~/.config/pidge/terminal.toml`** gains `mirror_idle_ms` (default 300000)
+  and `nudge_ms` (default 500; `0` disables the post-resize repaint nudge).
+- **`pidge terminal doctor` gains a mirror section**: the relay cap the
+  manifest serves, the live control taps, and a REAL reseed per shared pane
+  reporting which rung of the seed ladder was used and whether the sealed frame
+  fits. A machine whose seed cannot fit exits non-zero — that raw view would
+  reseed forever, and saying so beats shipping it.
+- The shared E2E fixture gains the `pane_output` rows (seed with RIS + SGR +
+  emoji; an output frame carrying the full raw 0x80–0xFF range) and the
+  `pane_output_cross_lane` failure case: `pane_output` and `agent_transcript`
+  share one anchor, so a byte frame presented as a transcript item must fail.
+
 ## 0.44.0 — 2026-08-06
 
 **Pairing v2 — `pidge terminal connect --qr`, the computer-first door.**

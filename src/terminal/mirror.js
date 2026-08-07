@@ -399,6 +399,10 @@ function createMirror({
     // funnels through here — this is the loss-recovery mechanism, and it is
     // why dropping frames is always safe.
     reseed() {
+      // A stopped mirror is a stood-down one: it must not re-open its own
+      // emission gate behind the daemon's back (the daemon builds a FRESH
+      // instance when the share comes back).
+      if (stopped) return Promise.resolve();
       stats.lastInboundAt = now();
       if (viewers < 1) viewers = 1;
       return chain(() => seed());
@@ -406,6 +410,7 @@ function createMirror({
 
     // `t:"resize"` — clamps inherited (cols 20–500, rows 5–300).
     resize(rawCols, rawRows) {
+      if (stopped) return Promise.resolve();
       stats.lastInboundAt = now();
       const cols = clampCols(rawCols);
       const rows = clampRows(rawRows);
