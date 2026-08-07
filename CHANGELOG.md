@@ -12,6 +12,17 @@
   running `pidge terminal daemon` in their own shell and watching it live. Who
   stdout is gets asked of the OS (device + inode of fd 1), so the answer stays
   right for launchd, for systemd, and for a shell redirect.
+- **`connect --qr` against a local server now accepts every spelling of
+  loopback.** The https-only rule keeps its one carve-out for http on the
+  loopback — the mock-server tests and local dev servers live there — but the
+  carve-out was case-sensitive and IPv4-only, so `http://LOCALHOST:3000`,
+  `HTTP://localhost:3000` and `http://[::1]:3000` were all refused for naming
+  the same machine in a different way. Scheme and host are case-insensitive
+  components, so they are now compared as such, and both IPv6 loopback
+  spellings (`[::1]`, `[::ffff:127.0.0.1]`) join the set. The rule stays
+  structural: literal loopback hosts only, never a DNS name that could merely
+  resolve to one, and userinfo (`http://localhost@elsewhere/`) still cannot
+  pass itself off as the host.
 
 ## 0.45.0 — 2026-08-07
 

@@ -13,12 +13,62 @@ const core = require('./core');
 
 const PAIR_QR_PREFIX = 'pidge-pair:v1:';
 
+// The loopback hosts the http carve-out below recognises. STRUCTURAL by
+// design: only literal loopback addresses and the one name the resolver
+// stack is required to map to them — never a DNS name that could merely
+// resolve to 127.0.0.1 today (that is the rebinding hole this list exists to
+// stay out of). Stored lowercase; the caller lowercases the host it tests.
+const LOOPBACK_HOSTS = new Set([
+  '127.0.0.1',
+  'localhost',
+  '[::1]',                 // the IPv6 loopback, in URL bracket form
+  '[::ffff:127.0.0.1]',    // …and its IPv4-mapped spelling
+]);
+
+// Split an authority into host + port, IPv6 brackets included. Returns null
+// for anything that is not a bare host[:port] — userinfo above all: a
+// `http://localhost@evil.example/` must never read as loopback.
+function splitAuthority(authority) {
+  if (authority.includes('@')) return null;
+  let host = authority;
+  let port = '';
+  if (host.startsWith('[')) {
+    const end = host.indexOf(']');
+    if (end === -1) return null;
+    port = host.slice(end + 1);
+    host = host.slice(0, end + 1);
+  } else {
+    const colon = host.lastIndexOf(':');
+    if (colon !== -1) { port = host.slice(colon); host = host.slice(0, colon); }
+  }
+  if (port !== '' && !/^:\d+$/.test(port)) return null;
+  return { host, port };
+}
+
 // https only, with ONE carve-out: loopback http, for the mock-server tests
 // and local dev servers. (The PHONE refuses every http base_url per §24.1 —
 // a loopback QR is only ever scanned by test tooling, never by the app.)
+//
+// Scheme and host are compared case-INSENSITIVELY because that is what they
+// are (RFC 3986 §3.1/§6.2.2.1) — `HTTP://LOCALHOST:3000` names the same
+// server as the documented spelling, and refusing it only ever cost a
+// developer their afternoon. The rest of the URL is left alone: only the two
+// case-insensitive components get folded. The failure direction never
+// changes — a host outside the literal set is refused, never accepted.
 function pairingBaseUrlOk(baseUrl) {
-  if (/^https:\/\/[^\s]+$/.test(baseUrl)) return true;
-  return /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(baseUrl);
+  const url = String(baseUrl || '');
+  if (/\s/.test(url) || url === '') return false;
+  const m = url.match(/^([A-Za-z][A-Za-z0-9+.-]*):\/\/(.*)$/);
+  if (!m) return false;
+  const scheme = m[1].toLowerCase();
+  const rest = m[2];
+  if (scheme === 'https') return rest.length > 0;
+  if (scheme !== 'http') return false;
+  const slash = rest.indexOf('/');
+  const authority = (slash === -1 ? rest : rest.slice(0, slash)).toLowerCase();
+  if (/[?#]/.test(authority)) return false;
+  const split = splitAuthority(authority);
+  return !!split && LOOPBACK_HOSTS.has(split.host);
 }
 
 // The parser side (§24.1) refuses host/os that are not DISPLAY-SAFE (>64
