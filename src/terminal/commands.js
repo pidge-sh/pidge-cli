@@ -1155,6 +1155,8 @@ async function runDoctor() {
     say('');
   }
 
+  const mirrorBad = await doctorMirror(bound.size > 0);
+
   if (!bound.size) {
     say('No pane is shared right now, so there is no mode to check. Share the pane a claude runs in and re-run — THAT is the acceptance test.');
   } else if (!liveAgents) {
@@ -1164,6 +1166,79 @@ async function runDoctor() {
   } else {
     say(`✓ ${liveAgents} shared pane(s) hold a live harness and are published as mode=agent. Occupant detection agrees with reality on this machine.`);
   }
+  if (mirrorBad) {
+    die(`pidge terminal doctor: ${mirrorBad} shared pane(s) could not produce a seed that fits the relay frame cap — the raw view would reseed forever on this machine (spec §19, gotcha #65).`, 2);
+  }
+}
+
+// The MIRROR half of the doctor (Phase B, spec §19 + the §12 real-binary rule).
+//
+// The seed is the one frame whose failure cannot be healed by asking again: an
+// oversized seed is dropped by the relay, the viewer sees the gap, asks for a
+// reseed, and the daemon regenerates the SAME oversized dump — forever. The
+// ladder degrades inside the cap precisely so that loop cannot start, and the
+// only way to know it holds against THIS tmux, at THIS pane size, with THESE
+// manifest limits is to make a real one and measure it. So: attach for real,
+// force one reseed, print what came out. Returns how many shares failed.
+async function doctorMirror(anyShares) {
+  say('--- mirror (the raw byte view, spec §19) ---\n');
+  let report;
+  try {
+    const { res, data } = await daemonCall('GET', '/mirror');
+    if (res.status !== 200) throw new Error(`daemon answered ${res.status}`);
+    report = data;
+  } catch (e) {
+    say(`(no mirror diagnostics — ${e.message}. Start the daemon and re-run.)\n`);
+    return 0;
+  }
+  say(`relay frame cap:  ${report.frame_cap} B (from the manifest — the seed ladder degrades against THIS number)`);
+  say(`daemon epoch:     ${report.epoch}   (echoed in every o/seed frame; a viewer gap ⇒ reseed)`);
+  say(`idle stand-down:  ${Math.round(report.settings.mirror_idle_ms / 1000)}s   ·  resize nudge: ${report.settings.nudge_ms ? `${report.settings.nudge_ms}ms` : 'OFF'}   (terminal.toml)`);
+  for (const w of report.warnings || []) say(`  ! terminal.toml: ${w}`);
+  say(`tmux control taps: ${report.hub.length ? report.hub.map((h) => `${h.session} [${h.panes.join(' ')}]${h.alive ? '' : ' DEAD'}`).join(', ') : 'none (no pane is being mirrored right now)'}`);
+  say('');
+
+  if (!anyShares) {
+    say('No pane is shared, so there is nothing to mirror. Share one and re-run.\n');
+    return 0;
+  }
+
+  let probes;
+  try {
+    const { data } = await daemonCall('POST', '/mirror/probe', {});
+    probes = (data && data.probes) || [];
+  } catch (e) {
+    say(`(the reseed probe could not run — ${e.message})\n`);
+    return 0;
+  }
+  let bad = 0;
+  for (const p of probes) {
+    say(`${p.public_id}  pane ${p.pane_id}  mode=${p.mode}`);
+    if (!p.attached) {
+      say('  tmux tap:            NOT ATTACHED — this computer could not open a control-mode client for the pane');
+      say('');
+      bad += 1;
+      continue;
+    }
+    const seed = p.seed;
+    if (!seed) {
+      say('  seed:                none produced');
+      say('');
+      bad += 1;
+      continue;
+    }
+    const rung = seed.scrollback === undefined ? '—' : `-${seed.scrollback} lines`;
+    say(`  seed:                ${seed.bytes === null ? 'SKIPPED' : `${seed.bytes} B sealed`}  (${seed.cols}x${seed.rows}${seed.alt ? ', alternate screen' : ''})`);
+    say(`  ladder rung used:    ${rung}${seed.degraded ? `  → DEGRADED: ${seed.degraded}` : ''}`);
+    say(`  fits the cap?        ${seed.fits ? 'yes ✓' : 'NO ✗  — the reseed loop starts here'}`);
+    say(`  sent on the cable?   ${seed.sent ? 'yes' : 'no (the cable is not up — the seed still had to fit)'}`);
+    say(`  frames/s · stripper: ${p.frames_per_s} · ${p.stripper_hits} ESC-k title sequence(s) removed from the live stream`);
+    say('');
+    if (!seed.fits) bad += 1;
+  }
+  if (!probes.length) say('No shared pane has a bound tmux pane to mirror.\n');
+  else if (!bad) say(`✓ ${probes.length} shared pane(s) produced a seed inside the relay frame cap against the tmux installed here.\n`);
+  return bad;
 }
 
 // --- dispatcher --------------------------------------------------------------
