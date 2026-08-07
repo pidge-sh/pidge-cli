@@ -2623,6 +2623,16 @@ class Daemon {
         ? this.ensureMirror(session, 'a viewer resized this pane')
         : (liveMirror && liveMirror.mirror) || null;
       if (!mirror) return; // no raw view open on this agent pane — nothing to resize for
+      // Honest limitation, said out loud the first time it can bite: tmux
+      // sizes a WINDOW per CLIENT, not per pane. Two shared panes of the same
+      // tmux session ride ONE control client (they must — two clients would
+      // fight over the geometry), so a resize from either phone screen moves
+      // the window both panes live in. The last gesture wins, and it converges.
+      const entry = this.mirrors.get(session.sid);
+      if (entry && this.hub.paneCount(entry.tmuxSession) > 1) {
+        this.noteOnce(`mirror-shared-geometry:${entry.tmuxSession}`,
+          `${session.publicId}: ${this.hub.paneCount(entry.tmuxSession)} shared panes live in tmux session ${JSON.stringify(entry.tmuxSession)} and tmux sizes a WINDOW per client — a resize from one pane screen moves the other too (last gesture wins; the seed after it repaints both)`);
+      }
       mirror.resize(msg.cols, msg.rows);
       return;
     }

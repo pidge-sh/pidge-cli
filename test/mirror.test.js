@@ -699,6 +699,20 @@ test('daemon: a `resize` clamps and drives the tmux client; on an AGENT pane wit
   assert.equal(agent.d.mirrors.size, 0, 'only a reseed (the raw toggle) opens an agent pane\'s mirror');
 });
 
+test('daemon: two shared panes in ONE tmux session say out loud that a resize moves the window they share', async () => {
+  const { d, session, fake } = mirrorDaemon({ occupant: 'term' });
+  const other = { sid: 'sess-n', publicId: 'ases_u', paneId: '%2', occupant: 'term', status: 'idle', waitingArmed: true, approvals: [] };
+  d.sessions.set(other.sid, other);
+  d.onViewerJoined(); // warms both — one tmux -C client, two panes
+  assert.equal(fake.made.length, 1, 'two clients would fight over the geometry — that is why the hub exists');
+  assert.equal(d.hub.paneCount('work'), 2);
+
+  d.handleInputFrame(session, inputFrame(d, { t: 'resize', cols: 100, rows: 30, vgen: 'v1', seq: 1, he: d.state.epoch }));
+  await sleep(30);
+  assert.ok(d.logLines.some((l) => /tmux sizes a WINDOW per client/.test(l)),
+    'the limitation is inherent to tmux — hiding it would be the dishonest half');
+});
+
 test('daemon: reseed/resize obey the ONE replay ledger — no vgen/he, no frame (and a replay is dropped)', async () => {
   const { d, session } = mirrorDaemon({ occupant: 'term' });
   d.handleInputFrame(session, inputFrame(d, { t: 'reseed', seq: 1, he: d.state.epoch })); // no vgen

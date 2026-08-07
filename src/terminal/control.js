@@ -256,6 +256,18 @@ class ControlHub {
     try { entry.control.kill(); } catch { /* already gone */ }
   }
 
+  // How many panes ride this session's client. The caller needs it because
+  // `refresh-client -C` is CLIENT-scoped, not pane-scoped: with two shared
+  // panes of one tmux session, a resize from either phone screen moves the
+  // WINDOW both live in. That is inherent to tmux (`window-size latest`) and
+  // not something a second client would fix — two clients would fight over the
+  // same geometry instead, which is exactly why the hub exists. So it is not
+  // hidden: the daemon narrates it the first time it can actually bite.
+  paneCount(sessionName) {
+    const e = this.entries.get(sessionName);
+    return e ? e.panes.size : 0;
+  }
+
   // Diagnostics for `pidge terminal doctor` / GET /mirror.
   stats() {
     return [...this.entries.entries()].map(([session, e]) => ({
