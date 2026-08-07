@@ -146,6 +146,21 @@ const SPAWN_TMUX_SESSION = 'pidge';
 
 function nowIso() { return new Date().toISOString(); }
 
+// Is this process's stdout the very file passed in? Asked by device+inode, so a
+// supervisor that wired fd 1 to the log (launchd StandardOutPath, systemd
+// StandardOutput=append:) is recognised regardless of how the path is spelled.
+// A tty, a pipe, /dev/null and a different file all answer false; anything we
+// cannot stat answers false, which keeps the echo (going quiet on a doubt is the
+// worse failure).
+function sameFileAsStdout(file, fdStat = null) {
+  try {
+    const out = fdStat || fs.fstatSync(1);
+    if (!out.isFile()) return false;
+    const target = fs.statSync(file);
+    return out.dev === target.dev && out.ino === target.ino;
+  } catch { return false; }
+}
+
 // Is the harness sitting in this pane? (see HARNESS_COMMANDS)
 function isHarnessCommand(cmd) {
   return HARNESS_COMMANDS.has(String(cmd || '').trim().toLowerCase());
@@ -250,7 +265,11 @@ class Daemon {
     this.drainArmedMs = 0;            // …and the interval it is currently armed with
     this.drainStopped = false;        // set on shutdown: the loop must not re-arm
     this.foreignMsgIds = new Set();   // queue rows that are NOT ours: logged once, never acked
-    this.logStream = null;
+    // The log sink (logStream / logSinkTried / echoToStdout) is deliberately
+    // NOT initialised here: the state migration ABOVE already called this.log(),
+    // so an assignment down here would drop an open stream on the floor and
+    // silence the daemon's own boot narration. ensureLogStream() owns all three
+    // fields and treats `undefined` as its starting state.
     this.exit = (code) => process.exit(code); // injectable for tests (POST /shutdown)
   }
 
@@ -279,13 +298,49 @@ class Daemon {
     return migrated;
   }
 
+  // ONE line, ONE sink. The service templates point the supervisor's stdout AT
+  // this very file (launchd `StandardOutPath`, systemd `StandardOutput=append:`),
+  // so a daemon that both writes the file AND echoes to stdout wrote every line
+  // TWICE — a log where a real repeat is indistinguishable from an echo, which
+  // is the one thing a log has to get right.
+  //
+  // The file write is the one that stays: it is the only sink that exists on the
+  // no-service-manager fallback (the detached daemon runs with stdio:'ignore' —
+  // dropping the file write would leave that machine with no log at all). The
+  // echo stays too, but only when stdout is NOT already this file: a human
+  // running `pidge terminal daemon` in their own shell still watches it live.
+  //
+  // Who stdout IS gets asked of the OS (device+inode of fd 1 vs the log file)
+  // rather than inferred from a flag we would have to keep true — it is right
+  // for launchd, for systemd's append:, and for a shell redirect nobody has
+  // thought of yet.
   log(...args) {
     const line = `[${nowIso()}] ${args.join(' ')}`;
-    console.log(line);
+    const stream = this.ensureLogStream();
+    if (this.echoToStdout) console.log(line);
+    if (stream) { try { stream.write(line + '\n'); } catch {} }
+  }
+
+  // Opens the log file (creating it SYNCHRONOUSLY first, so the identity check
+  // below has something to stat) and decides once whether stdout is a second
+  // mouth on the same file. Both answers are stable for the life of a daemon.
+  ensureLogStream() {
+    if (this.logStream) return this.logStream;
+    if (this.logSinkTried) return null;
+    this.logSinkTried = true;
     try {
-      this.logStream ||= fs.createWriteStream(core.LOG_FILE(), { flags: 'a' });
-      this.logStream.write(line + '\n');
-    } catch {}
+      const file = core.LOG_FILE();
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.closeSync(fs.openSync(file, 'a'));      // exists from here on
+      this.echoToStdout = !sameFileAsStdout(file);
+      this.logStream = fs.createWriteStream(file, { flags: 'a' });
+      // A write stream that errors with no listener takes the process down —
+      // the log is the last thing allowed to kill the daemon.
+      this.logStream.on('error', () => {});
+    } catch {
+      this.echoToStdout = true;                  // no file ⇒ stdout is all we have
+    }
+    return this.logStream;
   }
 
   // Say a thing ONCE per distinct fact. The occupant poll runs every second, so
@@ -3006,4 +3061,5 @@ function stripPrivate(item) {
 // felt latency of a command posted from the phone.
 module.exports = {
   Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_POLL_FAST_MS, DRAIN_KICK_FLOOR_MS, VIEWER_ACTIVE_WINDOW_MS,
+  sameFileAsStdout,
 };

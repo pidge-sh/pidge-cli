@@ -31,6 +31,7 @@ const adapter = require('../src/terminal/adapter-claude');
 const commands = require('../src/terminal/commands');
 const {
   Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_POLL_FAST_MS, DRAIN_KICK_FLOOR_MS, VIEWER_ACTIVE_WINDOW_MS,
+  sameFileAsStdout,
 } = require('../src/terminal/daemon');
 
 // A fresh config slot per test that writes one — terminalDir() reads the env
@@ -4643,4 +4644,79 @@ test('config: a junk key or a junk value refuses loudly and changes nothing', as
   assert.ok(errs.some((e) => /unknown setting "sudo"/.test(e)), JSON.stringify(errs));
   assert.ok(errs.some((e) => /pass `on` or `off`/.test(e)));
   assert.deepEqual(core.loadGrants(), { remote_spawn: false, inventory: true }, 'a refusal never half-applies');
+});
+
+// ===========================================================================
+// 9. the daemon log has ONE sink
+// ===========================================================================
+//
+// The service templates point the supervisor's stdout AT terminal.log itself
+// (launchd `StandardOutPath`, systemd `StandardOutput=append:`), so a daemon
+// that wrote the file AND echoed to stdout wrote every line twice — an echo no
+// reader can tell apart from a real repeat. These run the REAL `log()` in a
+// child process whose fd 1 is wired the way a supervisor wires it, and then the
+// way a shell does.
+
+// The smallest thing `log()` needs: it is a prototype method over three fields,
+// so the sink can be exercised without booting a whole daemon (no sockets, no
+// tmux, no network).
+const LOG_SINK_SCRIPT = `
+  const { Daemon } = require(${JSON.stringify(path.join(__dirname, '..', 'src', 'terminal', 'daemon.js'))});
+  const sink = Object.create(Daemon.prototype);
+  sink.logStream = null; sink.logSinkTried = false; sink.echoToStdout = true;
+  sink.log('CANARY-ONE');
+  sink.log('CANARY-TWO');
+  if (sink.logStream) sink.logStream.end();
+`;
+
+function logSinkSlot() {
+  const xdg = tmp('pidge-term-logsink-');
+  const file = path.join(xdg, 'pidge', 'terminal', 'terminal.log');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  return { xdg, file };
+}
+
+test('daemon log: when the supervisor already points stdout at terminal.log, each line lands ONCE', () => {
+  const { xdg, file } = logSinkSlot();
+  const fd = fs.openSync(file, 'a'); // exactly what launchd/systemd hand the service
+  try {
+    execFileSync(process.execPath, ['-e', LOG_SINK_SCRIPT], {
+      env: { ...process.env, XDG_CONFIG_HOME: xdg },
+      stdio: ['ignore', fd, 'pipe'],
+    });
+  } finally { fs.closeSync(fd); }
+
+  const body = fs.readFileSync(file, 'utf8');
+  assert.equal((body.match(/CANARY-ONE/g) || []).length, 1,
+    `the log file must carry one line per event, got:\n${body}`);
+  assert.equal((body.match(/CANARY-TWO/g) || []).length, 1);
+});
+
+test('daemon log: run from a shell, stdout is a DIFFERENT file — the human still watches it live', () => {
+  const { xdg, file } = logSinkSlot();
+  const out = execFileSync(process.execPath, ['-e', LOG_SINK_SCRIPT], {
+    env: { ...process.env, XDG_CONFIG_HOME: xdg },
+    encoding: 'utf8',
+  });
+  assert.equal((out.match(/CANARY-ONE/g) || []).length, 1, 'stdout keeps the echo when it is not the log');
+  const body = fs.readFileSync(file, 'utf8');
+  assert.equal((body.match(/CANARY-ONE/g) || []).length, 1, 'and the file is written exactly once either way');
+  assert.equal((body.match(/CANARY-TWO/g) || []).length, 1);
+});
+
+test('sameFileAsStdout answers by device+inode, never by how the path is spelled', () => {
+  const dir = tmp('pidge-term-logid-');
+  const file = path.join(dir, 'terminal.log');
+  const other = path.join(dir, 'other.log');
+  fs.writeFileSync(file, '');
+  fs.writeFileSync(other, '');
+  const asStdout = fs.statSync(file);
+
+  assert.equal(sameFileAsStdout(file, asStdout), true);
+  assert.equal(sameFileAsStdout(path.join(dir, '.', 'terminal.log'), asStdout), true,
+    'the same file reached by another spelling is still the same file');
+  assert.equal(sameFileAsStdout(other, asStdout), false);
+  assert.equal(sameFileAsStdout(file, fs.statSync(dir)), false, 'a directory is not a file sink');
+  assert.equal(sameFileAsStdout(path.join(dir, 'missing.log'), asStdout), false,
+    'a target we cannot stat KEEPS the echo — going quiet on a doubt is the worse failure');
 });
