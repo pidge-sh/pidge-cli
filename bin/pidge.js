@@ -285,6 +285,20 @@ function e2eKeyFingerprint(key) {
   return crypto.createHash('sha256').update(e2eKey(key)).digest().subarray(0, 4).toString('base64url');
 }
 
+// Per-channel key DERIVATION from a paired computer's key (setup
+// --from-computer; vectors: the fixture's `derivation` suite). Full pin:
+// HKDF-SHA256 (RFC 5869) extract-then-expand · salt EMPTY · IKM = the 32 RAW
+// key bytes (e2eKey refuses anything else — the classic mistake is feeding
+// the 43-char base64url STRING) · info "pidge-derive:v1:ch<public id>" ASCII ·
+// L = 32. One-way: no derived key reveals the computer key; each channel's
+// info makes its key distinct. Both sides derive (the app from the tunnel key
+// it holds) — NO secret travels for a derived channel.
+function e2eDeriveChannelKey(computerKey, channelId) {
+  const id = Number(channelId);
+  if (!Number.isInteger(id) || id < 0) throw new Error('e2e derivation needs the channel\'s public integer id');
+  return Buffer.from(crypto.hkdfSync('sha256', e2eKey(computerKey), Buffer.alloc(0), `pidge-derive:v1:ch${id}`, 32));
+}
+
 // PIDGE_SECRET reads from the SAME slot/precedence as PIDGE_TOKEN: env var wins
 // over the config file (scope-aware via PIDGE_AGENT/project/XDG_CONFIG_HOME) —
 // the {TOKEN, SECRET} pair always travels together from one source. Fresh read
@@ -408,7 +422,7 @@ function createBridgeAlertPolicy({ brokenAfter = 5, minStreakMs = 600000, cooldo
 // unchanged.
 // ---------------------------------------------------------------------------
 module.exports = {
-  e2eAad, e2eKeyFingerprint, e2eLoadSecret, e2eParseSecret,
+  e2eAad, e2eKeyFingerprint, e2eLoadSecret, e2eParseSecret, e2eDeriveChannelKey,
   e2eEncryptField, e2eDecryptField, e2eEncryptBlob, e2eDecryptBlob,
   E2E_NEVER_SEAL_LABEL_IDS, e2ePinKeyFor,
   // sealed media — the pure halves (gate decision + filename hygiene).
@@ -474,8 +488,10 @@ const OPTIONS = {
   'quiet-nag': { type: 'boolean' },            // silence the manifest-version nag for this run
   // onboarding v2
   claim: { type: 'string' },                   // setup --claim <single-use code>
+  'from-computer': { type: 'boolean' },        // setup: DERIVE PIDGE_SECRET from this machine's paired-computer key
   // Agent Sessions (`pidge terminal …`) — see src/terminal/
   code: { type: 'string' },                    // terminal connect: the Connect-a-computer claim code
+  qr: { type: 'boolean' },                     // terminal connect: computer-first pairing — mint K here, print a QR, type back the app's code
   secret: { type: 'string' },                  // terminal connect: PIDGE_SECRET fallback (env var preferred)
   session: { type: 'string' },                 // terminal disable: explicit session id (else ancestor-walk)
   approvals: { type: 'string' },               // terminal enable: comma tool list for the approval gate (off by default)
@@ -587,6 +603,9 @@ USAGE
                                           a Claude session as its structured transcript (E2E-sealed,
                                           typed replies land in its input box) or a plain terminal.
                                           connect --code C   once per computer (paste the app's one-liner)
+                                          connect --qr       computer-first pairing: prints a QR the app
+                                                             scans, you type back the code it shows
+                                                             (no one-liner, no secret in any clipboard)
                                           (claude sharing)   the ONLY door is the PreToolUse HOOK: paste
                                                              "Run exactly this one bash command and nothing
                                                              else: \`pidge terminal enable\`" INTO the session
@@ -794,7 +813,9 @@ const OPTION_DOCS = {
   digest: '--digest                 catchup: one condensed line per message (id · kind · 60 chars · handled by X: <note> / ✓ acked (no note) / PENDING)',
   target: '--target T               skill install: claude (default) → .claude/skills/pidge/SKILL.md · agents → AGENTS.md · gemini → GEMINI.md',
   claim: '--claim CODE             the single-use setup code (the human copies it from the Pidge app)',
+  'from-computer': '--from-computer          setup: derive PIDGE_SECRET from this machine\'s paired-computer key (both sides derive — no secret travels; needs `pidge terminal connect` done here)',
   code: '--code CODE              terminal connect: the Connect-a-computer claim code (from the app\'s one-liner)',
+  qr: '--qr                     terminal connect: computer-first pairing — mints the key HERE, prints a QR for the app to scan, then asks for the code the app shows (never combined with --code/PIDGE_SECRET)',
   secret: '--secret S               terminal connect: PIDGE_SECRET fallback (prefer the env var — keeps it out of argv)',
   session: '--session SID            terminal disable: a session id from `pidge terminal status` (optional when exactly one session is shared). `enable` takes no sid — the hook that catches the pasted command knows it.',
   approvals: '--approvals T1,T2        gate these tools behind an Approve/Deny push (off by default). It rides the PASTED command (`pidge terminal enable --approvals Bash,Write`) — the hook reads it there.',
@@ -857,9 +878,9 @@ const SEND_OPTS = [...CONTENT_OPTS, 'gated', 'wait', 'timeout', 'interval', 'rea
 const HELP = {
   setup: {
     summary: 'one-shot onboarding: exchange a single-use claim code for the channel key, store it, run doctor.',
-    usage: 'pidge setup --claim CODE [--url BASE] [--global] [--print] [--force] [--listen-mode MODE]',
+    usage: 'pidge setup --claim CODE [--url BASE] [--global] [--print] [--force] [--from-computer] [--listen-mode MODE]',
     body: 'The CLI writes the key itself (chmod 600) — it never appears on screen or in the agent\'s chat. Run it INSIDE your project (git): the key is scoped to that project, so N agents in N projects never collide (--global targets the shared machine file instead — for daemons/cron). Two agents in the SAME directory: set PIDGE_AGENT=<id> at each agent\'s launch. A fumbled setup is safe to re-run: within the code\'s 15-min TTL the same install gets its key again (server v84+). --quiet collapses the onboarding to one status line.',
-    opts: ['claim', 'url-base', 'global', 'print', 'force', 'listen-mode', 'quiet'],
+    opts: ['claim', 'url-base', 'global', 'print', 'force', 'from-computer', 'listen-mode', 'quiet'],
   },
   doctor: {
     summary: 'validate the setup WITHOUT exposing secrets (env source, server, key, device reach, realtime probe).',
@@ -1005,7 +1026,7 @@ const HELP = {
   },
   terminal: {
     summary: 'Terminals: share a tmux pane with the phone — a Claude session as structured, E2E-sealed conversation data (typed replies come back into it), or a plain terminal pane.',
-    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon] [--replace]  ·  pidge terminal share (inside a pane)  ·  pidge terminal config [remote_spawn|inventory] [on|off]  ·  pidge terminal enable (confirm)  ·  pidge terminal disable [--session SID|--all] | status | doctor | disconnect',
+    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon] [--replace]  ·  pidge terminal connect --qr (computer-first: scan from the app, type back the code)  ·  pidge terminal share (inside a pane)  ·  pidge terminal config [remote_spawn|inventory] [on|off]  ·  pidge terminal enable (confirm)  ·  pidge terminal disable [--session SID|--all] | status | doctor | disconnect',
     body: [
       'The user runs claude inside tmux — that is their ENTIRE responsibility. `connect` (once per computer) pairs with the phone: the app\'s Settings → Computers → Connect a computer mints a tunnel channel + E2E key and shows a one-liner carrying the claim code + PIDGE_SECRET; paste it in a terminal. It asks consent, installs Claude Code hooks (tagged `# pidge-hook`, cleanly removable), refreshes the Pidge skill, copies this CLI to ~/.config/pidge/terminal/cli (so the service never points into a prunable npx cache) and installs a background daemon (launchd on macOS, `systemd --user` on Linux/WSL; a WSL without systemd gets a detached daemon + the line that makes it durable).',
       '',
@@ -1019,7 +1040,7 @@ const HELP = {
       '',
       'E2E is mandatory (the transcript contains everything); the server relays sealed blobs it can never read. `disable` stops one share; `disconnect` = disable --all + uninstall hooks + daemon.',
     ].join('\n'),
-    opts: ['code', 'secret', 'session', 'approvals', 'yes', 'no-daemon', 'replace', 'url'],
+    opts: ['code', 'qr', 'secret', 'session', 'approvals', 'yes', 'no-daemon', 'replace', 'url'],
   },
   bridge: {
     summary: '24/7 supervisor: long-poll the channel, run YOUR handler once per batch, ack only on exit 0. Model-agnostic.',
@@ -4616,6 +4637,27 @@ async function runSetup() {
   const code = v.claim;
   if (!code) die('pidge: usage: pidge setup --claim <code> [--url <base>]   (the human copies the code from the Pidge app)', 1);
 
+  // --from-computer: derive PIDGE_SECRET from this machine's paired-computer
+  // key instead of receiving it — both sides derive, NO secret travels.
+  // Preconditions checked BEFORE any network so a machine that cannot derive
+  // never consumes the code. The two secret sources must not half-mix: an
+  // ambient PIDGE_SECRET alongside --from-computer is a confused invocation.
+  let computerKeyForDerivation = null;
+  if (v['from-computer']) {
+    if (process.env.PIDGE_SECRET) {
+      die('pidge setup --from-computer: PIDGE_SECRET is already set in this environment — the two secret sources must not mix. Unset it, or drop --from-computer.', 1);
+    }
+    const tcore = require('../src/terminal/core');
+    const tenv = tcore.loadTerminalEnv();
+    if (!tenv.secret) {
+      die('pidge setup --from-computer: this machine holds no paired-computer key (' + tcore.ENV_FILE() + ').\n' +
+        'Pair it first — `pidge terminal connect --qr` (or the app\'s Settings → Computers one-liner) — or drop --from-computer and deliver PIDGE_SECRET via the connect screen\'s terminal step.', 2);
+    }
+    try { computerKeyForDerivation = e2eParseSecret(tenv.secret); } catch (e) {
+      die(`pidge setup --from-computer: the stored computer key is unusable (${e.message}) — re-pair with \`pidge terminal connect --qr --replace\`.`, 2);
+    }
+  }
+
   // WHERE the key will live — decided BEFORE anything touches the network so
   // the fingerprint that binds the claim (identityHeaders hashes CONFIG_FILE)
   // is the identity this install will actually resolve on its next command.
@@ -4695,6 +4737,18 @@ async function runSetup() {
   const channelName = data.channel && data.channel.name;
   const channelId = data.channel && data.channel.id;
 
+  // --from-computer: the derivation itself (§ the info string binds the key to
+  // this channel's PUBLIC id, so the id must be known).
+  let derivedSecret = null;
+  if (computerKeyForDerivation) {
+    if (channelId === undefined || channelId === null) {
+      die('pidge setup --from-computer: the server did not report the channel id, so there is nothing to bind the derivation to — update the server, or drop --from-computer.', 2);
+    }
+    const derivedKey = e2eDeriveChannelKey(computerKeyForDerivation, channelId);
+    derivedSecret = derivedKey.toString('base64url');
+    note(`pidge: PIDGE_SECRET DERIVED from this computer's key (channel kf ${e2eKeyFingerprint(derivedKey)}) — the phone derives the same key; no secret traveled.`);
+  }
+
   // step 5: DECLARE how this agent operates (operating_contract) right after
   // the claim succeeds — ADVISORY metadata, the same for --print and the file
   // path. Done here (before the branch) so both onboarding modes declare it.
@@ -4712,7 +4766,8 @@ async function runSetup() {
     // environment already carries PIDGE_SECRET (the human exported it before
     // running setup), emit it alongside. (the secret comes from the app's
     // Connect-screen terminal step, never from the chat prompt.)
-    if (process.env.PIDGE_SECRET) console.log(`export PIDGE_SECRET=${process.env.PIDGE_SECRET}`);
+    if (derivedSecret) console.log(`export PIDGE_SECRET=${derivedSecret}`);
+    else if (process.env.PIDGE_SECRET) console.log(`export PIDGE_SECRET=${process.env.PIDGE_SECRET}`);
     console.error(`pidge: canal "${channelName}" — modo POR-AGENTE (nada gravado em disco). Cole as duas linhas no ambiente de lançamento DESTE agente (systemd/launcher/cron/profile). Cada agente tem a SUA chave; perdeu, é só pegar outro código no app e re-rodar (a chave do canal é a MESMA). NÃO rode --print de dentro de um agente — a chave apareceria no contexto dele.`);
     await fuseSkillAndHello(finalBase, data.key);
     await runDoctor(finalBase, data.key, 'fresh claim (per-agent env — not stored on disk)');
@@ -4729,7 +4784,7 @@ async function runSetup() {
   // TARGET scope only (never load-time FILE_ENV): re-claiming the same identity
   // must keep ITS secret, but a secret from a DIFFERENT scope must never bleed
   // into a new channel's file (it belongs to another channel's E2E).
-  const e2eSecret = process.env.PIDGE_SECRET || targetEnv.PIDGE_SECRET || null;
+  const e2eSecret = derivedSecret || process.env.PIDGE_SECRET || targetEnv.PIDGE_SECRET || null;
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(CONFIG_FILE,
     `PIDGE_URL=${finalBase}\nPIDGE_TOKEN=${data.key}\n${e2eSecret ? `PIDGE_SECRET=${e2eSecret}\n` : ''}`,

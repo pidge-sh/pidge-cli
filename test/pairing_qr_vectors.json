@@ -1,0 +1,50 @@
+{
+  "_readme": [
+    "pidge Pairing v2 — SHARED QR payload vectors (agent-sessions-spec §24.1/§24.6).",
+    "Payload: \"pidge-pair:v1:\" + base64url_unpadded(UTF-8 JSON {k, kf, host, os, base_url}).",
+    "The v1 segment sits OUTSIDE the base64: an unknown version must error (\"update the app\") BEFORE any decode.",
+    "Parsers MUST recompute kf from k and REFUSE on mismatch — the confirm screen may never show a fingerprint the stored key won't have.",
+    "k is validated by the BYOK validator: exact PIDGE_SECRET wire form, 32 bytes, base64url alphabet (standard base64 refused).",
+    "base_url must be well-formed https:// — the phone refuses http, and refuses a base_url that differs from its own (copy names BOTH urls).",
+    "host: trimmed, non-empty. os: macos|linux|wsl — unknown values are TOLERATED (rendered raw; older phone vs newer CLI).",
+    "Unknown JSON keys are IGNORED (§12 additive evolution).",
+    "The CLI asserts its generator emits `payload` byte-for-byte; iOS asserts the REAL scan-path parser accepts/refuses each case with a typed error.",
+    "DETERMINISTIC test material — NEVER use this key in production. Regenerate only on contract change: node test/gen-pairing-qr-vectors.js"
+  ],
+  "suite": "pidge-pairing-qr-v1",
+  "prefix": "pidge-pair:v1:",
+  "key_b64url": "W6BGCcWGXttmJH62KJUGoJXeyzF1t_cBG0sq5XL7NmM",
+  "kf": "v8iKDg",
+  "host": "studio.local",
+  "os": "macos",
+  "base_url": "https://api.pidge.sh",
+  "payload_json": "{\"k\":\"W6BGCcWGXttmJH62KJUGoJXeyzF1t_cBG0sq5XL7NmM\",\"kf\":\"v8iKDg\",\"host\":\"studio.local\",\"os\":\"macos\",\"base_url\":\"https://api.pidge.sh\"}",
+  "payload": "pidge-pair:v1:eyJrIjoiVzZCR0NjV0dYdHRtSkg2MktKVUdvSlhleXpGMXRfY0JHMHNxNVhMN05tTSIsImtmIjoidjhpS0RnIiwiaG9zdCI6InN0dWRpby5sb2NhbCIsIm9zIjoibWFjb3MiLCJiYXNlX3VybCI6Imh0dHBzOi8vYXBpLnBpZGdlLnNoIn0",
+  "unknown_extra_key_payload": "pidge-pair:v1:eyJrIjoiVzZCR0NjV0dYdHRtSkg2MktKVUdvSlhleXpGMXRfY0JHMHNxNVhMN05tTSIsImtmIjoidjhpS0RnIiwiaG9zdCI6InN0dWRpby5sb2NhbCIsIm9zIjoibWFjb3MiLCJiYXNlX3VybCI6Imh0dHBzOi8vYXBpLnBpZGdlLnNoIiwiY29sb3IiOiJ0ZWFsIn0",
+  "failure_cases": {
+    "unknown_version": {
+      "payload": "pidge-pair:v9:eyJrIjoiVzZCR0NjV0dYdHRtSkg2MktKVUdvSlhleXpGMXRfY0JHMHNxNVhMN05tTSIsImtmIjoidjhpS0RnIiwiaG9zdCI6InN0dWRpby5sb2NhbCIsIm9zIjoibWFjb3MiLCJiYXNlX3VybCI6Imh0dHBzOi8vYXBpLnBpZGdlLnNoIn0",
+      "note": "version segment is OUTSIDE the base64 — must error \"update the app\" before any decode is attempted"
+    },
+    "kf_mismatch": {
+      "payload": "pidge-pair:v1:eyJrIjoiVzZCR0NjV0dYdHRtSkg2MktKVUdvSlhleXpGMXRfY0JHMHNxNVhMN05tTSIsImtmIjoieWltc3dnIiwiaG9zdCI6InN0dWRpby5sb2NhbCIsIm9zIjoibWFjb3MiLCJiYXNlX3VybCI6Imh0dHBzOi8vYXBpLnBpZGdlLnNoIn0",
+      "note": "kf does not match SHA-256(k)[0..3] — the parser recomputes and REFUSES (the confirm screen never lies)"
+    },
+    "short_key": {
+      "payload": "pidge-pair:v1:eyJrIjoiVzZCR0NjV0dYdHRtSkg2MktKVUdvSlhleXpGMXRfY0IiLCJrZiI6IkNqZ1VSQSIsImhvc3QiOiJzdHVkaW8ubG9jYWwiLCJvcyI6Im1hY29zIiwiYmFzZV91cmwiOiJodHRwczovL2FwaS5waWRnZS5zaCJ9",
+      "note": "k decodes to 24 bytes — the BYOK validator refuses anything but exactly 32 (kf here matches the short bytes, so the LENGTH is the one failure)"
+    },
+    "standard_base64_key": {
+      "payload": "pidge-pair:v1:eyJrIjoiVzZCR0NjV0dYdHRtSkg2MktKVUdvSlhleXpGMXQvY0JHMHNxNVhMN05tTT0iLCJrZiI6InY4aUtEZyIsImhvc3QiOiJzdHVkaW8ubG9jYWwiLCJvcyI6Im1hY29zIiwiYmFzZV91cmwiOiJodHRwczovL2FwaS5waWRnZS5zaCJ9",
+      "note": "the SAME 32 bytes in standard base64 (contains + or /) — refused: the wire form is base64url exactly"
+    },
+    "http_base_url": {
+      "payload": "pidge-pair:v1:eyJrIjoiVzZCR0NjV0dYdHRtSkg2MktKVUdvSlhleXpGMXRfY0JHMHNxNVhMN05tTSIsImtmIjoidjhpS0RnIiwiaG9zdCI6InN0dWRpby5sb2NhbCIsIm9zIjoibWFjb3MiLCJiYXNlX3VybCI6Imh0dHA6Ly9hcGkucGlkZ2Uuc2gifQ",
+      "note": "base_url must be https:// — an http QR is refused outright (and a mismatching https one is refused naming both urls)"
+    },
+    "duplicate_key": {
+      "payload": "pidge-pair:v1:eyJrIjoiM2tJTlR3Q1ZCc3FsNGNvalJpbjltenZ2dnVaVGxDSlpqUXEwTE4yVGpKbyIsImsiOiJXNkJHQ2NXR1h0dG1KSDYyS0pVR29KWGV5ekYxdF9jQkcwc3E1WEw3Tm1NIiwia2YiOiJ2OGlLRGciLCJob3N0Ijoic3R1ZGlvLmxvY2FsIiwib3MiOiJtYWNvcyIsImJhc2VfdXJsIjoiaHR0cHM6Ly9hcGkucGlkZ2Uuc2gifQ",
+      "note": "the same JSON key twice (k: a wrong key first, the right one second) — parsers disagree on duplicate resolution, so ANY duplicated key is a typed refusal, never resolved"
+    }
+  }
+}

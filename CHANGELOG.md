@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.44.0 — 2026-08-06
+
+**Pairing v2 — `pidge terminal connect --qr`, the computer-first door.**
+Until now pairing always started on the
+phone: mint there, paste a one-liner carrying `code+SECRET` through the
+clipboard. The new door reverses the direction with a STRICTLY smaller
+surface: the computer mints the key and it leaves the machine **only by
+camera**.
+
+- **`connect --qr`**: mints K locally (32 bytes CSPRNG, the BYOK generator
+  class), prints a QR carrying `pidge-pair:v1:{k, kf, host, os, base_url}`
+  plus a screen-share warning, then blocks on
+  `Enter the code shown on your phone:`. The app scans, shows host+kf for
+  confirmation, creates the tunnel (the phone REMAINS the only channel
+  creator — `tunnel_requires_human` untouched) and displays a claim code; you
+  type it back. From the claim on it is the existing install path, byte for
+  byte (same retry-safe claim exchange, same kind guard, same hooks/skill/
+  daemon). A mistyped code reprompts (404 is uniform: unknown =
+  expired = mistyped); **nothing persists until the claim succeeds** — ctrl-C
+  at the prompt leaves zero residue. `--qr` refuses `--code`/`PIDGE_SECRET`
+  (the two doors never half-mix) and the existing-identity guard applies
+  verbatim (`--qr --replace` = consented switch, old channel stays server-side).
+- **In-tree QR encoder** (`src/terminal/qr.js`, ~300 lines, byte mode, EC
+  L/M): pidge-cli keeps its ZERO runtime dependencies — the renderer that
+  touches the computer key is code reviewed in this repo, not an npm package
+  trusted at install time. Cross-validated module-by-module against an
+  independent implementation (python-qrcode) across versions 1–20 × levels
+  L/M × all 8 masks (`test/gen-qr-golden.py`); CI re-asserts the committed
+  golden matrices with no python.
+- **Shared cross-wire fixture** `test/pairing_qr_vectors.json`: the exact
+  payload string the CLI emits, plus the failure cases (unknown version, kf mismatch, short key,
+  standard-base64 key, http base_url) the iOS parser must refuse with typed
+  errors.
+- **`pidge setup --claim CODE --from-computer` — the channel secret by
+  DERIVATION.** On a machine already paired as a computer, setup can now
+  derive `PIDGE_SECRET` from the computer key instead of receiving it:
+  `HKDF-SHA256(computer_key, salt empty, info "pidge-derive:v1:ch<id>", 32)`
+  — the app derives the SAME key on the phone side, so no secret travels at
+  all (no one-liner, no clipboard, no chat). One-way: no channel key ever
+  reveals the computer key. Refuses loudly before any network on an unpaired
+  machine, and refuses an ambient `PIDGE_SECRET` alongside the flag (two
+  secret sources never half-mix). The derivation is byte-asserted against the
+  shared fixture's `derivation` suite.
+- **E2E fixture caught up to the shared canonical copy**: the `derivation`
+  suite (per-channel key derivation — HKDF-SHA256, empty salt, raw-bytes IKM,
+  `pidge-derive:v1:ch<id>`, including the IKM-as-string failure case) and the
+  Terminals-v2 `computer_*` vectors with their cross-lane and cid-replay
+  failure cases — all asserted by this repo's node tests now.
+
 ## 0.43.2 — 2026-08-05
 
 - **The bridge's "channel looks broken" desktop alert is now sleep-aware.** On a

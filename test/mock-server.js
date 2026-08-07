@@ -32,6 +32,7 @@ function createMock() {
     uploads: [],
     blobs: {},             // name → Buffer, served at GET /blobs/<name>
     claimCode: 'claim-ok',   // POST /api/v1/claim exchanges this once
+    claimFailStatuses: [],   // failure injection: next claim attempts answer these statuses in order
     // The channel KIND the claim reports back (server manifest v100+). null =
     // an older server that reports NONE — the CLI must tolerate that (spec §12,
     // QA finding #1: reading a missing field as "not a tunnel" killed 100% of
@@ -115,6 +116,11 @@ function createMock() {
       let body = '';
       req.on('data', (c) => { body += c; });
       req.on('end', () => {
+        // Failure injection (the reprompt-on-5xx path of `connect --qr`):
+        // statuses pushed by a test are answered in order, then normal flow.
+        if (state.claimFailStatuses.length) {
+          return json(res, state.claimFailStatuses.shift(), { error: 'injected_failure' });
+        }
         let code = null;
         try { code = JSON.parse(body).code; } catch { /* keep null */ }
         if (state.claimCode && code === state.claimCode) {

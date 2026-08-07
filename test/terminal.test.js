@@ -771,6 +771,228 @@ test('connect: re-running WITHOUT --code on an existing identity still works (th
   } finally { await mock.stop(); }
 });
 
+// --- connect --qr: the computer-first door (Pairing v2, spec §24) ------------
+//
+// Same discipline as the runConnect harness above, plus a piped stdin: the
+// --qr prompt loop holds ONE readline for its whole life, so lines written
+// after the first prompt are consumed one per attempt, in order.
+
+function runConnectQr(port, { extra = [], input = null, env = {}, onPrompt = null, yes = true, endInput = false } = {}) {
+  const bin = path.join(__dirname, '..', 'bin', 'pidge.js');
+  const child = spawn(process.execPath,
+    [bin, 'terminal', 'connect', '--qr',
+      ...(port ? ['--url', `http://127.0.0.1:${port}`] : []),
+      ...(yes ? ['--yes'] : []), '--no-daemon', ...extra],
+    {
+      env: {
+        ...process.env,
+        PIDGE_SECRET: '',
+        PIDGE_NO_UPDATE_CHECK: '1',
+        PIDGE_QUIET_NAG: '1',
+        // The suite drives the flow through PIPES by construction — the
+        // non-TTY refusal (§24.4) has its own dedicated test below.
+        PIDGE_QR_ALLOW_NO_TTY: '1',
+        ...env,
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  const out = { code: null, stdout: '', stderr: '' };
+  let sawPrompt = false;
+  child.stdout.on('data', (c) => {
+    out.stdout += c;
+    if (!sawPrompt && out.stdout.includes('Enter the code shown on your phone:')) {
+      sawPrompt = true;
+      if (input !== null) child.stdin.write(input);
+      if (endInput) child.stdin.end(); // EOF after the scripted lines
+      if (onPrompt) onPrompt(child);
+    }
+  });
+  child.stderr.on('data', (c) => { out.stderr += c; });
+  return new Promise((resolve) => child.on('exit', (c) => { out.code = c; resolve(out); }));
+}
+
+test('connect --qr: the whole computer-first pairing against the mock — QR out, code typed, minted K at rest (§24.2)', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    // First attempt mistyped (404 → honest reprompt); second attempt carries
+    // spaces exactly as the app displays the code — ASCII whitespace strips,
+    // NOTHING else does.
+    const out = await runConnectQr(port, { input: 'not the code\n  claim -ok  \n' });
+    assert.equal(out.code, 0, `connect --qr died: ${out.stderr}`);
+    assert.match(out.stderr, /unknown, expired or mistyped — check the phone's screen/,
+      'the 404 is uniform (retry-safe claim contract) and REPROMPTS instead of dying');
+    assert.match(out.stdout, /[█▀▄]/, 'a QR was actually rendered');
+    assert.match(out.stdout, /do not share your screen/, 'the screen-share warning prints with the QR');
+    assert.doesNotMatch(out.stdout, /pidge-pair:/, 'the payload NEVER prints as text — it leaves by camera only');
+    assert.match(out.stdout, /✓ hooks installed/, 'from the claim on it is the §13.1 shared path, byte for byte');
+    const env = core.loadTerminalEnv();
+    assert.equal(env.token, 'hld_minted_by_claim');
+    assert.equal(mock.state.claimCode, null, 'the single-use code was consumed');
+    // The identity file holds the minted K verbatim (§24.6): the key at rest
+    // fingerprints to the SAME kf printed beside the QR before the claim.
+    const shownKf = out.stdout.match(/key fingerprint: (\S+)/);
+    assert.ok(shownKf, 'kf prints beside the QR');
+    const stored = Buffer.from(env.secret, 'base64url');
+    assert.equal(stored.length, 32);
+    assert.equal(core.e2eKeyFingerprint(stored), shownKf[1],
+      'the stored secret IS the key the QR carried — same bytes, never through the server');
+    assert.match(out.stdout, new RegExp(`fingerprint ${shownKf[1]} \\(compare with the app`),
+      'kf prints again at success for eye comparison (§24.2.5)');
+  } finally { await mock.stop(); }
+});
+
+test('connect --qr refuses --code / PIDGE_SECRET — the two pairing doors never half-mix (§24.2.1)', async () => {
+  freshHome();
+  freshXdg();
+  const withCode = await runConnectQr(null, { extra: ['--code', 'claim-ok'] });
+  assert.equal(withCode.code, 1);
+  assert.match(withCode.stderr, /do not combine it with --code or PIDGE_SECRET/);
+  const withSecret = await runConnectQr(null, { env: { PIDGE_SECRET: SECRET43() } });
+  assert.equal(withSecret.code, 1);
+  assert.match(withSecret.stderr, /do not combine it with --code or PIDGE_SECRET/);
+  assert.ok(!fs.existsSync(core.ENV_FILE()), 'a refused half-mix stores nothing');
+});
+
+test('connect --qr over an EXISTING identity refuses loudly; --qr --replace switches (guard #9 verbatim)', async () => {
+  freshHome();
+  freshXdg();
+  const oldSecret = SECRET43();
+  core.saveTerminalEnv({ base: 'https://api.pidge.sh', token: 'hld_prod_link', secret: oldSecret, channelId: 396 });
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    const refused = await runConnectQr(port);
+    assert.equal(refused.code, 1, 'a --qr pairing is a NEW pairing — the #9 guard applies verbatim');
+    assert.match(refused.stderr, /already connected to channel 396/);
+    assert.match(refused.stderr, /--replace/);
+    assert.equal(core.loadTerminalEnv().token, 'hld_prod_link', 'the stored identity is untouched');
+    assert.ok(!mock.state.reqLog.some((r) => r.pathname === '/api/v1/claim'), 'the refusal comes BEFORE any network');
+
+    const replaced = await runConnectQr(port, { extra: ['--replace'], input: 'claim-ok\n' });
+    assert.equal(replaced.code, 0, `--qr --replace must complete the switch: ${replaced.stderr}`);
+    const env = core.loadTerminalEnv();
+    assert.equal(env.token, 'hld_minted_by_claim');
+    assert.notEqual(env.secret, oldSecret, 'the replaced identity carries the NEW minted K');
+  } finally { await mock.stop(); }
+});
+
+test('connect --qr: ctrl-C at the prompt leaves ZERO residue — K dies with the process (§24.2.3)', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    const out = await runConnectQr(port, { onPrompt: (child) => child.kill('SIGINT') });
+    assert.notEqual(out.code, 0, 'an abandoned pairing is not a success');
+    assert.ok(!fs.existsSync(core.ENV_FILE()), 'no identity file');
+    assert.ok(!fs.existsSync(core.DAEMON_FILE()), 'no daemon config');
+    assert.ok(!fs.existsSync(path.join(core.terminalDir(), 'caps.json')), 'no caps cache');
+    assert.ok(!fs.existsSync(path.join(process.env.HOME, '.claude', 'settings.json')), 'no hooks');
+    assert.ok(!mock.state.reqLog.some((r) => r.pathname === '/api/v1/claim'), 'no claim was attempted');
+  } finally { await mock.stop(); }
+});
+
+test('connect --qr dies on a non-loopback http --url BEFORE printing any QR (the phone refuses http anyway)', async () => {
+  freshHome();
+  freshXdg();
+  const out = await runConnectQr(null, { extra: ['--url', 'http://192.168.1.5:3000'] });
+  assert.equal(out.code, 1);
+  assert.match(out.stderr, /https/);
+  assert.doesNotMatch(out.stdout, /[█▀▄]/, 'no QR is ever born invalid');
+  assert.ok(!fs.existsSync(core.ENV_FILE()));
+});
+
+test('connect --qr REFUSES a non-TTY stdout — K must never land in a pipe, a log or a mirrored transcript (§24.4)', async () => {
+  freshHome();
+  freshXdg();
+  const out = await runConnectQr(null, { env: { PIDGE_QR_ALLOW_NO_TTY: '' } });
+  assert.equal(out.code, 1);
+  assert.match(out.stderr, /only useful on a real terminal/);
+  assert.match(out.stderr, /the QR carries the computer key/);
+  assert.doesNotMatch(out.stdout, /[█▀▄]/, 'no QR reached the pipe');
+  assert.ok(!fs.existsSync(core.ENV_FILE()), 'nothing was stored');
+});
+
+test('connect --qr: stdin ending AFTER the claim dies EXPLICITLY (130) — never exit 0 with a half install', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    // No --yes: after the claim succeeds, the consent prompt reads from the
+    // SAME session and finds stdin ENDED. The old shape (a second readline on
+    // an ended stdin) dissolved the pending question and node exited 0 with
+    // the identity stored but no hooks, no daemon, no "Done".
+    const out = await runConnectQr(port, { yes: false, input: 'claim-ok\n', endInput: true });
+    assert.equal(out.code, 130, `an interrupted install is NOT a success: ${out.stderr}`);
+    assert.match(out.stderr, /input ended at the consent prompt/);
+    assert.match(out.stderr, /identity IS stored/);
+    assert.match(out.stderr, /re-run `pidge terminal connect` \(no flags\)/i,
+      'the exit names the documented finish-install path');
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim', 'the claimed identity survives');
+    assert.ok(!fs.existsSync(path.join(process.env.HOME, '.claude', 'settings.json')), 'no hooks were installed');
+  } finally { await mock.stop(); }
+});
+
+test('connect --qr: a pasted "code\\ny\\n" carries the CONSENT too — one session spans both prompts', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    // The old two-interface shape closed the claim readline WITH the 'y' still
+    // buffered inside it — the consent prompt then hung forever.
+    const out = await runConnectQr(port, { yes: false, input: 'claim-ok\ny\n' });
+    assert.equal(out.code, 0, `the pre-pasted consent must be honored: ${out.stderr}`);
+    assert.match(out.stdout, /✓ hooks installed/, 'the y reached the consent prompt');
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim');
+  } finally { await mock.stop(); }
+});
+
+test('connect --qr: a 5xx from the claim REPROMPTS with an honest line — never an unhandled stack', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  mock.state.claimFailStatuses = [500, 429];
+  try {
+    const out = await runConnectQr(port, { input: 'claim-ok\nclaim-ok\nclaim-ok\n' });
+    assert.equal(out.code, 0, `the loop must survive transient server failures: ${out.stderr}`);
+    assert.match(out.stderr, /The server answered 500/);
+    assert.match(out.stderr, /The server answered 429/);
+    assert.doesNotMatch(out.stderr, /at process|UnhandledPromiseRejection|Error:/,
+      'no raw stack ever reaches the human');
+    assert.match(out.stdout, /checking the code…/, 'the wait between Enter and the answer is narrated');
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim');
+  } finally { await mock.stop(); }
+});
+
+test('connect --qr: attempts are CAPPED — a flood of wrong codes dies with the fresh-pairing recipe', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  try {
+    const out = await runConnectQr(port, { input: Array(25).fill('wrong-code').join('\n') + '\n' });
+    assert.notEqual(out.code, 0);
+    assert.match(out.stderr, /too many failed attempts/);
+    assert.match(out.stderr, /Cancel this pairing/, "the recovery names the phone's cancel + a fresh QR");
+    const claims = mock.state.reqLog.filter((r) => r.pathname === '/api/v1/claim').length;
+    assert.ok(claims <= 20, `the cap bounds the POSTs (saw ${claims})`);
+    assert.ok(!fs.existsSync(core.ENV_FILE()), 'nothing was stored');
+  } finally { await mock.stop(); }
+});
+
 // ===========================================================================
 // 3b. commands: the daemon service install, one branch per platform
 // ===========================================================================

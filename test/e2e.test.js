@@ -77,6 +77,54 @@ test('failure cases from the fixture all fail LOUD (wrong AAD, corrupted tag, un
   assert.throws(() => e2e.e2eDecryptField(KEY, 'ch1:x:title', 'not an envelope'), /missing "v1:" prefix/);
 });
 
+test('computer lanes: cross-lane and cid-replay presentations fail the tag', () => {
+  const f = FIXTURE.failure_cases;
+  // The SYMMETRIC ANCHOR mistake the fixture exists to catch: both computer
+  // cable lanes anchor on the literal "computer", so only the field name
+  // separates a daemon frame from a viewer frame.
+  assert.throws(() => e2e.e2eDecryptBlob(KEY, f.computer_cross_lane.aad,
+    Buffer.from(f.computer_cross_lane.framed_b64url, 'base64url')),
+  /failed to authenticate/, 'a computer_meta frame under the computer_req AAD must fail (anti cross-lane)');
+  // And the reason computer_cmd anchors per-cid: a consumed spawn can never
+  // replay on a fresh message row.
+  assert.throws(() => e2e.e2eDecryptField(KEY, f.computer_cmd_cid_replay.aad, f.computer_cmd_cid_replay.envelope),
+    /failed to authenticate/, 'a computer_cmd envelope replayed under a different cid must fail');
+});
+
+test('derivation (§20): hkdfSync reproduces every committed vector byte-for-byte', () => {
+  const crypto = require('node:crypto');
+  const d = FIXTURE.derivation;
+  const ikm = Buffer.from(d.computer_key_b64url, 'base64url');
+  assert.equal(ikm.length, 32, 'the computer key is 32 raw bytes');
+  assert.equal(e2e.e2eKeyFingerprint(ikm), d.computer_kf);
+  assert.equal(d.vectors.length, 3, 'ch1 / ch42 / ch999999');
+  for (const v of d.vectors) {
+    assert.equal(v.info, `pidge-derive:v1:ch${v.channel_id}`, `${v.name}: info string is the pinned pattern`);
+    // The §20 pin, executed: HKDF-SHA256, salt EMPTY, IKM = raw bytes, L = 32.
+    const derived = Buffer.from(crypto.hkdfSync('sha256', ikm, Buffer.alloc(0), v.info, 32));
+    assert.equal(derived.toString('base64url'), v.derived_key_b64url, `${v.name}: derivation must be byte-identical`);
+    assert.equal(e2e.e2eKeyFingerprint(derived), v.derived_kf, `${v.name}: derived kf`);
+    assert.notEqual(v.derived_key_b64url, d.computer_key_b64url, `${v.name}: a derived key never equals its parent`);
+    // And the PRODUCTION helper (`setup --from-computer` path) emits the same bytes.
+    assert.equal(e2e.e2eDeriveChannelKey(ikm, v.channel_id).toString('base64url'),
+      v.derived_key_b64url, `${v.name}: e2eDeriveChannelKey must match the fixture`);
+  }
+  // The classic-mistake guard is structural: a 43-byte STRING buffer is not a key.
+  assert.throws(() => e2e.e2eDeriveChannelKey(Buffer.from(d.computer_key_b64url, 'utf8'), 42),
+    /32-byte Buffer/, 'the base64url STRING as IKM must be unrepresentable');
+  assert.throws(() => e2e.e2eDeriveChannelKey(ikm, 'ch42'), /public integer id/);
+  // The mistake someone WILL make: feeding HKDF the 43-char base64url STRING
+  // instead of the 32 raw bytes. The fixture pins the WRONG result so every
+  // implementation can assert its own output does NOT equal it.
+  const fc = d.failure_cases.ikm_is_base64url_string;
+  const wrong = Buffer.from(crypto.hkdfSync('sha256',
+    Buffer.from(d.computer_key_b64url, 'utf8'), Buffer.alloc(0), fc.info, 32));
+  assert.equal(wrong.toString('base64url'), fc.wrong_derived_key_b64url, 'the fixture reproduces the classic mistake exactly');
+  const right = d.vectors.find((v) => v.channel_id === fc.channel_id);
+  assert.notEqual(fc.wrong_derived_key_b64url, right.derived_key_b64url,
+    'a conforming ch42 result must NOT equal the string-IKM result');
+});
+
 test('kf — fingerprints match the fixture and a wrong key is DETECTABLE before decrypting', () => {
   assert.equal(e2e.e2eKeyFingerprint(KEY), FIXTURE.kf);
   assert.equal(e2e.e2eKeyFingerprint(WRONG_KEY), FIXTURE.wrong_key_kf);

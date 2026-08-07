@@ -248,6 +248,79 @@ test('setup --claim INSIDE a git project writes the PROJECT-scoped env (600) and
   assert.match(stderr, /doctor: all good/);
 });
 
+// --- setup --from-computer: PIDGE_SECRET by DERIVATION (no secret travels) ---
+
+const DERIVATION = JSON.parse(fs.readFileSync(path.join(__dirname, 'e2e_vectors.json'), 'utf8')).derivation;
+
+// The paired-computer identity slot, as `pidge terminal connect` writes it.
+function writeTerminalEnv(home, secret) {
+  const dir = path.join(home, 'pidge', 'terminal');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'env'),
+    `PIDGE_URL=https://api.pidge.sh\nPIDGE_TOKEN=hld_tunnel\nPIDGE_SECRET=${secret}\nPIDGE_CHANNEL_ID=396\n`,
+    { mode: 0o600 });
+}
+
+test('setup --from-computer DERIVES the secret from the paired-computer key — fixture-exact, nothing travels', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-derive-'));
+  const proj = makeProject();
+  // The machine's computer key = the fixture's derivation IKM; the mock's
+  // channel id is 1, so the expected secret is the fixture's ch1 vector —
+  // the SAME bytes the app derives on the phone side.
+  writeTerminalEnv(home, DERIVATION.computer_key_b64url);
+  const ch1 = DERIVATION.vectors.find((v) => v.channel_id === 1);
+
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--from-computer', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', PIDGE_SECRET: '', XDG_CONFIG_HOME: home }, proj,
+  );
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const written = fs.readFileSync(projectEnvPath(home, proj), 'utf8');
+  assert.match(written, new RegExp(`PIDGE_SECRET=${ch1.derived_key_b64url}`),
+    'the derived channel key must be byte-identical to the shared fixture vector');
+  assert.match(stderr, /PIDGE_SECRET DERIVED from this computer's key/);
+  assert.match(stderr, new RegExp(`channel kf ${ch1.derived_kf}`), 'the narrated kf is the derived key\'s');
+  assert.ok(!stdout.includes(ch1.derived_key_b64url) && !stderr.includes(ch1.derived_key_b64url),
+    'the derived secret must never hit the terminal — only the file');
+});
+
+test('setup --from-computer on an UNPAIRED machine refuses BEFORE any network (the code survives)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-derive-'));
+
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--from-computer', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', PIDGE_SECRET: '', XDG_CONFIG_HOME: home }, makeProject(),
+  );
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 2);
+  assert.match(stderr, /no paired-computer key/);
+  assert.match(stderr, /pidge terminal connect/, 'the refusal names the pairing recipe');
+  assert.equal(mock.state.claimCode, 'claim-ok', 'the single-use code must not be consumed');
+  assert.ok(!mock.state.reqLog.some((r) => r.pathname === '/api/v1/claim'), 'no claim was attempted');
+});
+
+test('setup --from-computer with an ambient PIDGE_SECRET dies loud — the two secret sources never half-mix', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-derive-'));
+  writeTerminalEnv(home, DERIVATION.computer_key_b64url);
+
+  const { result } = runCli(
+    ['setup', '--claim', 'claim-ok', '--from-computer', '--url', 'http://127.0.0.1:9'],
+    9, { PIDGE_TOKEN: '', PIDGE_URL: '', PIDGE_SECRET: DERIVATION.computer_key_b64url, XDG_CONFIG_HOME: home }, makeProject(),
+  );
+  const { code, stderr } = await result;
+  assert.equal(code, 1);
+  assert.match(stderr, /must not mix/);
+});
+
 test('setup OUTSIDE any project writes the legacy shared file (single-agent machine unchanged)', async () => {
   const mock = createMock();
   const port = await mock.start();
