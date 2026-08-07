@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **`terminal.log` no longer says everything twice.** The daemon wrote each line
+  to the log file *and* echoed it to stdout — which is the same file, because
+  the launchd plist points `StandardOutPath` at it (and the systemd unit
+  `StandardOutput=append:`). Every entry landed twice, so a genuine repeat was
+  indistinguishable from an echo in the one file you read when something is
+  wrong. The file write is now the single sink; the stdout echo survives only
+  when stdout is *not* that file, which is exactly the case where a human is
+  running `pidge terminal daemon` in their own shell and watching it live. Who
+  stdout is gets asked of the OS (device + inode of fd 1), so the answer stays
+  right for launchd, for systemd, and for a shell redirect.
+
 ## 0.45.0 — 2026-08-07
 
 **Terminals Phase B, part 1: the raw byte view returns, scoped to the pane you
