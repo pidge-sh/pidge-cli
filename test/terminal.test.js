@@ -1134,7 +1134,7 @@ test('uninstallDaemonService removes the right thing per platform', () => {
   assert.ok(fs.existsSync(unit));
 
   const rec = recorder();
-  const out = withPlatform('linux', () => commands.uninstallDaemonService({ run: rec.run }));
+  const out = withPlatform('linux', () => commands.uninstallDaemonService({ systemd: true, run: rec.run, query: rec.query }));
   assert.deepEqual(out, { kind: 'systemd', removed: true });
   assert.ok(!fs.existsSync(unit), 'the unit file is gone');
   assert.deepEqual(rec.calls, [
@@ -1150,10 +1150,10 @@ test('uninstallDaemonService removes the right thing per platform', () => {
   const plist = commands.launchdPlistPath();
   assert.ok(fs.existsSync(plist));
   const rec2 = recorder();
-  assert.deepEqual(withPlatform('darwin', () => commands.uninstallDaemonService({ run: rec2.run })),
+  assert.deepEqual(withPlatform('darwin', () => commands.uninstallDaemonService({ run: rec2.run, query: rec2.query })),
     { kind: 'launchd', removed: true });
   assert.ok(!fs.existsSync(plist));
-  assert.deepEqual(withPlatform('darwin', () => commands.uninstallDaemonService({ run: rec2.run })),
+  assert.deepEqual(withPlatform('darwin', () => commands.uninstallDaemonService({ run: rec2.run, query: rec2.query })),
     { kind: 'launchd', removed: false }, 'a second teardown reports nothing removed instead of throwing');
 });
 
@@ -1365,6 +1365,117 @@ test('linux: with no service manager there is no shared label — the detached f
   const otherDir = path.join(tmp('pidge-other-xdg-'), 'pidge', 'terminal');
   fs.mkdirSync(otherDir, { recursive: true });
   assert.equal(commands.foreignDaemonConfig({ platform: 'linux', systemd: false, query: noQuery }), null);
+});
+
+// --- and the same question on the way OUT -----------------------------------
+//
+// Teardown resolves its two ends from DIFFERENT variables: the config slot from
+// XDG_CONFIG_HOME, the launchd plist from $HOME (launchd reads nowhere else, so
+// no pin can change that). Under a custom XDG_CONFIG_HOME, `disconnect` read the
+// right config and would have unloaded a plist belonging to a THIRD slot —
+// retiring one identity by taking another one offline, in silence. Same guard,
+// same recognition, the other direction.
+
+test('darwin: teardown REFUSES when the installed service serves another slot — and touches nothing', () => {
+  freshHome();
+  freshXdg();
+  const otherCfg = tmp('pidge-other-xdg-');
+  const otherDir = path.join(otherCfg, 'pidge', 'terminal');
+  fs.mkdirSync(otherDir, { recursive: true });
+  // The stranger's plist is the one that lives at OUR $HOME address — that is
+  // the whole bug: one plist path, two config slots.
+  const file = commands.launchdPlistPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `<dict><key>StandardOutPath</key><string>${path.join(otherDir, 'terminal.log')}</string></dict>`);
+
+  const rec = recorder();
+  const out = captureDie(() => withPlatform('darwin', () => commands.uninstallDaemonService({ run: rec.run, query: rec.query })));
+
+  assert.ok(out.died, 'unloading a stranger must STOP the teardown, not warn about it');
+  assert.match(out.message, /serves a DIFFERENT config slot/);
+  assert.match(out.message, new RegExp(otherDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'the message names the slot actually installed');
+  assert.match(out.message, new RegExp(core.terminalDir().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'and the slot this run resolves');
+  assert.match(out.message, new RegExp(`XDG_CONFIG_HOME=${otherCfg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} pidge terminal disconnect`),
+    'the way out is the env that reaches BOTH halves of the other slot');
+  assert.deepEqual(rec.calls, [], 'no launchctl unload ran');
+  assert.ok(fs.existsSync(file), 'and the stranger\'s plist is still there');
+});
+
+test('darwin: a LOADED job from another slot is refused too, even with no plist on disk', () => {
+  freshHome();
+  freshXdg();
+  const otherDir = path.join(tmp('pidge-other-xdg-'), 'pidge', 'terminal');
+  fs.mkdirSync(otherDir, { recursive: true });
+  const loaded = `gui/501/sh.pidge.terminal = {\n\tstate = running\n\tstdout path = ${path.join(otherDir, 'terminal.log')}\n}`;
+
+  const rec = recorder();
+  const out = captureDie(() => withPlatform('darwin', () => commands.uninstallDaemonService({
+    run: rec.run, query: (cmd) => (cmd === 'launchctl' ? loaded : ''),
+  })));
+  assert.ok(out.died);
+  assert.deepEqual(rec.calls, []);
+});
+
+test('darwin: teardown of OUR OWN slot is untouched — the guard must not strand a real disconnect', () => {
+  freshHome();
+  freshXdg();
+  const install = recorder();
+  withPlatform('darwin', () => commands.installDaemonService({ run: install.run, query: install.query }));
+  const plist = commands.launchdPlistPath();
+  assert.ok(fs.existsSync(plist));
+
+  const rec = recorder();
+  const loaded = `gui/501/sh.pidge.terminal = {\n\tstdout path = ${core.LOG_FILE()}\n}`;
+  const out = withPlatform('darwin', () => commands.uninstallDaemonService({
+    run: rec.run, query: (cmd) => (cmd === 'launchctl' ? loaded : ''),
+  }));
+  assert.deepEqual(out, { kind: 'launchd', removed: true });
+  assert.ok(rec.calls.some((c) => c.startsWith('launchctl unload -w')));
+  assert.ok(!fs.existsSync(plist));
+});
+
+test('teardown of a slot that is RUBBLE proceeds — a plist outliving its config must never lock anyone out', () => {
+  freshHome();
+  freshXdg();
+  const gone = path.join(tmp('pidge-gone-'), 'vanished', 'pidge', 'terminal');
+  const file = commands.launchdPlistPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `<dict><key>StandardOutPath</key><string>${path.join(gone, 'terminal.log')}</string></dict>`);
+
+  const rec = recorder();
+  const out = withPlatform('darwin', () => commands.uninstallDaemonService({ run: rec.run, query: rec.query }));
+  assert.deepEqual(out, { kind: 'launchd', removed: true }, 'rubble holds no identity — it gets cleaned up');
+  assert.ok(!fs.existsSync(file));
+});
+
+test('linux: the teardown refusal reads the installed unit the same way the install one does', () => {
+  freshHome();
+  freshXdg();
+  const otherCfg = tmp('pidge-other-xdg-');
+  const otherDir = path.join(otherCfg, 'pidge', 'terminal');
+  fs.mkdirSync(otherDir, { recursive: true });
+  const frag = path.join(otherCfg, 'systemd', 'user', 'pidge-terminal.service');
+  fs.mkdirSync(path.dirname(frag), { recursive: true });
+  fs.writeFileSync(frag, `[Service]\nStandardOutput=append:${path.join(otherDir, 'terminal.log')}\n`);
+
+  const rec = recorder();
+  const out = captureDie(() => withPlatform('linux', () => commands.uninstallDaemonService({
+    systemd: true, run: rec.run,
+    query: (cmd, args) => (cmd === 'systemctl' && args.includes('FragmentPath') ? `${frag}\n` : ''),
+  })));
+  assert.ok(out.died, '`systemctl --user disable --now` would have stopped the STRANGER');
+  assert.match(out.message, /serves a DIFFERENT config slot/);
+  assert.deepEqual(rec.calls, [], 'no disable, no daemon-reload');
+  assert.ok(fs.existsSync(frag), 'the stranger\'s unit survives');
+});
+
+test('the escape hatch is ONE helper — install and teardown point at the same env', () => {
+  const plainConfig = path.join('/somewhere', '.config', 'pidge', 'terminal');
+  assert.equal(commands.slotEnvPrefix(plainConfig), 'HOME=/somewhere',
+    'a slot under a plain .config is reached by HOME, which addresses the plist too');
+  const relocated = path.join('/odd/cfgroot', 'pidge', 'terminal');
+  assert.equal(commands.slotEnvPrefix(relocated), 'XDG_CONFIG_HOME=/odd/cfgroot',
+    'a genuinely relocated config dir has no HOME that finds it');
 });
 
 test('normalizeTty turns a short tty name into the path tmux reports — on BOTH ps flavors', () => {

@@ -23,6 +23,20 @@
   structural: literal loopback hosts only, never a DNS name that could merely
   resolve to one, and userinfo (`http://localhost@elsewhere/`) still cannot
   pass itself off as the host.
+- **`pidge terminal disconnect` no longer takes a stranger's daemon offline.**
+  The install side already refuses to take the per-user service name from a
+  config slot that isn't its own; teardown still resolved its two ends from
+  different variables — the config dir through `XDG_CONFIG_HOME`, the launchd
+  plist from `$HOME`, which is the only place launchd looks. Under a custom
+  `XDG_CONFIG_HOME`, `disconnect` therefore read the right config and would
+  unload a plist belonging to a **third** slot: retiring one identity by taking
+  a different computer offline, silently — the exact shape install stops. It
+  now asks the same question install asks (which slot does the installed
+  service actually *serve*, via `launchctl print` / the unit's `FragmentPath` /
+  the template on disk) and refuses with both directories named and the
+  environment that reaches the other one. Tearing down your own slot is
+  unchanged, and a service whose config dir no longer exists is still rubble —
+  cleaned up, never a lock-out.
 
 ## 0.45.0 — 2026-08-07
 

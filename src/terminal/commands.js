@@ -750,21 +750,25 @@ function foreignDaemonConfig(probe = {}) {
   return null;
 }
 
+// <configHome>/pidge/terminal → the env that reaches that slot again. HOME is
+// preferred whenever the slot sits in a plain `.config`, because it addresses
+// BOTH halves at once: the config dir resolves through XDG_CONFIG_HOME while
+// the launchd plist only ever lives under $HOME, so an XDG-only prefix would
+// read the right config and then address the WRONG plist — advice that breaks
+// a third daemon while retiring the second.
+function slotEnvPrefix(dir) {
+  const configHome = path.dirname(path.dirname(dir));
+  return path.basename(configHome) === '.config'
+    ? `HOME=${path.dirname(configHome)}`
+    : `XDG_CONFIG_HOME=${configHome}`;
+}
+
 // Refuse the hijack, naming BOTH slots and the two ways out. Never guesses for
 // the human: which identity survives is their call, not the installer's.
 function assertNoForeignDaemon(probe = {}) {
   const foreign = foreignDaemonConfig(probe);
   if (!foreign) return null;
-  // <configHome>/pidge/terminal → the env that reaches that slot again. HOME is
-  // preferred whenever the slot sits in a plain `.config`, because it addresses
-  // BOTH halves: `disconnect` resolves the config through XDG_CONFIG_HOME but
-  // the launchd plist through os.homedir(), so an XDG-only prefix would read
-  // the right config and then unload the WRONG plist — advice that breaks a
-  // third daemon while retiring the second.
-  const configHome = path.dirname(path.dirname(foreign.dir));
-  const env = path.basename(configHome) === '.config'
-    ? `HOME=${path.dirname(configHome)}`
-    : `XDG_CONFIG_HOME=${configHome}`;
+  const env = slotEnvPrefix(foreign.dir);
   die('pidge terminal connect: this computer already runs a pidge daemon for a DIFFERENT config slot.\n' +
     `  already installed:  ${foreign.dir}\n` +
     `                      (${foreign.where})\n` +
@@ -777,6 +781,40 @@ function assertNoForeignDaemon(probe = {}) {
     `      ${env} pidge terminal connect\n` +
     '  · or retire it first, then re-run this connect:\n' +
     `      ${env} pidge terminal disconnect`);
+  return null;
+}
+
+// The OTHER half of the same address, and the reason this exists at all: the
+// two ends of a teardown are resolved from DIFFERENT variables. The config slot
+// comes from XDG_CONFIG_HOME (falling back to $HOME/.config) while the launchd
+// plist is only ever `$HOME/Library/LaunchAgents/<label>.plist` — launchd reads
+// nowhere else, so there is no pinning that could make an XDG-only environment
+// address its own plist. Under a custom XDG_CONFIG_HOME, `disconnect` therefore
+// read the right config and would unload a plist belonging to a THIRD slot:
+// retiring one identity by taking a different one offline, silently, which is
+// the exact shape install already refuses.
+//
+// So teardown asks the same question install asks — which slot does the
+// installed service actually SERVE — and stops when the answer is not ours. All
+// the recognition (launchctl print, the unit FragmentPath, the template on
+// disk, rubble tolerated, symlinked prefixes) is foreignDaemonConfig's,
+// unchanged: one guard, two commands.
+function assertNoForeignTeardown(probe = {}) {
+  const foreign = foreignDaemonConfig(probe);
+  if (!foreign) return null;
+  const env = slotEnvPrefix(foreign.dir);
+  die('pidge terminal disconnect: the daemon service on this computer serves a DIFFERENT config slot.\n' +
+    `  installed service:  ${foreign.dir}\n` +
+    `                      (${foreign.where})\n` +
+    `  this run resolves:  ${foreign.mine}\n` +
+    '\n' +
+    'Removing it from here would take that OTHER identity offline — the computer it\n' +
+    'serves would simply stop answering, with nothing said. Refusing.\n' +
+    'Pick one:\n' +
+    '  · retire the INSTALLED slot — re-run with its environment:\n' +
+    `      ${env} pidge terminal disconnect\n` +
+    '  · or leave it running: this slot has no service of its own, so there is\n' +
+    '    nothing here to remove.');
   return null;
 }
 
@@ -1009,6 +1047,7 @@ function startDetachedDaemon(probe = {}) {
 }
 
 function uninstallDaemonService(probe = {}) {
+  assertNoForeignTeardown(probe); // never unload a service belonging to another slot
   const run = probe.run || ((cmd, args) => execFileSync(cmd, args, { stdio: 'ignore' }));
   if (daemonPlatform(probe) === 'darwin') {
     const file = launchdPlistPath();
@@ -1227,6 +1266,10 @@ async function runDisable(v) {
 }
 
 async function runDisconnect() {
+  // FIRST, before anything is torn down: the service installed here has to be
+  // the one this environment owns. A refusal that arrives after the shares are
+  // disabled and the hooks are gone is not a refusal, it is half a teardown.
+  assertNoForeignTeardown();
   const health = await daemonAlive();
   if (health) { try { await daemonCall('POST', '/disable', { all: true }); } catch {} }
   uninstallHooks();
@@ -1415,6 +1458,6 @@ module.exports = {
   installHooks, uninstallHooks, hookShimSource, PIDGE_HOOK_MARKER,
   installDaemonService, uninstallDaemonService, launchdPlistPath, systemdUnitPath,
   copyCliToStablePath, stableCliDir, stableCliEntry, installPidgeSkill,
-  shutdownLocalDaemon, serviceTerminalDir, foreignDaemonConfig,
+  shutdownLocalDaemon, serviceTerminalDir, foreignDaemonConfig, slotEnvPrefix,
   SYSTEMD_UNIT, LAUNCHD_LABEL,
 };
