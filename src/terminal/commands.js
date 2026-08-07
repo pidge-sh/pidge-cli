@@ -18,6 +18,7 @@ const { execFileSync, spawn } = require('child_process');
 const core = require('./core');
 const { buildPairingPayload } = require('./pairing');
 const { qrEncodeText, qrRenderTerminal } = require('./qr');
+const { formatFrameActivity } = require('./mirror');
 
 const PIDGE_HOOK_MARKER = '# pidge-hook';
 const DAEMON_PORT = 41717;
@@ -1419,7 +1420,7 @@ async function doctorMirror(anyShares) {
     say(`  ladder rung used:    ${rung}${seed.degraded ? `  → DEGRADED: ${seed.degraded}` : ''}`);
     say(`  fits the cap?        ${seed.fits ? 'yes ✓' : 'NO ✗  — the reseed loop starts here'}`);
     say(`  sent on the cable?   ${seed.sent ? 'yes' : 'no (the cable is not up — the seed still had to fit)'}`);
-    say(`  frames/s · stripper: ${p.frames_per_s} · ${p.stripper_hits} ESC-k title sequence(s) removed from the live stream`);
+    say(`  frames · stripper:   ${formatFrameActivity(p)} · ${p.stripper_hits} ESC-k title sequence(s) removed from the live stream`);
     say('');
     if (!seed.fits) bad += 1;
   }

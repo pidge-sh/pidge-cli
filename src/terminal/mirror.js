@@ -55,6 +55,22 @@ const BUFFER_DROP_BYTES = 256 * 1024;
 // long so the storm drains instead of re-flooding.
 const PENALTY_MS = 2000;
 
+// The shortest window a frames/s figure is allowed to be computed over. Under
+// it, an all-time average is arithmetic on noise: two frames 3 ms apart are not
+// "666 frames per second", they are two frames. The diagnostic says so instead.
+const RATE_MIN_SPAN_MS = 1000;
+
+// The doctor's frame line, as a pure formatter (the count is always true; the
+// rate is only printed when the sample earns it). Shared so the daemon side and
+// the printed line can never disagree about when a rate exists.
+function formatFrameActivity({ frames_sent: sent = 0, frames_span_ms: spanMs, frames_per_s: rate } = {}) {
+  const count = `${sent} frame${sent === 1 ? '' : 's'}`;
+  if (typeof rate === 'number' && rate > 0) return `${count} · ${rate}/s`;
+  if (!sent) return `${count} sent`;
+  const span = typeof spanMs === 'number' ? `${spanMs} ms` : 'an unmeasured span';
+  return `${count} in ${span} — too short a sample for a rate`;
+}
+
 const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
 
 function createMirror({
@@ -456,12 +472,20 @@ function createMirror({
     get lastInboundAt() { return stats.lastInboundAt; },
     get outSeq() { return outSeq; },
     stats() {
-      const spanMs = stats.framesLastAt && stats.framesFirstAt
-        ? Math.max(1, stats.framesLastAt - stats.framesFirstAt) : 0;
+      // A rate needs a sample that can support one. The span between the first
+      // and last frame is measured, never clamped: with a single frame it is
+      // genuinely 0 ms, and forcing that to 1 ms manufactured "1000 frames/s"
+      // on a pane that had sent exactly the seed — 33x over the relay budget,
+      // in the one output whose whole job is to be trusted. Under the floor the
+      // rate is `null` and the raw count + span are what get reported.
+      const spanMs = stats.framesFirstAt && stats.framesLastAt
+        ? stats.framesLastAt - stats.framesFirstAt : 0;
+      const rateable = stats.framesSent >= 2 && spanMs >= RATE_MIN_SPAN_MS;
       return {
         target, viewers, attached, epoch, out_seq: outSeq,
         frames_sent: stats.framesSent,
-        frames_per_s: spanMs ? Number((stats.framesSent / (spanMs / 1000)).toFixed(2)) : 0,
+        frames_span_ms: spanMs,
+        frames_per_s: rateable ? Number((stats.framesSent / (spanMs / 1000)).toFixed(2)) : null,
         stripper_hits: stats.stripperHits,
         seeds: stats.seeds,
         last_seed: stats.lastSeed,
@@ -481,4 +505,7 @@ function createMirror({
   };
 }
 
-module.exports = { createMirror, BUFFER_DROP_BYTES, SEED_SCROLLBACK, ALT_SCREEN_PREFIX, PENALTY_MS };
+module.exports = {
+  createMirror, BUFFER_DROP_BYTES, SEED_SCROLLBACK, ALT_SCREEN_PREFIX, PENALTY_MS,
+  RATE_MIN_SPAN_MS, formatFrameActivity,
+};

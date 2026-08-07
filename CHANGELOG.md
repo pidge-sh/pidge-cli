@@ -1,7 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.45.1 — 2026-08-07
 
+**`pidge terminal doctor` no longer reports a frame rate it cannot measure.**
+On the first real run of the mirror section, a pane that had sent exactly one
+frame — the seed — printed `frames/s: 1000`, against a relay budget of 30 per
+second. Nothing was wrong: the span between the first and last frame was 0 ms,
+a clamp turned that into 1 ms to avoid dividing by zero, and the division
+manufactured the most alarming number the field could hold. Every small sample
+was wrong the same way (two frames 3 ms apart read as "666/s").
+
+- The span is now measured, never clamped, and a rate is computed only from at
+  least two frames spanning at least a second. Under that, the line reports the
+  raw count and the span it was measured over (`1 frame in 0 ms — too short a
+  sample for a rate`) instead of extrapolating one.
+- The daemon's probe carries the span alongside the count, so the printed line
+  and the daemon agree on when a rate exists at all.
+- `frames_sent`, `stripper_hits`, `seeds`, `drops` and the seed ladder were
+  correct and are unchanged. This is the diagnostic whose whole job is to be
+  trusted; a number that reads 33x over budget on an idle pane teaches the
+  reader to distrust the rest of it.
 - **`terminal.log` no longer says everything twice.** The daemon wrote each line
   to the log file *and* echoed it to stdout — which is the same file, because
   the launchd plist points `StandardOutPath` at it (and the systemd unit

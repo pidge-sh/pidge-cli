@@ -2949,7 +2949,8 @@ class Daemon {
       probes.push({
         public_id: s.publicId, pane_id: s.paneId, mode: s.occupant || 'agent',
         attached: st.attached, seed: st.last_seed, frame_cap: st.frame_cap,
-        stripper_hits: st.stripper_hits, frames_sent: st.frames_sent, frames_per_s: st.frames_per_s,
+        stripper_hits: st.stripper_hits, frames_sent: st.frames_sent,
+        frames_span_ms: st.frames_span_ms, frames_per_s: st.frames_per_s,
       });
     }
     return { ok: true, frame_cap: this.frameCap(), probes };
