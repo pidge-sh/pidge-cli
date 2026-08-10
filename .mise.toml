@@ -1,0 +1,5 @@
+[tools]
+# `engines` no package.json diz >=18 e o CI roda a matriz 18/20/22; 22 é o que
+# se usa pra desenvolver (é o node do box). Worktree novo pega a mesma versão
+# sem ninguém lembrar de nada — `script/orca-setup` roda `mise trust` + install.
+node = "22"

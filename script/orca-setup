@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Setup de worktree do Orca — roda quando o worktree é criado
+# (orca.yaml → scripts.setup). Idempotente: rodar de novo não quebra nem gera
+# diff no `git status`.
+#
+# O que ele garante:
+#   1. node do .mise.toml no PATH (com o `mise trust`, que é POR CAMINHO —
+#      worktree novo = caminho novo = sem trust o mise se recusa a ativar)
+#   2. arquivos gitignorados que só existem no checkout principal
+#   3. `npm ci` — sem isto a suíte morre em `Cannot find module 'ws'`
+#
+# Não há banco, porta nem .env obrigatório neste repo: a suíte sobe um mock
+# server local (test/mock-server.js) e roda offline, sem segredo nenhum.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+ROOT="${ORCA_ROOT_PATH:-${CONDUCTOR_ROOT_PATH:-}}"
+HERE="$(pwd -P)"
+
+# --- 1. toolchain --------------------------------------------------------
+for dir in "$HOME/.local/bin" "$HOME/.local/share/mise/shims"; do
+  [ -d "$dir" ] && PATH="$dir:$PATH"
+done
+export PATH
+
+if command -v mise >/dev/null 2>&1; then
+  # `mise trust` é por caminho de arquivo: sem isto o mise ignora o .mise.toml
+  # deste worktree e o `node` pode nem ser o certo.
+  [ -f .mise.toml ] && mise trust .mise.toml >/dev/null 2>&1 || true
+  mise install || true
+fi
+
+command -v node >/dev/null 2>&1 || {
+  echo "orca-setup: ERRO — node não está no PATH (esperado do mise, .mise.toml)." >&2
+  exit 1
+}
+
+# --- 2. arquivos gitignorados vindos do checkout principal ----------------
+if [ -n "$ROOT" ] && [ "$ROOT" != "$HERE" ] && [ -d "$ROOT" ]; then
+  # Padrões privados da suíte de higiene (test/hygiene.test.js): untracked de
+  # propósito, ausentes no CI público. Sem eles a suíte passa, mas com a
+  # varredura genérica só — o worktree veria menos que o principal. Symlink:
+  # é fonte read-only, mantida à mão no principal.
+  if [ -f "$ROOT/test/.hygiene-private-patterns.json" ]; then
+    ln -sfn "$ROOT/test/.hygiene-private-patterns.json" test/.hygiene-private-patterns.json
+  fi
+
+  # A skill do projeto (gitignorada: é gerada por `pidge skill install`).
+  # COPIA, nunca symlink — o self-heal do CLI REESCREVE esse arquivo no lugar,
+  # e por um symlink a escrita vazaria pro checkout principal.
+  skill='.claude/skills/pidge/SKILL.md'
+  if [ -f "$ROOT/$skill" ] && [ ! -f "$skill" ]; then
+    mkdir -p "$(dirname "$skill")"
+    cp "$ROOT/$skill" "$skill"
+  fi
+fi
+
+# --- 3. dependências ------------------------------------------------------
+# `npm ci` (não `npm install`): respeita o package-lock à risca e não mexe nele
+# — setup não pode gerar diff. Ele apaga e recria node_modules, que é
+# exatamente por que node_modules NÃO pode estar em sharedDirectories.
+if [ -f package-lock.json ]; then
+  npm ci
+else
+  echo "orca-setup: AVISO — sem package-lock.json, caindo pra npm install." >&2
+  npm install
+fi
+
+# --- smoke ---------------------------------------------------------------
+# Offline por construção: `--version` só lê o package.json.
+echo
+echo "orca-setup: pronto."
+echo "  node    : $(node --version)"
+echo "  pidge   : $(node bin/pidge.js --version)"
+echo "  suíte   : npm test   (~90 s, offline, contra test/mock-server.js)"

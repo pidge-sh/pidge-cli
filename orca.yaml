@@ -1,0 +1,39 @@
+# Orca (https://www.onorca.dev) — ciclo de vida dos worktrees do pidge-cli.
+#
+# Versionado de propósito: é isto que faz um worktree novo nascer pronto
+# (dependências instaladas, arquivos gitignorados que o principal tem) em vez de
+# quebrar no primeiro `npm test` com "Cannot find module 'ws'".
+#
+# Env disponível nos scripts:
+#   $ORCA_ROOT_PATH      checkout principal (/srv/projects/pidge-cli)
+#   $ORCA_WORKTREE_PATH  o worktree recém-criado
+#   $ORCA_WORKSPACE_NAME nome do workspace (= basename do worktree)
+#   $CONDUCTOR_ROOT_PATH mesmo que ORCA_ROOT_PATH, por compat com o Conductor
+#
+# ATENÇÃO: o Orca só lê este arquivo se o repo NÃO tiver um setup script local
+# configurado na UI (Settings → Repository → Worktree hooks). Script local vence
+# o orca.yaml por padrão. Sintoma de que venceu: worktree novo sem node_modules.
+
+scripts:
+  # Roda depois que o worktree é criado. Idempotente — pode rodar de novo.
+  setup: script/orca-setup
+  # Sem `archive`: este repo não tem banco, porta nem daemon por worktree. O
+  # único estado fora do git é node_modules, que vai junto com o diretório.
+
+defaultTabs:
+  # A suíte é o único loop de feedback do repo (não há servidor pra subir), e
+  # ela roda offline contra o mock server local — vale abrir já rodando.
+  # ~90 s. Se a aba abrir ANTES do setup terminar, ela falha em `require('ws')`:
+  # é só rodar de novo, o setup já terá instalado.
+  - title: test
+    command: npm test
+
+# Sem `worktree.sharedDirectories` de propósito. O candidato óbvio seria
+# `node_modules`, mas ele é REGENERÁVEL e o setup roda `npm ci`, que APAGA o
+# diretório antes de reinstalar — compartilhá-lo faria cada worktree novo
+# demolir o node_modules de todos os vizinhos no meio da suíte deles. E o
+# tamanho não justifica: a única devDependency é `ws` (~1 MB).
+#
+# script/orca-setup também NÃO mora em bin/: `package.json` publica a pasta
+# `bin` inteira no npm (`files`), e script de infra de dev não tem por que
+# viajar no tarball de quem faz `npx pidge-cli`.
