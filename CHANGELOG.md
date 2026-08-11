@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.46.0 — 2026-08-11
+
+**The seed now says where the cursor is, and paints the whole screen it
+belongs to.** A repaint frame used to carry the pane's text and nothing about
+its cursor, so the viewer's emulator was left with the cursor wherever the last
+byte happened to land — usually below the real one, because trailing blank rows
+were trimmed on the way. Editors and prompt UIs that repaint *relative to the
+cursor* then drew every subsequent frame from the wrong row: text stacked on
+itself, then "healed" on the next repaint, then broke again. That was never
+recovery; it was the same damage re-applied per seed.
+
+Three things change together, because they only work together:
+
+- The pane's size, alternate-screen state **and** cursor (position +
+  visibility) are read in ONE tmux message. A cursor read a round-trip later
+  describes a different screen than the capture does.
+- The visible screen is captured with an explicit range and then forced to
+  exactly the pane's row count — padded when short, so the trailing blank rows
+  are really there. `capture-pane`'s trailing-blank behavior is not something a
+  protocol can rest on.
+- The body ends with a cursor-position sequence (plus a hide when the pane
+  hides its own cursor) and carries no trailing newline — one more newline
+  after the last row scrolls the screen out from under it.
+
+The frame gained a `cur` field, and it is a promise: *this data paints the full
+visible screen and ends with the cursor where the host has it*, so a viewer
+that sees it must not trim. Mixed versions degrade to the old behavior in both
+directions — an older viewer ignores the field, and a newer one on an older
+daemon simply never sees it. The degrade ladder keeps the promise honest:
+dropping colors keeps the whole screen and keeps `cur`; anything that has to
+cut into the screen itself drops `cur` and reverts to the previous frame shape.
+
+- **A full-screen program no longer ships the shell history hiding underneath
+  it.** When the pane is on the alternate screen, the seed is the visible screen
+  and nothing else. Before, a 36-row pager arrived with ~185 lines of the normal
+  buffer stapled underneath, and scrolling the mirror walked through shell
+  history that had nothing to do with what was on screen.
+- **Rebuilding a mirror no longer freezes it forever.** Frame sequence numbers
+  are monotonic per share for the life of the daemon process, but the counter
+  lived on the mirror *instance* — and a mirror is rebuilt for reasons the
+  phone never learns about (idle stand-down, the tmux tap dying, a session
+  rename). It restarted at 1 under the same epoch, so the viewer's replay guard
+  rejected every frame after the rebuild as one it had already seen, including
+  the seed meant to heal it: a permanently frozen mirror, with nothing in any
+  log to say so. The daemon now keeps the high-water mark per share and hands
+  it to the new mirror.
+- **Pairing by QR no longer asks you to type a code back.** After the QR is
+  printed, the CLI polls a rendezvous address derived from the computer key
+  itself — never transmitted, computable only by a holder of that key — and the
+  phone drops the single-use claim code there when you confirm. First of
+  {fetched, typed} wins: the prompt stays armed the whole time, the fetched
+  code walks the exact same claim exchange, and a server without the mailbox
+  (or a phone you have not confirmed yet) simply answers "nothing here", which
+  is silent by design. After a minute of waiting you get one soft reminder that
+  typing still works. Nothing persists until the claim succeeds, as before.
+- **`pidge update` stops reporting a success the daemon never got.** On a
+  computer running Agent Sessions the service does not run the copy on your
+  PATH: it runs a vendored copy under the config slot, precisely so it survives
+  cache prunes and PATH surprises. A global install alone therefore left every
+  published daemon fix invisible while `update` printed a version bump. It now
+  follows a successful global install by re-installing the daemon through the
+  sanctioned path — the freshly installed entry point running
+  `terminal connect`, the one command that owns vendoring and service
+  recycling — and its success line names both numbers ("npm global X · daemon
+  slot Y"). With no daemon on the machine, it says that only the global moved.
+  When the two cannot be lined up, that is a warning with the command that
+  fixes it, not a silent success. `pidge terminal doctor` now opens with the
+  same pair.
+
 ## 0.45.2 — 2026-08-11
 
 **The mirror stops painting the same bytes twice when a repaint lands mid-burst.**

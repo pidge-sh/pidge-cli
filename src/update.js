@@ -8,10 +8,21 @@
 // them. A one-word update, plus a self-check at `terminal connect` (the one
 // moment we know this computer is about to be used), closes that.
 //
+// The SECOND failure mode, which cost a whole arc: on a computer running Agent
+// Sessions, `npm i -g` is not the copy that matters. The daemon runs a
+// VENDORED copy under the config slot (a path this feature owns, immune to npx
+// cache prunes and PATH surprises), so a global install alone left every
+// published daemon fix invisible while `update` reported success. Whenever a
+// daemon is installed here, the global install is followed by a re-vendorize
+// through the sanctioned path — the freshly installed entry point running
+// `terminal connect`, the one command that owns copying and service recycling
+// — and the success line names BOTH versions, because they can differ.
+//
 // Everything here is injectable so the tests never touch the network or run a
 // package manager: runUpdate({run, fetchLatest, …}).
 
 const { execFileSync } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 
 const PKG = 'pidge-cli';
@@ -67,18 +78,88 @@ async function latestVersion(timeoutMs = 5000) {
   } catch { return null; }
 }
 
+// --- the daemon's own copy (the slot the service actually runs) -------------
+
+// Required lazily: `pidge update` must keep working on a machine where the
+// terminal module is never touched, and this file is loaded by the version
+// nag on paths that have nothing to do with Agent Sessions.
+function terminalPaths() {
+  const core = require('./terminal/core');
+  const dir = path.join(core.terminalDir(), 'cli');
+  return { dir, entry: path.join(dir, 'bin', 'pidge.js'), daemonFile: core.DAEMON_FILE() };
+}
+
+// Is there a daemon on this machine at all? Either half is enough: the config
+// the service reads, or the vendored tree the service runs.
+function daemonSlotPresent() {
+  try {
+    const p = terminalPaths();
+    return fs.existsSync(p.daemonFile) || fs.existsSync(p.entry);
+  } catch { return false; }
+}
+
+// The version the SERVICE runs, which is the one that matters for a daemon fix.
+function slotVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(terminalPaths().dir, 'package.json'), 'utf8')).version || null;
+  } catch { return null; }
+}
+
+// The entry point of the copy that was JUST installed globally — resolved by
+// ASKING the package manager, never assembled from a guessed prefix (npm's
+// global root is `lib/node_modules` on unix and `node_modules` on Windows, and
+// nvm/volta/homebrew each move the prefix somewhere else). Returns null when
+// the manager cannot be asked or the file is not there, and the caller then
+// says so instead of running something that does not exist.
+function globalRootArgv(manager) {
+  switch (manager) {
+    case 'pnpm': return ['pnpm', ['root', '-g']];
+    case 'yarn': return ['yarn', ['global', 'dir']];
+    case 'bun': return null; // bun has no stable "print the global root" verb
+    default: return ['npm', ['root', '-g']];
+  }
+}
+function globalEntryPath(manager, capture) {
+  const argv = globalRootArgv(manager);
+  if (!argv) return null;
+  let root;
+  try {
+    root = String(capture(argv[0], argv[1]) || '').trim().split('\n').pop().trim();
+  } catch { return null; }
+  if (!root) return null;
+  // `yarn global dir` prints the folder ABOVE node_modules.
+  const roots = manager === 'yarn' ? [path.join(root, 'node_modules'), root] : [root];
+  for (const r of roots) {
+    const entry = path.join(r, PKG, 'bin', 'pidge.js');
+    if (fs.existsSync(entry)) return entry;
+  }
+  return null;
+}
+
 async function runUpdate({
   run = (cmd, args) => execFileSync(cmd, args, { stdio: 'inherit' }),
+  capture = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }),
   fetchLatest = latestVersion,
   current = currentVersion(),
   manager = detectManager(),
+  hasDaemon = daemonSlotPresent,
+  readSlotVersion = slotVersion,
+  resolveGlobalEntry = globalEntryPath,
   say = (m) => console.log(m),
   warn = (m) => console.error(m),
 } = {}) {
   const latest = await fetchLatest();
   if (latest && current && !isOlder(current, latest)) {
     say(`pidge update: already on the latest (${current}).`);
-    return { ok: true, ran: false, current, latest };
+    // Not a no-op on a computer with a daemon: the global can be current while
+    // the slot the service runs is months behind (that is precisely how a
+    // published daemon fix stays invisible). Say what each one is, and name
+    // the command that lines them up — nothing is installed behind the
+    // human's back on a path they asked nothing of.
+    const daemon = hasDaemon();
+    const slot = daemon ? readSlotVersion() : null;
+    if (daemon) sayVersions({ say, warn, globalVersion: current, slot, reVendored: false });
+    return { ok: true, ran: false, current, latest, slot };
   }
   if (!latest) warn('pidge update: could not reach the npm registry — installing @latest anyway.');
   const [cmd, args] = installArgv(manager);
@@ -86,12 +167,48 @@ async function runUpdate({
     run(cmd, args);
   } catch (e) {
     warn(`pidge update: ${cmd} ${args.join(' ')} failed (${e.message}).\n  Install it yourself:  npm i -g ${PKG}@latest   (or run the pinned one: npx -y ${PKG}@latest)`);
-    return { ok: false, ran: true, current, latest };
+    return { ok: false, ran: true, current, latest, slot: null };
   }
+  const installed = latest || 'latest';
   say(latest
     ? `pidge update: installed ${PKG}@${latest} (was ${current || 'unknown'}) via ${cmd}.`
     : `pidge update: installed ${PKG}@latest (was ${current || 'unknown'}) via ${cmd}.`);
-  return { ok: true, ran: true, current, latest };
+
+  if (!hasDaemon()) {
+    say('  (no Agent Sessions daemon on this computer — only the global CLI was updated.)');
+    return { ok: true, ran: true, current, latest, slot: null, reVendored: false };
+  }
+
+  // The sanctioned re-vendorize: run the FRESHLY INSTALLED entry point's
+  // `terminal connect`. That command owns the copy into the config slot and
+  // the service recycle — doing either by hand here would be a second
+  // implementation of the install, free to drift from the real one.
+  const entry = resolveGlobalEntry(manager, capture);
+  if (!entry) {
+    warn(`pidge update: the new global copy could not be located, so the daemon still runs its old vendored copy (${readSlotVersion() || 'unknown version'}).\n  Finish it by hand:  pidge terminal connect --yes`);
+    return { ok: false, ran: true, current, latest, slot: readSlotVersion(), reVendored: false };
+  }
+  try {
+    run(process.execPath, [entry, 'terminal', 'connect', '--yes']);
+  } catch (e) {
+    warn(`pidge update: the daemon re-install failed (${e.message}) — the global CLI is ${installed}, but the service still runs ${readSlotVersion() || 'an unknown version'}.\n  Finish it by hand:  pidge terminal connect --yes`);
+    return { ok: false, ran: true, current, latest, slot: readSlotVersion(), reVendored: false };
+  }
+  const slot = readSlotVersion();
+  sayVersions({ say, warn, globalVersion: latest || slot || current, slot, reVendored: true });
+  return { ok: true, ran: true, current, latest, slot, reVendored: true };
 }
 
-module.exports = { runUpdate, latestVersion, currentVersion, detectManager, installArgv, isOlder, PKG, REGISTRY_URL };
+// The two numbers, always together: they are different installs and a single
+// number has already hidden a months-old daemon behind a current CLI once.
+function sayVersions({ say, warn, globalVersion, slot, reVendored }) {
+  say(`pidge update: npm global ${globalVersion || 'unknown'} · daemon slot ${slot || 'unknown'}${reVendored ? ' (re-installed and restarted)' : ''}`);
+  if (slot && globalVersion && slot !== globalVersion) {
+    warn(`pidge update: the daemon still runs ${slot} while the CLI is ${globalVersion} — the service serves its own copy.\n  Line them up with:  pidge terminal connect --yes`);
+  }
+}
+
+module.exports = {
+  runUpdate, latestVersion, currentVersion, detectManager, installArgv, isOlder,
+  daemonSlotPresent, slotVersion, globalEntryPath, PKG, REGISTRY_URL,
+};

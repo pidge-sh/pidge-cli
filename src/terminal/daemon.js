@@ -246,6 +246,13 @@ class Daemon {
     this.mirrorWarnings = knobs.warnings;
     this.hub = new ControlHub({ narrate: (m) => this.log(m) });
     this.mirrors = new Map();   // sid → { mirror, release, tmuxSession, paneId }
+    // sid → the highest out-seq this share has ever put on the wire in THIS
+    // process. A mirror instance is disposable (stand-down, tap death, rename);
+    // the counter the viewer checks for gaps is not, because `epoch` names the
+    // PROCESS. Entries outlive their mirror on purpose and are never reset
+    // while the daemon lives — a reused sid must not rewind a viewer's
+    // high-water mark. Bounded by the number of shares on this computer.
+    this.mirrorSeq = new Map();
     // --- the computer lane (v2 §17) ---
     // The ComputerChannel subscription is held while the machine is CONNECTED,
     // with zero shared panes — it is what makes the phone's online chip, the
@@ -2856,6 +2863,7 @@ class Daemon {
       control: handle.control,
       target: session.paneId,
       epoch: this.state.epoch,
+      startSeq: this.mirrorSeq.get(session.sid) || 0,
       seal: (frame) => this.sealPaneFrame(session, frame),
       sendFrame: (sealed) => this.sendPaneFrame(session, sealed),
       narrate: (m) => this.log(`${session.publicId}: ${m}`),
@@ -2872,6 +2880,13 @@ class Daemon {
     const entry = this.mirrors.get(sid);
     if (!entry) return false;
     this.mirrors.delete(sid);
+    // Carry the counter across the rebuild BEFORE anything can throw: every
+    // teardown funnels through here (stand-down sweep, tap death, share
+    // disabled, shutdown), so this is the one place that has to remember.
+    try {
+      const reached = entry.mirror.outSeq;
+      if (Number.isFinite(reached) && reached > (this.mirrorSeq.get(sid) || 0)) this.mirrorSeq.set(sid, reached);
+    } catch {}
     try { entry.mirror.stop(); } catch {}
     try { entry.release(); } catch {}
     this.log(`mirror for pane ${entry.paneId} stood down — ${why}`);

@@ -13,7 +13,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const { qrEncodeText, qrRenderTerminal } = require('../src/terminal/qr.js');
-const { buildPairingPayload, PAIR_QR_PREFIX, pairingBaseUrlOk } = require('../src/terminal/pairing.js');
+const { buildPairingPayload, PAIR_QR_PREFIX, PAIR_DROP_PREFIX, pairingBaseUrlOk, pairDropId } = require('../src/terminal/pairing.js');
 const core = require('../src/terminal/core.js');
 const { buildFixture } = require('./gen-pairing-qr-vectors.js');
 
@@ -45,6 +45,23 @@ test('payload wire form: prefix outside the base64, unpadded, pinned field order
   assert.deepEqual(Object.keys(parsed), ['k', 'kf', 'host', 'os', 'base_url'], 'ONE canonical serialization order');
   assert.equal(parsed.kf, core.e2eKeyFingerprint(Buffer.from(parsed.k, 'base64url')),
     'kf in the payload IS the fingerprint of k — the parser recomputes and refuses a mismatch');
+});
+
+// --- the rendezvous mailbox address (§24.7) ----------------------------------
+
+test('the drop address derives from K alone — the fixture pins the value both sides must compute', () => {
+  assert.equal(pairDropId(KEY), FIXTURE.pair_drop.drop_id,
+    'the phone posts the claim code to THIS address and the computer polls it — a derivation that drifts is a pairing that silently never completes');
+  assert.equal(PAIR_DROP_PREFIX, FIXTURE.pair_drop.prefix, 'the domain separator is part of the wire contract');
+  assert.equal(pairDropId(KEY).length, 43, 'the full 32-byte digest, unpadded base64url');
+  assert.match(pairDropId(KEY), /^[A-Za-z0-9_-]{43}$/);
+  // Spelled out independently of the module, so a refactor inside it cannot
+  // quietly redefine the address the two implementations agreed on.
+  assert.equal(pairDropId(KEY), crypto.createHash('sha256')
+    .update(Buffer.concat([Buffer.from('pidge:pair-drop:v1:', 'utf8'), KEY])).digest('base64url'));
+  assert.notEqual(pairDropId(crypto.createHash('sha256').update('another computer').digest()), pairDropId(KEY));
+  assert.throws(() => pairDropId(KEY.subarray(0, 24)), /32-byte/);
+  assert.throws(() => pairDropId(FIXTURE.key_b64url), /32-byte/, 'a string is not a key');
 });
 
 test('the builder refuses what the phone would refuse — no QR is ever born invalid', () => {

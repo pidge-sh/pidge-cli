@@ -9,9 +9,25 @@
 // evolution). The payload carries K — it is a SECRET: it exists only to be
 // rendered as a QR, is never logged, and never persists anywhere.
 
+const crypto = require('crypto');
 const core = require('./core');
 
 const PAIR_QR_PREFIX = 'pidge-pair:v1:';
+
+// The rendezvous mailbox address (spec §24.7). Both sides DERIVE it from the
+// computer key; it is never transmitted, so only a K-holder can compute it and
+// the server stores a row it cannot correlate to anything (key-blindness
+// intact). The domain-separating prefix is part of the wire contract — the
+// shared fixture pins one K to one drop_id and both implementations assert it.
+const PAIR_DROP_PREFIX = 'pidge:pair-drop:v1:';
+
+// → 43 chars of unpadded base64url (the full 32-byte digest).
+function pairDropId(key) {
+  if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('pair drop id needs the 32-byte computer key');
+  return crypto.createHash('sha256')
+    .update(Buffer.concat([Buffer.from(PAIR_DROP_PREFIX, 'utf8'), key]))
+    .digest('base64url');
+}
 
 // The loopback hosts the http carve-out below recognises. STRUCTURAL by
 // design: only literal loopback addresses and the one name the resolver
@@ -111,4 +127,4 @@ function buildPairingPayload({ key, host, os, baseUrl }) {
   return PAIR_QR_PREFIX + Buffer.from(json, 'utf8').toString('base64url');
 }
 
-module.exports = { PAIR_QR_PREFIX, buildPairingPayload, pairingBaseUrlOk };
+module.exports = { PAIR_QR_PREFIX, PAIR_DROP_PREFIX, buildPairingPayload, pairingBaseUrlOk, pairDropId };
