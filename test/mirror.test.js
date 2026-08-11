@@ -1037,3 +1037,43 @@ test('mirror (REAL tmux): a pane on the ALTERNATE screen seeds with the ESC[?104
       try { tmuxSock(sock, ['kill-server']); } catch { /* already gone */ }
     }
   });
+
+// The scramble the phone-side acceptance QA reported ("arrow keys through a
+// prompt, the mirror goes to pieces, then repairs itself"). Every test above
+// reseeds BEFORE calling onOutput, which is exactly why the daemon half of that
+// report went unseen for a whole arc: the interesting state is output ALREADY
+// COALESCED when the reseed lands.
+test('bytes waiting in the coalescer when a reseed lands are NOT sent again after the seed', async () => {
+  const { mirror, frames } = harness({ flushMs: 50 });
+  await mirror.reseed();
+  frames.length = 0;
+
+  // A repaint burst arrives and parks in the 50 ms window…
+  mirror.onOutput(Buffer.from('\x1b[A\x1b[K2. No, exit'));
+  // …and the viewer asks for a repaint before the window closes. capture-pane
+  // renders the screen AS IT IS, so those bytes are already IN the seed.
+  await mirror.reseed();
+
+  await sleep(120);
+  const kinds = frames.map((f) => f.t);
+  assert.deepEqual(kinds, ['seed'],
+    'the seed alone — re-sending the captured bytes as an `o` frame makes the viewer apply them twice, '
+    + 'and since the seqs stay contiguous nothing on either side ever notices');
+});
+
+test('output produced AFTER the capture still flows — the seed hold is a hold, not a mute', async () => {
+  const { mirror, frames } = harness({ flushMs: 20 });
+  await mirror.reseed();
+  frames.length = 0;
+
+  mirror.onOutput(Buffer.from('captured, must not repeat'));
+  await mirror.reseed();
+  // Genuinely new bytes, produced once the capture is done.
+  mirror.onOutput(Buffer.from('brand new'));
+  await sleep(120);
+
+  assert.deepEqual(frames.map((f) => f.t), ['seed', 'o']);
+  assert.equal(Buffer.from(frames[1].data, 'base64').toString(), 'brand new',
+    'only the post-capture bytes ride the o frame');
+  assert.deepEqual(frames.map((f) => f.seq), [2, 3], 'one counter, still monotonic across the pair');
+});

@@ -95,6 +95,7 @@ function createMirror({
   let stopped = false;
   let penaltyUntil = 0;    // rate-limited by the relay → flush slower briefly
   let seedWanted = false;  // a dropped buffer heals via seed on next flush
+  let seedInFlight = false;// a capture is running — hold the coalescer (see runSeed)
   let ctrlChain = Promise.resolve(); // serializes reseed/resize (see below)
   let nudgeTimer = null;   // debounce timer for the post-resize repaint nudge
   let titleSwallow = false; // live-stream title stripper: inside `ESC k …`, discarding up to ST/BEL
@@ -124,15 +125,50 @@ function createMirror({
   }
 
   function scheduleFlush() {
-    if (flushTimer || stopped) return;
+    if (flushTimer || stopped || seedInFlight) return;
     const wait = now() < penaltyUntil ? flushMs * 4 : flushMs;
     flushTimer = setTimeout(() => { flushTimer = null; flush(); }, wait);
     if (flushTimer.unref) flushTimer.unref();
   }
 
+  // Everything a capture is about to contain, dropped before it runs. Coalesced
+  // bytes and the timer that would have sent them go together — leaving the
+  // timer armed just delays the same double-send by one tick.
+  function discardPending() {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    pending = [];
+    pendingBytes = 0;
+  }
+
+  // A seed, with the coalescer held shut until it is on the wire.
+  //
+  // The bug this exists for: `capture-pane` renders the screen AS IT IS, which
+  // includes every byte still sitting in the 80 ms coalesce buffer. `reseed()`
+  // used to call `seed()` directly — only the flush path ever cleared `pending`
+  // — so the buffered bytes were captured INTO the seed and then sent again,
+  // moments later, as an `o` frame with a higher seq. The viewer reset, painted
+  // the capture (which already had them), and applied them a SECOND time. With
+  // arrow keys through a prompt those bytes are relative sequences (cursor
+  // moves, erase-to-end, insert-line), so replaying them on a screen that
+  // already shows them is precisely the scramble reported in the B.1 QA — and
+  // because the seqs stay contiguous, nothing on either side detects it.
+  //
+  // Honest bound: bytes produced during the capture's own round-trip (a few ms)
+  // can still land in both. What is closed here is the 80 ms window, which is
+  // where the reported damage lived; the residue self-heals on the next repaint.
+  function runSeed() {
+    seedInFlight = true;
+    return Promise.resolve()
+      .then(() => seed())
+      .finally(() => {
+        seedInFlight = false;
+        if (pendingBytes) scheduleFlush();   // bytes that arrived AFTER the capture are real
+      });
+  }
+
   function flush() {
     if (stopped) return;
-    if (seedWanted) { seedWanted = false; pending = []; pendingBytes = 0; seed(); return; }
+    if (seedWanted) { seedWanted = false; discardPending(); runSeed(); return; }
     if (!pendingBytes) return;
     const buf = Buffer.concat(pending, pendingBytes);
     pending = [];
@@ -421,7 +457,8 @@ function createMirror({
       if (stopped) return Promise.resolve();
       stats.lastInboundAt = now();
       if (viewers < 1) viewers = 1;
-      return chain(() => seed());
+      // Drop what the capture is about to contain, THEN seed (see runSeed).
+      return chain(() => { discardPending(); return runSeed(); });
     },
 
     // `t:"resize"` — clamps inherited (cols 20–500, rows 5–300).

@@ -828,6 +828,8 @@ test('connect --qr: the whole computer-first pairing against the mock — QR out
       'the 404 is uniform (retry-safe claim contract) and REPROMPTS instead of dying');
     assert.match(out.stdout, /[█▀▄]/, 'a QR was actually rendered');
     assert.match(out.stdout, /do not share your screen/, 'the screen-share warning prints with the QR');
+    assert.match(out.stdout, /Camera app will not read this one/,
+      'a raw payload is invisible to the phone\'s stock scanner by design — the limitation prints where the mistake happens');
     assert.doesNotMatch(out.stdout, /pidge-pair:/, 'the payload NEVER prints as text — it leaves by camera only');
     assert.match(out.stdout, /✓ hooks installed/, 'from the claim on it is the §13.1 shared path, byte for byte');
     const env = core.loadTerminalEnv();
