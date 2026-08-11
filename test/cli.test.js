@@ -434,7 +434,7 @@ test('doctor does NOT warn when the home skill CARRIES the marker (that one self
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
   fs.mkdirSync(path.dirname(homeSkill), { recursive: true });
   // A marked (current) home skill — nothing to nag about.
-  fs.writeFileSync(homeSkill, `---\nname: pidge\ndescription: x.\n# pidge-skill rev=20 manifest=16\n---\n\n# Pidge\n\nok\n\n<!-- pidge-skill-end -->\n`);
+  fs.writeFileSync(homeSkill, `---\nname: pidge\ndescription: x.\n# pidge-skill rev=21 manifest=16\n---\n\n# Pidge\n\nok\n\n<!-- pidge-skill-end -->\n`);
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-doctorcwd2-'));
 
   const { result } = runCli(['doctor'], port, { HOME: home }, cwd);
@@ -530,6 +530,12 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   assert.ok(!/template decision/.test(skill), 'mock templates.decision_table row must NOT be pulled');
   assert.ok(!/Pick the right send/.test(skill), 'the dead content_template menu heading is gone');
   assert.match(skill, /manifest v16/);
+  // the pidge-report COMPANION lands as a sibling skill, marked + trailed like the main one.
+  const report = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge-report', 'SKILL.md'), 'utf8');
+  assert.match(report, /name: pidge-report/);
+  assert.match(report, /\n# pidge-skill rev=21 manifest=16\n/, 'companion carries the same marker');
+  assert.ok(report.trimEnd().endsWith('<!-- pidge-skill-end -->'), 'companion carries the trailer');
+  assert.match(skill, /pidge-report/, 'the main skill points at the companion');
 });
 
 // --- self-heal: the local skill self-heals (any pidge command refreshes a stale skill) ---
@@ -579,10 +585,10 @@ test('self-heal — a 0.15.2 marker-first install self-heals into the fixed in-f
   // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
   assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
   assert.ok(!/<!-- pidge-skill rev=/.test(healed), 'the old HTML-comment marker is gone (the end trailer is not it)');
-  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
   assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
   assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 20, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 21, manifest v16\)/, 'one stderr note');
 });
 
 test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
@@ -599,10 +605,14 @@ test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the loc
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
-  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 20, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 21, manifest v16\)/, 'one stderr note');
+  // the heal also (re)writes the pidge-report companion — this is exactly how an
+  // existing install GAINS the companion on a spine bump, with zero human action.
+  const reportFile = path.join(path.dirname(path.dirname(file)), 'pidge-report', 'SKILL.md');
+  assert.match(fs.readFileSync(reportFile, 'utf8'), /name: pidge-report/, 'the companion sibling was written by the heal');
 });
 
 test('self-heal — a MANIFEST bump (server version > installed) self-heals the local skill', async () => {
@@ -617,7 +627,7 @@ test('self-heal — a MANIFEST bump (server version > installed) self-heals the 
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
 });
@@ -627,7 +637,7 @@ test('self-heal — a FRESH skill (new-format marker current) is left byte-for-b
   const port = await mock.start();
   // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
   // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
-  const { dir, file } = seedNewSkill(20, 16, 'SENTINEL FRESH — keep me');
+  const { dir, file } = seedNewSkill(21, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -677,7 +687,7 @@ test('home self-heal — a STALE home skill self-heals even when there is NO pro
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(homeSkill, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'the home skill was regenerated to the current rev');
+  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'the home skill was regenerated to the current rev');
   assert.ok(!/STALE HOME DOCTRINE/.test(healed), 'the stale home doctrine was replaced by a real regeneration');
   assert.match(stderr, /refreshed your local Pidge skill/, 'the home heal narrated itself');
 });
@@ -697,8 +707,8 @@ test('home self-heal — BOTH project and home skills stale: both heal in one pa
   await mock.stop();
 
   assert.equal(code, 0, `stderr: ${stderr}`);
-  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=20 manifest=16/, 'home healed');
-  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=20 manifest=16/, 'project healed');
+  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=21 manifest=16/, 'home healed');
+  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=21 manifest=16/, 'project healed');
   assert.match(stderr, /2 locations incl\. ~\/\.claude/, 'the note reports BOTH locations were refreshed');
 });
 
@@ -707,7 +717,7 @@ test('home self-heal — a FRESH home skill is left byte-for-byte (no needless h
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homefresh-'));
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
-  seedSkillAt(homeSkill, 20, 'SENTINEL HOME — keep me'); // current rev
+  seedSkillAt(homeSkill, 21, 'SENTINEL HOME — keep me'); // current rev
   const original = fs.readFileSync(homeSkill, 'utf8');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj2-'));
 
@@ -753,7 +763,7 @@ test('atomic self-heal — a TORN write (marker intact, tail truncated) is detec
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A partial write that died after the frontmatter: rev/manifest read as CURRENT, so
   // without the trailer check this file looked "fresh" forever and never healed.
-  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=20 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
+  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=21 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
   const { code, stderr } = await result;
@@ -782,7 +792,7 @@ test('atomic self-heal — "pidge-skill" in body PROSE is not the marker: a mark
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'a real marker was written by the heal');
+  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'a real marker was written by the heal');
   assert.ok(!/rev=99/.test(healed), 'the prose decoy is gone with the regeneration');
 });
 
@@ -800,7 +810,7 @@ test('atomic self-heal — 4 concurrent heals never tear the file (atomic tmp+re
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
   assert.equal((healed.match(/# pidge-skill rev=/g) || []).length, 1, 'exactly ONE marker — no interleaved halves');
-  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'a whole, current skill won');
+  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'a whole, current skill won');
   assert.match(healed.trimEnd(), /<!-- pidge-skill-end -->$/, 'the trailer closes the file — no torn tail');
   const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
   assert.deepEqual(leftovers, [], 'no tmp litter after concurrent heals');
@@ -3381,7 +3391,7 @@ function runSkillInstall(args, port, cwd) {
   });
 }
 
-test('skill install --target agents|gemini writes root files with the SAME content as claude', async () => {
+test('skill install --target agents|gemini writes root files = the claude spine + inlined report doctrine', async () => {
   const mock = createMock();
   const port = await mock.start();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-target-'));
@@ -3395,8 +3405,15 @@ test('skill install --target agents|gemini writes root files with the SAME conte
   const claudeMd = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
   const agentsMd = fs.readFileSync(path.join(dir, 'AGENTS.md'), 'utf8');
   const geminiMd = fs.readFileSync(path.join(dir, 'GEMINI.md'), 'utf8');
-  assert.equal(agentsMd, claudeMd, 'AGENTS.md content must equal the claude skill');
-  assert.equal(geminiMd, claudeMd, 'GEMINI.md content must equal the claude skill');
+  assert.equal(agentsMd, geminiMd, 'both single-file targets carry identical content');
+  // The single-file targets have no second file to install the pidge-report
+  // companion into, so they carry the SAME doctrine inlined above the trailer;
+  // the claude target keeps a lean spine and installs the companion as a sibling.
+  const spine = claudeMd.replace(/<!-- pidge-skill-end -->\n$/, '');
+  assert.ok(agentsMd.startsWith(spine), 'AGENTS.md begins with the exact claude spine');
+  assert.match(agentsMd, /# Pidge Report — write for the feed, not the archive/);
+  assert.match(agentsMd, /Five shapes, five budgets/);
+  assert.ok(!/Five shapes, five budgets/.test(claudeMd), 'the claude skill points at the companion instead of inlining it');
   // the new spine section rode along into every target.
   assert.match(agentsMd, /Waking up in an interactive session/);
   assert.match(agentsMd, /Only then speak/);

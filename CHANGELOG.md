@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.46.0 — 2026-08-11
+
+**`skill install` now ships two skills: `pidge` (the transport) + `pidge-report`
+(the writing).** Months of real agent reports showed a consistent failure mode —
+not wrong sends, unreadable ones: hourly walls of bold text, 500-character titles
+carrying the agent's internal notes, the conclusion parked in the footer,
+1,000 characters ending in "nothing actionable right now". None of that is a
+transport problem, so the content doctrine got its own skill.
+
+- The claude target writes `.claude/skills/pidge-report/SKILL.md` alongside the
+  pidge skill: conclusion-first (the banner shows the beginning), a size budget
+  per report shape (status tick / alert / decision / daily pulse / deep report),
+  delta-only recurrence, bold and emoji discipline, phone-friendly layout, and
+  when a chart image or a `--file` beats prose. The main skill stays lean and
+  points at the companion instead of inlining it.
+- The single-file targets (`--target agents|gemini`) have no second file to
+  install into, so they carry the same doctrine inlined above the trailer.
+- The companion shares the spine revision and the frontmatter marker, so the
+  existing self-heal covers it unchanged: on the first pidge command after this
+  update, every onboarded install regenerates the pidge skill and **gains the
+  companion** — zero human action. It is rewritten by every install/heal of the
+  pair and never triggers a heal on its own.
+- The `skill install` JSON echo gains `report_file` (null for single-file targets).
+
 ## 0.45.2 — 2026-08-11
 
 **The mirror stops painting the same bytes twice when a repaint lands mid-burst.**
