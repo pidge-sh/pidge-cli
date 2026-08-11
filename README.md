@@ -374,6 +374,23 @@ compromised agent machine — `PIDGE_SECRET` sits in your env/config in the clea
   an answer.
 - A genuine follow-up question is a **new** notification, never a second answer on
   the same one.
+- **Voice notes: Pidge does NOT transcribe.** The human's composer can record audio,
+  and it arrives as an ordinary `attachment` — but every read (`listen`, `online`,
+  `wait`'s composer drain, `catchup`, a `bridge` batch) marks it `"kind":"voice"`,
+  carries `duration_seconds` when the sender's device measured it, and states once
+  per render that nothing here turns speech into text. You get the **file**, never the
+  words: a sealed voice note is already decrypted to `attachment.path`, a clear one
+  keeps its `url` and only lands on disk with `--download` (the posture for every clear
+  attachment — unchanged). **Never guess what the human said.** Transcribe locally and
+  work from the transcript:
+
+  ```bash
+  # the path rides the JSON: .messages[].attachment.path (sealed) — or --download a clear one
+  whisper "$VOICE_PATH" --model small --output_format txt   # or whisper.cpp, or your own STT API
+  ```
+
+  No transcriber on the machine? Say so plainly and ask them to type it — an invented
+  transcript is worse than an honest "I can't hear this."
 - **One consumer per channel.** A channel's inbound queue is served ONCE: whoever runs
   `listen`/`ack` **consumes** each message (delivered stamp → visibility lease → green
   ✓✓). If a **24/7 bridge/daemon is the channel's consumer**, a second runtime that
