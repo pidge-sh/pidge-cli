@@ -162,13 +162,22 @@ function createMirror({
       .then(() => seed())
       .finally(() => {
         seedInFlight = false;
-        if (pendingBytes) scheduleFlush();   // bytes that arrived AFTER the capture are real
+        // Bytes that arrived AFTER the capture are real — and so is a repaint
+        // asked for while we were capturing. `seedWanted` MUST be in this
+        // condition: a runaway burst dropped mid-seed sets it with an empty
+        // buffer, and without it that heal never fires (the old code self-healed
+        // here — adversarial review caught the regression).
+        if (pendingBytes || seedWanted) scheduleFlush();
       });
   }
 
   function flush() {
     if (stopped) return;
-    if (seedWanted) { seedWanted = false; discardPending(); runSeed(); return; }
+    // Through the SAME chain as reseed(): un-chained, two seeds can run at once
+    // — clobbering `seedInFlight` (re-opening the double-apply window mid-capture),
+    // interleaving capture-pane pairs on the shared control client, and sealing
+    // two frames off the same `outSeq`.
+    if (seedWanted) { seedWanted = false; chain(() => { discardPending(); return runSeed(); }); return; }
     if (!pendingBytes) return;
     const buf = Buffer.concat(pending, pendingBytes);
     pending = [];
@@ -245,7 +254,14 @@ function createMirror({
         fits: true, sent: ok, ...note,
       };
     };
-    const skipped = (why) => { stats.lastSeed = { at: now(), bytes: null, cols, rows, alt: altBefore, fits: false, sent: false, degraded: why }; };
+    // A skipped seed sent NOTHING, and discardPending() already threw away the
+    // bytes the capture was meant to carry — so there is no seq gap for the
+    // viewer to notice and nothing would ever re-ask. Arm the retry here, where
+    // every skip path passes, instead of trusting a reseed that may never come.
+    const skipped = (why) => {
+      stats.lastSeed = { at: now(), bytes: null, cols, rows, alt: altBefore, fits: false, sent: false, degraded: why };
+      seedWanted = true;
+    };
 
     for (let i = 0; i < SEED_SCROLLBACK.length; i++) {
       const got = await capture(true, SEED_SCROLLBACK[i]);
@@ -492,8 +508,11 @@ function createMirror({
     },
 
     // The cable reconnected: repaint anyone still watching (their gap detector
-    // may not fire if nothing moved while we were away).
-    onRelayUp() { if (viewers > 0) chain(() => seed()); },
+    // may not fire if nothing moved while we were away). Same discipline as
+    // reseed() — a bare seed() here would capture the coalesced bytes and then
+    // send them AGAIN, which is the whole bug, on the path every daemon walks
+    // (laptop wake, network change). Caught by adversarial review with a PoC.
+    onRelayUp() { if (viewers > 0) chain(() => { discardPending(); return runSeed(); }); },
 
     // The hub's control client died under us (session gone, renamed, detached).
     // Stay ALIVE but mark detached: the daemon re-attaches on the next reseed,

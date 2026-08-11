@@ -18,9 +18,22 @@ numbers stay perfectly contiguous, neither side ever detects it; the daemon's ow
 counters report zero drops throughout, which is why this went a whole arc without
 being found.
 
-A reseed now drops what the capture is about to contain and holds the coalescer
-shut until the seed is on the wire; bytes produced after the capture still flow
-normally. Honest bound: bytes produced during the capture's own round-trip (a few
+**Every** path to a capture now drops what that capture is about to contain and
+holds the coalescer shut until the seed is on the wire — the viewer's reseed, the
+cable-restore repaint, and the runaway-buffer heal alike. The first cut fixed
+only the viewer's reseed, which left the bug fully alive on cable restore: a
+laptop waking or a network changing hit it, which is to say every daemon, often.
+
+Bytes produced after the capture still flow — the hold is a hold, not a mute. A
+repaint asked for WHILE a capture is running is no longer stranded (a runaway
+burst dropped mid-seed sets its heal flag with an empty buffer, and a naive
+"reschedule only if there are bytes" check forgets it exists). And a capture that
+FAILS now leaves the retry armed: it sent nothing, the buffered bytes are already
+discarded, and the sequence numbers stay contiguous — so without an armed retry
+nothing would ever re-ask and the viewer would never learn it is missing
+anything.
+
+Honest bound: bytes produced during the capture's own round-trip (a few
 milliseconds) can still land in both, and that residue heals on the next repaint.
 What closes here is the 80 ms window, which is where the damage lived.
 
