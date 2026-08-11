@@ -413,6 +413,96 @@ function createBridgeAlertPolicy({ brokenAfter = 5, minStreakMs = 600000, cooldo
   };
 }
 
+// --- voice notes: name them honestly, transcribe NOTHING ---------------------
+// The human's composer can record audio. That arrives as an ordinary
+// attachment, and an agent that only sees `filename` + a byte count has no way
+// to know it is holding speech — so it either ignores it or, worse, invents
+// what the human "said". Both are failures we can prevent with metadata: the
+// render stamps `kind:"voice"`, carries the sender-declared `duration_seconds`
+// through, and states ONCE that Pidge does not transcribe.
+//
+// Detection is deliberately at RENDER time, not on the wire: a sealed
+// attachment says `application/octet-stream` and its real name is an envelope
+// only the client can open — the `.m4a` is legible exactly one step after
+// e2eProcessAttachment decrypts `message_filename`.
+const VOICE_AUDIO_EXTENSIONS = new Set(['.m4a', '.mp3', '.wav', '.ogg', '.opus']);
+
+// ONE line, on purpose: it enters an agent's context every render that carries
+// a voice note, so it says the whole truth and stops. Nothing in this CLI
+// transcribes, bundles a model, or calls an STT API — pretending otherwise (or
+// staying silent and letting the agent guess) is the dishonesty this kills.
+const VOICE_HINT = 'Pidge does not transcribe voice notes. Transcribe locally if you need text (e.g. whisper.cpp, `whisper`, or your own STT API).';
+
+// A voice note is `audio/*` OR an audio extension on the (already opened)
+// filename. Both halves are needed: a clear send carries a real content type,
+// while a sealed one is generic bytes whose name only exists after decryption.
+// Exported for tests.
+function isVoiceAttachment(att) {
+  if (!att || typeof att !== 'object') return false;
+  const ct = typeof att.content_type === 'string' ? att.content_type.trim().toLowerCase() : '';
+  if (ct.startsWith('audio/')) return true;
+  const name = typeof att.filename === 'string' ? att.filename : '';
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0) return false; // no extension, or a dot-leading name with none
+  return VOICE_AUDIO_EXTENSIONS.has(name.slice(dot).toLowerCase());
+}
+
+// duration_seconds is OPTIONAL and server-declared — an integer when the sender
+// measured it, absent otherwise. Anything that isn't a finite non-negative
+// number is treated as absent: a voice note with no length still renders fine,
+// and we never print a duration we can't stand behind. Exported for tests.
+function voiceDurationSeconds(att) {
+  const raw = att && att.duration_seconds;
+  if (raw === null || raw === undefined || raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.round(n);
+}
+
+// m:ss (h:mm:ss past the hour) — how a human reads a recording's length.
+// Exported for tests.
+function formatVoiceDuration(total) {
+  const s = Math.max(0, Math.round(Number(total) || 0));
+  const secs = String(s % 60).padStart(2, '0');
+  const mins = Math.floor(s / 60);
+  if (mins < 60) return `${mins}:${secs}`;
+  return `${Math.floor(mins / 60)}:${String(mins % 60).padStart(2, '0')}:${secs}`;
+}
+
+// The render step, run ONCE per printed batch over the FINISHED, ordered rows —
+// never inside the per-row async open, where whichever download resolved first
+// would decide who carries the hint. Voice rows gain `kind`/`duration_seconds`
+// and one 🎤 line each; the hint rides the FIRST voice attachment of the batch
+// and prints once. A non-audio attachment is not touched at all. Mutates the
+// (already-copied) attachment objects and returns the rows. Exported for tests.
+function annotateVoiceAttachments(rows, log = console.error) {
+  if (!Array.isArray(rows)) return rows;
+  let hinted = false;
+  for (const row of rows) {
+    const att = row && typeof row === 'object' ? row.attachment : null;
+    if (!isVoiceAttachment(att)) continue;
+    att.kind = 'voice';
+    const secs = voiceDurationSeconds(att);
+    if (secs === null) delete att.duration_seconds; // never echo a garbage length back
+    else att.duration_seconds = secs;
+    const when = secs === null ? '' : `, ${formatVoiceDuration(secs)}`;
+    // WHERE the bytes are, in the same words the JSON uses. A clear attachment
+    // keeps its opt-in posture — this line reports it, it does not change it.
+    let where;
+    if (att.path) where = `saved to ${att.path}`;
+    else if (att.sealed) where = 'sealed, bytes NOT downloaded (--no-download / --digest)';
+    else if (att.url) where = 'not saved — it is a clear attachment; --download writes it to disk';
+    else where = 'no local copy';
+    log(`pidge: 🎤 voice note${when} — ${where}`);
+    if (!hinted) {
+      hinted = true;
+      att.hint = VOICE_HINT;
+      log(`pidge: ${VOICE_HINT}`);
+    }
+  }
+  return rows;
+}
+
 // ---------------------------------------------------------------------------
 // Test seam: require()ing this file exposes the pure e2e helpers and stops
 // HERE — none of the CLI machinery below (parseArgs, the TOKEN check, command
@@ -427,6 +517,9 @@ module.exports = {
   E2E_NEVER_SEAL_LABEL_IDS, e2ePinKeyFor,
   // sealed media — the pure halves (gate decision + filename hygiene).
   e2eMediaSealDecision, sanitizeAttachmentName,
+  // voice notes — detection + the render annotation (pure; no transcription).
+  isVoiceAttachment, voiceDurationSeconds, formatVoiceDuration, annotateVoiceAttachments,
+  VOICE_HINT, VOICE_AUDIO_EXTENSIONS,
   // bridge outage triage — the pure halves of the sleep-aware alert policy.
   classifyBridgeFailure, sleptThrough, createBridgeAlertPolicy, BRIDGE_LOCAL_ERRNOS,
 };
@@ -1015,7 +1108,7 @@ const HELP = {
   listen: {
     summary: 'block until the human MESSAGES you from the app, print, ACK after the work, exit.',
     usage: 'pidge listen [--timeout N] [--all] [--ack-on-read] [--follow] [--download] [--download-dir DIR]',
-    body: 'One-shot by design (loop it, don\'t daemonize). a read message is DELIVERED (gray ✓✓), NOT done — ack it AFTER the work with `pidge ack --up-to <id>` (a ~10-min lease re-serves un-acked messages, so a crash never loses one). a message may carry an `attachment` (a photo/file from the app\'s composer) — a SEALED one is auto-downloaded + decrypted to a local file (`attachment.path` in the JSON); a clear one keeps its fetchable `url` (--download saves it too).',
+    body: 'One-shot by design (loop it, don\'t daemonize). a read message is DELIVERED (gray ✓✓), NOT done — ack it AFTER the work with `pidge ack --up-to <id>` (a ~10-min lease re-serves un-acked messages, so a crash never loses one). a message may carry an `attachment` (a photo/file from the app\'s composer) — a SEALED one is auto-downloaded + decrypted to a local file (`attachment.path` in the JSON); a clear one keeps its fetchable `url` (--download saves it too). An audio attachment (a VOICE NOTE the human recorded) is marked `kind:"voice"` with `duration_seconds` when they measured it — you get the FILE, never a transcript: Pidge does not transcribe, so transcribe locally (whisper.cpp, `whisper`, your own STT) and never guess what they said.',
     opts: ['timeout', 'all-listen', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
   },
   online: {
@@ -1203,7 +1296,7 @@ const KNOWN_MANIFEST_VERSION = 67;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 19;
+const SKILL_REVISION = 20;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -2718,7 +2811,7 @@ async function drainComposerQueue() {
     warnConsumerConflict(data);
     const raw = data.messages || [];
     if (!raw.length) return null; // raced — another consumer took them; keep waiting
-    const msgs = await Promise.all(raw.map((m) => e2eOpenMessageRow(m)));
+    const msgs = annotateVoiceAttachments(await Promise.all(raw.map((m) => e2eOpenMessageRow(m))));
     const contexts = await e2eOpenContinuityContexts(data && data.continuity_contexts);
     return { msgs, contexts };
   } catch { return null; }
@@ -4030,7 +4123,9 @@ async function runBridge() {
 
     // ONE handler invocation per batch — the whole tick as JSON on stdin.
     // Sealed rows are opened BEFORE the handler sees them (same path as listen).
-    const opened = await Promise.all(msgs.map((m) => e2eOpenMessageRow(m)));
+    // …and a voice note reaches the handler NAMED (kind/duration + the
+    // no-transcription hint), not as an anonymous blob it might narrate blind.
+    const opened = annotateVoiceAttachments(await Promise.all(msgs.map((m) => e2eOpenMessageRow(m))));
     const batchIds = opened.map((m) => Number(m.id)).filter(Number.isInteger);
     const batch = { messages: opened, ...(firstBatch ? { history_hint: true } : {}) };
     // gotcha #51: continuity contexts are READ-ONLY provenance, NOT messages —
@@ -5030,6 +5125,7 @@ ${notes.map((n) => `- ${n}`).join('\n')}
 - \`pidge ask …\` blocks and prints \`chosen_action\` JSON; \`pidge wait <cid>\` blocks on an existing send.
 - **A wait hears BOTH planes (0.32+).** While you block on a notification, the human may TYPE in the channel composer instead of tapping a button — to them it is ONE conversation. The wait wakes on that too and prints \`kind:"human_message"\` with the message rows: handle them FIRST, \`pidge ack --up-to <id>\` after the work, then resume \`pidge wait <cid>\` (your notification is still unanswered). Parsing: switch on \`kind\` — \`human_message\` = the human spoke on the side; anything else = the answer to your question.
 - \`pidge listen\` blocks until the human MESSAGES you from the app (composer) — run it when idle.
+- **Voice notes: Pidge does NOT transcribe.** A message may carry an \`attachment\` with \`"kind":"voice"\` — audio the human RECORDED (plus \`duration_seconds\` when their device measured it, and a \`hint\` saying exactly this). You get the FILE, never the words: a sealed one is already decrypted to \`attachment.path\`, a clear one needs \`--download\`. **Never guess what they said.** Need text? Transcribe LOCALLY, then work from the transcript — e.g. \`whisper "$PATH" --model small --output_format txt\` (or whisper.cpp, or your own STT API). No transcriber on this machine? Say so plainly and ask them to type it.
 - **A pending notification's answer does NOT surface in plain \`pidge listen\`** (messages only).
   To collect the answer to a question you already sent: \`pidge wait <cid>\` (you printed the cid
   on stderr at send time) or \`pidge listen --all\` (replies + messages). Park the cid, never re-send.
@@ -5582,6 +5678,9 @@ ${SKILL_END_MARKER}
       // Enforce --limit locally (server ignores it here) — the
       // newest N after the sort/since-filter.
       const printed = catchupLimit != null ? fresh.slice(0, catchupLimit) : fresh;
+      // Voice notes are named AFTER the since/limit slice — narrating a 🎤 for a
+      // row this run then filters out would describe something nobody printed.
+      annotateVoiceAttachments(printed);
       if (v.digest) {
         // --digest — one condensed line per message. The condensed view for
         // "what happened, who handled what" before offering work; the raw JSON works
@@ -5729,7 +5828,7 @@ ${SKILL_END_MARKER}
         // can't open is blanked with a precise e2e_error, never base64).
         // async now — a sealed attachment is downloaded + unsealed to a
         // local path here (attachment.path in the printed JSON).
-        const msgs = await Promise.all(msgsRaw.map((m) => e2eOpenMessageRow(m)));
+        const msgs = annotateVoiceAttachments(await Promise.all(msgsRaw.map((m) => e2eOpenMessageRow(m))));
         console.log(JSON.stringify(msgs, null, 2));
         // Heads-up on ORPHANED backlog served on the first quick read
         // (--all only). It's within-channel — NOT the cross-channel leak.

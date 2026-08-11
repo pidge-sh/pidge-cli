@@ -434,7 +434,7 @@ test('doctor does NOT warn when the home skill CARRIES the marker (that one self
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
   fs.mkdirSync(path.dirname(homeSkill), { recursive: true });
   // A marked (current) home skill — nothing to nag about.
-  fs.writeFileSync(homeSkill, `---\nname: pidge\ndescription: x.\n# pidge-skill rev=19 manifest=16\n---\n\n# Pidge\n\nok\n\n<!-- pidge-skill-end -->\n`);
+  fs.writeFileSync(homeSkill, `---\nname: pidge\ndescription: x.\n# pidge-skill rev=20 manifest=16\n---\n\n# Pidge\n\nok\n\n<!-- pidge-skill-end -->\n`);
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-doctorcwd2-'));
 
   const { result } = runCli(['doctor'], port, { HOME: home }, cwd);
@@ -579,10 +579,10 @@ test('self-heal — a 0.15.2 marker-first install self-heals into the fixed in-f
   // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
   assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
   assert.ok(!/<!-- pidge-skill rev=/.test(healed), 'the old HTML-comment marker is gone (the end trailer is not it)');
-  assert.match(healed, /\n# pidge-skill rev=19 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
   assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
   assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 19, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 20, manifest v16\)/, 'one stderr note');
 });
 
 test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
@@ -599,10 +599,10 @@ test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the loc
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
-  assert.match(healed, /\n# pidge-skill rev=19 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 19, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 20, manifest v16\)/, 'one stderr note');
 });
 
 test('self-heal — a MANIFEST bump (server version > installed) self-heals the local skill', async () => {
@@ -617,7 +617,7 @@ test('self-heal — a MANIFEST bump (server version > installed) self-heals the 
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=19 manifest=16\n/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
 });
@@ -627,7 +627,7 @@ test('self-heal — a FRESH skill (new-format marker current) is left byte-for-b
   const port = await mock.start();
   // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
   // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
-  const { dir, file } = seedNewSkill(19, 16, 'SENTINEL FRESH — keep me');
+  const { dir, file } = seedNewSkill(20, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -677,7 +677,7 @@ test('home self-heal — a STALE home skill self-heals even when there is NO pro
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(homeSkill, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=19 manifest=16\n/, 'the home skill was regenerated to the current rev');
+  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'the home skill was regenerated to the current rev');
   assert.ok(!/STALE HOME DOCTRINE/.test(healed), 'the stale home doctrine was replaced by a real regeneration');
   assert.match(stderr, /refreshed your local Pidge skill/, 'the home heal narrated itself');
 });
@@ -697,8 +697,8 @@ test('home self-heal — BOTH project and home skills stale: both heal in one pa
   await mock.stop();
 
   assert.equal(code, 0, `stderr: ${stderr}`);
-  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=19 manifest=16/, 'home healed');
-  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=19 manifest=16/, 'project healed');
+  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=20 manifest=16/, 'home healed');
+  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=20 manifest=16/, 'project healed');
   assert.match(stderr, /2 locations incl\. ~\/\.claude/, 'the note reports BOTH locations were refreshed');
 });
 
@@ -707,7 +707,7 @@ test('home self-heal — a FRESH home skill is left byte-for-byte (no needless h
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homefresh-'));
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
-  seedSkillAt(homeSkill, 19, 'SENTINEL HOME — keep me'); // current rev
+  seedSkillAt(homeSkill, 20, 'SENTINEL HOME — keep me'); // current rev
   const original = fs.readFileSync(homeSkill, 'utf8');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj2-'));
 
@@ -753,7 +753,7 @@ test('atomic self-heal — a TORN write (marker intact, tail truncated) is detec
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A partial write that died after the frontmatter: rev/manifest read as CURRENT, so
   // without the trailer check this file looked "fresh" forever and never healed.
-  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=19 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
+  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=20 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
   const { code, stderr } = await result;
@@ -782,7 +782,7 @@ test('atomic self-heal — "pidge-skill" in body PROSE is not the marker: a mark
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=19 manifest=16\n/, 'a real marker was written by the heal');
+  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'a real marker was written by the heal');
   assert.ok(!/rev=99/.test(healed), 'the prose decoy is gone with the regeneration');
 });
 
@@ -800,7 +800,7 @@ test('atomic self-heal — 4 concurrent heals never tear the file (atomic tmp+re
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
   assert.equal((healed.match(/# pidge-skill rev=/g) || []).length, 1, 'exactly ONE marker — no interleaved halves');
-  assert.match(healed, /\n# pidge-skill rev=19 manifest=16\n/, 'a whole, current skill won');
+  assert.match(healed, /\n# pidge-skill rev=20 manifest=16\n/, 'a whole, current skill won');
   assert.match(healed.trimEnd(), /<!-- pidge-skill-end -->$/, 'the trailer closes the file — no torn tail');
   const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
   assert.deepEqual(leftovers, [], 'no tmp litter after concurrent heals');

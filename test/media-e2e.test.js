@@ -244,7 +244,7 @@ test('media pin: a confirmed sealed-media send LATCHES; a later "gate closed" se
 
 // --- RECEIVE: inbound attachments ----------------------------------------------
 
-function sealedAttachmentRow(mock, { id = 40, cid = 'cid-att-1', name = 'foto.png', bytes = Buffer.from('jpeg-bytes') } = {}) {
+function sealedAttachmentRow(mock, { id = 40, cid = 'cid-att-1', name = 'foto.png', bytes = Buffer.from('jpeg-bytes'), extra = {} } = {}) {
   mock.state.blobs.a1 = e2e.e2eEncryptBlob(KEY, aad(cid, 'message_blob'), bytes);
   return {
     id, channel_id: CHANNEL_ID, kind: 'message', created_at: 'x',
@@ -253,6 +253,8 @@ function sealedAttachmentRow(mock, { id = 40, cid = 'cid-att-1', name = 'foto.pn
       filename: e2e.e2eEncryptField(KEY, aad(cid, 'message_filename'), name),
       content_type: 'application/octet-stream', byte_size: mock.state.blobs.a1.length,
       url: '/blobs/a1', enc: 'v1',
+      // clear metadata rides alongside the sealed blob (a length is not content)
+      ...extra,
     },
   };
 }
@@ -345,6 +347,75 @@ test('listen: a CLEAR attachment passes through with its url; --download saves i
   out = JSON.parse(r.stdout)[0];
   assert.ok(out.attachment.path);
   assert.deepEqual(fs.readFileSync(out.attachment.path), plain);
+});
+
+// --- Voice notes: a sealed one is only recognizable AFTER the filename opens -----
+
+test('listen: a SEALED voice note is named `voice` once its filename decrypts (generic content_type)', async () => {
+  // On the wire this row is application/octet-stream + an envelope for a name:
+  // nothing says "audio". The `.m4a` becomes legible exactly one step after
+  // message_filename opens — which is why detection lives in the render.
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-vsealed-'));
+  const plain = Buffer.from('the-m4a-bytes');
+  mock.state.messages = [sealedAttachmentRow(mock, {
+    id: 45, name: 'nota-de-voz.m4a', bytes: plain, extra: { duration_seconds: 95 },
+  })];
+
+  const { code, stdout, stderr } = await runCli(
+    ['listen', '--no-realtime', '--timeout', '20', '--interval', '1'],
+    port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const att = JSON.parse(stdout)[0].attachment;
+  assert.equal(att.filename, 'nota-de-voz.m4a', 'the real name, decrypted');
+  assert.equal(att.kind, 'voice', 'recognized by extension — the content_type never said audio');
+  assert.equal(att.duration_seconds, 95);
+  assert.match(att.hint, /does not transcribe/);
+  assert.deepEqual(fs.readFileSync(att.path), plain, 'the file on disk is the PLAINTEXT audio');
+  assert.match(stderr, /🎤 voice note, 1:35 — saved to /);
+  assert.equal(stderr.match(/does not transcribe/g).length, 1, 'the hint is ONE line');
+});
+
+test('catchup --no-download: a sealed voice note is still NAMED, and says the bytes stayed put', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-vnodl-'));
+  mock.state.messages = [sealedAttachmentRow(mock, {
+    id: 46, name: 'recado.m4a', extra: { duration_seconds: 7 },
+  })];
+
+  const { code, stdout, stderr } = await runCli(
+    ['catchup', '--no-download'], port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const att = JSON.parse(stdout).messages[0].attachment;
+  assert.equal(att.kind, 'voice', 'the name opens off the row — no network needed to know it is audio');
+  assert.equal(att.sealed, true);
+  assert.equal(att.duration_seconds, 7);
+  assert.equal(att.path, undefined, 'no bytes were fetched');
+  assert.match(stderr, /🎤 voice note, 0:07 — sealed, bytes NOT downloaded/);
+});
+
+test('listen: a sealed PHOTO is not a voice note (the regression that keeps the two apart)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-vphoto-'));
+  mock.state.messages = [sealedAttachmentRow(mock, { id: 47, name: 'foto.png' })];
+
+  const { code, stdout, stderr } = await runCli(
+    ['listen', '--no-realtime', '--timeout', '20', '--interval', '1'],
+    port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const att = JSON.parse(stdout)[0].attachment;
+  assert.equal(att.kind, undefined);
+  assert.equal(att.hint, undefined);
+  assert.ok(!/🎤/.test(stderr));
 });
 
 // --- Regressions: hostile-server hardening ---------------------------------------
