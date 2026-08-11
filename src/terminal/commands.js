@@ -303,6 +303,13 @@ async function runConnect(v) {
     say(qrRenderTerminal(qrEncodeText(payload)));
     say(`\n  key fingerprint: ${qrKf}   (the app must show these SAME six characters)`);
     say('  ⚠ this QR carries the computer key — do not share your screen while it is visible');
+    // The phone's built-in Camera app ignores this code and always will: it
+    // surfaces URLs and other well-known payloads, and this one is deliberately
+    // raw key material with no scheme in front of it (§24.5 — the payload is a
+    // secret, never a link). Someone who points Camera at it gets silence and
+    // reads that as a broken QR, so the app path named above is repeated here,
+    // as a limitation, where the mistake actually happens.
+    say('  the iPhone Camera app will not read this one — the payload is raw, not a link; scan it inside Pidge, on the screen named above');
     say("  (QR doesn't fit? zoom the terminal out — ⌘− / ctrl−− — or enlarge the window)\n");
     // ONE session carries every remaining prompt (claim code + consent) —
     // see makePromptSession for why two interfaces lose lines and why EOF

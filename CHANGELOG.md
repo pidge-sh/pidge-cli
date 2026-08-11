@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.45.2 — 2026-08-11
+
+**The mirror stops painting the same bytes twice when a repaint lands mid-burst.**
+`capture-pane` renders the screen as it is, which includes every byte still
+sitting in the 80 ms coalesce buffer. A reseed used to capture straight past that
+buffer — only the flush path ever cleared it — so those bytes went out INSIDE the
+seed and then again, moments later, as an ordinary output frame with a higher
+seq. The phone reset its emulator, painted the capture (which already had them),
+and applied them a second time.
+
+With arrow keys walking a prompt, the buffered bytes are relative sequences —
+cursor up, erase-to-end-of-line, insert-line — so replaying them onto a screen
+that already shows them is exactly the scramble reported from the field: lines
+written on top of each other, self-healing a beat later. And because the sequence
+numbers stay perfectly contiguous, neither side ever detects it; the daemon's own
+counters report zero drops throughout, which is why this went a whole arc without
+being found.
+
+**Every** path to a capture now drops what that capture is about to contain and
+holds the coalescer shut until the seed is on the wire — the viewer's reseed, the
+cable-restore repaint, and the runaway-buffer heal alike. The first cut fixed
+only the viewer's reseed, which left the bug fully alive on cable restore: a
+laptop waking or a network changing hit it, which is to say every daemon, often.
+
+Bytes produced after the capture still flow — the hold is a hold, not a mute. A
+repaint asked for WHILE a capture is running is no longer stranded (a runaway
+burst dropped mid-seed sets its heal flag with an empty buffer, and a naive
+"reschedule only if there are bytes" check forgets it exists). And a capture that
+FAILS now leaves the retry armed: it sent nothing, the buffered bytes are already
+discarded, and the sequence numbers stay contiguous — so without an armed retry
+nothing would ever re-ask and the viewer would never learn it is missing
+anything.
+
+Honest bound: bytes produced during the capture's own round-trip (a few
+milliseconds) can still land in both, and that residue heals on the next repaint.
+What closes here is the 80 ms window, which is where the damage lived.
+
+- **`connect --qr` now says out loud that the phone's Camera app cannot read
+  its QR.** The code carries raw key material rather than a link, which is the
+  whole point — nothing about it is a URL, so the stock scanner shows no
+  action banner and stays silent. Pointed at it, a person reasonably concludes
+  the QR is broken and starts over. The instruction naming the in-app scanner
+  was already printed above the code; the limitation is now printed below it
+  too, where the mistake is actually made.
+
 ## 0.45.1 — 2026-08-07
 
 **`pidge terminal doctor` no longer reports a frame rate it cannot measure.**

@@ -1037,3 +1037,96 @@ test('mirror (REAL tmux): a pane on the ALTERNATE screen seeds with the ESC[?104
       try { tmuxSock(sock, ['kill-server']); } catch { /* already gone */ }
     }
   });
+
+// The scramble the phone-side acceptance QA reported ("arrow keys through a
+// prompt, the mirror goes to pieces, then repairs itself"). Every test above
+// reseeds BEFORE calling onOutput, which is exactly why the daemon half of that
+// report went unseen for a whole arc: the interesting state is output ALREADY
+// COALESCED when the reseed lands.
+test('bytes waiting in the coalescer when a reseed lands are NOT sent again after the seed', async () => {
+  const { mirror, frames } = harness({ flushMs: 50 });
+  await mirror.reseed();
+  frames.length = 0;
+
+  // A repaint burst arrives and parks in the 50 ms window…
+  mirror.onOutput(Buffer.from('\x1b[A\x1b[K2. No, exit'));
+  // …and the viewer asks for a repaint before the window closes. capture-pane
+  // renders the screen AS IT IS, so those bytes are already IN the seed.
+  await mirror.reseed();
+
+  await sleep(120);
+  const kinds = frames.map((f) => f.t);
+  assert.deepEqual(kinds, ['seed'],
+    'the seed alone — re-sending the captured bytes as an `o` frame makes the viewer apply them twice, '
+    + 'and since the seqs stay contiguous nothing on either side ever notices');
+});
+
+test('output produced AFTER the capture still flows — the seed hold is a hold, not a mute', async () => {
+  const { mirror, frames } = harness({ flushMs: 20 });
+  await mirror.reseed();
+  frames.length = 0;
+
+  mirror.onOutput(Buffer.from('captured, must not repeat'));
+  await mirror.reseed();
+  // Genuinely new bytes, produced once the capture is done.
+  mirror.onOutput(Buffer.from('brand new'));
+  await sleep(120);
+
+  assert.deepEqual(frames.map((f) => f.t), ['seed', 'o']);
+  assert.equal(Buffer.from(frames[1].data, 'base64').toString(), 'brand new',
+    'only the post-capture bytes ride the o frame');
+  assert.deepEqual(frames.map((f) => f.seq), [2, 3], 'one counter, still monotonic across the pair');
+});
+
+// Three more paths that reach a capture, each found by adversarial review after
+// the first fix landed. The lesson they encode together: a seed is never just
+// `seed()` — it is "drop what the capture will contain, hold the coalescer,
+// and leave a retry armed if it goes wrong". Any caller that forgets one of
+// those three re-opens the double-apply window on its own path.
+test('a cable restore repaints without re-sending the bytes its capture already carries', async () => {
+  const { mirror, frames } = harness({ flushMs: 50 });
+  await mirror.reseed();
+  frames.length = 0;
+
+  mirror.onOutput(Buffer.from('\x1b[A\x1b[Kmid-burst'));
+  mirror.onRelayUp();                 // laptop wake / network change — routine
+  await sleep(150);
+
+  assert.deepEqual(frames.map((f) => f.t), ['seed'],
+    'the reconnect repaint walks the same discipline as a viewer reseed, or it is the same bug on a path every daemon hits');
+});
+
+test('a runaway burst dropped WHILE a seed is in flight still gets its healing repaint', async () => {
+  const { mirror, frames } = harness({ flushMs: 20 });
+  await mirror.reseed();
+  frames.length = 0;
+
+  // Start a seed and, without awaiting it, blow past the buffer ceiling. The
+  // buffer is dropped whole and only `seedWanted` remembers a repaint is owed —
+  // with an EMPTY pending buffer, which is exactly the state a naive
+  // "reschedule if there are bytes" check forgets about.
+  const inFlight = mirror.reseed();
+  mirror.onOutput(Buffer.alloc(BUFFER_DROP_BYTES + 1, 0x61));
+  await inFlight;
+  await sleep(150);
+
+  assert.ok(frames.filter((f) => f.t === 'seed').length >= 2,
+    'a repaint beats a partial stream — and the old code healed this, so losing it would be a regression');
+});
+
+test('a capture that fails leaves a repaint owed — the discarded bytes have no gap to announce them', async () => {
+  const control = mockControl({});
+  const { mirror, frames } = harness({ control, flushMs: 20 });
+  await mirror.reseed();
+  frames.length = 0;
+
+  mirror.onOutput(Buffer.from('these bytes were discarded for a capture that never came'));
+  control.captureOk = false;          // tmux blinks: the capture returns nothing
+  await mirror.reseed();
+  assert.deepEqual(frames, [], 'precondition: the failed seed sent nothing at all');
+  control.captureOk = true;
+  await sleep(150);
+
+  assert.ok(frames.some((f) => f.t === 'seed'),
+    'without an armed retry nothing re-asks: the seqs stay contiguous, so the viewer never learns it is missing anything');
+});
