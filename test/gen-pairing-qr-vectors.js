@@ -13,7 +13,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { buildPairingPayload, PAIR_QR_PREFIX } = require('../src/terminal/pairing.js');
+const { buildPairingPayload, PAIR_QR_PREFIX, PAIR_DROP_PREFIX, pairDropId } = require('../src/terminal/pairing.js');
 const core = require('../src/terminal/core.js');
 
 const KEY = crypto.createHash('sha256').update('pidge pairing v1 shared test key — NEVER production').digest();
@@ -61,6 +61,11 @@ function buildFixture() {
     prefix: PAIR_QR_PREFIX,
     key_b64url: KEY.toString('base64url'),
     kf: core.e2eKeyFingerprint(KEY),
+    pair_drop: {
+      prefix: PAIR_DROP_PREFIX,
+      drop_id: pairDropId(KEY),
+      note: 'spec §24.7 — drop_id = base64url_unpadded(SHA-256(UTF-8 prefix || raw 32-byte K)), 43 chars. Derived by CLI and phone, never transmitted alongside K; both sides assert THIS value from key_b64url.',
+    },
     host: HOST,
     os: OS,
     base_url: BASE_URL,

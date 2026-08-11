@@ -16,7 +16,7 @@ const crypto = require('crypto');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 const core = require('./core');
-const { buildPairingPayload } = require('./pairing');
+const { buildPairingPayload, pairDropId } = require('./pairing');
 const { qrEncodeText, qrRenderTerminal } = require('./qr');
 const { formatFrameActivity } = require('./mirror');
 
@@ -150,8 +150,78 @@ function makePromptSession() {
       while (!pending.length && !ended) await new Promise((resolve) => { wake = resolve; });
       return pending.length ? pending.shift() : null;
     },
+    /// A line from somewhere OTHER than the keyboard — the rendezvous mailbox
+    /// below. It joins the very same queue on purpose: the claim exchange then
+    /// has exactly ONE caller, whichever way the code arrived, so a code
+    /// fetched and a code typed can never race into two claims.
+    push(line) { if (pending.length < PROMPT_PENDING_MAX) pending.push(line); kick(); },
+    /// Forget a queued line equal to one already consumed. The one realistic
+    /// double: the mailbox delivered the code AND the human typed the same
+    /// code a beat later — without this, the leftover would be read as the
+    /// answer to the NEXT question (the consent prompt).
+    dropPending(value) {
+      for (let i = pending.length - 1; i >= 0; i--) {
+        if (String(pending[i]).replace(/[\t\n\v\f\r ]+/g, '') === value) pending.splice(i, 1);
+      }
+    },
     close() { rl.close(); },
   };
+}
+
+// --- the rendezvous mailbox (§24.7) -----------------------------------------
+//
+// The phone drops the single-use claim code at an address derived from K
+// (never transmitted — see pairDropId), and this computer polls it while the
+// typed prompt stays armed. First of {fetched, typed} wins, and the fetched
+// code walks the EXACT same claim path, so nothing about the exchange changes.
+//
+// A 404 stream is the NORMAL state: the drop does not exist until the human
+// confirms on the phone, and a server too old to know the route answers the
+// same way. So the poll says nothing until it has something — except for one
+// soft reminder after a minute, which is also what the older-server case
+// degrades to.
+const CLAIM_PROMPT = 'Enter the code shown on your phone: ';
+const PAIR_DROP_FIRST_MS = 750;      // the human may have confirmed already
+const PAIR_DROP_EVERY_MS = 2000;
+const PAIR_DROP_JITTER_MS = 400;     // N computers pairing at once must not sync up
+const PAIR_DROP_TTL_MS = 15 * 60 * 1000; // the claim code's own lifetime
+const PAIR_DROP_HINT_AFTER_MS = 60 * 1000;
+
+function startPairDropPoll({ base, dropId, deliver, now = () => Date.now() }) {
+  const startedAt = now();
+  let timer = null;
+  let stopped = false;
+  let hinted = false;
+  const stop = () => { stopped = true; if (timer) { clearTimeout(timer); timer = null; } };
+  const arm = (ms) => {
+    timer = setTimeout(tick, ms);
+    if (timer.unref) timer.unref(); // ctrl-C must not be held open by a poll
+  };
+  async function tick() {
+    if (stopped) return;
+    let code = null;
+    try {
+      const res = await core.fetchT(`${base}/api/v1/pair_drops/${encodeURIComponent(dropId)}`,
+        { headers: { accept: 'application/json' } }, 10_000);
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        // Same normalization the typed path applies: ASCII whitespace only.
+        const got = data && typeof data.code === 'string' ? data.code.replace(/[\t\n\v\f\r ]+/g, '') : '';
+        if (got) code = got;
+      }
+    } catch { /* offline, server down, DNS — the typed prompt is still armed */ }
+    if (stopped) return;
+    if (code) { stop(); deliver(code); return; }
+    if (!hinted && now() - startedAt >= PAIR_DROP_HINT_AFTER_MS) {
+      hinted = true;
+      say('\n  (your phone can hand the code over by itself — if it has not, just type it here.)');
+      process.stdout.write(CLAIM_PROMPT);
+    }
+    if (now() - startedAt >= PAIR_DROP_TTL_MS) { stop(); return; }
+    arm(PAIR_DROP_EVERY_MS + Math.floor(Math.random() * PAIR_DROP_JITTER_MS));
+  }
+  arm(PAIR_DROP_FIRST_MS);
+  return { stop };
 }
 
 // §24.2.4 — the blocking prompt of `connect --qr`. A 404 is uniform by design
@@ -165,7 +235,7 @@ const CLAIM_PROMPT_MAX_ATTEMPTS = 20;
 async function promptClaimLoop(base, session) {
   let attempts = 0;
   for (;;) {
-    const answer = await session.nextLine('Enter the code shown on your phone: ');
+    const answer = await session.nextLine(CLAIM_PROMPT);
     if (answer === null) {
       die('pidge terminal connect: input ended before a code was typed — nothing was stored on this machine.\n' +
         "On your phone, tap 'Cancel this pairing'; when you retry, scan the FRESH QR (this one's key died with this process).", 130);
@@ -195,6 +265,7 @@ async function promptClaimLoop(base, session) {
       console.error(`The server answered ${res.httpStatus} — wait a moment and type the code again.`);
       continue;
     }
+    session.dropPending(code); // the same code typed AND fetched must not answer the next question
     return res;
   }
 }
@@ -315,7 +386,22 @@ async function runConnect(v) {
     // see makePromptSession for why two interfaces lose lines and why EOF
     // must die explicitly instead of letting node exit 0 mid-install.
     promptSession = makePromptSession();
-    const claim = await promptClaimLoop(base, promptSession);
+    // …and the rendezvous mailbox races the keyboard for the first code
+    // (§24.7). Both routes end in the same queue, so the claim below has one
+    // caller either way. Nothing here persists anything: a code that never
+    // arrives leaves this machine exactly as it was.
+    const drop = startPairDropPoll({
+      base,
+      dropId: pairDropId(key),
+      deliver: (fetched) => {
+        say('\n✓ your phone handed the code over — no typing needed');
+        promptSession.push(fetched);
+      },
+    });
+    let claim;
+    try {
+      claim = await promptClaimLoop(base, promptSession);
+    } finally { drop.stop(); }
     token = claim.token;
     channelId = claim.channelId;
     effectiveBase = claim.effectiveBase;
@@ -1304,6 +1390,7 @@ async function runDisconnect() {
 // (gotcha #75: every field that governs RENDERING gets a step like this.)
 async function runDoctor() {
   say('pidge terminal doctor — occupant detection, against the binaries actually installed here.\n');
+  doctorVersions();
   let panes;
   try {
     panes = core.tmuxPanes({ onWarn: (m) => say(`  ! ${m}`) });
@@ -1364,6 +1451,26 @@ async function runDoctor() {
   if (mirrorBad) {
     die(`pidge terminal doctor: ${mirrorBad} shared pane(s) could not produce a seed that fits the relay frame cap — the raw view would reseed forever on this machine (spec §19, gotcha #65).`, 2);
   }
+}
+
+// Which pidge is which. The CLI you typed and the copy the SERVICE runs are
+// two different installs: connect vendors the CLI into the config slot so the
+// daemon survives npx cache prunes and PATH surprises, which also means a
+// global upgrade alone never reaches the daemon. When they disagree, every
+// daemon-side fix in the newer one is invisible until the slot is refreshed —
+// so the doctor states both numbers before it states anything else.
+function doctorVersions() {
+  const { slotVersion } = require('../update');
+  let mine = null;
+  try { mine = require(path.join(__dirname, '..', '..', 'package.json')).version || null; } catch { /* unpacked oddly */ }
+  const slot = slotVersion();
+  say(`this CLI:         ${mine || 'unknown'}`);
+  say(`daemon slot:      ${slot || 'none installed'}   (${stableCliDir()} — what the service actually runs)`);
+  if (slot && mine && slot !== mine) {
+    say(`  ! the service runs ${slot} while this CLI is ${mine} — a fix published in the newer one is NOT running.`);
+    say('    Refresh it with:  pidge terminal connect --yes');
+  }
+  say('');
 }
 
 // The MIRROR half of the doctor (Phase B, spec §19 + the §12 real-binary rule).

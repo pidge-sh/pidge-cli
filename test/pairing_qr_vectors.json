@@ -15,6 +15,11 @@
   "prefix": "pidge-pair:v1:",
   "key_b64url": "W6BGCcWGXttmJH62KJUGoJXeyzF1t_cBG0sq5XL7NmM",
   "kf": "v8iKDg",
+  "pair_drop": {
+    "prefix": "pidge:pair-drop:v1:",
+    "drop_id": "dwnRa61qHLg2DrEtxIfr72tXcSh28f6rMUz7-V7aUkQ",
+    "note": "spec §24.7 — drop_id = base64url_unpadded(SHA-256(UTF-8 prefix || raw 32-byte K)), 43 chars. Derived by CLI and phone, never transmitted alongside K; both sides assert THIS value from key_b64url."
+  },
   "host": "studio.local",
   "os": "macos",
   "base_url": "https://api.pidge.sh",

@@ -33,6 +33,8 @@ function createMock() {
     blobs: {},             // name → Buffer, served at GET /blobs/<name>
     claimCode: 'claim-ok',   // POST /api/v1/claim exchanges this once
     claimFailStatuses: [],   // failure injection: next claim attempts answer these statuses in order
+    pairDropCode: null,      // the rendezvous mailbox: null ⇒ every GET /pair_drops/:id is a 404
+    pairDropReads: [],       // every drop_id the CLI polled, in order (assert the derivation)
     // The channel KIND the claim reports back (server manifest v100+). null =
     // an older server that reports NONE — the CLI must tolerate that (spec §12,
     // QA finding #1: reading a missing field as "not a tunnel" killed 100% of
@@ -134,6 +136,20 @@ function createMock() {
         json(res, 404, { error: 'not_found' });
       });
       return;
+    }
+    // The rendezvous mailbox (spec §24.7): the phone drops the claim code at an
+    // address derived from K, the computer polls it. UNAUTHENTICATED (the
+    // computer holds no credential yet), SINGLE-USE, uniform 404 for
+    // absent/expired/consumed. `pairDropCode` null (the default) makes every
+    // GET a 404 — which is also exactly how an older server without the route
+    // answers, so the typed-code leg is tested against both at once.
+    const dropMatch = url.pathname.match(/^\/api\/v1\/pair_drops\/([^/]+)$/);
+    if (req.method === 'GET' && dropMatch) {
+      state.pairDropReads.push(dropMatch[1]);
+      if (!state.pairDropCode) return json(res, 404, { error: 'not_found' });
+      const code = state.pairDropCode;
+      state.pairDropCode = null; // single-use: the row is deleted on first hit
+      return json(res, 200, { code });
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/whoami') {
       const auth = req.headers.authorization || '';

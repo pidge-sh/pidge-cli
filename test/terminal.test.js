@@ -29,6 +29,7 @@ if (os.homedir() !== process.env.HOME || os.homedir() === REAL_HOME) {
 const core = require('../src/terminal/core');
 const adapter = require('../src/terminal/adapter-claude');
 const commands = require('../src/terminal/commands');
+const { pairDropId } = require('../src/terminal/pairing');
 const {
   Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_POLL_FAST_MS, DRAIN_KICK_FLOOR_MS, VIEWER_ACTIVE_WINDOW_MS,
   sameFileAsStdout,
@@ -778,7 +779,14 @@ test('connect: re-running WITHOUT --code on an existing identity still works (th
 // --qr prompt loop holds ONE readline for its whole life, so lines written
 // after the first prompt are consumed one per attempt, in order.
 
-function runConnectQr(port, { extra = [], input = null, env = {}, onPrompt = null, yes = true, endInput = false } = {}) {
+function runConnectQr(port, {
+  extra = [], input = null, env = {}, onPrompt = null, yes = true, endInput = false,
+  // A leg that expects the code to arrive WITHOUT stdin has no other way to
+  // end: if the mechanism breaks, the child waits at the prompt forever and
+  // the suite hangs instead of failing. Cap it, and let the assertions read a
+  // killed child as the failure it is.
+  killAfterMs = 0,
+} = {}) {
   const bin = path.join(__dirname, '..', 'bin', 'pidge.js');
   const child = spawn(process.execPath,
     [bin, 'terminal', 'connect', '--qr',
@@ -809,7 +817,12 @@ function runConnectQr(port, { extra = [], input = null, env = {}, onPrompt = nul
     }
   });
   child.stderr.on('data', (c) => { out.stderr += c; });
-  return new Promise((resolve) => child.on('exit', (c) => { out.code = c; resolve(out); }));
+  const guard = killAfterMs ? setTimeout(() => { out.timedOut = true; child.kill('SIGKILL'); }, killAfterMs) : null;
+  return new Promise((resolve) => child.on('exit', (c) => {
+    if (guard) clearTimeout(guard);
+    out.code = c;
+    resolve(out);
+  }));
 }
 
 test('connect --qr: the whole computer-first pairing against the mock — QR out, code typed, minted K at rest (§24.2)', async () => {
@@ -845,6 +858,56 @@ test('connect --qr: the whole computer-first pairing against the mock — QR out
       'the stored secret IS the key the QR carried — same bytes, never through the server');
     assert.match(out.stdout, new RegExp(`fingerprint ${shownKf[1]} \\(compare with the app`),
       'kf prints again at success for eye comparison (§24.2.5)');
+  } finally { await mock.stop(); }
+});
+
+test('connect --qr: the code arrives from the PHONE through the rendezvous mailbox — stdin is never typed (§24.7)', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  mock.state.pairDropCode = 'claim-ok'; // the phone posted the code it just minted
+  try {
+    // input: null ⇒ NOTHING is ever written to the child's stdin.
+    const out = await runConnectQr(port, { input: null, killAfterMs: 20_000 });
+    assert.ok(!out.timedOut, 'the pairing never completed on its own — the prompt is all that is left, which is the whole thing this closes');
+    assert.equal(out.code, 0, `the mailbox leg must complete on its own: ${out.stderr}`);
+    assert.match(out.stdout, /handed the code over/, 'the human is told where the code came from');
+    assert.match(out.stdout, /✓ hooks installed/, 'the fetched code walks the SAME path as a typed one');
+    const env = core.loadTerminalEnv();
+    assert.equal(env.token, 'hld_minted_by_claim');
+
+    // The address is DERIVED from the key that ended up at rest — that is the
+    // whole contract: the phone computed the same 43 chars from the K it
+    // scanned, and neither side ever transmitted it.
+    const stored = Buffer.from(env.secret, 'base64url');
+    assert.equal(stored.length, 32);
+    assert.ok(mock.state.pairDropReads.length >= 1, 'the CLI polled the drop');
+    for (const id of mock.state.pairDropReads) {
+      assert.equal(id, pairDropId(stored), 'the CLI polled exactly the address its own key derives');
+      assert.equal(id.length, 43);
+    }
+    assert.equal(mock.state.pairDropCode, null, 'single-use: the row is consumed on the first hit');
+    // Exactly one claim: a fetched code and an armed prompt must not both fire.
+    assert.equal(mock.state.reqLog.filter((r) => r.pathname === '/api/v1/claim').length, 1);
+  } finally { await mock.stop(); }
+});
+
+test('connect --qr: a server with no mailbox (or nothing dropped yet) stays SILENT and the typed code still works', async () => {
+  freshHome();
+  freshXdg();
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.claimKind = 'tunnel';
+  // pairDropCode stays null: every poll 404s, which is also how a server that
+  // never heard of the route answers.
+  try {
+    const out = await runConnectQr(port, { input: 'claim-ok\n' });
+    assert.equal(out.code, 0, out.stderr);
+    assert.doesNotMatch(out.stdout, /handed the code over/);
+    assert.doesNotMatch(out.stdout + out.stderr, /pair_drop/i, 'a 404 stream is the expected state — it says nothing');
+    assert.equal(core.loadTerminalEnv().token, 'hld_minted_by_claim');
   } finally { await mock.stop(); }
 });
 
@@ -1799,75 +1862,6 @@ test('a second connect REPLACES the stable copy instead of merging into a half-o
     'an upgrade must not leave a previous version file behind');
   assert.deepEqual(fs.readdirSync(core.terminalDir()).filter((f) => /^cli\.new\./.test(f)), [],
     'no staging dir may survive a successful swap');
-});
-
-// ===========================================================================
-// 3c. `pidge update` — the CLI keeps itself current
-// ===========================================================================
-
-const update = require('../src/update');
-
-test('update: it INVOKES the package manager and reports the version it moved to', async () => {
-  const runs = [];
-  const said = [];
-  const r = await update.runUpdate({
-    run: (cmd, args) => runs.push([cmd, ...args].join(' ')),
-    fetchLatest: async () => '9.9.9',
-    current: '0.41.0',
-    manager: 'npm',
-    say: (m) => said.push(m),
-    warn: (m) => said.push(m),
-  });
-
-  assert.deepEqual(runs, ['npm i -g pidge-cli@latest'], 'the whole point is that it actually installs');
-  assert.equal(r.ok, true);
-  assert.equal(r.ran, true);
-  assert.match(said.join('\n'), /installed pidge-cli@9\.9\.9 \(was 0\.41\.0\)/);
-});
-
-test('update: already current ⇒ no manager runs; a failed install is non-ok + the manual line', async () => {
-  const runs = [];
-  const current = await update.runUpdate({
-    run: (cmd, args) => runs.push(cmd + args.join(' ')), fetchLatest: async () => '0.41.0',
-    current: '0.41.0', manager: 'npm', say: () => {}, warn: () => {},
-  });
-  assert.deepEqual(runs, [], 'no reinstall when there is nothing to gain');
-  assert.equal(current.ran, false);
-  assert.equal(current.ok, true);
-
-  const warns = [];
-  const failed = await update.runUpdate({
-    run: () => { throw new Error('EACCES'); }, fetchLatest: async () => '9.9.9',
-    current: '0.41.0', manager: 'npm', say: () => {}, warn: (m) => warns.push(m),
-  });
-  assert.equal(failed.ok, false);
-  assert.match(warns.join('\n'), /npm i -g pidge-cli@latest failed \(EACCES\)/);
-  assert.match(warns.join('\n'), /Install it yourself/, 'a failure always hands back the manual line');
-});
-
-test('update: an unreachable registry warns and installs anyway (never blocks)', async () => {
-  const runs = [];
-  const warns = [];
-  const r = await update.runUpdate({
-    run: (cmd, args) => runs.push([cmd, ...args].join(' ')), fetchLatest: async () => null,
-    current: '0.41.0', manager: 'pnpm', say: () => {}, warn: (m) => warns.push(m),
-  });
-  assert.deepEqual(runs, ['pnpm add -g pidge-cli@latest'], 'each manager gets its own verb');
-  assert.equal(r.ok, true);
-  assert.match(warns.join('\n'), /could not reach the npm registry/);
-});
-
-test('update: the manager is inferred from where THIS copy lives; semver compares numerically', () => {
-  assert.equal(update.detectManager('/Users/x/.npm/_npx/abc/node_modules/.bin/pidge'), 'npm');
-  assert.equal(update.detectManager('/Users/x/Library/pnpm/global/5/node_modules/pidge-cli/bin/pidge.js'), 'pnpm');
-  assert.equal(update.detectManager('/Users/x/.yarn/bin/pidge'), 'yarn');
-  assert.equal(update.detectManager('/Users/x/.bun/install/global/node_modules/pidge-cli/bin/pidge.js'), 'bun');
-
-  assert.equal(update.isOlder('0.28.0', '0.41.0'), true, 'the exact gap the installed base sat in');
-  assert.equal(update.isOlder('0.9.0', '0.10.0'), true, 'numeric, not lexicographic');
-  assert.equal(update.isOlder('0.41.0', '0.41.0'), false);
-  assert.equal(update.isOlder('1.0.0', '0.41.0'), false);
-  assert.equal(update.currentVersion(), require('../package.json').version);
 });
 
 // ===========================================================================

@@ -119,7 +119,20 @@ test('the geometry clamps are the inherited ones (cols 20–500, rows 5–300) a
 // A control client stand-in with the same narrow surface the real one exposes.
 // `alt` is a QUEUE of #{alternate_on} answers, consumed one per read (last one
 // sticky) — that is how the two-read fail-closed case is scripted without a race.
-function mockControl({ cols = 80, rows = 24, alt = ['0'], sgrLines = null, plainLines = null, captureOk = true } = {}) {
+//
+// The geometry read answers the SIX fields the seed asks for in one message
+// (size, alternate screen, cursor x/y, cursor visibility). `noCursor: true`
+// answers the older three, as a tmux that does not know the cursor variables
+// would (it renders unknown format words as empty strings).
+//
+// The screen capture (`-S 0 -E rows-1`) and the scrollback capture
+// (`-S -N -E -1`) are DIFFERENT ranges and answer with different content, the
+// way a real pane does — a mock that returned the screen for both would hide
+// exactly the alternate-screen bug the history rule exists for.
+function mockControl({
+  cols = 80, rows = 24, alt = ['0'], sgrLines = null, plainLines = null,
+  histLines = [], captureOk = true, cursor = [0, 0], cursorFlag = '1', noCursor = false,
+} = {}) {
   const sent = [];
   const altQueue = [...alt];
   const nextAlt = () => (altQueue.length > 1 ? altQueue.shift() : (altQueue[0] || '0'));
@@ -130,11 +143,15 @@ function mockControl({ cols = 80, rows = 24, alt = ['0'], sgrLines = null, plain
     command(line) {
       sent.push(line);
       if (line.startsWith('display-message')) {
-        if (line.includes('#{pane_width}')) return Promise.resolve({ ok: true, lines: [`${cols} ${rows} ${nextAlt()}`] });
+        if (line.includes('#{pane_width}')) {
+          const tail = noCursor ? '  ' : ` ${cursor[0]} ${cursor[1]} ${cursorFlag}`;
+          return Promise.resolve({ ok: true, lines: [`${cols} ${rows} ${nextAlt()}${tail}`] });
+        }
         return Promise.resolve({ ok: true, lines: [nextAlt()] });
       }
       if (line.startsWith('capture-pane')) {
         if (!this.captureOk) return Promise.resolve({ ok: false, lines: [] });
+        if (/ -E -1\b/.test(line)) return Promise.resolve({ ok: true, lines: histLines });
         const withSgr = line.includes(' -e ');
         const body = (withSgr ? sgrLines : plainLines) || ['seed-line-1', 'seed-line-2 \x1b[1mbold\x1b[0m', '%output %9 NOT_A_REAL_NOTIFICATION'];
         return Promise.resolve({ ok: true, lines: body });
@@ -143,6 +160,11 @@ function mockControl({ cols = 80, rows = 24, alt = ['0'], sgrLines = null, plain
     },
   };
 }
+
+// The seed body, as latin1 text (what the viewer's emulator is fed).
+const seedText = (frame) => Buffer.from(frame.data, 'base64').toString('latin1');
+// …split into rows, minus the trailing cursor-restore tail.
+const seedRows = (frame) => seedText(frame).replace(/\x1b\[\?25l$/, '').replace(/\x1b\[\d+;\d+H$/, '').split('\r\n');
 
 // Frames are sealed as plain JSON here so the tests can read them AND so the
 // frame cap arithmetic is deterministic (the real seal adds a fixed 29-byte
@@ -235,7 +257,7 @@ test('a runaway burst is dropped WHOLE and healed by a seed — a repaint beats 
 test('seed ladder: an over-cap SGR screen is resent WITHOUT COLORS — inside the cap, loudly', async () => {
   const fat = Array.from({ length: 40 }, () => '\x1b[1;31m' + 'x'.repeat(200) + '\x1b[0m');
   const lean = Array.from({ length: 40 }, () => 'x'.repeat(20));
-  const { mirror, frames, logs } = harness({ sgrLines: fat, plainLines: lean, frameCap: 2000 });
+  const { mirror, frames, logs } = harness({ rows: 40, sgrLines: fat, plainLines: lean, frameCap: 2000 });
   await mirror.reseed();
   assert.equal(frames.length, 1, 'exactly one seed — an over-cap frame is NEVER sent');
   assert.ok(JSON.stringify(frames[0]).length <= 2000);
@@ -245,7 +267,7 @@ test('seed ladder: an over-cap SGR screen is resent WITHOUT COLORS — inside th
 
 test('seed ladder: over the cap even WITHOUT colors ⇒ the TOP lines are truncated (the bottom is the live part)', async () => {
   const many = Array.from({ length: 300 }, (_, i) => `line-${i}-${'y'.repeat(40)}`);
-  const { mirror, frames, logs } = harness({ sgrLines: many, plainLines: many, frameCap: 1500 });
+  const { mirror, frames, logs } = harness({ rows: 300, sgrLines: many, plainLines: many, frameCap: 1500 });
   await mirror.reseed();
   assert.equal(frames.length, 1);
   assert.ok(JSON.stringify(frames[0]).length <= 1500);
@@ -253,6 +275,8 @@ test('seed ladder: over the cap even WITHOUT colors ⇒ the TOP lines are trunca
   assert.ok(body.includes('line-299'), 'the BOTTOM of the screen survives — it is the live part');
   assert.ok(!body.includes('line-0-'), 'the top is what gets cut');
   assert.ok(logs.some((l) => /TOP lines truncated/.test(l)));
+  assert.equal(frames[0].cur, undefined,
+    'a seed that could not carry the whole screen has no business promising where the cursor is on it');
 });
 
 test('seed ladder floor: a cap smaller than the envelope itself SKIPS the seed loudly — it never feeds the reseed loop', async () => {
@@ -295,6 +319,92 @@ test('seed: a NORMAL-screen pane never even asks the second time (no prefix, no 
   const altReads = control.sent.filter((l) => l.includes('#{alternate_on}'));
   assert.equal(altReads.length, 1, 'the confirm read is skipped when the first already said no');
   assert.ok(!Buffer.from(frames[0].data, 'base64').toString('latin1').startsWith('\x1b'));
+});
+
+// --- the cursor contract: full height, no trailing newline, a CUP at the end -
+
+test('seed: the frame carries the cursor tmux reported, and the body ENDS by putting it back there', async () => {
+  const { mirror, control, frames } = harness({ rows: 6, cursor: [12, 3], plainLines: ['one', 'two'], sgrLines: ['one', 'two'] });
+  await mirror.reseed();
+  assert.deepEqual(frames[0].cur, [12, 3], 'cru from tmux, 0-based — the viewer converts, the daemon does not');
+  assert.ok(seedText(frames[0]).endsWith('\x1b[4;13H'),
+    'the last bytes of a seed put the cursor where the host has it (1-based CUP) — everything after this paints relative to it');
+  // ONE display-message carries geometry, alternate-screen state AND the cursor.
+  const geometry = control.sent.filter((l) => l.startsWith('display-message') && l.includes('#{pane_width}'));
+  assert.equal(geometry.length, 1);
+  assert.ok(/#\{cursor_x\}\s+#\{cursor_y\}\s+#\{cursor_flag\}/.test(geometry[0]),
+    'a cursor read one round-trip later describes a different screen than the capture does');
+});
+
+test('seed: the screen portion is padded to the FULL row count, and the body carries NO trailing newline', async () => {
+  const { mirror, frames } = harness({ rows: 6, cursor: [0, 1], plainLines: ['a', 'b'], sgrLines: ['a', 'b'] });
+  await mirror.reseed();
+  const rows = seedRows(frames[0]);
+  assert.deepEqual(rows, ['a', 'b', '', '', '', ''],
+    'trailing blank rows are part of the promise — exactly `rows` of them, and the viewer may not trim them');
+  assert.equal(rows.length, 6, 'a body with a newline after the LAST row would split into seven');
+
+  // With a full screen the shape is visible directly: content up to the last
+  // row, then the CUP — never a newline in between (one more newline scrolls
+  // the screen and lands every later repaint one row off).
+  const full = harness({ rows: 3, cursor: [0, 0], plainLines: ['a', 'b', 'c'], sgrLines: ['a', 'b', 'c'] });
+  await full.mirror.reseed();
+  assert.equal(seedText(full.frames[0]), 'a\r\nb\r\nc\x1b[1;1H');
+});
+
+test('seed: a capture longer than the pane keeps the FIRST rows and says so once', async () => {
+  const over = Array.from({ length: 9 }, (_, i) => `row-${i}`);
+  const { mirror, frames, logs } = harness({ rows: 4, cursor: [0, 0], plainLines: over, sgrLines: over });
+  await mirror.reseed();
+  assert.deepEqual(seedRows(frames[0]), ['row-0', 'row-1', 'row-2', 'row-3']);
+  assert.ok(logs.some((l) => /keeping the first 4/.test(l)), `expected the loud line, got ${JSON.stringify(logs)}`);
+});
+
+test('seed: a hidden cursor rides along as DECTCEM off — a TUI mid-redraw does not sprout a caret', async () => {
+  const { mirror, frames } = harness({ rows: 3, cursor: [5, 2], cursorFlag: '0', plainLines: ['x'], sgrLines: ['x'] });
+  await mirror.reseed();
+  assert.ok(seedText(frames[0]).endsWith('\x1b[3;6H\x1b[?25l'));
+});
+
+test('seed: on the ALTERNATE screen the scrollback is NEVER captured — the mirror is the visible screen, whole', async () => {
+  const hist = Array.from({ length: 185 }, (_, i) => `shell-history-${i}`);
+  const { mirror, control, frames } = harness({ rows: 4, alt: ['1'], histLines: hist, plainLines: ['TUI'], sgrLines: ['TUI'] });
+  await mirror.reseed();
+  assert.deepEqual(control.sent.filter((l) => l.startsWith('capture-pane') && / -E -1\b/.test(l)), [],
+    'the normal buffer under a full-screen TUI is the shell history it is covering — shipping it gives the viewer hundreds of lines that are not the thing on screen');
+  const rows = seedRows(frames[0]);
+  assert.equal(rows.length, 4, 'exactly the visible screen, at full height');
+  assert.ok(rows[0].endsWith('TUI'), 'the alt prefix rides in front of the first row');
+  assert.deepEqual(frames[0].cur, [0, 0]);
+});
+
+test('seed: on the NORMAL screen the scrollback is a SEPARATE capture that sits ABOVE the full-height screen', async () => {
+  const { mirror, control, frames } = harness({
+    rows: 3, histLines: ['old-1', 'old-2'], plainLines: ['now'], sgrLines: ['now'],
+  });
+  await mirror.reseed();
+  const captures = control.sent.filter((l) => l.startsWith('capture-pane'));
+  assert.equal(captures.length, 2, 'one explicit range for the screen, one for the history');
+  assert.ok(/-S 0 -E 2\b/.test(captures[0]), `the screen range is explicit: ${captures[0]}`);
+  assert.ok(/-S -200 -E -1\b/.test(captures[1]), `the history range stops where the screen starts: ${captures[1]}`);
+  assert.deepEqual(seedRows(frames[0]), ['old-1', 'old-2', 'now', '', '']);
+});
+
+test('seed degrade: dropping the COLORS keeps the whole screen, so it keeps the cursor too', async () => {
+  const fat = Array.from({ length: 20 }, () => '\x1b[1;31m' + 'x'.repeat(200) + '\x1b[0m');
+  const lean = Array.from({ length: 20 }, () => 'x'.repeat(20));
+  const { mirror, frames, logs } = harness({ rows: 20, cursor: [7, 19], sgrLines: fat, plainLines: lean, frameCap: 1200 });
+  await mirror.reseed();
+  assert.ok(logs.some((l) => /WITHOUT COLORS/.test(l)));
+  assert.deepEqual(frames[0].cur, [7, 19], 'colors are lost, the screen is not — the cursor promise still holds');
+  assert.ok(seedText(frames[0]).endsWith('\x1b[20;8H'));
+});
+
+test('seed: a tmux that cannot report the cursor produces the LEGACY frame — no cur, no padding, trailing newline', async () => {
+  const { mirror, frames } = harness({ rows: 6, noCursor: true, plainLines: ['a', 'b'], sgrLines: ['a', 'b'] });
+  await mirror.reseed();
+  assert.equal(frames[0].cur, undefined, 'the frame never claims a cursor it could not read');
+  assert.equal(seedText(frames[0]), 'a\r\nb\r\n', 'the pre-cursor body shape, byte for byte — the viewer trims as it always did');
 });
 
 // --- the live-stream title stripper (gotcha #64's sibling) ------------------
@@ -853,6 +963,35 @@ test('daemon: the mirror stands down only when BOTH windows are cold — and a r
   assert.equal(d.fake.made.length, 2);
 });
 
+test('daemon: a REBUILT mirror CONTINUES the share\'s seq — a counter back at 1 reads as a replay, forever', async () => {
+  const { d, session, sent } = mirrorDaemon({ occupant: 'term' });
+  const epoch = d.state.epoch;
+  d.handleInputFrame(session, inputFrame(d, { t: 'reseed', vgen: 'v1', seq: 1, he: epoch }));
+  await sleep(40);
+  d.fake.made[0].emit('%1', 'live bytes');
+  await sleep(250);
+  assert.deepEqual(paneFrames(d, sent).map((f) => f.seq), [1, 2]);
+
+  // Leg 1 — the idle stand-down. The viewer learns nothing about it: same
+  // epoch, so the next frame it sees MUST be the next number it expects.
+  d.stopMirror(session.sid, 'test stand-down');
+  assert.equal(d.mirrors.size, 0);
+  sent.length = 0;
+  d.handleInputFrame(session, inputFrame(d, { t: 'reseed', vgen: 'v1', seq: 2, he: epoch }));
+  await sleep(40);
+  assert.deepEqual(paneFrames(d, sent).map((f) => f.seq), [3],
+    'seq is monotonic per (share, epoch) — and epoch names the daemon PROCESS, not the mirror instance');
+
+  // Leg 2 — the tap dies under us (session renamed, client killed) and the next
+  // reseed rebuilds through a DIFFERENT path. Same rule.
+  d.fake.made[1].close('killed');
+  sent.length = 0;
+  d.handleInputFrame(session, inputFrame(d, { t: 'reseed', vgen: 'v1', seq: 3, he: epoch }));
+  await sleep(40);
+  assert.deepEqual(paneFrames(d, sent).map((f) => f.seq), [4]);
+  assert.equal(d.state.epoch, epoch, 'a rebuild is not a new process — the epoch may never move here');
+});
+
 test('daemon: disabling a share takes its mirror and its tmux tap with it', async () => {
   const { d, session } = mirrorDaemon({ occupant: 'term' });
   d.api = async () => ({ res: { status: 204 } });
@@ -963,6 +1102,23 @@ function tmuxSock(sock, args) {
   return execFileSync('tmux', ['-L', sock, ...args], { encoding: 'utf8', timeout: 10_000 });
 }
 
+// Type a command into a real pane and wait until its output is actually on the
+// screen. A fresh pane's shell can still be sourcing its rc when send-keys
+// lands — the text is echoed and never runs, which reads as a mysterious
+// assertion failure minutes later. So: send, look, and send again if the shell
+// clearly was not listening yet.
+async function tmuxRunUntil(sock, paneId, line, needle, tries = 12) {
+  for (let i = 0; i < tries; i++) {
+    tmuxSock(sock, ['send-keys', '-t', paneId, '-l', line]);
+    tmuxSock(sock, ['send-keys', '-t', paneId, 'Enter']);
+    for (let j = 0; j < 6; j++) {
+      await sleep(250);
+      if (tmuxSock(sock, ['capture-pane', '-p', '-J', '-S', '-500', '-t', paneId]).includes(needle)) return true;
+    }
+  }
+  return false;
+}
+
 test('mirror (REAL tmux): a live pane seeds inside the cap and its bytes round-trip through %output',
   { skip: !REAL_TMUX }, async () => {
     const sock = `pidge-mirror-${process.pid}`;
@@ -1009,11 +1165,19 @@ test('mirror (REAL tmux): a pane on the ALTERNATE screen seeds with the ESC[?104
     tmuxSock(sock, ['new-session', '-d', '-s', 'alt', '-x', '80', '-y', '24']);
     try {
       const paneId = tmuxSock(sock, ['list-panes', '-t', 'alt', '-F', '#{pane_id}']).trim();
-      // `less` puts the pane on the alternate screen — the pre-existing-TUI case.
-      tmuxSock(sock, ['send-keys', '-t', paneId, '-l', 'printf "a\\nb\\nc\\n" | less']);
-      tmuxSock(sock, ['send-keys', '-t', paneId, 'Enter']);
-      await sleep(1200);
-      assert.equal(tmuxSock(sock, ['display-message', '-p', '-t', paneId, '#{alternate_on}']).trim(), '1',
+      // `less` puts the pane on the alternate screen — the pre-existing-TUI
+      // case. A fresh pane's shell may still be sourcing its rc, so keep
+      // asking until the alternate screen is genuinely on.
+      let alt = '0';
+      for (let i = 0; i < 12 && alt !== '1'; i++) {
+        tmuxSock(sock, ['send-keys', '-t', paneId, '-l', 'printf "a\\nb\\nc\\n" | less']);
+        tmuxSock(sock, ['send-keys', '-t', paneId, 'Enter']);
+        for (let j = 0; j < 6 && alt !== '1'; j++) {
+          await sleep(250);
+          alt = tmuxSock(sock, ['display-message', '-p', '-t', paneId, '#{alternate_on}']).trim();
+        }
+      }
+      assert.equal(alt, '1',
         'this tmux/less pair did not reach the alternate screen — the assertion below would be meaningless');
 
       const hub = new ControlHub({ socketArgs: ['-L', sock], narrate: () => {} });
@@ -1031,6 +1195,58 @@ test('mirror (REAL tmux): a pane on the ALTERNATE screen seeds with the ESC[?104
       assert.ok(seed, 'a seed was produced');
       assert.ok(Buffer.from(seed.data, 'base64').toString('latin1').startsWith('\x1b[?1049h'),
         'capture-pane renders CELLS — without this prefix the viewer never learns it is on the alt screen');
+      // …and NOTHING from the normal buffer underneath it. A shell history the
+      // TUI is covering would give the viewer hundreds of lines to scroll that
+      // are not the thing on screen.
+      const rows = Buffer.from(seed.data, 'base64').toString('latin1')
+        .replace(/^\x1b\[\?1049h/, '').replace(/\x1b\[\?25l$/, '').replace(/\x1b\[\d+;\d+H$/, '')
+        .split('\r\n');
+      assert.equal(rows.length, 24, `an alt-screen seed is exactly the visible screen, at full height (got ${rows.length})`);
+      mirror.stop();
+      h.release();
+    } finally {
+      try { tmuxSock(sock, ['kill-server']); } catch { /* already gone */ }
+    }
+  });
+
+test('mirror (REAL tmux): the seed carries THIS tmux\'s cursor, at full screen height, with the scrollback above it',
+  { skip: !REAL_TMUX }, async () => {
+    const sock = `pidge-mirror-cur-${process.pid}`;
+    tmuxSock(sock, ['new-session', '-d', '-s', 'cur', '-x', '80', '-y', '20']);
+    try {
+      const paneId = tmuxSock(sock, ['list-panes', '-t', 'cur', '-F', '#{pane_id}']).trim();
+      // Fill more scrollback than the screen holds, so "full height" and
+      // "history above" are distinguishable from each other.
+      const ran = await tmuxRunUntil(sock, paneId,
+        'for i in $(seq 1 30); do echo "scroll-$i"; done', 'scroll-30');
+      assert.ok(ran, 'the pane never ran the command — nothing below could be measured');
+
+      const hub = new ControlHub({ socketArgs: ['-L', sock], narrate: () => {} });
+      const frames = [];
+      const h = hub.attach('cur', paneId, { onOutput: () => {}, onLost: () => {} });
+      const mirror = createMirror({
+        control: h.control, target: paneId, epoch: 3,
+        seal: (f) => JSON.stringify(f),
+        sendFrame: (data) => { frames.push(JSON.parse(data)); return true; },
+        frameCap: 65536, flushMs: 30, nudgeMs: 0,
+      });
+      await sleep(400);
+      await mirror.reseed();
+      const seed = frames.find((f) => f.t === 'seed');
+      assert.ok(seed, 'a seed was produced');
+
+      // What tmux itself says the cursor is, asked independently of the mirror.
+      const truth = tmuxSock(sock, ['display-message', '-p', '-t', paneId, '#{cursor_x} #{cursor_y}'])
+        .trim().split(/\s+/).map(Number);
+      assert.deepEqual(seed.cur, truth, 'the frame states the REAL cursor of this pane — everything the viewer paints next is relative to it');
+
+      const body = Buffer.from(seed.data, 'base64').toString('latin1');
+      assert.ok(body.endsWith(`\x1b[${truth[1] + 1};${truth[0] + 1}H`),
+        `the body ends by putting the cursor back: ${JSON.stringify(body.slice(-16))}`);
+      const rows = body.replace(/\x1b\[\d+;\d+H$/, '').split('\r\n');
+      assert.ok(rows.length > 20, 'the scrollback rides ABOVE the screen on the normal buffer');
+      assert.ok(rows.slice(-20).some((l) => l.includes('scroll-30')), 'the last 20 rows ARE the visible screen');
+      assert.ok(rows.some((l) => l.includes('scroll-1')), 'and the history above it came from the separate capture');
       mirror.stop();
       h.release();
     } finally {

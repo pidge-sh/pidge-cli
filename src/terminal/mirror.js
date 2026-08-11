@@ -77,6 +77,8 @@ function createMirror({
   control,     // the ControlHub's client for this pane's tmux session
   target,      // the PANE id (`%42`) — capture/display/refresh target and the %output filter
   epoch,       // the daemon epoch, echoed in every o/seed frame (viewer gap detection)
+  startSeq = 0, // the share's seq high-water: a REBUILT mirror continues the
+                // counter instead of restarting it (see below)
   seal,        // (frameObj)  → sealed wire string (pane_output AAD, base64url)
   sendFrame,   // (data)      → boolean — false = not sent (cable down/closed)
   narrate = () => {},
@@ -87,7 +89,15 @@ function createMirror({
   nudgePauseMs = 60,      // pause between the two jiggle steps (one real SIGWINCH each)
   now = () => Date.now(),
 }) {
-  let outSeq = 0;          // daemon→viewer, ONE counter per share for o+seed frames
+  // daemon→viewer, ONE counter per share for o+seed frames. It starts where the
+  // PREVIOUS mirror for this share left off, because `seq` is monotonic per
+  // (share, epoch) and `epoch` means "daemon process" — it is not a mirror
+  // generation. A mirror is rebuilt for reasons the viewer never learns about
+  // (idle stand-down, the tmux tap dying, a session rename), and a counter that
+  // restarted at 0 under the same epoch would make every frame after the
+  // rebuild look like a replay of one the viewer already saw. It would then
+  // refuse the seed that was supposed to heal it — silently, and forever.
+  let outSeq = Number.isFinite(startSeq) && startSeq > 0 ? Math.floor(startSeq) : 0;
   let viewers = 0;         // the emission gate (see reseed(): a reseed proves a watcher)
   let pending = [];        // coalesce buffer (Buffer[])
   let pendingBytes = 0;
@@ -212,37 +222,96 @@ function createMirror({
     // never crosses the mirror on its own, and the viewer's RIS actively wipes
     // whatever state it had — a viewer joining a pre-existing full-screen TUI
     // never opened the alt-drag gate.
-    const size = await control.command(`display-message -p -t ${t} '#{pane_width} #{pane_height} #{alternate_on}'`);
-    const m = size.ok ? /^(\d+)\s+(\d+)(?:\s+(\d+))?/.exec(size.lines[0] || '') : null;
+    // The CURSOR rides the same message for the same reason: a cursor read one
+    // round-trip later describes a different screen than the capture does, and
+    // a seed that lands the viewer's cursor anywhere but the host's row/col
+    // makes every cursor-relative repaint after it land wrong — which is the
+    // "scramble that heals itself" the field reported, one seed at a time.
+    const size = await control.command(`display-message -p -t ${t} '#{pane_width} #{pane_height} #{alternate_on} #{cursor_x} #{cursor_y} #{cursor_flag}'`);
+    const m = size.ok ? /^(\d+)\s+(\d+)(?:\s+(\d+))?(?:\s+(\d+)\s+(\d+)\s+(\d+))?/.exec(size.lines[0] || '') : null;
     const cols = m ? parseInt(m[1], 10) : 80;
     const rows = m ? parseInt(m[2], 10) : 24;
     const altBefore = !!m && m[3] === '1';
+    // 0-based, exactly as tmux reports it. A tmux that does not know these
+    // format variables answers with empty strings, so the whole cursor group
+    // is absent — and a seed that cannot state the cursor must not claim one:
+    // `cur` stays off and the LEGACY body shape is used end to end.
+    const cur = m && m[4] !== undefined ? [parseInt(m[4], 10), parseInt(m[5], 10)] : null;
+    const cursorHidden = !!cur && m[6] === '0';
+    // The tail that makes `cur` true: park the cursor where the host has it,
+    // and hide it if the host hides it (a TUI mid-redraw).
+    const cursorTail = cur ? `\x1b[${cur[1] + 1};${cur[0] + 1}H${cursorHidden ? '\x1b[?25l' : ''}` : '';
 
-    // One capture (with or without SGR) at one scrollback depth, plus the
-    // SECOND #{alternate_on} read immediately after it: the prefix is emitted
-    // only if BOTH reads agree on `1` — a TUI exiting mid-seed must fail
-    // CLOSED (arrows leaking into a normal shell drive the zsh history; a shut
-    // gate merely loses a scroll). Skipped entirely when the first read
-    // already said no (no prefix either way). Mid-session flips need nothing:
+    // One capture PAIR (screen, then scrollback) at one depth, plus the SECOND
+    // #{alternate_on} read immediately after it: the prefix is emitted only if
+    // BOTH reads agree on `1` — a TUI exiting mid-seed must fail CLOSED
+    // (arrows leaking into a normal shell drive the zsh history; a shut gate
+    // merely loses a scroll). Skipped entirely when the first read already
+    // said no (no prefix either way). Mid-session flips need nothing:
     // DECSET/DECRST 1049 cross on the LIVE path. Returns null on failure — the
     // caller distinguishes `stopped` (silent) from a real capture error.
-    async function capture(sgr, lines) {
-      const cap = await control.command(`capture-pane -p${sgr ? ' -e' : ''} -J -S -${lines} -t ${t}`);
-      if (!cap.ok || stopped) return null;
+    //
+    // The screen is captured with an EXPLICIT range (`-S 0 -E rows-1`) and then
+    // forced to exactly `rows` lines, because capture-pane's trailing-blank
+    // behavior is not something a protocol may rest on: this tmux returns the
+    // full grid, the field has seen trimmed captures. Padding here is what lets
+    // the frame promise "this data paints the whole visible screen" — without
+    // it the CUP at the end would address a row the viewer never drew.
+    //
+    // Scrollback is a SEPARATE capture (`-S -N -E -1`) and is skipped entirely
+    // on the alternate screen: under a full-screen TUI the normal buffer holds
+    // the shell history the TUI is covering, and shipping it would give the
+    // viewer hundreds of lines to scroll that are not the thing on screen.
+    async function capture(sgr, historyLines) {
+      const e = sgr ? ' -e' : '';
+      const screenCap = await control.command(`capture-pane -p${e} -J -S 0 -E ${rows - 1} -t ${t}`);
+      if (!screenCap.ok || stopped) return null;
+      const screen = screenCap.lines;
+      let padded = screen;
+      if (screen.length < rows) padded = screen.concat(new Array(rows - screen.length).fill(''));
+      else if (screen.length > rows) {
+        noteOnce(`pidge terminal: capture-pane returned ${screen.length} lines for a ${rows}-row screen — keeping the first ${rows} (an explicit -S 0 -E ${rows - 1} range should not be able to overflow)`);
+        padded = screen.slice(0, rows);
+      }
+      let history = [];
+      if (!altBefore && historyLines > 0) {
+        const histCap = await control.command(`capture-pane -p${e} -J -S -${historyLines} -E -1 -t ${t}`);
+        if (!histCap.ok || stopped) return null;
+        history = histCap.lines;
+      }
       let prefix = '';
       if (altBefore) {
         const again = await control.command(`display-message -p -t ${t} '#{alternate_on}'`);
         if (stopped) return null;
         if (again.ok && (again.lines[0] || '').trim() === '1') prefix = ALT_SCREEN_PREFIX;
       }
-      return { lines: cap.lines, prefix };
+      return { screen, padded, history, prefix };
     }
     // Block body lines are latin1-preserved bytes; \r\n between lines so the
     // viewer's emulator repaints rows, not one endless line. The state prefix
     // rides INSIDE data, so it counts toward the frame cap honestly. `seq` is
     // outSeq+1 on every attempt — it only advances when a frame is SENT.
-    const sealData = (dataBuf) => seal({ t: 'seed', epoch, seq: outSeq + 1, cols, rows, data: dataBuf.toString('base64') });
-    const sealLines = (prefix, bodyLines) => sealData(Buffer.from(prefix + bodyLines.join('\r\n') + '\r\n', 'latin1'));
+    //
+    // Two body shapes, and the difference is a PROMISE:
+    //  · cursor form — full-height screen, NO trailing newline (one more
+    //    newline after the last row scrolls the screen out from under the CUP),
+    //    then the CUP; the frame carries `cur` and the viewer must not trim.
+    //  · legacy form — what shipped before: whatever lines came back, trailing
+    //    `\r\n`, no `cur`. A seed that cannot carry the WHOLE screen has no
+    //    business promising a cursor position on it, so every degrade that cuts
+    //    into the screen falls back here and the viewer trims as it always did.
+    const sealBody = (dataBuf, withCursor) => seal(withCursor
+      ? { t: 'seed', epoch, seq: outSeq + 1, cols, rows, data: dataBuf.toString('base64'), cur }
+      : { t: 'seed', epoch, seq: outSeq + 1, cols, rows, data: dataBuf.toString('base64') });
+    const sealCursor = (prefix, bodyLines) =>
+      sealBody(Buffer.from(prefix + bodyLines.join('\r\n') + cursorTail, 'latin1'), true);
+    const sealLegacy = (prefix, bodyLines) =>
+      sealBody(Buffer.from(prefix + bodyLines.join('\r\n') + '\r\n', 'latin1'), false);
+    // The full seed, in whichever shape this pane's cursor read earned.
+    const sealFull = (got, useHistory) => (cur
+      ? sealCursor(got.prefix, useHistory ? [...got.history, ...got.padded] : got.padded)
+      : sealLegacy(got.prefix, useHistory ? [...got.history, ...got.screen] : got.screen));
+    const sealData = (dataBuf) => sealBody(dataBuf, false);
     const fits = (sealed) => Buffer.byteLength(sealed) <= frameCap;
     const send = (sealed, note) => {
       outSeq += 1;
@@ -251,7 +320,7 @@ function createMirror({
       if (ok) { stats.framesSent += 1; stats.framesFirstAt ||= now(); stats.framesLastAt = now(); }
       stats.lastSeed = {
         at: now(), bytes: Buffer.byteLength(sealed), cols, rows, alt: altBefore,
-        fits: true, sent: ok, ...note,
+        cur: null, fits: true, sent: ok, ...note,
       };
     };
     // A skipped seed sent NOTHING, and discardPending() already threw away the
@@ -259,12 +328,15 @@ function createMirror({
     // viewer to notice and nothing would ever re-ask. Arm the retry here, where
     // every skip path passes, instead of trusting a reseed that may never come.
     const skipped = (why) => {
-      stats.lastSeed = { at: now(), bytes: null, cols, rows, alt: altBefore, fits: false, sent: false, degraded: why };
+      stats.lastSeed = { at: now(), bytes: null, cols, rows, alt: altBefore, cur: null, fits: false, sent: false, degraded: why };
       seedWanted = true;
     };
 
-    for (let i = 0; i < SEED_SCROLLBACK.length; i++) {
-      const got = await capture(true, SEED_SCROLLBACK[i]);
+    // On the alternate screen there is no scrollback to ask for, so the ladder
+    // is its floor: the visible screen, once.
+    const ladder = altBefore ? [0] : SEED_SCROLLBACK;
+    for (let i = 0; i < ladder.length; i++) {
+      const got = await capture(true, ladder[i]);
       if (!got) {
         if (!stopped) {
           noteOnce('pidge terminal: capture-pane failed — seed skipped (will retry on the next reseed)');
@@ -272,16 +344,17 @@ function createMirror({
         }
         return;
       }
-      const sealed = sealLines(got.prefix, got.lines);
+      const sealed = sealFull(got, ladder[i] > 0);
       if (fits(sealed)) {
-        if (i > 0) noteOnce(`pidge terminal: seed shrunk to ${SEED_SCROLLBACK[i]} lines of scrollback to fit the relay frame cap`);
-        send(sealed, { scrollback: SEED_SCROLLBACK[i], degraded: i > 0 ? 'scrollback-shrunk' : null });
+        if (i > 0) noteOnce(`pidge terminal: seed shrunk to ${ladder[i]} lines of scrollback to fit the relay frame cap`);
+        send(sealed, { scrollback: ladder[i], cur, degraded: i > 0 ? 'scrollback-shrunk' : null });
         return;
       }
     }
 
     // Ladder exhausted: the bare visible screen WITH SGR is over the cap.
     // (a) re-capture the visible screen without -e — colors lost, not content.
+    //     The screen is still WHOLE here, so `cur` survives this rung.
     const plain = await capture(false, 0);
     if (!plain) {
       if (!stopped) {
@@ -290,18 +363,20 @@ function createMirror({
       }
       return;
     }
-    let sealed = sealLines(plain.prefix, plain.lines);
+    let sealed = sealFull(plain, false);
     if (fits(sealed)) {
       noteOnce('pidge terminal: seed exceeded the relay frame cap — resent WITHOUT COLORS (SGR stripped, content intact; degrade loudly, never loop)');
-      send(sealed, { scrollback: 0, degraded: 'sgr-stripped' });
+      send(sealed, { scrollback: 0, cur, degraded: 'sgr-stripped' });
       return;
     }
     // (b) even the plain screen is over the cap: keep the LARGEST bottom slice
     // of lines that fits (binary search — sealing is cheap, the dump is not).
+    // From here the screen itself is cut, so the frame drops `cur` and reverts
+    // to the legacy body — the viewer trims trailing blanks, as it always has.
     let best = null;
-    for (let lo = 1, hi = plain.lines.length; lo <= hi;) {
+    for (let lo = 1, hi = plain.screen.length; lo <= hi;) {
       const mid = (lo + hi) >> 1;
-      const s = sealLines(plain.prefix, plain.lines.slice(plain.lines.length - mid));
+      const s = sealLegacy(plain.prefix, plain.screen.slice(plain.screen.length - mid));
       if (fits(s)) { best = s; lo = mid + 1; } else { hi = mid - 1; }
     }
     if (best) {
@@ -313,7 +388,7 @@ function createMirror({
     // giant line). Keep the TAIL bytes — the freshest — halving until the
     // sealed frame fits. A partial screen still beats a dark viewer, and a
     // dark viewer beats the reseed loop.
-    let bytes = Buffer.from(plain.prefix + plain.lines.join('\r\n') + '\r\n', 'latin1');
+    let bytes = Buffer.from(plain.prefix + plain.screen.join('\r\n') + '\r\n', 'latin1');
     while (bytes.length > 1 && !fits(sealData(bytes))) bytes = bytes.subarray(bytes.length >> 1);
     sealed = sealData(bytes);
     if (!fits(sealed)) {
