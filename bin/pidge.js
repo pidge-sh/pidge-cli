@@ -1296,7 +1296,7 @@ const KNOWN_MANIFEST_VERSION = 67;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 20;
+const SKILL_REVISION = 21;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -4929,11 +4929,117 @@ async function fuseSkillAndHello(base, token) {
 // `--target` picks the DESTINATION only — the generated content is identical
 // (it's already agent-agnostic). claude = a Claude Code skill; agents/gemini = the
 // emerging root-file conventions (AGENTS.md for Codex et al., GEMINI.md for Gemini).
+// Every install also carries the `pidge-report` companion (sibling skill file, or
+// inlined for the single-file targets) — see reportSiblingOf below.
 const SKILL_TARGETS = {
   claude: () => path.join(process.cwd(), '.claude', 'skills', 'pidge', 'SKILL.md'),
   agents: () => path.join(process.cwd(), 'AGENTS.md'),
   gemini: () => path.join(process.cwd(), 'GEMINI.md'),
 };
+
+// The COMPANION skill: `pidge-report` — the content contract for reports.
+// The `pidge` skill is the TRANSPORT doctrine (types, buttons, waiting); this is
+// the WRITING doctrine — how a body should read so it survives a phone feed. A
+// separate skill on purpose: it loads only when the agent is composing content,
+// and it evolves without touching the transport spine. It installs as a SIBLING
+// of a real `pidge` skill dir (the claude target, and every self-heal override —
+// both always end in …/skills/pidge/SKILL.md); the single-file targets
+// (AGENTS.md / GEMINI.md) have no second file to install into, so they get the
+// same doctrine INLINED above the trailer instead. It shares SKILL_REVISION and
+// the frontmatter marker, so the existing staleness scan reads it unchanged, and
+// it is (re)written by every install/heal of the pidge skill — that is also how
+// it self-heals (and how existing installs GAIN it on the next spine bump); the
+// sibling never triggers a heal on its own, it rides the pair's.
+function reportSiblingOf(pidgeSkillFile) {
+  const dir = path.dirname(pidgeSkillFile);
+  if (path.basename(dir) !== 'pidge') return null; // AGENTS.md/GEMINI.md — no sibling dir
+  return path.join(path.dirname(dir), 'pidge-report', 'SKILL.md');
+}
+
+const REPORT_SKILL_TITLE = 'Pidge Report — write for the feed, not the archive';
+// Distilled from reading months of real production feeds: the failure mode of
+// agent reports is never spelling, it is VOLUME — hourly walls of bold text whose
+// conclusion ("nothing actionable") hides in the footer. Every rule below exists
+// because its violation was observed repeatedly in live channels.
+const REPORT_SKILL_BODY = `Your report lands in a scrolling feed on a phone: a lock-screen banner of ~150 characters, and — only IF the human taps — a detail screen. A report is good when the banner alone resolves most cases and the detail reads top-to-bottom in 20 seconds. You are not writing an archive entry; you are interrupting a person. Size the send by what the human must DECIDE, not by how much you found out.
+
+## The six laws
+
+1. **Inverted pyramid.** The conclusion or ask is the FIRST line of \`--body\` AND the first line of \`--body-markdown\` — never the footer. The banner shows the beginning; nobody scrolls a notification hunting for the point. "Nothing to do" opens the text — or the push doesn't go out at all (law 2).
+2. **Nothing actionable ≈ no new push.** Routine monitoring with no material change goes into the next digest, or rewrites ONE self-replacing card (\`--collapse-key <slug>\`) instead of stacking a new banner per tick. A feed of periodic "all quiet" pushes trains your human to ignore you — and then the one push that matters drowns.
+3. **A size budget per shape** (table below). Over budget? Cut CONTENT, don't compress the prose into fragments. What didn't fit rides \`--file\` or waits for the digest.
+4. **Delta only.** A recurring report carries what CHANGED since the previous one. Stable state is half a line ("hedge unchanged") or absent. Never re-explain context the human already read today — reference it.
+5. **Bold ≤4 per send, on the NEW datum only.** When everything is bold, nothing is. Emoji only as start-of-line semantic markers (🔴 problem · ✅ done · 🔎 watching), never decoration.
+6. **A question inside a report = buttons + top.** A "decisions for you:" footer with no \`--actions\` is a decision that never happens.
+
+## Five shapes, five budgets
+
+| Shape | Markdown budget | Skeleton |
+|---|---|---|
+| Status tick / heartbeat | ≤300 chars | the changed datum (1 line) → 1–2 bullets ONLY if something nears a trigger → "rest monitored". Always \`--collapse-key\` |
+| Alert (a trigger fired) | ≤400 | what fired + what it means + YOUR next step. Analysis goes in a later decision send, not here |
+| Decision | ≤900 | **Recommend: {action}.** + state in 1 line → 2–3 pros → 1 honest con → "Yes = exactly what I'll do. No = what happens." + buttons |
+| Daily pulse / digest | ≤1,200 (~14 lines) | headline → decisions WITH BUTTONS at the top → 🔴 new problems → ✅ wins → one KPI-delta line → today's top-3 asks |
+| Deep / weekly report | ≤1,500 in the push | executive summary; the full artifact rides \`--file\` (Quick Look on the phone). Never paste the report into the markdown |
+
+One decision per send — a second pendency is a NEW send on the same \`--thread\`.
+
+## Layout that renders well on a phone
+
+- **Short blocks, real spacing.** Blocks of 1–3 lines separated by ONE blank line. A dense wall doesn't scan; double blank lines waste half a phone screen.
+- **Bold lead-ins instead of headers.** \`**Deploy:** …\` reads better than a \`##\` section for anything under ~10 lines; save \`#\`/\`##\` for a long digest.
+- **Bullets over paragraphs** for enumerations — one line per bullet; a bullet that wraps past 2 lines is a paragraph in disguise (cut it).
+- **KPIs as one delta line**, not a section: \`open 171 (=) · breached 159 (−5) · new 38 (−2)\`.
+- **Tables only when narrow:** ≤3 columns × ≤6 rows. Wider or longer → a chart image or a \`--file\`.
+- **Title ≤60 chars** — a headline (fact + direction), never a paragraph, never your internal state ("FYI, no buttons, stage-2 only if…" is YOUR memo, not lock-screen text). **Body ≤140** — the gist that closes the matter unopened. **The markdown never repeats the title.**
+
+The daily-pulse shape, rendered:
+
+\`\`\`markdown
+**Quote for the big lead is the one thing today.**
+
+🤔 Decide: enable the bot loop-breaker? (buttons on this send)
+
+🔴 New: two replies stuck >20h · one delivery unconfirmed for today 16:00
+✅ Won: biggest lead in weeks got an owner in 14 min
+
+KPIs: ours 38 (−2) · open 171 (=) · breached 159 (−5)
+
+📣 Today: Marcos × the 15k quote · logistics × the 16:00 delivery
+\`\`\`
+
+## When text loses
+
+- **3+ numbers with a time/size dimension → a chart image.** Render a simple PNG (white background, one highlighted series, the takeaway as the chart title) and attach \`--image chart.png\`. For 2 numbers, text wins.
+- **A real artifact (log, csv, long report) → \`--file\`**, with a 3-line digest in the markdown. Never paste hundreds of lines.
+- One \`--image\` + one \`--file\` can ride the same send.
+
+## Anti-patterns (each observed in real feeds)
+
+| Sin | What it looks like |
+|---|---|
+| Title-paragraph | a 500-char title carrying the whole thesis plus agent-internal notes |
+| Body = title | a detail screen that repeats the banner verbatim, plus a canned footer |
+| Conclusion in the footer | 1,000 chars ending in "nothing actionable right now" — the banner showed the least useful part |
+| All bold | 90%+ of the text bolded; the eye finds nothing |
+| Recycled context | the same position/plan re-explained in every send of the day |
+| A log dressed as pushes | hourly "accumulated" updates stacking 8+ cards a day |
+| Decision without a button | "decisions for you:" as a footer bullet list, \`actions: []\` |
+
+## The 10-second pre-send check
+
+1. First line of body AND markdown = the conclusion/ask?
+2. Title ≤60 · body ≤140 · markdown within the shape's budget?
+3. Does this need to be a push NOW — or a collapse-key rewrite / the next digest? (law 2)
+4. Did I cut everything the human already read today? (law 4)
+5. ≤4 bolds; emoji as semaphore only?
+6. Question → buttons at the top · number series → image · artifact → \`--file\`?
+7. Markdown doesn't repeat the title; zero agent-internal notes in user-visible text.
+
+## Make it stick
+
+The first time you operate in a channel, record the contract in the channel's \`agent_preferences\` (advisory, channel-key writable — see the manifest) — e.g. \`report_style: "conclusion-first, size budgets per shape, delta-only, decisions get buttons at the top"\`. Every future session — yours or another runtime's on the same channel — inherits the standard instead of relearning it.
+`;
 
 // destFileOverride lets the self-heal write to a SPECIFIC file (e.g. the
 // HOME skill ~/.claude/skills/pidge/SKILL.md) rather than the cwd-relative claude
@@ -5002,6 +5108,7 @@ The banner shows your **\`--title\`** and **\`--body\`** (plain text). **\`--bod
 - Put the rich part (tables, lists, code, an image) in **\`--body-markdown\`** (and/or \`--image\`) — the human sees it when they tap in.
 - A good send: **title = the answer at a glance · body = the few facts they need to decide/act · body-markdown = the rich detail · ONE ask.** Never ship a title-only notification.
 - **A real artifact rides as an attachment, never as pasted text.** A log, xlsx, pdf, csv → \`--file <path>\` (the human gets a Quick Look preview + share/save on the phone); a picture → \`--image <path>\`. One image + one file can ride the same send. Long output (a build log, a report): distilled digest in \`--body-markdown\`, raw thing attached with \`--file\` — never paste hundreds of lines into the markdown.
+- **Composing a report / update / digest whose markdown runs past a few lines? Read the \`pidge-report\` skill FIRST** (installed alongside this one) — it is the content contract for the feed: conclusion-first, a size budget per report shape, delta-only recurrence, when a chart image beats prose. This skill is the transport; that one is the writing.
 
 ## Approval has two paths — know which one you're in
 
@@ -5204,15 +5311,40 @@ Mirroring is E2E-sealed and fully interactive: the human's typed replies land di
 
 ${SKILL_END_MARKER}
 `;
+  // The companion report skill (see reportSiblingOf above): a sibling file for
+  // skill-dir destinations, the same doctrine inlined above the trailer for the
+  // single-file targets. It carries the SAME marker line, so the staleness scan
+  // and the torn-write check treat it exactly like the main skill.
+  const reportSkill = `---
+name: pidge-report
+description: How to WRITE a report, update or digest that reads well in the Pidge feed on a phone. The pidge skill is the transport (types, buttons, waiting); this is the content contract — conclusion-first, a size budget per report shape, delta-only recurrence, bold/emoji discipline, phone-friendly layout, when a chart image or file attachment beats prose. Read it BEFORE composing any send whose markdown body runs past ~2 lines, and before designing any recurring report.
+# pidge-skill rev=${SKILL_REVISION} manifest=${m.manifest_version}
+---
+
+# ${REPORT_SKILL_TITLE}
+
+${REPORT_SKILL_BODY}
+${SKILL_END_MARKER}
+`;
   const file = destFor();
+  const reportFile = reportSiblingOf(file);
+  const content = reportFile
+    ? skill
+    : skill.replace(`${SKILL_END_MARKER}\n`, `# ${REPORT_SKILL_TITLE}\n\n${REPORT_SKILL_BODY}\n${SKILL_END_MARKER}\n`);
+  writeSkillFile(file, content);
+  if (reportFile) writeSkillFile(reportFile, reportSkill);
+  return { file, report_file: reportFile, manifest_version: m.manifest_version };
+}
+
+// never clobber silently — the installed skill may have been customized.
+// When the file being replaced differs from what we're writing, keep the old
+// content as <dest>.bak and say so in one stderr line.
+function writeSkillFile(file, content) {
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
-  // never clobber silently — the installed skill may have been customized.
-  // When the file being replaced differs from what we're writing, keep the old
-  // content as <dest>.bak and say so in one stderr line.
   let previous = null;
   try { previous = fs.readFileSync(file, 'utf8'); } catch { /* no existing file */ }
-  if (previous !== null && previous !== skill) {
+  if (previous !== null && previous !== content) {
     // NEVER clobber an existing .bak. The FIRST install
     // to a shared target (agents/gemini) parks the user's ORIGINAL file (e.g. their
     // hand-written AGENTS.md) at <dest>.bak; a later re-install whose generated
@@ -5233,13 +5365,12 @@ ${SKILL_END_MARKER}
   // concurrent heals each rename a WHOLE file (last one wins), never interleaved bytes.
   const tmp = path.join(dir, `.SKILL.md.${process.pid}.${crypto.randomUUID().slice(0, 8)}.tmp`);
   try {
-    fs.writeFileSync(tmp, skill);
+    fs.writeFileSync(tmp, content);
     fs.renameSync(tmp, file);
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
     throw e;
   }
-  return { file, manifest_version: m.manifest_version };
 }
 
 (async () => {
@@ -5277,8 +5408,8 @@ ${SKILL_END_MARKER}
         die(`pidge: unknown --target ${JSON.stringify(v.target)} — use claude (default), agents or gemini`, 1);
       let r;
       try { r = await installSkill(BASE, TOKEN, target); } catch (e) { die(`pidge: ${e.message}`, 2); }
-      console.error(`pidge: skill written to ${r.file} (target ${target}, manifest v${r.manifest_version}) — your future sessions in this project know Pidge now`);
-      console.log(JSON.stringify({ ok: true, file: r.file, target, manifest_version: r.manifest_version }));
+      console.error(`pidge: skill written to ${r.file}${r.report_file ? ` + companion ${r.report_file}` : ''} (target ${target}, manifest v${r.manifest_version}) — your future sessions in this project know Pidge now`);
+      console.log(JSON.stringify({ ok: true, file: r.file, report_file: r.report_file, target, manifest_version: r.manifest_version }));
       process.exit(0);
     }
     // === AXIS 1 — the married catalog of 5. Each stamps the
