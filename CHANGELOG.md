@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.47.0 — 2026-08-12
+
+**A pane tap now belongs to each share that uses it, and a dead tap admits it
+is dead.** During a terminal-to-agent handoff, the old and new share lifetimes
+can briefly overlap on the same tmux pane. The control hub used to keep only
+one callback per pane, so collecting the older share removed the newer share's
+callback and killed their shared control client. Registrations are now
+independently owned and released; the last registration, not whichever share
+leaves first, tears down the client.
+
+A control client that fails three consecutive screen captures now marks its
+mirror detached and stops retrying internally. The next viewer reseed takes the
+existing recovery path: replace the tap, preserve the share's sequence
+high-water, and repaint. A short capture hiccup still retries before crossing
+that threshold.
+
 ## 0.46.0 — 2026-08-11
 
 Two independent things ride this release: the closing tranche of the terminal

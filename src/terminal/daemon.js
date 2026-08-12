@@ -898,6 +898,20 @@ class Daemon {
     this.releaseWriterLock(oldSid);
     s.sid = newSid;
     s.currentSid = newSid;
+    // The mirror belongs to the SHARE being adopted, not to the transient sid
+    // that happened to open it. Re-key the live instance with the same record
+    // before any later idle sweep can mistake it for an orphan. Its hub handle
+    // and sequence counter continue unchanged.
+    const liveMirror = this.mirrors.get(oldSid);
+    if (liveMirror) {
+      this.mirrors.delete(oldSid);
+      this.mirrors.set(newSid, liveMirror);
+    }
+    if (this.mirrorSeq.has(oldSid)) {
+      const remembered = this.mirrorSeq.get(oldSid);
+      this.mirrorSeq.delete(oldSid);
+      this.mirrorSeq.set(newSid, Math.max(remembered || 0, this.mirrorSeq.get(newSid) || 0));
+    }
     s.tty = tty || null;
     if (occupant) s.occupant = occupant;
     if (occupant === 'agent') s.harness = 'claude';
