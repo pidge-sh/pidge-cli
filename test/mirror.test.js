@@ -294,6 +294,7 @@ test('seed: a failed capture-pane is narrated and skipped — the next reseed re
   await mirror.reseed();
   assert.equal(frames.length, 0);
   assert.ok(logs.some((l) => /capture-pane failed/.test(l)));
+  mirror.stop();
 });
 
 // --- the alternate-screen prefix (gotcha #64) -------------------------------
@@ -646,6 +647,24 @@ test('hub: refcount — the LAST pane to leave takes the client with it', () => 
   assert.equal(hub.size, 0);
 });
 
+test('hub: collecting one share leaves another share on the same pane capturing', () => {
+  const f = fakeControlFactory();
+  const hub = new ControlHub({ create: f.create });
+  const stale = [];
+  const live = [];
+  const orphan = hub.attach('work', '%1', { onOutput: (b) => stale.push(b.toString()) });
+  hub.attach('work', '%1', { onOutput: (b) => live.push(b.toString()) });
+
+  f.made[0].emit('%1', 'before sweep');
+  orphan.release();
+  f.made[0].emit('%1', 'after sweep');
+
+  assert.deepEqual(stale, ['before sweep']);
+  assert.deepEqual(live, ['before sweep', 'after sweep']);
+  assert.equal(f.made[0].closed, false, 'the live share still owns this control client');
+  assert.equal(hub.size, 1);
+});
+
 test('hub: %session-renamed is a HIGH death — every pane is told, and the client is killed (old-arc finding #10)', () => {
   const f = fakeControlFactory();
   const said = [];
@@ -841,6 +860,34 @@ test('daemon: live pane output reaches the wire sealed on pane_output, binary-cl
   assert.ok(Buffer.from(frames[0].data, 'base64').equals(raw), 'not one byte is mangled between tmux and the seal');
 });
 
+test('daemon: adoption survives the idle sweep and the live share keeps capturing', async () => {
+  const { d, session, fake, sent } = mirrorDaemon({ occupant: 'term' });
+  d.api = async () => ({ res: { status: 200 }, data: {} });
+  d.handleInputFrame(session, inputFrame(d, { t: 'reseed', vgen: 'v1', seq: 1, he: d.state.epoch }));
+  await sleep(40);
+  const liveMirror = d.mirrors.get(session.sid);
+  assert.ok(liveMirror, 'precondition: the terminal share owns a live tap');
+
+  assert.equal(d.adoptSid(session, 'sess-live', {
+    tp: null, tty: null, notice: 'adopted', tag: 'adopted', occupant: 'agent', why: 'occupant changed',
+  }), true);
+  assert.equal(d.mirrors.has('sess-m'), false, 'the retired sid leaves no mirror for the sweep to collect');
+  assert.equal(d.mirrors.get('sess-live'), liveMirror, 'the share keeps the same mirror instance');
+
+  d.mirrorSettings = { ...d.mirrorSettings, mirror_idle_ms: 1000 };
+  d.lastViewerActivityAt = 0;
+  liveMirror.mirror.noteInbound();
+  d.mirrorTick();
+  assert.equal(d.mirrors.get('sess-live'), liveMirror, 'the sweep leaves the adopted live share alone');
+
+  sent.length = 0;
+  fake.made[0].emit('%1', 'still capturing');
+  await sleep(250);
+  assert.equal(paneFrames(d, sent).at(-1).t, 'o');
+  assert.equal(Buffer.from(paneFrames(d, sent).at(-1).data, 'base64').toString(), 'still capturing');
+  d.stopMirror('sess-live', 'test cleanup');
+});
+
 test('daemon: a `resize` clamps and drives the tmux client; on an AGENT pane with no raw view open it attaches NOTHING', async () => {
   const term = mirrorDaemon({ occupant: 'term' });
   term.d.handleInputFrame(term.session, inputFrame(term.d, { t: 'resize', cols: 9999, rows: 2, vgen: 'v1', seq: 1, he: term.d.state.epoch }));
@@ -961,6 +1008,36 @@ test('daemon: the mirror stands down only when BOTH windows are cold — and a r
   await sleep(30);
   assert.equal(d.mirrors.size, 1, 'standing down early is safe by construction — the reseed re-attaches');
   assert.equal(d.fake.made.length, 2);
+});
+
+test('daemon: repeated capture failures detach a surviving mirror so the next viewer reseed rebuilds it', async () => {
+  const { d, session, fake, sent } = mirrorDaemon({ occupant: 'term' });
+  d.handleInputFrame(session, inputFrame(d, { t: 'reseed', vgen: 'v1', seq: 1, he: d.state.epoch }));
+  await sleep(40);
+  assert.equal(d.mirrors.get(session.sid).mirror.attached, true);
+
+  const broken = fake.made[0];
+  const originalCommand = broken.command.bind(broken);
+  broken.command = (line) => line.startsWith('capture-pane')
+    ? Promise.resolve({ ok: false, lines: [] })
+    : originalCommand(line);
+
+  try {
+    sent.length = 0;
+    d.handleInputFrame(session, inputFrame(d, { t: 'reseed', vgen: 'v1', seq: 2, he: d.state.epoch }));
+    await sleep(250);
+    assert.equal(d.mirrors.size, 1, 'the failed mirror remains addressable until a viewer asks again');
+    assert.equal(d.mirrors.get(session.sid).mirror.attached, false,
+      'a control client that cannot capture must stop claiming it is attached');
+
+    d.handleInputFrame(session, inputFrame(d, { t: 'reseed', vgen: 'v1', seq: 3, he: d.state.epoch }));
+    await sleep(40);
+    assert.equal(fake.made.length, 2, 'the viewer request replaces the detached tap');
+    assert.equal(d.mirrors.get(session.sid).mirror.attached, true);
+    assert.ok(paneFrames(d, sent).some((f) => f.t === 'seed'), 'the rebuilt tap repaints the viewer');
+  } finally {
+    d.stopMirror(session.sid, 'test cleanup');
+  }
 });
 
 test('daemon: a REBUILT mirror CONTINUES the share\'s seq — a counter back at 1 reads as a replay, forever', async () => {

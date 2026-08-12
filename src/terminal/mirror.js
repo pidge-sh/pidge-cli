@@ -60,6 +60,11 @@ const PENALTY_MS = 2000;
 // "666 frames per second", they are two frames. The diagnostic says so instead.
 const RATE_MIN_SPAN_MS = 1000;
 
+// A single failed capture can be a raced resize or short tmux hiccup. A tap
+// that cannot capture three times in a row is no longer healthy, however: stop
+// the internal retry loop and let the daemon's next viewer reseed replace it.
+const CAPTURE_FAILURE_LIMIT = 3;
+
 // The doctor's frame line, as a pure formatter (the count is always true; the
 // rate is only printed when the sample earns it). Shared so the daemon side and
 // the printed line can never disagree about when a rate exists.
@@ -111,6 +116,7 @@ function createMirror({
   let titleSwallow = false; // live-stream title stripper: inside `ESC k …`, discarding up to ST/BEL
   let heldEsc = false;      // live-stream title stripper: last byte was a bare ESC — classify on the NEXT byte
   let attached = true;      // the hub's client is alive for this pane
+  let captureFailures = 0;  // consecutive capture command failures on this tap
   const notedOnce = new Set();
   const noteOnce = (msg) => { if (!notedOnce.has(msg)) { notedOnce.add(msg); narrate(msg); } };
 
@@ -135,7 +141,7 @@ function createMirror({
   }
 
   function scheduleFlush() {
-    if (flushTimer || stopped || seedInFlight) return;
+    if (flushTimer || stopped || !attached || seedInFlight) return;
     const wait = now() < penaltyUntil ? flushMs * 4 : flushMs;
     flushTimer = setTimeout(() => { flushTimer = null; flush(); }, wait);
     if (flushTimer.unref) flushTimer.unref();
@@ -177,7 +183,7 @@ function createMirror({
         // condition: a runaway burst dropped mid-seed sets it with an empty
         // buffer, and without it that heal never fires (the old code self-healed
         // here — adversarial review caught the regression).
-        if (pendingBytes || seedWanted) scheduleFlush();
+        if (attached && (pendingBytes || seedWanted)) scheduleFlush();
       });
   }
 
@@ -214,7 +220,7 @@ function createMirror({
   //   and every degrade is narrated loudly. A frame over the cap is NEVER
   //   sent — degrade loudly, never loop (and degrade beats a dark screen).
   async function seed() {
-    if (stopped) return;
+    if (stopped || !attached) return;
     const t = tmuxQuote(target);
     // #{alternate_on} rides the SAME display-message as the geometry — the
     // FIRST of the two reads the seed state prefix is gated on (gotcha #64 /
@@ -262,10 +268,20 @@ function createMirror({
     // on the alternate screen: under a full-screen TUI the normal buffer holds
     // the shell history the TUI is covering, and shipping it would give the
     // viewer hundreds of lines to scroll that are not the thing on screen.
+    const failedCapture = () => {
+      captureFailures += 1;
+      if (captureFailures >= CAPTURE_FAILURE_LIMIT) {
+        attached = false;
+        seedWanted = false;
+        noteOnce(`pidge terminal: the tmux tap for ${target} failed ${CAPTURE_FAILURE_LIMIT} consecutive captures — marked detached; the next viewer reseed re-attaches`);
+      }
+      return null;
+    };
     async function capture(sgr, historyLines) {
       const e = sgr ? ' -e' : '';
       const screenCap = await control.command(`capture-pane -p${e} -J -S 0 -E ${rows - 1} -t ${t}`);
-      if (!screenCap.ok || stopped) return null;
+      if (stopped) return null;
+      if (!screenCap.ok) return failedCapture();
       const screen = screenCap.lines;
       let padded = screen;
       if (screen.length < rows) padded = screen.concat(new Array(rows - screen.length).fill(''));
@@ -276,7 +292,8 @@ function createMirror({
       let history = [];
       if (!altBefore && historyLines > 0) {
         const histCap = await control.command(`capture-pane -p${e} -J -S -${historyLines} -E -1 -t ${t}`);
-        if (!histCap.ok || stopped) return null;
+        if (stopped) return null;
+        if (!histCap.ok) return failedCapture();
         history = histCap.lines;
       }
       let prefix = '';
@@ -285,6 +302,7 @@ function createMirror({
         if (stopped) return null;
         if (again.ok && (again.lines[0] || '').trim() === '1') prefix = ALT_SCREEN_PREFIX;
       }
+      captureFailures = 0;
       return { screen, padded, history, prefix };
     }
     // Block body lines are latin1-preserved bytes; \r\n between lines so the
@@ -329,7 +347,7 @@ function createMirror({
     // every skip path passes, instead of trusting a reseed that may never come.
     const skipped = (why) => {
       stats.lastSeed = { at: now(), bytes: null, cols, rows, alt: altBefore, cur: null, fits: false, sent: false, degraded: why };
-      seedWanted = true;
+      seedWanted = attached;
     };
 
     // On the alternate screen there is no scrollback to ask for, so the ladder
@@ -519,7 +537,7 @@ function createMirror({
     // Raw pane bytes from the control client (%output for OUR pane, already
     // unescaped and routed by the hub).
     onOutput(bytes) {
-      if (stopped) return;
+      if (stopped || !attached) return;
       // The stripper sees EVERY live byte, even while nobody watches: a title
       // sequence can straddle a join, and stale state would either leak title
       // text as ghost cells or eat real output right after the join's seed.
@@ -545,7 +563,7 @@ function createMirror({
       // A stopped mirror is a stood-down one: it must not re-open its own
       // emission gate behind the daemon's back (the daemon builds a FRESH
       // instance when the share comes back).
-      if (stopped) return Promise.resolve();
+      if (stopped || !attached) return Promise.resolve();
       stats.lastInboundAt = now();
       if (viewers < 1) viewers = 1;
       // Drop what the capture is about to contain, THEN seed (see runSeed).
@@ -587,7 +605,7 @@ function createMirror({
     // reseed() — a bare seed() here would capture the coalesced bytes and then
     // send them AGAIN, which is the whole bug, on the path every daemon walks
     // (laptop wake, network change). Caught by adversarial review with a PoC.
-    onRelayUp() { if (viewers > 0) chain(() => { discardPending(); return runSeed(); }); },
+    onRelayUp() { if (viewers > 0 && attached) chain(() => { discardPending(); return runSeed(); }); },
 
     // The hub's control client died under us (session gone, renamed, detached).
     // Stay ALIVE but mark detached: the daemon re-attaches on the next reseed,

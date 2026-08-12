@@ -182,7 +182,7 @@ class ControlHub {
     this.socketArgs = socketArgs;
     this.narrate = narrate;
     this.create = create;
-    this.entries = new Map(); // sessionName → { control, panes: Map(paneId → onOutput), lastGeometry }
+    this.entries = new Map(); // sessionName → { control, panes: Map(paneId → Map(registration → callbacks)) }
   }
 
   // Register a pane on the control client of `sessionName`, attaching one if
@@ -203,8 +203,9 @@ class ControlHub {
           // Identity guard: a dying client's last bytes must never be routed
           // through a successor's pane table.
           if (this.entries.get(sessionName) !== entry) return;
-          const fn = entry.panes.get(pid);
-          if (fn) fn(bytes);
+          const registrations = entry.panes.get(pid);
+          if (!registrations) return;
+          for (const { onOutput: fn } of registrations.values()) fn(bytes);
         },
         onEvent: (tag) => {
           if (this.entries.get(sessionName) !== entry) return;
@@ -225,19 +226,23 @@ class ControlHub {
         },
       });
     }
-    entry.panes.set(paneId, onOutput);
-    entry.lost ||= new Map();
-    entry.lost.set(paneId, onLost);
+    let registrations = entry.panes.get(paneId);
+    if (!registrations) {
+      registrations = new Map();
+      entry.panes.set(paneId, registrations);
+    }
+    const registration = Symbol('share');
+    registrations.set(registration, { onOutput, onLost });
     return {
       control: entry.control,
-      // Refcount down. The LAST pane to leave takes the client with it —
-      // re-attaching is cheap and a reseed cures whatever was missed, so
-      // erring toward standing down early is safe by construction (§19).
+      // Refcount down by registration, not pane id. Two share lifetimes may
+      // overlap on one pane while an occupant is being replaced; releasing
+      // either one must leave the other's callback and control client intact.
       release: () => {
         const live = this.entries.get(sessionName);
         if (live !== entry) return; // already superseded — nothing of ours left
-        entry.panes.delete(paneId);
-        entry.lost.delete(paneId);
+        registrations.delete(registration);
+        if (!registrations.size) entry.panes.delete(paneId);
         if (entry.panes.size) return;
         this.entries.delete(sessionName);
         try { entry.control.kill(); } catch { /* already gone */ }
@@ -249,8 +254,10 @@ class ControlHub {
   // an entry that has already been replaced (every caller identity-guards).
   drop(sessionName, entry, reason) {
     this.entries.delete(sessionName);
-    for (const [, onLost] of entry.lost || []) {
-      try { onLost(reason); } catch { /* a mirror's bookkeeping must not kill the hub */ }
+    for (const registrations of entry.panes.values()) {
+      for (const { onLost } of registrations.values()) {
+        try { onLost(reason); } catch { /* a mirror's bookkeeping must not kill the hub */ }
+      }
     }
     entry.panes.clear();
     try { entry.control.kill(); } catch { /* already gone */ }
