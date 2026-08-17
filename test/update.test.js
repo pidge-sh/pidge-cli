@@ -156,13 +156,20 @@ test('update: a re-vendorize that leaves the slot BEHIND says so instead of repo
   assert.match(s.warned.join('\n'), /pidge terminal connect --yes/, 'a warning always carries the way out');
 });
 
-test('update: NO daemon on this computer ⇒ no re-vendorize, and the line says only the global moved', async () => {
+test('update: NO daemon on this computer ⇒ no re-vendorize, and NOT ONE WORD about a daemon', async () => {
   const s = scenario({ daemon: false });
   const r = await update.runUpdate(s.opts);
   assert.deepEqual(s.runs, ['npm i -g pidge-cli@latest'], 'nothing is installed for a service that does not exist');
   assert.equal(r.reVendored, false);
   assert.equal(r.slot, null);
-  assert.match(s.said.join('\n'), /only the global CLI was updated/);
+  // The update reports what it did — the global copy moved — and stops there.
+  // A computer that never installed Terminals must not learn the feature exists
+  // from a line explaining which half of it was skipped.
+  const output = [...s.said, ...s.warned].join('\n');
+  assert.match(output, /installed pidge-cli@9\.9\.9 \(was 0\.41\.0\)/, 'it still says exactly what moved');
+  for (const word of [/daemon/i, /Agent Sessions/i, /slot/i, /terminal/i, /mirror/i]) {
+    assert.ok(!word.test(output), `a machine without Terminals hears nothing about it (${word})`);
+  }
 });
 
 test('update: a global copy that cannot be located leaves the daemon honest — non-ok, with the manual line', async () => {

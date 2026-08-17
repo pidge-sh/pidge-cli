@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.47.1 — 2026-08-17
+
+**The CLI only announces Terminals to a computer that installed it.** On a
+machine with no terminal daemon, `pidge --help` drops the whole
+`pidge terminal <sub>` block and the aside that points `pidge update` at
+`terminal connect`; `pidge update` says what it installed and stops (no line
+about a daemon that isn't there); `pidge setup --help` stops advertising
+`--from-computer`, which needs a paired computer; and a generated skill carries
+no session-mirroring doctrine. Nothing was removed from the CLI: every
+`pidge terminal …` command still runs when typed, with its own help intact, and
+a computer that has the daemon sees exactly the text it saw before.
+`PIDGE_TERMINAL_HELP=1` forces the full text anywhere.
+
 ## 0.47.0 — 2026-08-12
 
 **A pane tap now belongs to each share that uses it, and a dead tap admits it

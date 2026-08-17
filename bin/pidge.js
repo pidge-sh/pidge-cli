@@ -51,6 +51,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
+// The one question about Terminals this CLI is allowed to ask when deciding
+// what to SAY: does this computer have the feature installed?
+const { announceTerminals } = require('../src/terminals-installed');
 
 // `pidge --version` / `-v` — handled BEFORE parseArgs (which would otherwise
 // throw "Unknown option" on the undeclared flag). Prints the version, exit 0.
@@ -639,7 +642,12 @@ const OPTIONS = {
   'no-defer': { type: 'boolean' },             // bridge: turn OFF the polite poller (never defer to an interactive run)
 };
 
-const USAGE = `pidge — send an iPhone notification to a human and block until they answer.
+// The overview is assembled, not one literal, because ONE block of it is
+// conditional: a computer with no Terminals daemon never hears about Terminals
+// (see src/terminals-installed). With the feature installed — or with its
+// override env set — the three pieces join back into the exact text this help
+// has always printed.
+const USAGE_HEAD = `pidge — send an iPhone notification to a human and block until they answer.
 
 USAGE
   pidge setup --claim CODE [--url BASE]   one-shot onboarding: exchange the single-use
@@ -691,8 +699,10 @@ USAGE
                                           another runtime (a bridge/daemon) is the real consumer of — so
                                           you learn what's already handled WITHOUT stealing a message.
                                           Exit 0 (printed, even if empty) · 2 error. NEVER run \`listen\`
-                                          on a channel another runtime consumes (double-consume).
-  pidge terminal <sub>                    TERMINALS: share a tmux PANE with the human's phone —
+                                          on a channel another runtime consumes (double-consume).`;
+
+// Printed only on a computer that installed Terminals.
+const USAGE_TERMINAL = `  pidge terminal <sub>                    TERMINALS: share a tmux PANE with the human's phone —
                                           a Claude session as its structured transcript (E2E-sealed,
                                           typed replies land in its input box) or a plain terminal.
                                           connect --code C   once per computer (paste the app's one-liner)
@@ -711,10 +721,13 @@ USAGE
                                           enable             a CONFIRMATION of the above (never the door)
                                           doctor             does this computer read a LIVE agent AS an
                                                              agent? run it on the machine, with claude up
-                                          disable · status · disconnect
-  pidge update                            update this CLI to the latest published pidge-cli
-                                          (npm/pnpm/yarn/bun auto-detected; \`terminal connect\` nudges you here)
-  pidge bridge --exec '<handler>'         24/7 SUPERVISOR: loop listen --all → your handler runs
+                                          disable · status · disconnect`;
+
+// The update line names its Terminals caller only where that caller exists.
+const usageUpdate = (withTerminals) => `  pidge update                            update this CLI to the latest published pidge-cli
+                                          (npm/pnpm/yarn/bun auto-detected${withTerminals ? '; \`terminal connect\` nudges you here' : ''})`;
+
+const USAGE_TAIL = `  pidge bridge --exec '<handler>'         24/7 SUPERVISOR: loop listen --all → your handler runs
                                           ONCE per batch (batch JSON on stdin) → exit 0 ⇒ ack of the
                                           batch's EXACT ids · non-zero ⇒ NOT acked (the server lease
                                           re-serves). ONE instance per channel (pid-checked lockfile by
@@ -854,6 +867,14 @@ it never produces an answer, so --wait/ask refuse it.
 
 Full spec (the contract — always current): GET $PIDGE_URL/api/v1/manifest`;
 
+function usageText() {
+  const withTerminals = announceTerminals();
+  const parts = [USAGE_HEAD];
+  if (withTerminals) parts.push(USAGE_TERMINAL);
+  parts.push(usageUpdate(withTerminals), USAGE_TAIL);
+  return parts.join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // per-subcommand help. `pidge <cmd> --help` (and `pidge help <cmd>`) must
 // show the focused help for THAT command — its synopsis, what it does, and only
@@ -968,12 +989,17 @@ const CONTENT_OPTS = ['title', 'body', 'body-markdown', 'body-markdown-file', 's
 // blocking knobs. (`live` is status-only — it never answers, so it skips these.)
 const SEND_OPTS = [...CONTENT_OPTS, 'gated', 'wait', 'timeout', 'interval', 'realtime', 'no-realtime'];
 
+// `usage`, `body` and `opts` may be a FUNCTION of "does this computer have
+// Terminals installed?" — the few entries whose text names the feature print it
+// only where the feature lives (the flags themselves never change: --from-computer
+// still works when typed, it just stops advertising a pairing this machine
+// cannot have done).
 const HELP = {
   setup: {
     summary: 'one-shot onboarding: exchange a single-use claim code for the channel key, store it, run doctor.',
-    usage: 'pidge setup --claim CODE [--url BASE] [--global] [--print] [--force] [--from-computer] [--listen-mode MODE]',
+    usage: (t) => `pidge setup --claim CODE [--url BASE] [--global] [--print] [--force]${t ? ' [--from-computer]' : ''} [--listen-mode MODE]`,
     body: 'The CLI writes the key itself (chmod 600) — it never appears on screen or in the agent\'s chat. Run it INSIDE your project (git): the key is scoped to that project, so N agents in N projects never collide (--global targets the shared machine file instead — for daemons/cron). Two agents in the SAME directory: set PIDGE_AGENT=<id> at each agent\'s launch. A fumbled setup is safe to re-run: within the code\'s 15-min TTL the same install gets its key again (server v84+). --quiet collapses the onboarding to one status line.',
-    opts: ['claim', 'url-base', 'global', 'print', 'force', 'from-computer', 'listen-mode', 'quiet'],
+    opts: (t) => ['claim', 'url-base', 'global', 'print', 'force', ...(t ? ['from-computer'] : []), 'listen-mode', 'quiet'],
   },
   doctor: {
     summary: 'validate the setup WITHOUT exposing secrets (env source, server, key, device reach, realtime probe).',
@@ -988,7 +1014,7 @@ const HELP = {
   update: {
     summary: 'update this CLI to the latest published pidge-cli (npm/pnpm/yarn/bun, auto-detected).',
     usage: 'pidge update [--manager npm|pnpm|yarn|bun]',
-    body: 'The installed base is the failure mode: `npx pidge-cli` prefers a copy your machine ALREADY has, so an old install keeps running (0.28.0 was measured on a real Mac while 0.40.0 was published) and every newer subcommand reads as "unknown option". This installs `pidge-cli@latest` globally with the manager that owns this copy. Already current ⇒ it says so and exits 0; an unreachable registry ⇒ it warns and installs anyway; a failed install ⇒ exit 2 with the manual line. `pidge terminal connect` runs the same check and points here.',
+    body: (t) => `The installed base is the failure mode: \`npx pidge-cli\` prefers a copy your machine ALREADY has, so an old install keeps running (0.28.0 was measured on a real Mac while 0.40.0 was published) and every newer subcommand reads as "unknown option". This installs \`pidge-cli@latest\` globally with the manager that owns this copy. Already current ⇒ it says so and exits 0; an unreachable registry ⇒ it warns and installs anyway; a failed install ⇒ exit 2 with the manual line.${t ? ' `pidge terminal connect` runs the same check and points here.' : ''}`,
     opts: ['manager'],
   },
   hello: {
@@ -1206,12 +1232,17 @@ const HELP = {
 // unknown / absent (so `pidge --help` and `pidge help` keep the full overview).
 function helpFor(topic) {
   const h = HELP[topic];
-  if (!h) return USAGE;
-  const lines = [`pidge ${topic} — ${h.summary}`, '', 'USAGE', `  ${h.usage}`];
-  if (h.body) { lines.push('', h.body); }
-  if (h.opts && h.opts.length) {
+  if (!h) return usageText();
+  // one question, asked once per render (see src/terminals-installed)
+  const t = announceTerminals();
+  const pick = (field) => (typeof field === 'function' ? field(t) : field);
+  const body = pick(h.body);
+  const opts = pick(h.opts);
+  const lines = [`pidge ${topic} — ${h.summary}`, '', 'USAGE', `  ${pick(h.usage)}`];
+  if (body) { lines.push('', body); }
+  if (opts && opts.length) {
     lines.push('', 'OPTIONS');
-    for (const key of h.opts) lines.push(`  ${OPTION_DOCS[key] || key}`);
+    for (const key of opts) lines.push(`  ${OPTION_DOCS[key] || key}`);
   }
   lines.push('', 'Run `pidge --help` for all commands; GET $PIDGE_URL/api/v1/manifest is the full contract (Bearer auth).');
   return lines.join('\n');
@@ -1237,7 +1268,7 @@ let parsed;
 try {
   parsed = parseArgs({ args: RAW_ARGV, options: OPTIONS, allowPositionals: true });
 } catch (e) {
-  die(`pidge: ${e.message}\n\n${USAGE}`, 1);
+  die(`pidge: ${e.message}\n\n${usageText()}`, 1);
 }
 const v = parsed.values;
 if (rescuedClaim && v.claim === undefined) v.claim = rescuedClaim;
@@ -1259,7 +1290,7 @@ if (v.help || command === 'help') {
   console.log(helpFor(topic));
   process.exit(0);
 }
-if (!command) { console.error(USAGE); process.exit(1); }
+if (!command) { console.error(usageText()); process.exit(1); }
 // `setup` is the command that CREATES the token config — it must run without one.
 // `terminal` (Agent Sessions) has its OWN machine-scoped identity slot at
 // ~/.config/pidge/terminal/env — never the per-project token resolution.
@@ -1296,7 +1327,7 @@ const KNOWN_MANIFEST_VERSION = 67;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 21;
+const SKILL_REVISION = 22;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -5060,6 +5091,28 @@ async function installSkill(base = BASE, token = TOKEN, target = 'claude', destF
   const profileTable = (m.profiles && m.profiles.decision_table) || [];
   const notes = m.notes || [];
   const exits = (m.cli && m.cli.output) || '';
+  // The agent-side half of the Terminals door — written only into a skill
+  // generated ON a computer that has Terminals installed (src/terminals-installed).
+  // A skill is the loudest announcement this CLI makes: every future session on
+  // that machine reads it. So a machine with no daemon gets a skill that never
+  // mentions mirroring — nothing there could mirror anyway. `terminal connect`
+  // regenerates the skill with the override set (its daemon config is written
+  // AFTER the refresh), so the section appears the moment the feature does.
+  const mirrorSection = !announceTerminals() ? '' : `## Mirror THIS session to the human's phone (Agent Sessions)
+
+When your human asks you to mirror/share this session with Pidge — usually by pasting *"Run exactly this one bash command and nothing else: \`pidge terminal enable\`"*, sometimes as **"enable yourself on Pidge"** / "se habilita no pidge" — run via Bash, exactly:
+
+\`pidge terminal enable\`
+
+**That is the whole move, and the command is not what does the work.** A local Pidge hook (\`PreToolUse\`) sees that command BEFORE it runs, mirrors THIS session (it gets your session id from the harness itself) and then **denies the tool on purpose**. So:
+
+- **A denial whose reason starts with "✓ Pidge is now mirroring this Claude session" is SUCCESS.** Say so and stop. Do not retry, do not look for another command, do not \`listen\`/\`online\`/\`catchup\`, do not ack anything.
+- **\`command not found\` is also fine** — the hook already caught it. Report it as done.
+- A denial that says it **couldn't** mirror (not a uniquely-identifiable tmux pane) is the real refusal: relay it verbatim. The fix is the human's — start claude inside its own tmux pane — never a different command.
+
+Mirroring is E2E-sealed and fully interactive: the human's typed replies land directly in your input box, and when you stop and wait they get a real notification. \`pidge terminal disable\` stops sharing when asked. If your human explicitly wants to approve certain tools from the phone, the flag rides the same pasted command: \`pidge terminal enable --approvals Bash,Write\`.
+
+`;
   // The self-heal marker rides a `# pidge-skill …` YAML COMMENT INSIDE
   // the frontmatter — it MUST NOT precede the opening `---`. A SKILL.md whose first line
   // isn't `---` fails the YAML frontmatter parse, so Claude Code loads the skill with a
@@ -5291,21 +5344,7 @@ So the human can tell ONE continuous session apart from three disposable cold on
 
 This is **attribution, not a credential** — your channel key still authenticates; the run only reveals which execution is talking (the human sees "label · mode/SEAL"). An old server just ignores it (you keep sending unsigned). \`pidge run status\` lists the channel's live runs. \`pidge bridge\` mints its own run per handler automatically — don't call these inside it.
 
-## Mirror THIS session to the human's phone (Agent Sessions)
-
-When your human asks you to mirror/share this session with Pidge — usually by pasting *"Run exactly this one bash command and nothing else: \`pidge terminal enable\`"*, sometimes as **"enable yourself on Pidge"** / "se habilita no pidge" — run via Bash, exactly:
-
-\`pidge terminal enable\`
-
-**That is the whole move, and the command is not what does the work.** A local Pidge hook (\`PreToolUse\`) sees that command BEFORE it runs, mirrors THIS session (it gets your session id from the harness itself) and then **denies the tool on purpose**. So:
-
-- **A denial whose reason starts with "✓ Pidge is now mirroring this Claude session" is SUCCESS.** Say so and stop. Do not retry, do not look for another command, do not \`listen\`/\`online\`/\`catchup\`, do not ack anything.
-- **\`command not found\` is also fine** — the hook already caught it. Report it as done.
-- A denial that says it **couldn't** mirror (not a uniquely-identifiable tmux pane) is the real refusal: relay it verbatim. The fix is the human's — start claude inside its own tmux pane — never a different command.
-
-Mirroring is E2E-sealed and fully interactive: the human's typed replies land directly in your input box, and when you stop and wait they get a real notification. \`pidge terminal disable\` stops sharing when asked. If your human explicitly wants to approve certain tools from the phone, the flag rides the same pasted command: \`pidge terminal enable --approvals Bash,Write\`.
-
-## Full spec
+${mirrorSection}## Full spec
 
 \`curl $PIDGE_URL/api/v1/manifest -H "Authorization: Bearer $PIDGE_TOKEN"\` — the always-current contract (fields, profiles, custom actions, media, threads, realtime).
 

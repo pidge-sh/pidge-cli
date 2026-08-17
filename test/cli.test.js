@@ -434,7 +434,7 @@ test('doctor does NOT warn when the home skill CARRIES the marker (that one self
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
   fs.mkdirSync(path.dirname(homeSkill), { recursive: true });
   // A marked (current) home skill — nothing to nag about.
-  fs.writeFileSync(homeSkill, `---\nname: pidge\ndescription: x.\n# pidge-skill rev=21 manifest=16\n---\n\n# Pidge\n\nok\n\n<!-- pidge-skill-end -->\n`);
+  fs.writeFileSync(homeSkill, `---\nname: pidge\ndescription: x.\n# pidge-skill rev=22 manifest=16\n---\n\n# Pidge\n\nok\n\n<!-- pidge-skill-end -->\n`);
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-doctorcwd2-'));
 
   const { result } = runCli(['doctor'], port, { HOME: home }, cwd);
@@ -533,9 +533,34 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   // the pidge-report COMPANION lands as a sibling skill, marked + trailed like the main one.
   const report = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge-report', 'SKILL.md'), 'utf8');
   assert.match(report, /name: pidge-report/);
-  assert.match(report, /\n# pidge-skill rev=21 manifest=16\n/, 'companion carries the same marker');
+  assert.match(report, /\n# pidge-skill rev=22 manifest=16\n/, 'companion carries the same marker');
   assert.ok(report.trimEnd().endsWith('<!-- pidge-skill-end -->'), 'companion carries the trailer');
   assert.match(skill, /pidge-report/, 'the main skill points at the companion');
+  // The skill is the loudest announcement this CLI makes — every future session
+  // on the machine reads it. This one was generated on a computer with no
+  // Terminals daemon (isolated HOME/XDG above), so it teaches nothing about
+  // mirroring a session that could not be mirrored here.
+  assert.ok(!/Mirror THIS session/.test(skill), 'no daemon here ⇒ no mirroring doctrine');
+  assert.ok(!/pidge terminal enable/.test(skill));
+  assert.match(skill, /## Full spec/, 'the section it replaces is the only thing that moved');
+});
+
+test('skill install — on a computer WITH Terminals the skill carries the mirroring doctrine', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-skill-term-'));
+  // Either half of "Terminals lives here" is enough — this seeds the daemon config.
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-skill-xdg-'));
+  fs.mkdirSync(path.join(xdg, 'pidge', 'terminal'), { recursive: true });
+  fs.writeFileSync(path.join(xdg, 'pidge', 'terminal', 'daemon.json'), JSON.stringify({ port: 8765, token: 'x' }));
+
+  const out = await runCli(['skill', 'install'], port, { XDG_CONFIG_HOME: xdg }, dir).result;
+  await mock.stop();
+
+  assert.equal(out.code, 0, `stderr: ${out.stderr}`);
+  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  assert.match(skill, /## Mirror THIS session to the human's phone/);
+  assert.match(skill, /is SUCCESS/, 'including that the DENIAL is the success signal');
 });
 
 // --- self-heal: the local skill self-heals (any pidge command refreshes a stale skill) ---
@@ -585,10 +610,10 @@ test('self-heal — a 0.15.2 marker-first install self-heals into the fixed in-f
   // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
   assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
   assert.ok(!/<!-- pidge-skill rev=/.test(healed), 'the old HTML-comment marker is gone (the end trailer is not it)');
-  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
   assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
   assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 21, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 22, manifest v16\)/, 'one stderr note');
 });
 
 test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
@@ -605,10 +630,10 @@ test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the loc
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
-  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 21, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 22, manifest v16\)/, 'one stderr note');
   // the heal also (re)writes the pidge-report companion — this is exactly how an
   // existing install GAINS the companion on a spine bump, with zero human action.
   const reportFile = path.join(path.dirname(path.dirname(file)), 'pidge-report', 'SKILL.md');
@@ -627,7 +652,7 @@ test('self-heal — a MANIFEST bump (server version > installed) self-heals the 
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
 });
@@ -637,7 +662,7 @@ test('self-heal — a FRESH skill (new-format marker current) is left byte-for-b
   const port = await mock.start();
   // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
   // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
-  const { dir, file } = seedNewSkill(21, 16, 'SENTINEL FRESH — keep me');
+  const { dir, file } = seedNewSkill(22, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -687,7 +712,7 @@ test('home self-heal — a STALE home skill self-heals even when there is NO pro
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(homeSkill, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'the home skill was regenerated to the current rev');
+  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'the home skill was regenerated to the current rev');
   assert.ok(!/STALE HOME DOCTRINE/.test(healed), 'the stale home doctrine was replaced by a real regeneration');
   assert.match(stderr, /refreshed your local Pidge skill/, 'the home heal narrated itself');
 });
@@ -707,8 +732,8 @@ test('home self-heal — BOTH project and home skills stale: both heal in one pa
   await mock.stop();
 
   assert.equal(code, 0, `stderr: ${stderr}`);
-  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=21 manifest=16/, 'home healed');
-  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=21 manifest=16/, 'project healed');
+  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=22 manifest=16/, 'home healed');
+  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=22 manifest=16/, 'project healed');
   assert.match(stderr, /2 locations incl\. ~\/\.claude/, 'the note reports BOTH locations were refreshed');
 });
 
@@ -717,7 +742,7 @@ test('home self-heal — a FRESH home skill is left byte-for-byte (no needless h
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homefresh-'));
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
-  seedSkillAt(homeSkill, 21, 'SENTINEL HOME — keep me'); // current rev
+  seedSkillAt(homeSkill, 22, 'SENTINEL HOME — keep me'); // current rev
   const original = fs.readFileSync(homeSkill, 'utf8');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj2-'));
 
@@ -763,7 +788,7 @@ test('atomic self-heal — a TORN write (marker intact, tail truncated) is detec
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A partial write that died after the frontmatter: rev/manifest read as CURRENT, so
   // without the trailer check this file looked "fresh" forever and never healed.
-  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=21 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
+  fs.writeFileSync(file, '---\nname: pidge\ndescription: Send rich stuff.\n# pidge-skill rev=22 manifest=16\n---\n\n# Pidge\n\nTRUNCATED MID-');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
   const { code, stderr } = await result;
@@ -792,7 +817,7 @@ test('atomic self-heal — "pidge-skill" in body PROSE is not the marker: a mark
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'a real marker was written by the heal');
+  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'a real marker was written by the heal');
   assert.ok(!/rev=99/.test(healed), 'the prose decoy is gone with the regeneration');
 });
 
@@ -810,7 +835,7 @@ test('atomic self-heal — 4 concurrent heals never tear the file (atomic tmp+re
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
   assert.equal((healed.match(/# pidge-skill rev=/g) || []).length, 1, 'exactly ONE marker — no interleaved halves');
-  assert.match(healed, /\n# pidge-skill rev=21 manifest=16\n/, 'a whole, current skill won');
+  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'a whole, current skill won');
   assert.match(healed.trimEnd(), /<!-- pidge-skill-end -->$/, 'the trailer closes the file — no torn tail');
   const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
   assert.deepEqual(leftovers, [], 'no tmp litter after concurrent heals');
@@ -1902,6 +1927,82 @@ test('subcommand help — `pidge --help` (no command) keeps the global overview;
   out = await runCli(['help', 'ask'], 1).result;
   assert.equal(out.code, 0);
   assert.match(out.stdout, /^pidge ask —/, '`pidge help <cmd>` is the focused form');
+});
+
+// --- the help only ANNOUNCES Terminals to a computer that installed it ------
+//
+// The commands never move: `pidge terminal …` typed on purpose still runs
+// everywhere, and its own help still answers. What is gated is the VOLUNTEERING
+// — a person who never installed the feature must not read about panes, mirrors
+// or Agent Sessions in the overview of a notification CLI. runCli already gives
+// every spawn a fresh XDG_CONFIG_HOME/HOME, so "no daemon" is the default here;
+// a slot is seeded by hand for the other half.
+
+// The vendored tree the service runs — one half of "Terminals lives here" (the
+// daemon config is the other; either one is enough).
+function seedDaemonSlot() {
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-slot-'));
+  const dir = path.join(xdg, 'pidge', 'terminal', 'cli', 'bin');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'pidge.js'), '#!/usr/bin/env node\n');
+  return xdg;
+}
+
+// The FEATURE, not the word: "in YOUR terminal", the `:terminal` custom-action
+// flag and the app's E2E "TERMINAL step" are shells and wire fields that survive
+// on every machine — only these say Terminals exists.
+const TERMINAL_MENTIONS = [/pidge terminal/, /Agent Sessions/i, /TERMINALS: share/, /tmux/i, /mirror(ing|ed|s)?\b/i];
+
+test('help — a computer with NO Terminals daemon is never told the feature exists', async () => {
+  const out = await runCli(['--help'], 1).result;
+  assert.equal(out.code, 0);
+  for (const re of TERMINAL_MENTIONS) {
+    assert.doesNotMatch(out.stdout, re, `the overview volunteers nothing about Terminals (${re})`);
+  }
+  // …and nothing ELSE was lost with it: the overview is the same document.
+  assert.match(out.stdout, /pidge setup --claim CODE/);
+  assert.match(out.stdout, /pidge update {2,}/, 'update is still listed — only its Terminals aside is gone');
+  assert.match(out.stdout, /pidge bridge --exec/);
+  assert.match(out.stdout, /Full spec \(the contract/);
+});
+
+test('help — with the daemon slot present the overview is the FULL one, Terminals block and all', async () => {
+  const out = await runCli(['--help'], 1, { XDG_CONFIG_HOME: seedDaemonSlot() }).result;
+  assert.equal(out.code, 0);
+  assert.match(out.stdout, /pidge terminal <sub> {2,}TERMINALS: share a tmux PANE/);
+  assert.match(out.stdout, /Run exactly this one bash command and nothing/, 'the enable recipe rides the block');
+  assert.match(out.stdout, /`terminal connect` nudges you here/, 'and the update line points back at it');
+});
+
+test('help — PIDGE_TERMINAL_HELP=1 forces the full overview on a machine with no daemon', async () => {
+  const out = await runCli(['--help'], 1, { PIDGE_TERMINAL_HELP: '1' }).result;
+  assert.equal(out.code, 0);
+  assert.match(out.stdout, /pidge terminal <sub> {2,}TERMINALS: share a tmux PANE/);
+  assert.match(out.stdout, /`terminal connect` nudges you here/);
+});
+
+test('help — the focused helps follow the same rule (update, setup), and `terminal --help` always answers', async () => {
+  let out = await runCli(['update', '--help'], 1).result;
+  assert.equal(out.code, 0);
+  assert.doesNotMatch(out.stdout, /terminal connect/, 'update stops naming a caller this computer does not have');
+  assert.match(out.stdout, /installs `pidge-cli@latest` globally/, 'the rest of its story is untouched');
+
+  out = await runCli(['setup', '--help'], 1).result;
+  assert.equal(out.code, 0);
+  assert.doesNotMatch(out.stdout, /--from-computer/, 'a derivation that needs a paired computer stays unadvertised');
+  assert.match(out.stdout, /--claim CODE/);
+
+  const xdg = seedDaemonSlot();
+  out = await runCli(['update', '--help'], 1, { XDG_CONFIG_HOME: xdg }).result;
+  assert.match(out.stdout, /`pidge terminal connect` runs the same check/);
+  out = await runCli(['setup', '--help'], 1, { XDG_CONFIG_HOME: xdg }).result;
+  assert.match(out.stdout, /--from-computer/);
+
+  // Typing the command IS knowing about it — its help never hides.
+  out = await runCli(['terminal', '--help'], 1).result;
+  assert.equal(out.code, 0);
+  assert.match(out.stdout, /^pidge terminal —/);
+  assert.match(out.stdout, /pidge terminal connect --code CODE/);
 });
 
 // The manifest-version nag is throttled to once / 24h (per-install cache).

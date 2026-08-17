@@ -24,6 +24,10 @@
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+// "Is Terminals installed here?" has exactly ONE implementation (src/terminals-installed).
+// This file needs the FACT — it decides whether to re-vendorize, which copies
+// files and restarts a service, so it must never read the text-only override.
+const { terminalPaths, daemonSlotPresent } = require('./terminals-installed');
 
 const PKG = 'pidge-cli';
 const REGISTRY_URL = `https://registry.npmjs.org/${PKG}/latest`;
@@ -79,24 +83,6 @@ async function latestVersion(timeoutMs = 5000) {
 }
 
 // --- the daemon's own copy (the slot the service actually runs) -------------
-
-// Required lazily: `pidge update` must keep working on a machine where the
-// terminal module is never touched, and this file is loaded by the version
-// nag on paths that have nothing to do with Agent Sessions.
-function terminalPaths() {
-  const core = require('./terminal/core');
-  const dir = path.join(core.terminalDir(), 'cli');
-  return { dir, entry: path.join(dir, 'bin', 'pidge.js'), daemonFile: core.DAEMON_FILE() };
-}
-
-// Is there a daemon on this machine at all? Either half is enough: the config
-// the service reads, or the vendored tree the service runs.
-function daemonSlotPresent() {
-  try {
-    const p = terminalPaths();
-    return fs.existsSync(p.daemonFile) || fs.existsSync(p.entry);
-  } catch { return false; }
-}
 
 // The version the SERVICE runs, which is the one that matters for a daemon fix.
 function slotVersion() {
@@ -174,10 +160,11 @@ async function runUpdate({
     ? `pidge update: installed ${PKG}@${latest} (was ${current || 'unknown'}) via ${cmd}.`
     : `pidge update: installed ${PKG}@latest (was ${current || 'unknown'}) via ${cmd}.`);
 
-  if (!hasDaemon()) {
-    say('  (no Agent Sessions daemon on this computer — only the global CLI was updated.)');
-    return { ok: true, ran: true, current, latest, slot: null, reVendored: false };
-  }
+  // No daemon here ⇒ the update has nothing to say about one. The global copy
+  // IS the whole install on this computer, and the line naming a feature this
+  // machine never installed was the CLI announcing Terminals to someone who
+  // never asked for it.
+  if (!hasDaemon()) return { ok: true, ran: true, current, latest, slot: null, reVendored: false };
 
   // The sanctioned re-vendorize: run the FRESHLY INSTALLED entry point's
   // `terminal connect`. That command owns the copy into the config slot and

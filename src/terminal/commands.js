@@ -537,7 +537,13 @@ function installPidgeSkill({ base, token }) {
   try {
     execFileSync(process.execPath, [entry, 'skill', 'install'], {
       cwd: home,
-      env: { ...process.env, PIDGE_URL: base, PIDGE_TOKEN: token, PIDGE_QUIET_NAG: '1' },
+      // PIDGE_TERMINAL_HELP=1: the generated skill only carries the mirroring
+      // section on a computer that has Terminals — and at THIS point in connect
+      // the daemon config does not exist yet (it is written a few steps below),
+      // so the child would look around, see nothing, and write the one skill
+      // that must not miss it. The override states the fact the child cannot
+      // observe yet: this computer is getting Terminals right now.
+      env: { ...process.env, PIDGE_URL: base, PIDGE_TOKEN: token, PIDGE_QUIET_NAG: '1', PIDGE_TERMINAL_HELP: '1' },
       stdio: ['ignore', 'ignore', 'pipe'],
       timeout: 60_000,
       encoding: 'utf8',
