@@ -1,0 +1,33 @@
+name: check-workflows
+
+# Static analysis of the workflows themselves (zizmor): unpinned actions,
+# over-broad GITHUB_TOKEN permissions, template injection, credential
+# persistence. CI that can publish deserves its own lint.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Findings are uploaded as SARIF to the repository's code-scanning tab.
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: run zizmor
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        with:
+          # Pinned rather than `latest`: a linter that gates merges is part of
+          # the supply chain too.
+          version: v1.29.0
+          inputs: .github/workflows
