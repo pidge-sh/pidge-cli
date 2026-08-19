@@ -7,6 +7,10 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only by default: nothing here writes to the repo or the registry.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -17,12 +21,19 @@ jobs:
         node: [18, 20, 22]
     name: node ${{ matrix.node }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Don't leave the job token in .git/config for later steps to reuse.
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
-          cache: npm
-      - run: npm ci
+          # No dependency cache: a poisoned cache entry is a supply-chain hole,
+          # and this tree has exactly one devDependency to fetch.
+          package-manager-cache: false
+      # --ignore-scripts: no dependency here needs a lifecycle script to install,
+      # so refuse to run any that a compromised release might add.
+      - run: npm ci --ignore-scripts
       # One file at a time, each under its own timeout: the TAP stream buffers a
       # whole file's output, so a single hung test reads as global silence — this
       # names the file (and its last lines) instead.
