@@ -35,9 +35,9 @@ const ROOT = path.join(__dirname, '..');
 
 // --- installed under an alias? ---------------------------------------------
 //
-// `npm i -g pidge` (or `@pidge/cli`) installs a thin alias package whose only
-// dependency is this one, so THIS copy then lives at
-// <global root>/pidge/node_modules/pidge-cli — nested, with the `pidge` bin
+// `npm i -g @pidge/cli` installs a thin alias package whose only dependency
+// is this one, so THIS copy then lives at
+// <global root>/@pidge/cli/node_modules/pidge-cli — nested, with the `pidge` bin
 // owned by the alias. Two things follow. The global install `update` normally
 // runs (`npm i -g pidge-cli@latest`) cannot work there: it tries to link a
 // second `pidge` bin over the alias's and npm refuses (EEXIST). And
@@ -45,7 +45,10 @@ const ROOT = path.join(__dirname, '..');
 // included. The copy that has to move is the NESTED one, in place — a local
 // install run in the alias's own folder, which touches neither the global
 // root nor the bin. The alias itself never needs to move: it carries no code.
-const ALIAS_NAMES = ['pidge', '@pidge/cli'];
+//
+// The scoped name is the only alias: the registry refuses a bare `pidge` as too
+// close to names that already exist, and that refusal applies to anyone.
+const ALIAS_NAMES = ['@pidge/cli'];
 function aliasInstall(root = ROOT) {
   let real = root;
   try { real = fs.realpathSync(root); } catch { /* not on disk: judge the path as given */ }

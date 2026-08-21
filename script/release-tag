@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Cut a release: tag the current main as v<package.json version> and push the
+# tag. The tag is what starts .github/workflows/publish.yml — nothing else does,
+# and no workflow creates tags. Run this yourself, on purpose, after the PR that
+# bumped the version has merged.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+[ "$branch" = main ] || { echo "release-tag: on '$branch', not main" >&2; exit 1; }
+[ -z "$(git status --porcelain)" ] || { echo "release-tag: the working tree is not clean" >&2; exit 1; }
+
+git fetch -q origin main --tags
+[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] \
+  || { echo "release-tag: main is not at origin/main — pull (or push) first" >&2; exit 1; }
+
+version=$(node -p "require('./package.json').version")
+tag="v$version"
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  echo "release-tag: $tag already exists — bump the version in package.json first" >&2; exit 1
+fi
+if npm view "pidge-cli@$version" version >/dev/null 2>&1; then
+  echo "release-tag: pidge-cli@$version is already on the registry" >&2; exit 1
+fi
+
+echo "release-tag: tagging $(git rev-parse --short HEAD) as $tag"
+git tag -a "$tag" -m "$version"
+git push origin "$tag"
+
+cat <<MSG
+
+$tag pushed. The publish workflow is running:
+  https://github.com/pidge-sh/pidge-cli/actions/workflows/publish.yml
+
+Next:
+  1. If the npm-publish Environment still requires a reviewer, approve the run there.
+  2. Approve pidge-cli@$version under "Staged Packages" on npmjs.com — this is the gate that matters.
+  3. Verify:  npm view pidge-cli@$version dist.attestations
+MSG

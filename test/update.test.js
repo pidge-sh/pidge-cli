@@ -244,19 +244,21 @@ test('update: the slot version is read from the vendored copy, and its absence i
   assert.equal(update.slotVersion(), null, 'a mangled slot reads as unknown — the doctor prints that, it does not crash');
 });
 
-// --- installed under an alias (`npm i -g pidge` / `@pidge/cli`) -------------
+// --- installed under an alias (`npm i -g @pidge/cli`) ----------------------
 
-const ALIAS = { name: 'pidge', dir: '/usr/local/lib/node_modules/pidge' };
+const ALIAS = { name: '@pidge/cli', dir: '/usr/local/lib/node_modules/@pidge/cli' };
 
-test('alias: detected ONLY at <root>/<alias>/node_modules/pidge-cli, for the two alias names', () => {
-  assert.deepStrictEqual(update.aliasInstall('/usr/local/lib/node_modules/pidge/node_modules/pidge-cli'), ALIAS);
+test('alias: detected ONLY at <root>/<alias>/node_modules/pidge-cli, for the alias name', () => {
+  assert.deepStrictEqual(update.aliasInstall('/usr/local/lib/node_modules/@pidge/cli/node_modules/pidge-cli'), ALIAS);
   assert.deepStrictEqual(update.aliasInstall('/opt/nm/node_modules/@pidge/cli/node_modules/pidge-cli'),
     { name: '@pidge/cli', dir: '/opt/nm/node_modules/@pidge/cli' });
   // plain global install, a project's own dependency, a stranger's dependency: none is an alias
   assert.strictEqual(update.aliasInstall('/usr/local/lib/node_modules/pidge-cli'), null);
   assert.strictEqual(update.aliasInstall('/home/me/project/node_modules/pidge-cli'), null);
   assert.strictEqual(update.aliasInstall('/usr/local/lib/node_modules/some-tool/node_modules/pidge-cli'), null);
-  assert.strictEqual(update.aliasInstall('/usr/local/lib/node_modules/pidge/node_modules/not-pidge-cli'), null);
+  assert.strictEqual(update.aliasInstall('/usr/local/lib/node_modules/@pidge/cli/node_modules/not-pidge-cli'), null);
+  // a bare `pidge` is not an alias name: the registry does not grant it
+  assert.strictEqual(update.aliasInstall('/usr/local/lib/node_modules/pidge/node_modules/pidge-cli'), null);
   // this checkout is not installed under anything
   assert.strictEqual(update.aliasInstall(), null);
 });
@@ -265,19 +267,19 @@ test('alias: on npm the refresh is a nested install IN PLACE — never a second 
   assert.deepStrictEqual(update.installArgv('npm', ALIAS),
     ['npm', ['--prefix', ALIAS.dir, 'i', '--no-save', '--no-package-lock', 'pidge-cli@latest']]);
   // other managers: re-add the alias; the version is read back afterwards
-  assert.deepStrictEqual(update.installArgv('pnpm', ALIAS), ['pnpm', ['add', '-g', 'pidge@latest']]);
-  assert.deepStrictEqual(update.installArgv('yarn', ALIAS), ['yarn', ['global', 'add', 'pidge@latest']]);
+  assert.deepStrictEqual(update.installArgv('pnpm', ALIAS), ['pnpm', ['add', '-g', '@pidge/cli@latest']]);
+  assert.deepStrictEqual(update.installArgv('yarn', ALIAS), ['yarn', ['global', 'add', '@pidge/cli@latest']]);
   // without an alias, nothing changed
   assert.deepStrictEqual(update.installArgv('npm'), ['npm', ['i', '-g', 'pidge-cli@latest']]);
-  assert.strictEqual(update.manualLine('npm', ALIAS), 'npm uninstall -g pidge && npm i -g pidge');
-  assert.strictEqual(update.manualLine('bun', ALIAS), 'bun remove -g pidge && bun add -g pidge');
+  assert.strictEqual(update.manualLine('npm', ALIAS), 'npm uninstall -g @pidge/cli && npm i -g @pidge/cli');
+  assert.strictEqual(update.manualLine('bun', ALIAS), 'bun remove -g @pidge/cli && bun add -g @pidge/cli');
   assert.match(update.manualLine('npm'), /npm i -g pidge-cli@latest/);
 });
 
 test('alias: the fresh entry point is the nested copy, found without asking the manager', () => {
   const root = tmp('pidge-alias-root-');
-  const dir = path.join(root, 'pidge');
-  const alias = { name: 'pidge', dir };
+  const dir = path.join(root, '@pidge', 'cli');
+  const alias = { name: '@pidge/cli', dir };
   let asked = 0;
   const capture = () => { asked++; return root; };
   assert.strictEqual(update.globalEntryPath('npm', capture, alias), null);
@@ -295,23 +297,23 @@ test('alias: a run under the alias refreshes in place, reads the version back, a
   const r = await update.runUpdate({ ...s.opts, alias: ALIAS, readInstalledVersion: () => '9.9.9' });
   assert.strictEqual(r.ok, true);
   assert.deepStrictEqual(s.runs, [`npm --prefix ${ALIAS.dir} i --no-save --no-package-lock pidge-cli@latest`]);
-  assert.match(s.said[0], /installed pidge-cli@9\.9\.9 .* \(under the pidge alias\)/);
+  assert.match(s.said[0], /installed pidge-cli@9\.9\.9 .* \(under the @pidge\/cli alias\)/);
 });
 
 test('alias: a refresh that leaves the nested copy behind is NOT reported as installed', async () => {
-  const s = scenario({ daemon: false, manager: 'pnpm', entry: '/x/pidge/node_modules/pidge-cli/bin/pidge.js' });
+  const s = scenario({ daemon: false, manager: 'pnpm', entry: '/x/@pidge/cli/node_modules/pidge-cli/bin/pidge.js' });
   const r = await update.runUpdate({ ...s.opts, alias: ALIAS, readInstalledVersion: () => '0.41.0' });
   assert.strictEqual(r.ok, false);
-  assert.deepStrictEqual(s.runs, ['pnpm add -g pidge@latest']);
+  assert.deepStrictEqual(s.runs, ['pnpm add -g @pidge/cli@latest']);
   assert.strictEqual(s.said.length, 0, 'no success line');
   assert.match(s.warned[0], /still 0\.41\.0 after the refresh/);
-  assert.match(s.warned[0], /pnpm remove -g pidge && pnpm add -g pidge/);
+  assert.match(s.warned[0], /pnpm remove -g @pidge\/cli && pnpm add -g @pidge\/cli/);
 });
 
 test('alias: a failed refresh points at reinstalling the ALIAS, not at `npm i -g pidge-cli`', async () => {
   const s = scenario({ daemon: false, installThrows: 'boom' });
   const r = await update.runUpdate({ ...s.opts, alias: ALIAS });
   assert.strictEqual(r.ok, false);
-  assert.match(s.warned[0], /npm uninstall -g pidge && npm i -g pidge/);
+  assert.match(s.warned[0], /npm uninstall -g @pidge\/cli && npm i -g @pidge\/cli/);
   assert.doesNotMatch(s.warned[0], /npm i -g pidge-cli@latest/);
 });
