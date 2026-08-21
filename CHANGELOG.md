@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.48.0 — 2026-08-21
+
+**`pidge update` understands an alias install.** `npm i -g pidge` (and
+`@pidge/cli`) installs a thin alias package whose only dependency is
+`pidge-cli`, so the CLI lives nested under the alias with the `pidge` bin owned
+by the alias. There, the old update path (`npm i -g pidge-cli@latest`) failed:
+npm refuses to link a second `pidge` bin over the alias's. The CLI now notices
+where it is installed and refreshes the nested copy in place — a local install
+in the alias's own folder, which touches neither the global root nor the bin —
+then reads the version back from disk before saying "installed". On a package
+manager whose global layout it does not know, it re-adds the alias and, if the
+nested copy did not move, says so and prints the reinstall line instead of a
+success line. A plain `npm i -g pidge-cli` install behaves exactly as before.
+
+The alias packages themselves live in `alias/` (source only; they are not part
+of the `pidge-cli` tarball) and require `pidge-cli >= 0.48.0`.
+
 ## 0.47.1 — 2026-08-17
 
 **The CLI only announces Terminals to a computer that installed it.** On a
