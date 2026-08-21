@@ -4,23 +4,28 @@
 
 Publishing is tag-driven. A `v*` tag runs `.github/workflows/publish.yml`, which
 builds and tests, then hands the tarball to npm as a *staged* publish; the
-maintainer approves it on npmjs.com. Nothing is published by a push to `main`.
+maintainer approves it on npmjs.com with their passkey. That approval is the
+human gate. Nothing is published by a push to `main`, and no workflow creates
+tags.
 
-The tag is created by the maintainer, from their own terminal, on purpose: it is
-the deliberate act that starts a release, and no workflow creates tags. So when a
-PR that bumps `version` in `package.json` merges, **remind the maintainer that
-the release is not out until they tag**, and point them at the helper:
+**The agent cuts the tag.** A change that should ship goes out as one PR that
+bumps `version` in `package.json` and adds the CHANGELOG entry (pick the bump:
+patch for fixes, minor for features). Once that PR is merged, the agent runs,
+from a checkout of `main`:
 
 ```sh
-script/release-tag   # checks main is clean and current and the version is unreleased; tags; pushes
+script/release-tag   # refuses unless main is clean and at origin/main and the version is untagged and unpublished; tags; pushes
 ```
 
-After the push: approve the `npm-publish` Environment in Actions if it still
-requires a reviewer, then approve the package under "Staged Packages" on
-npmjs.com. Then verify: `npm view pidge-cli version` and
+and then tells the maintainer the package is staged and waiting for their
+approval under "Staged Packages" on npmjs.com. If the `npm-publish` Environment
+still requires a reviewer, say so too — that click happens in the GitHub UI.
+
+Then verify and report: `npm view pidge-cli version` and
 `npm view pidge-cli@X.Y.Z dist.attestations`.
 
-Never create, move or delete a `v*` tag yourself.
+Never move or delete a `v*` tag; if a release run fails before publishing, the
+fix ships as the next patch version with a new tag.
 
 ## A release PR
 

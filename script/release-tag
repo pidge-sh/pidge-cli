@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Cut a release: tag the current main as v<package.json version> and push the
 # tag. The tag is what starts .github/workflows/publish.yml — nothing else does,
-# and no workflow creates tags. Run this yourself, on purpose, after the PR that
-# bumped the version has merged.
+# and no workflow creates tags. Run it after the PR that
+# bumped the version has merged; the human gate is the staged-publish approval on npmjs.com.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
