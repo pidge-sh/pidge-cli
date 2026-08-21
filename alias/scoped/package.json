@@ -1,0 +1,36 @@
+{
+  "name": "@pidge/cli",
+  "version": "1.0.0",
+  "description": "Alias for pidge-cli under the @pidge scope: installs and runs the same CLI.",
+  "keywords": [
+    "pidge",
+    "notifications",
+    "agent",
+    "cli",
+    "push",
+    "ai"
+  ],
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "pidge": "bin/pidge.js"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "pidge-cli": ">=0.48.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pidge-sh/pidge-cli.git"
+  }
+}
