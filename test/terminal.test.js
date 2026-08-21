@@ -31,7 +31,7 @@ const adapter = require('../src/terminal/adapter-claude');
 const commands = require('../src/terminal/commands');
 const { pairDropId } = require('../src/terminal/pairing');
 const {
-  Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_POLL_FAST_MS, DRAIN_KICK_FLOOR_MS, VIEWER_ACTIVE_WINDOW_MS,
+  Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_POLL_FAST_MS, DRAIN_KICK_FLOOR_MS, VIEWER_ACTIVE_WINDOW_MS, CMD_SEEN_RING,
   sameFileAsStdout,
 } = require('../src/terminal/daemon');
 
@@ -4180,12 +4180,12 @@ test('the daemon beats the computer presence every heartbeat — no payload, and
 
 test('caps ride every capabilities frame and report the epoch, the machine grants + os', () => {
   const d = computerDaemon();
-  assert.deepEqual(core.loadGrants(), { remote_spawn: false, inventory: true }, 'spawn OFF, inventory ON by default');
+  assert.deepEqual(core.loadGrants(), { remote_spawn: false, remote_capture: false, inventory: true }, 'spawn OFF, capture OFF, inventory ON by default');
   d.publishCaps('test');
   const [caps] = metaFrames(d);
   // The PINNED shape (§17) — iOS builds against exactly these keys.
   assert.deepEqual(Object.keys(caps).sort(),
-    ['epoch', 'hostname', 'inventory', 'kind', 'os', 'remote_spawn']);
+    ['epoch', 'hostname', 'inventory', 'kind', 'os', 'remote_capture', 'remote_spawn']);
   assert.equal(caps.kind, 'caps');
   // MANDATORY: with zero shared panes there is no agent_meta anywhere, so this
   // frame is the viewer's ONLY source for the `he` its first computer_req must
@@ -4193,15 +4193,17 @@ test('caps ride every capabilities frame and report the epoch, the machine grant
   assert.equal(caps.epoch, d.state.epoch);
   assert.ok(Number.isInteger(caps.epoch) && caps.epoch > 0);
   assert.equal(caps.remote_spawn, false);
+  assert.equal(caps.remote_capture, false);
   assert.equal(caps.inventory, true);
   assert.equal(typeof caps.hostname, 'string');
   assert.ok(['macos', 'linux', 'wsl'].includes(caps.os), `unexpected os ${caps.os}`);
 
-  core.saveGrants({ remote_spawn: true, inventory: false });
+  core.saveGrants({ remote_spawn: true, remote_capture: true, inventory: false });
   d.ws.sent.length = 0;
   d.publishCaps('after the flip');
   const [caps2] = metaFrames(d);
   assert.equal(caps2.remote_spawn, true);
+  assert.equal(caps2.remote_capture, true);
   assert.equal(caps2.inventory, false);
 });
 
@@ -4498,6 +4500,14 @@ test('capture + kill_share ride the same queue, and both narrate what happened',
   await mock.start();
   try {
     const d = await drainDaemon(mock);
+    // Without the grant a capture is REFUSED out loud, acked, and shares nothing.
+    mock.state.messages.push(cmdRow(d, 20, 'cmd-20', { op: 'capture', pane_id: '%8' }));
+    await withTmuxAsync({ panes: [pane('%8')] }, () => d.drainOnce());
+    assert.equal(d.sessions.size, 0, 'nothing is shared without remote_capture');
+    assert.ok(metaFrames(d).some((f) => /REFUSED a remote capture of pane %8.*remote_capture on/.test(f.text || '')));
+    assert.deepEqual(mock.state.ackBodies.at(-1), { ids: [20] });
+    core.saveGrants({ remote_capture: true });
+    d.ws.sent.length = 0;
     mock.state.messages.push(cmdRow(d, 21, 'cmd-21', { op: 'capture', pane_id: '%8' }));
     await withTmuxAsync({ panes: [pane('%8')] }, () => d.drainOnce());
     const share = [...d.sessions.values()][0];
@@ -4535,7 +4545,7 @@ test('the drain leaves rows it cannot open ALONE, and runs a re-served command e
   await mock.start();
   try {
     const d = await drainDaemon(mock);
-    core.saveGrants({ remote_spawn: true });
+    core.saveGrants({ remote_spawn: true, remote_capture: true });
     // A human's composer message (or another lane's row): not ours to eat.
     mock.state.messages.push({ id: 31, kind: 'message', body: 'hello from the app' });
     mock.state.messages.push(cmdRow(d, 32, 'cmd-32', { op: 'capture', pane_id: '%3' }));
@@ -4723,6 +4733,7 @@ test('config: the grants default OFF/ON, flip on disk, and print in plain words'
     await commands.runTerminal('config', {}, []);
     assert.ok(lines.some((l) => /Remote spawn from your phone: OFF \(enable: pidge terminal config remote_spawn on\)/.test(l)), JSON.stringify(lines));
     assert.ok(lines.some((l) => /Pane inventory to your phone: ON \(disable: pidge terminal config inventory off\)/.test(l)));
+    assert.ok(lines.some((l) => /Remote capture of any pane from your phone: OFF \(enable: pidge terminal config remote_capture on\)/.test(l)));
 
     lines.length = 0;
     await commands.runTerminal('config', {}, ['remote_spawn', 'on']);
@@ -4733,7 +4744,12 @@ test('config: the grants default OFF/ON, flip on disk, and print in plain words'
 
     lines.length = 0;
     await commands.runTerminal('config', {}, ['inventory', 'off']);
-    assert.deepEqual(core.loadGrants(), { remote_spawn: true, inventory: false });
+    assert.deepEqual(core.loadGrants(), { remote_spawn: true, remote_capture: false, inventory: false });
+
+    lines.length = 0;
+    await commands.runTerminal('config', {}, ['remote_capture', 'on']);
+    assert.ok(lines.some((l) => /Remote capture of any pane from your phone: ON \(disable: pidge terminal config remote_capture off\)/.test(l)));
+    assert.deepEqual(core.loadGrants(), { remote_spawn: true, remote_capture: true, inventory: false });
   } finally { console.log = realLog; }
 });
 
@@ -4750,7 +4766,7 @@ test('config: a junk key or a junk value refuses loudly and changes nothing', as
   } finally { console.error = realErr; process.exit = realExit; }
   assert.ok(errs.some((e) => /unknown setting "sudo"/.test(e)), JSON.stringify(errs));
   assert.ok(errs.some((e) => /pass `on` or `off`/.test(e)));
-  assert.deepEqual(core.loadGrants(), { remote_spawn: false, inventory: true }, 'a refusal never half-applies');
+  assert.deepEqual(core.loadGrants(), { remote_spawn: false, remote_capture: false, inventory: true }, 'a refusal never half-applies');
 });
 
 // ===========================================================================
@@ -4826,4 +4842,26 @@ test('sameFileAsStdout answers by device+inode, never by how the path is spelled
   assert.equal(sameFileAsStdout(file, fs.statSync(dir)), false, 'a directory is not a file sink');
   assert.equal(sameFileAsStdout(path.join(dir, 'missing.log'), asStdout), false,
     'a target we cannot stat KEEPS the echo — going quiet on a doubt is the worse failure');
+});
+
+test('the durable lane refuses a row OLDER than anything a full ring remembers — the one replay membership can no longer catch', async () => {
+  const mock = createMock();
+  await mock.start();
+  try {
+    const d = await drainDaemon(mock);
+    core.saveGrants({ remote_capture: true });
+    // A full ring of newer ids: the oldest command this computer remembers is 5000.
+    for (let i = 5000; i < 5000 + CMD_SEEN_RING; i++) d.handledCmdIds.add(i);
+    mock.state.messages.push(cmdRow(d, 4321, 'cmd-4321', { op: 'capture', pane_id: '%3' }));
+    await withTmuxAsync({ panes: [pane('%3')] }, () => d.drainOnce());
+    assert.equal(d.sessions.size, 0, 'acked, never run');
+    assert.ok(metaFrames(d).some((f) => /dropped queue row 4321: older than any command/.test(f.text || '')));
+    assert.deepEqual(mock.state.ackBodies.at(-1), { ids: [4321] });
+
+    // A ring that is NOT full has no floor: it still remembers everything it ever ran.
+    d.handledCmdIds.delete(5000 + CMD_SEEN_RING - 1);
+    mock.state.messages.push(cmdRow(d, 4322, 'cmd-4322', { op: 'capture', pane_id: '%3' }));
+    await withTmuxAsync({ panes: [pane('%3')] }, () => d.drainOnce());
+    assert.equal(d.sessions.size, 1, 'a ring with room vouches by membership alone');
+  } finally { await mock.stop(); }
 });

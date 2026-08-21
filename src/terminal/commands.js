@@ -287,6 +287,10 @@ async function runConnect(v) {
   const code = v.code || null;
   const base = (v.url || 'https://api.pidge.sh').replace(/\/$/, '');
   const secretRaw = process.env.PIDGE_SECRET || v.secret || null;
+  if (!process.env.PIDGE_SECRET && v.secret) {
+    // argv is readable by every process of this user (`ps`) and by shell history.
+    console.error('pidge terminal connect: --secret rides argv, which `ps` and your shell history can read — next time prefer PIDGE_SECRET=… in the environment.');
+  }
   const existing = core.loadTerminalEnv();
 
   // §24.2.1 — the two pairing doors must not half-mix: --qr mints its own key
@@ -1195,8 +1199,9 @@ async function runEnable(v) {
 //
 // The grants live ON THE MACHINE because that is where the risk lives: typing
 // into a pane the human already shared is consented by the share itself, but
-// SPAWNING a pane and LISTING every pane create new surface with zero
-// machine-side act. Defaults: remote_spawn OFF, inventory ON.
+// SPAWNING a pane, CAPTURING one nobody here shared and LISTING every pane
+// create new surface with zero machine-side act. Defaults: remote_spawn OFF,
+// remote_capture OFF, inventory ON.
 async function runConfig(args) {
   const [key, value] = args || [];
   if (!key) {

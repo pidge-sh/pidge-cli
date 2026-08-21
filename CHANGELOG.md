@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.49.0 — 2026-08-21
+
+**Capturing a pane from the phone now needs a grant.** `pidge terminal config
+remote_capture on|off` (default **OFF**) decides whether the phone may share a
+pane nobody on this computer shared — the same door `remote_spawn` already has,
+because a captured pane is a live input surface. A capture without the grant is
+refused out loud (the notice names the line that opens it) and acked, never run.
+The capabilities frame carries `remote_capture` next to `remote_spawn` and
+`inventory`; `connect`, `status` and bare `config` print all three. If you
+capture from the phone today, run that line once after updating.
+
+Also:
+
+- The durable command lane (`spawn`, `capture`, `kill_share`) remembers the last
+  1000 handled rows instead of 200 and, once full, refuses any row older than the
+  oldest it remembers — a relay re-serving an ancient genuine command is acked
+  and dropped, never re-run.
+- An attachment url off this server is fetched only over https to a public host.
+  Other schemes, credentials in the url and internal addresses (loopback,
+  link-local, private ranges, cloud metadata) are refused with a precise
+  `e2e_error`, and nothing is written.
+- `pidge terminal connect --secret` warns that argv is readable by `ps` and shell
+  history, and points at `PIDGE_SECRET` in the environment.
+
 ## 0.48.1 — 2026-08-21
 
 **Release pipeline only; the CLI is unchanged from 0.48.0** (which never reached

@@ -571,3 +571,29 @@ test('a 0-byte file at the cache path is NOT trusted — catchup re-downloads', 
   assert.equal(row.attachment.path, dest);
   assert.deepEqual(fs.readFileSync(dest), plain, 'the real plaintext replaced the 0-byte husk');
 });
+
+test('listen: an attachment url off this server is fetched only over https to a public host — other schemes, credentials and internal addresses are refused, nothing written', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-att-url-'));
+  mock.state.messages = [
+    sealedAttachmentRow(mock, { id: 61, cid: 'cid-u-1', extra: { url: 'http://169.254.169.254/latest/meta-data/' } }),
+    sealedAttachmentRow(mock, { id: 62, cid: 'cid-u-2', extra: { url: 'https://10.0.0.7/blobs/a1' } }),
+    sealedAttachmentRow(mock, { id: 63, cid: 'cid-u-3', extra: { url: 'file:///etc/passwd' } }),
+    sealedAttachmentRow(mock, { id: 64, cid: 'cid-u-4', extra: { url: 'https://user:pw@cdn.example/blobs/a1' } }),
+  ];
+
+  const { code, stdout, stderr } = await runCli(
+    ['listen', '--no-realtime', '--timeout', '20', '--interval', '1'],
+    port, { PIDGE_SECRET: SECRET }, xdg);
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const out = JSON.parse(stdout);
+  assert.equal(out.length, 4);
+  for (const o of out) {
+    assert.match(o.e2e_error, /attachment url/, `row ${o.id}: ${o.e2e_error}`);
+    assert.equal(o.attachment.path, undefined);
+  }
+  assert.ok(!fs.existsSync(path.join(xdg, 'pidge', 'downloads')), 'no downloads dir, no file');
+});

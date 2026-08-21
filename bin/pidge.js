@@ -717,7 +717,7 @@ const USAGE_TERMINAL = `  pidge terminal <sub>                    TERMINALS: sha
                                                              the tool — no PATH, no picker, no sid.
                                           share              share THIS pane (run it inside the pane)
                                           config K on|off    what the phone may do to this computer:
-                                                             remote_spawn (default OFF) · inventory (ON)
+                                                             remote_spawn (OFF) · remote_capture (OFF) · inventory (ON)
                                           enable             a CONFIRMATION of the above (never the door)
                                           doctor             does this computer read a LIVE agent AS an
                                                              agent? run it on the machine, with claude up
@@ -1145,7 +1145,7 @@ const HELP = {
   },
   terminal: {
     summary: 'Terminals: share a tmux pane with the phone — a Claude session as structured, E2E-sealed conversation data (typed replies come back into it), or a plain terminal pane.',
-    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon] [--replace]  ·  pidge terminal connect --qr (computer-first: scan from the app, type back the code)  ·  pidge terminal share (inside a pane)  ·  pidge terminal config [remote_spawn|inventory] [on|off]  ·  pidge terminal enable (confirm)  ·  pidge terminal disable [--session SID|--all] | status | doctor | disconnect',
+    usage: 'pidge terminal connect --code CODE [--url BASE] [--yes] [--no-daemon] [--replace]  ·  pidge terminal connect --qr (computer-first: scan from the app, type back the code)  ·  pidge terminal share (inside a pane)  ·  pidge terminal config [remote_spawn|remote_capture|inventory] [on|off]  ·  pidge terminal enable (confirm)  ·  pidge terminal disable [--session SID|--all] | status | doctor | disconnect',
     body: [
       'The user runs claude inside tmux — that is their ENTIRE responsibility. `connect` (once per computer) pairs with the phone: the app\'s Settings → Computers → Connect a computer mints a tunnel channel + E2E key and shows a one-liner carrying the claim code + PIDGE_SECRET; paste it in a terminal. It asks consent, installs Claude Code hooks (tagged `# pidge-hook`, cleanly removable), refreshes the Pidge skill, copies this CLI to ~/.config/pidge/terminal/cli (so the service never points into a prunable npx cache) and installs a background daemon (launchd on macOS, `systemd --user` on Linux/WSL; a WSL without systemd gets a detached daemon + the line that makes it durable).',
       '',
@@ -1155,7 +1155,7 @@ const HELP = {
       '',
       'THE UNIT IS A PANE, not a session. `pidge terminal share`, typed INSIDE any tmux pane, shares that pane with the phone (it matches its own tty against `#{pane_tty}` — no guessing); if claude is running there it shares as an agent view, otherwise as a terminal. When claude starts in (or exits from) a shared pane the share STAYS — same row, same history, the view just switches. The daemon holds ONE always-on socket while this computer is connected, so the phone sees it online with zero shared panes.',
       '',
-      'WHAT THE PHONE MAY DO TO THIS COMPUTER IS GRANTED HERE, and printed in plain words by `connect` and `status`: `pidge terminal config remote_spawn on|off` (default OFF — spawn a new pane, optionally running claude, from the phone) and `pidge terminal config inventory on|off` (default ON — answer the phone\'s on-demand pane list, sealed and never stored). Bare `pidge terminal config` prints both. Typing into a pane you already shared needs no grant: the share IS the consent. Spawn and inventory create new surface with no act on this machine, so the grant lives where the risk lives.',
+      'WHAT THE PHONE MAY DO TO THIS COMPUTER IS GRANTED HERE, and printed in plain words by `connect` and `status`: `pidge terminal config remote_spawn on|off` (default OFF — spawn a new pane, optionally running claude, from the phone), `pidge terminal config remote_capture on|off` (default OFF — let the phone share a pane nobody here shared, which makes it a live input surface) and `pidge terminal config inventory on|off` (default ON — answer the phone\'s on-demand pane list, sealed and never stored). Bare `pidge terminal config` prints all three. Typing into a pane you already shared needs no grant: the share IS the consent. Spawn, capture and inventory create new surface with no act on this machine, so the grant lives where the risk lives.',
       '',
       'E2E is mandatory (the transcript contains everything); the server relays sealed blobs it can never read. `disable` stops one share; `disconnect` = disable --all + uninstall hooks + daemon.',
     ].join('\n'),
@@ -2198,6 +2198,39 @@ async function e2eOpenContinuityContexts(contexts) {
   }));
 }
 
+// An attachment url comes off the wire. Relative ⇒ this server. Absolute ⇒
+// http(s) only, and off this server it must be https to a public host: a
+// hostile or confused server must not turn this CLI into a probe of the
+// network it sits on (cloud metadata, a printer, the daemon's own loopback).
+function attachmentUrl(u, base = BASE) {
+  if (typeof u !== 'string' || !u) throw new Error('attachment url is missing');
+  if (u.startsWith('/')) return `${base}${u}`;
+  let url;
+  try { url = new URL(u); } catch { throw new Error(`attachment url is neither a path on this server nor an absolute http(s) url: ${u}`); }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error(`attachment url scheme ${url.protocol} refused — http(s) only`);
+  if (url.username || url.password) throw new Error('attachment url carries credentials — refused');
+  let baseOrigin = null;
+  try { baseOrigin = new URL(base).origin; } catch { /* an unparsable BASE vouches for nothing */ }
+  if (baseOrigin && url.origin === baseOrigin) return url.href;
+  if (url.protocol !== 'https:') throw new Error(`attachment url off this server must be https (got ${url.origin})`);
+  if (isInternalHost(url.hostname)) throw new Error(`attachment url points at an internal address (${url.hostname}) — refused`);
+  return url.href;
+}
+function isInternalHost(h) {
+  const host = String(h || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '0.0.0.0') return true;
+  const v4 = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+  }
+  if (host.includes(':')) {
+    return host === '::' || host === '::1' || host.startsWith('::ffff:') || /^f[cd]/.test(host) || /^fe[89ab]/.test(host);
+  }
+  return false;
+}
+
 // you→agent: one message's attachment. A SEALED one ({enc:"v1"} on the
 // block) is ALWAYS downloaded + unsealed to a local file — its signed URL
 // serves ciphertext, useless to an agent otherwise; the plaintext lands at
@@ -2217,9 +2250,8 @@ async function e2eProcessAttachment(m, out, fail, dl = {}) {
   // rows; existence for sealed, whose plaintext size ≠ the ciphertext byte_size).
   const noDownload = !!dl.noDownload;
   const skipIfExists = !!dl.skipIfExists;
-  const absUrl = (u) => (typeof u === 'string' && u.startsWith('/') ? `${BASE}${u}` : u);
   const download = async () => {
-    const res = await fetchT(absUrl(att.url));
+    const res = await fetchT(attachmentUrl(att.url));
     if (!(res.status >= 200 && res.status < 300)) throw new Error(`download answered ${res.status}`);
     return Buffer.from(await res.arrayBuffer());
   };
