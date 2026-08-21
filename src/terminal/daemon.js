@@ -128,8 +128,12 @@ const DRAIN_POLL_FAST_MS = DRAIN_KICK_FLOOR_MS;
 const VIEWER_ACTIVE_WINDOW_MS = 180_000;
 // Commands whose outcome is durable on this computer (a spawned pane) must not
 // be re-run when an ack is lost (#39 is at-least-once) — the handled ids ride
-// state.json, bounded.
-const CMD_SEEN_RING = 200;
+// state.json, bounded. This lane is deliberately NOT epoch-bound (a command
+// posted while the daemon restarts must still run), so the ring is also the
+// only replay defense against a relay re-serving a genuine old row: it is wide,
+// and once full, anything OLDER than the oldest id it remembers is refused in
+// drainOnce — queue ids only grow, so older-than-everything can only be a replay.
+const CMD_SEEN_RING = 1000;
 // Occupant polling (§16) rides the existing 400 ms tail tick but is throttled:
 // one `tmux list-panes` per second answers for EVERY bound pane, and 2.5 execs
 // a second forever is a battery cost with no product gain.
@@ -375,6 +379,15 @@ class Daemon {
       // open a second window after a restart.
       cmdIds: [...this.handledCmdIds].slice(-CMD_SEEN_RING),
     });
+  }
+
+  // Only meaningful once the ring is full: until then it remembers EVERY id it
+  // ever ran, and membership alone answers "seen before?".
+  isOlderThanRing(id) {
+    if (this.handledCmdIds.size < CMD_SEEN_RING) return false;
+    let oldest = Infinity;
+    for (const n of this.handledCmdIds) if (n < oldest) oldest = n;
+    return Number(id) < oldest;
   }
 
   noteHandledCmd(id) {
@@ -2031,7 +2044,9 @@ class Daemon {
   }
 
   // The capabilities frame (PINNED shape — iOS builds against it, spec §17):
-  // {kind:"caps", epoch, remote_spawn, inventory, hostname, os}.
+  // {kind:"caps", epoch, remote_spawn, remote_capture, inventory, hostname, os}.
+  // `remote_capture` is additive: a viewer that predates it ignores the key and
+  // simply hears the refusal when it asks.
   //
   // `epoch` is MANDATORY and it is the reason this frame is re-published on
   // every viewer_joined: with ZERO shared panes there is no agent_meta anywhere
@@ -2045,6 +2060,7 @@ class Daemon {
       kind: 'caps',
       epoch: this.state.epoch,
       remote_spawn: grants.remote_spawn,
+      remote_capture: grants.remote_capture,
       inventory: grants.inventory,
       hostname: os.hostname(),
       os: core.computerOs(),
@@ -2333,6 +2349,14 @@ class Daemon {
         ackIds.push(row.id);
         continue;
       }
+      if (this.isOlderThanRing(row.id)) {
+        // Older than everything the ring remembers: a relay re-serving an
+        // ancient genuine row, which the ring can no longer vouch against by
+        // membership. Acked so it stops re-serving; run never; said out loud.
+        this.narrateComputer(`dropped queue row ${row.id}: older than any command this computer remembers — acked, not run`);
+        ackIds.push(row.id);
+        continue;
+      }
       try {
         await this.runComputerCommand(cmd, row);
       } catch (e) {
@@ -2430,6 +2454,12 @@ class Daemon {
 
   async cmdCapture(cmd) {
     const paneId = typeof cmd.pane_id === 'string' ? cmd.pane_id : null;
+    if (!core.loadGrants().remote_capture) {
+      // Same shape as the spawn refusal: narrated, and it names the line that
+      // opens the door. A captured pane is a live input surface nobody on this
+      // machine chose to share — that is a machine-side decision, not the phone's.
+      return this.narrateComputer(`REFUSED a remote capture of pane ${paneId || '(no pane_id)'}: this computer does not grant it. Turn it on here with \`pidge terminal config remote_capture on\`.`);
+    }
     const out = await this.shareExistingPane(paneId, { by: 'your phone' });
     if (!out.ok) return this.narrateComputer(`could not capture ${paneId || '(no pane_id)'}: ${out.error}`);
     this.narrateComputer(`captured pane ${out.pane_id}${out.loc ? ` (${out.loc})` : ''} as ${out.public_id} in ${out.mode} mode`);
@@ -3091,5 +3121,5 @@ function stripPrivate(item) {
 // felt latency of a command posted from the phone.
 module.exports = {
   Daemon, HEARTBEAT_MS, DRAIN_POLL_MS, DRAIN_POLL_FAST_MS, DRAIN_KICK_FLOOR_MS, VIEWER_ACTIVE_WINDOW_MS,
-  sameFileAsStdout,
+  CMD_SEEN_RING, sameFileAsStdout,
 };

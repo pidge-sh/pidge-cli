@@ -371,28 +371,33 @@ function saveTerminalEnv({ base, token, secret, channelId }) {
 // --- capability grants (v2 Phase A, spec §17 + decisions §22.2/§22.3) -------
 //
 // Input into a pane the human already shared is command execution — that risk
-// is consented by the share itself. `spawn` and `inventory` are different in
-// kind: they create NEW surface with ZERO machine-side act, so the grant lives
-// where the risk lives (on the machine), is stated in plain words at connect
-// time, and rides every capabilities frame so the phone renders only what was
-// actually granted. Defaults: remote_spawn OFF, inventory ON.
-const GRANT_KEYS = ['remote_spawn', 'inventory'];
-const GRANT_DEFAULTS = { remote_spawn: false, inventory: true };
+// is consented by the share itself. `spawn`, `capture` and `inventory` are
+// different in kind: they create NEW surface with ZERO machine-side act, so the
+// grant lives where the risk lives (on the machine), is stated in plain words
+// at connect time, and rides every capabilities frame so the phone renders only
+// what was actually granted. `capture` is the strongest of the three — it turns
+// a pane nobody here shared into a live input surface — so it is gated exactly
+// like spawn. Defaults: remote_spawn OFF, remote_capture OFF, inventory ON.
+const GRANT_KEYS = ['remote_spawn', 'remote_capture', 'inventory'];
+const GRANT_DEFAULTS = { remote_spawn: false, remote_capture: false, inventory: true };
 
 function loadGrants() {
   const cfg = readJson(CONFIG_FILE(), null) || {};
-  // Read STRICTLY: only a literal `true` opens remote_spawn, only a literal
-  // `false` closes inventory. A junk/absent file is the documented default,
-  // never an accident that grants something.
+  // Read STRICTLY: only a literal `true` opens remote_spawn or remote_capture,
+  // only a literal `false` closes inventory. A junk/absent file is the
+  // documented default, never an accident that grants something.
   return {
     remote_spawn: cfg.remote_spawn === true,
+    remote_capture: cfg.remote_capture === true,
     inventory: cfg.inventory !== false,
   };
 }
 
 function saveGrants(changes) {
   const next = { ...loadGrants(), ...changes };
-  writeJson(CONFIG_FILE(), { remote_spawn: !!next.remote_spawn, inventory: !!next.inventory });
+  writeJson(CONFIG_FILE(), {
+    remote_spawn: !!next.remote_spawn, remote_capture: !!next.remote_capture, inventory: !!next.inventory,
+  });
   return loadGrants();
 }
 
@@ -403,6 +408,8 @@ function grantLines(grants = loadGrants()) {
   return [
     `Remote spawn from your phone: ${grants.remote_spawn ? 'ON' : 'OFF'} ` +
       `(${grants.remote_spawn ? 'disable: pidge terminal config remote_spawn off' : 'enable: pidge terminal config remote_spawn on'})`,
+    `Remote capture of any pane from your phone: ${grants.remote_capture ? 'ON' : 'OFF'} ` +
+      `(${grants.remote_capture ? 'disable: pidge terminal config remote_capture off' : 'enable: pidge terminal config remote_capture on'})`,
     `Pane inventory to your phone: ${grants.inventory ? 'ON' : 'OFF'} ` +
       `(${grants.inventory ? 'disable: pidge terminal config inventory off' : 'enable: pidge terminal config inventory on'})`,
   ];
