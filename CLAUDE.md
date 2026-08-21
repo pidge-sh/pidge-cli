@@ -10,11 +10,11 @@ tags.
 
 **The agent cuts the tag.** A change that should ship goes out as one PR that
 bumps `version` in `package.json` and adds the CHANGELOG entry (pick the bump:
-patch for fixes, minor for features). Once that PR is merged, the agent runs,
-from a checkout of `main`:
+patch for fixes, minor for features). Once that PR is merged, the agent runs it
+from any checkout (it tags `origin/main`):
 
 ```sh
-script/release-tag   # refuses unless main is clean and at origin/main and the version is untagged and unpublished; tags; pushes
+script/release-tag   # refuses unless the version is untagged and unpublished; tags origin/main; pushes
 ```
 
 and then tells the maintainer the package is staged and waiting for their
