@@ -107,7 +107,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          tarball=$(ls dist/*.tgz)
+          # Absolute path on purpose: a relative `dist/x.tgz` is parsed by npm as
+          # the GitHub shorthand `owner/repo`, not as a file. `./x` or `/x` is a file.
+          tarball=$(ls "$PWD"/dist/*.tgz)
           test -f "$tarball" || { echo "::error::no tarball in the artifact"; exit 1; }
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
           echo "publishing $tarball"
