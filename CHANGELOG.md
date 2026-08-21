@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.48.1 — 2026-08-21
+
+**Release pipeline only; the CLI is unchanged from 0.48.0** (which never reached
+the registry). The publish job handed npm the tarball as `dist/<name>.tgz`, and
+npm reads a relative path with a slash as the GitHub shorthand `owner/repo`, so
+the publish failed before uploading anything. The path is now absolute.
+
 ## 0.48.0 — 2026-08-21
 
 **`pidge update` understands an alias install.** `npm i -g pidge` (and
