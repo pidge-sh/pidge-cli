@@ -1,7 +1,7 @@
 'use strict';
-// The alias packages under alias/ (`pidge`, `@pidge/cli`): a manifest whose only
+// The alias package under alias/ (`@pidge/cli`): a manifest whose only
 // dependency is pidge-cli and a bin that spawns the real entry point. What is
-// checked here is the contract a consumer of `npm i -g pidge` relies on — the
+// checked here is the contract a consumer of `npm i -g @pidge/cli` relies on — the
 // same CLI, the same exit codes, the real version — against THIS tree, by
 // standing the alias up in a scratch prefix with pidge-cli linked where npm
 // would have nested it.
@@ -15,7 +15,6 @@ const { spawnSync } = require('node:child_process');
 
 const ROOT = path.join(__dirname, '..');
 const ALIASES = [
-  { dir: 'pidge', name: 'pidge' },
   { dir: 'scoped', name: '@pidge/cli' },
 ];
 const pkg = require(path.join(ROOT, 'package.json'));
@@ -26,7 +25,7 @@ const env = { ...process.env, HOME, XDG_CONFIG_HOME: tmp('pidge-alias-xdg-'), PI
 
 function readJson(p) { return JSON.parse(fs.readFileSync(p, 'utf8')); }
 
-test('alias: both manifests point the same bin name at a bin that depends only on pidge-cli', () => {
+test('alias: the manifest points the `pidge` bin at a bin that depends only on pidge-cli', () => {
   for (const a of ALIASES) {
     const m = readJson(path.join(ROOT, 'alias', a.dir, 'package.json'));
     assert.strictEqual(m.name, a.name);
@@ -40,11 +39,10 @@ test('alias: both manifests point the same bin name at a bin that depends only o
   }
 });
 
-test('alias: the two bins are byte-identical — one implementation, two names', () => {
-  const [a, b] = ALIASES.map((x) => fs.readFileSync(path.join(ROOT, 'alias', x.dir, 'bin', 'pidge.js'), 'utf8'));
-  assert.strictEqual(a, b);
-  assert.match(a, /^#!\/usr\/bin\/env node\n/);
-  assert.doesNotMatch(a, /shell:\s*true/, 'the alias never routes argv through a shell');
+test('alias: the bin is a plain node script that never routes argv through a shell', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'alias', 'scoped', 'bin', 'pidge.js'), 'utf8');
+  assert.match(src, /^#!\/usr\/bin\/env node\n/);
+  assert.doesNotMatch(src, /shell:\s*true/);
 });
 
 test('alias: nothing under alias/ ships in the pidge-cli tarball', () => {
