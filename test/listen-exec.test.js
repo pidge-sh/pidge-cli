@@ -104,20 +104,105 @@ test('listen --exec: a FAILING handler acks NOTHING, prints handler_failed on ST
   const port = await mock.start();
   mock.state.messages = [{ id: 3, kind: 'message', body: 'trabalho', created_at: 'x' }];
 
+  // The handler ends MID-LINE (no trailing newline) on purpose: the teed
+  // output and the CLI's machine line would otherwise share one unparseable
+  // line — on the exact channel the agent parses.
   const r = await runCli(
-    ['listen', '--all', '--exec', `${process.execPath} -e "require('fs').readFileSync(0); process.exit(4)"`,
+    ['listen', '--all', '--exec', `${process.execPath} -e "require('fs').readFileSync(0); process.stdout.write('parcial sem newline'); process.exit(4)"`,
       '--no-realtime', '--timeout', '10', '--interval', '1'],
     port,
   ).result;
   await mock.stop();
 
   assert.equal(r.code, 2, `a failed handler is exit 2; stderr:\n${r.stderr}`);
-  const line = JSON.parse(r.stdout.trim().split('\n').pop());
+  const lines = r.stdout.split('\n').filter((l) => l.length);
+  assert.equal(lines[lines.length - 2], 'parcial sem newline', 'the handler\'s tail keeps its own line');
+  const line = JSON.parse(lines[lines.length - 1]); // parses ALONE — no glued prefix
   assert.equal(line.type, 'handler_failed', 'the failure comes out where the agent WAKES UP: stdout');
   assert.equal(line.exit, 4, 'the handler\'s own exit code rides along');
   assert.deepEqual(line.ids, [3], 'and the ids that were NOT acked');
   assert.equal(mock.state.ackBodies.length, 0, 'a failed handler must NEVER ack');
   assert.match(r.stderr, /NOTHING acked/, 'and the human line says so too');
+});
+
+// The other half of a green handler: the work happened and the ACK did not
+// land. The ack's return value used to be discarded, so the round exited 0 —
+// a green round over a queue that still holds the batch.
+test('listen --exec: a handler that exits 0 over a FAILED ack prints ack_failed and exits 2', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 11, kind: 'message', body: 'trabalho real', created_at: 'x' }];
+  mock.state.ackStatus = 503; // the ack does not land
+
+  const r = await runCli(
+    ['listen', '--all', '--exec', `${process.execPath} -e "require('fs').readFileSync(0); console.log('pidge-summary: fiz o trabalho')"`,
+      '--no-realtime', '--timeout', '10', '--interval', '1'],
+    port,
+  ).result;
+  await mock.stop();
+
+  assert.equal(r.code, 2, `an unacked round is NOT green; stderr:\n${r.stderr}`);
+  const line = JSON.parse(r.stdout.trim().split('\n').pop());
+  assert.equal(line.type, 'ack_failed', 'the agent wakes up on stdout, same as handler_failed');
+  assert.deepEqual(line.ids, [11], 'with the ids the server never marked done');
+  assert.match(r.stderr, /ACK did NOT land/, 'the human line says what happened');
+  assert.match(r.stderr, /pidge ack --ids 11/, 'and how to fix it by hand');
+});
+
+test('listen --exec: an ack that lands keeps the round green (exit 0, no ack_failed)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 12, kind: 'message', body: 'ok', created_at: 'x' }];
+
+  const r = await runCli(
+    ['listen', '--all', '--exec', `${process.execPath} -e "require('fs').readFileSync(0); console.log('pidge-summary: pronto')"`,
+      '--no-realtime', '--timeout', '10', '--interval', '1'],
+    port,
+  ).result;
+  await mock.stop();
+
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+  assert.ok(!/ack_failed/.test(r.stdout), 'no failure line on a round that really acked');
+  assert.deepEqual(mock.state.ackBodies, [{ ids: [12], summary: 'pronto' }]);
+});
+
+// The batch ack narrates what the SERVER did, not what we hoped: 0 acked rows
+// never get the green ✓✓ line, and an ack with no note says it will be filed
+// as drained instead of borrowing the good line.
+test('listen --exec: an ack the server processed ZERO rows for never prints the green line', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 21, kind: 'message', body: 'x', created_at: 'x' }];
+  mock.state.ackAcked = 0;
+
+  const r = await runCli(
+    ['listen', '--all', '--exec', `${process.execPath} -e "require('fs').readFileSync(0); console.log('pidge-summary: fiz')"`,
+      '--no-realtime', '--timeout', '10', '--interval', '1'],
+    port,
+  ).result;
+  await mock.stop();
+
+  assert.equal(r.code, 0, `the HTTP ack succeeded — the round still ends; stderr:\n${r.stderr}`);
+  assert.match(r.stderr, /acked 0 of 1 message/);
+  assert.ok(!/green ✓✓/.test(r.stderr), 'nothing was processed — nothing is green');
+});
+
+test('listen --exec: a note-LESS ack says DRAINED instead of promising a green ✓✓', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 22, kind: 'message', body: 'x', created_at: 'x' }];
+
+  const r = await runCli(
+    ['listen', '--all', '--exec', `${process.execPath} -e "require('fs').readFileSync(0)"`,
+      '--no-realtime', '--timeout', '10', '--interval', '1'],
+    port,
+  ).result;
+  await mock.stop();
+
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+  assert.match(r.stderr, /with NO note/);
+  assert.match(r.stderr, /DRAINED/);
+  assert.ok(!/green ✓✓/.test(r.stderr), 'the green promise belongs to acks that can say what happened');
 });
 
 test('listen --exec: a hung handler is SIGTERMed at --handler-timeout — no ack, handler_failed says timeout', async () => {
@@ -250,6 +335,10 @@ test('listen HOLDS the channel lock while it runs and releases it on the way out
   assert.match(b.stderr, /listen REFUSED/);
   assert.match(b.stderr, /LIVE consumer/);
   assert.match(b.stderr, /pidge catchup/, 'it points at the read-only alternative');
+  // The refusal must ALSO name the escape hatch — the EEXIST path has always
+  // had it, this one sent the reader to a dead end when the pid was a stranger.
+  assert.match(b.stderr, new RegExp(`rm "${lockPathFor(xdg).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`),
+    'the pre-check refusal carries the same rm escape hatch as the EEXIST one');
 
   // …and a BRIDGE under a live listen is refused the same way (symmetry)
   const c = await runCli(['bridge', '--exec', 'true', '--no-realtime'], port, { XDG_CONFIG_HOME: xdg }).result;
@@ -278,6 +367,80 @@ test('listen releases the lock on the DELIVERED path too (exit 0), so the next r
   await mock.stop();
   assert.equal(r2.code, 0, `the relaunch must not meet its own corpse; stderr:\n${r2.stderr}`);
   assert.match(r2.stdout, /de novo/);
+});
+
+// Ctrl-C / SIGTERM kills Node WITHOUT running the 'exit' hook, so every
+// interrupted listen used to leave a corpse lock behind.
+for (const [sig, expected] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+  test(`listen releases the lock on ${sig} and exits ${expected} (the shell's own convention)`, async () => {
+    const mock = createMock();
+    const port = await mock.start();
+    const xdg = tmpDir('pidge-listen-sig-');
+
+    const a = runCli(['listen', '--no-realtime', '--timeout', '60', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg });
+    assert.ok(await waitFor(() => fs.existsSync(lockPathFor(xdg))), 'the listener took the lock');
+    a.child.kill(sig);
+    const r = await a.result;
+    await mock.stop();
+
+    assert.equal(r.code, expected, `stderr:\n${r.stderr}`);
+    assert.match(r.stderr, new RegExp(`${sig}: released the consumer lock`));
+    assert.ok(!fs.existsSync(lockPathFor(xdg)), 'no corpse lock left behind for the next listener to fight');
+  });
+}
+
+// A pid is not an identity: pids wrap. A lock naming a REUSED pid looked alive
+// forever and locked every listen out of the channel until a human deleted it.
+test('a REUSED pid is a corpse, not a live consumer — the start time settles it', async (t) => {
+  if (process.platform !== 'linux' || !fs.existsSync(`/proc/${process.pid}/stat`)) return t.skip('needs /proc');
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = tmpDir('pidge-listen-reuse-');
+  fs.mkdirSync(path.join(xdg, 'pidge'), { recursive: true });
+  // A pid that IS alive (this very test process) but whose recorded start time
+  // belongs to the process that died and gave the number up.
+  fs.writeFileSync(lockPathFor(xdg), JSON.stringify({
+    pid: process.pid, proc_started_at: '1', started_at: 'x', label: 'long-dead-bridge',
+  }) + '\n');
+
+  mock.state.messages = [{ id: 55, kind: 'message', body: 'oi', created_at: 'x' }];
+  const r = await runCli(['listen', '--no-realtime', '--timeout', '10', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg }).result;
+  await mock.stop();
+  assert.equal(r.code, 0, `a reused pid must not wedge the channel; stderr:\n${r.stderr}`);
+  assert.match(r.stderr, /STALE lock/);
+});
+
+test('the SAME live process is still refused — the start time matches, so the holder is real', async (t) => {
+  if (process.platform !== 'linux' || !fs.existsSync(`/proc/${process.pid}/stat`)) return t.skip('needs /proc');
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = tmpDir('pidge-listen-live-');
+  fs.mkdirSync(path.join(xdg, 'pidge'), { recursive: true });
+  const stat = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8');
+  const started = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[19];
+  fs.writeFileSync(lockPathFor(xdg), JSON.stringify({
+    pid: process.pid, proc_started_at: started, started_at: 'x', label: 'very-much-alive',
+  }) + '\n');
+
+  const r = await runCli(['listen', '--no-realtime', '--timeout', '5'], port, { XDG_CONFIG_HOME: xdg }).result;
+  await mock.stop();
+  assert.equal(r.code, 2, `stderr:\n${r.stderr}`);
+  assert.match(r.stderr, /listen REFUSED/);
+  assert.match(r.stderr, /very-much-alive/);
+});
+
+test('a listen WRITES its own start time into the lock, so the next one can tell it apart', async (t) => {
+  if (process.platform !== 'linux' || !fs.existsSync(`/proc/${process.pid}/stat`)) return t.skip('needs /proc');
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = tmpDir('pidge-listen-stamp-');
+  const a = runCli(['listen', '--no-realtime', '--timeout', '10', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg });
+  assert.ok(await waitFor(() => fs.existsSync(lockPathFor(xdg))));
+  const lock = JSON.parse(fs.readFileSync(lockPathFor(xdg), 'utf8'));
+  a.child.kill('SIGTERM');
+  await a.result;
+  await mock.stop();
+  assert.match(String(lock.proc_started_at), /^\d+$/, 'the lock pins the pid to THIS process');
 });
 
 test('a CRASHED listener (dead pid) never wedges the channel — the next one claims the corpse', async () => {

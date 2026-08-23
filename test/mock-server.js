@@ -24,6 +24,7 @@ function createMock() {
     messages: [],          // served by GET /api/v1/messages
     messageReads: [],      // every GET /api/v1/messages req.url (assert catchup's history=true&all=true)
     notifications: {},     // cid → body for GET /api/v1/notifications/:cid
+    pollStatus: 200,       // a test forces a non-200 on that poll (401 = rotated key)
     inboxNotifications: [], // rows for GET /api/v1/notifications (the list)
     inboxSummary: null,     // body for GET /api/v1/inbox/summary (null → default zeros)
     acks: [],
@@ -50,6 +51,13 @@ function createMock() {
     notifyStatus: 201,       // a test forces a non-2xx to exercise approve's fail-closed send
     selftests: {},           // id → {nonce, window_seconds, created, processed}
     selftestSeq: 100,        // next selftest/message id
+    // A REAL consumer (some other process) picking the nonce up and acking it
+    // after N ms. The CLI never acks its own nonce any more, so this is the
+    // only way a selftest PASSES — which is the point of the test.
+    selftestAckedAfterMs: null,
+    // a test forces a non-200 on GET /selftest/:id — the verdict READ fails,
+    // which says nothing about the listener and must not be blamed on it.
+    selftestStatus: 200,
     // the /live_activities wire.
     liveWrites: [],          // every {method, path, body} the CLI sent
     liveCards: {},           // cid → true (existence drives started|updated + PATCH 404)
@@ -72,6 +80,12 @@ function createMock() {
     provenance: null,           // whoami provenance{} (null ⇒ omitted)
     consumeConflict: null,      // GET /messages consumer_conflict (null ⇒ omitted)
     ackAnnotated: 0,            // POST /ack annotated count
+    // POST /ack failure injection: a non-2xx status (the ack that doesn't
+    // land), and the `acked` count the server reports — 0 models "the server
+    // took the call and processed NOTHING" (a sibling mid-batch, rows already
+    // processed), which must never render as a green ✓✓.
+    ackStatus: 200,
+    ackAcked: 1,
     // execution attribution (runs). runsSupported:false makes every /runs
     // endpoint 404 (models an OLD server → the CLI degrades silently).
     runsSupported: true,
@@ -302,6 +316,8 @@ function createMock() {
         if (state.hangAck) return; // simulate a wedged proxy stalling the ack POST
         // state=delivered RENEWS the lease (not consumed); else PROCESS it.
         if (p.state === 'delivered') return json(res, 200, { renewed: 1 });
+        // the ack that does NOT land: the rows stay queued and re-serve.
+        if (state.ackStatus !== 200) return json(res, state.ackStatus, { error: 'nope' });
         // mark an acked selftest PROCESSED (the round-trip PASS signal). ids
         // acks just those; up_to (no ids) processes + clears the whole queue.
         const ackedIds = Array.isArray(p.ids) ? p.ids : state.messages.map((mm) => mm.id);
@@ -310,7 +326,7 @@ function createMock() {
         // `annotated` = rows a prior consumer acked
         // without a note that THIS ack filled in. 0 by default (models nothing to
         // annotate / an older server the CLI treats identically — no narration).
-        json(res, 200, { acked: 1, annotated: state.ackAnnotated, ...(state.ackSkipped ? { skipped: state.ackSkipped } : {}) });
+        json(res, 200, { acked: state.ackAcked, annotated: state.ackAnnotated, ...(state.ackSkipped ? { skipped: state.ackSkipped } : {}) });
       });
       return;
     }
@@ -459,6 +475,9 @@ function createMock() {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end('{{{ not json');
       }
+      // a test forces a status on the POLL itself (401 = the key was rotated
+      // mid-wait — a wall, not a timeout).
+      if (state.pollStatus && state.pollStatus !== 200) return json(res, state.pollStatus, { error: 'unauthorized' });
       const cid = decodeURIComponent(m[1]);
       // messages_pending mirrors prod: PRESENT-ONLY, and only when the caller
       // opted in (wake_on_message=true) AND a composer row sits deliverable
@@ -486,6 +505,15 @@ function createMock() {
         // dropSelftest: the nonce never reaches the queue (simulates an orphaned/
         // unreachable listener or a transport that drops it) → the CLI FAILs with cause.
         if (!state.dropSelftest) state.messages.push({ id, kind: 'system', system_kind: 'selftest', nonce, body: `selftest nonce=${nonce}` });
+        // Somebody else is listening: they take the nonce off the queue and ack
+        // it, exactly as a live `pidge listen`/`bridge` would.
+        if (state.selftestAckedAfterMs != null) {
+          const t = setTimeout(() => {
+            state.selftests[id].processed = true;
+            state.messages = state.messages.filter((mm) => mm.id !== id);
+          }, state.selftestAckedAfterMs);
+          if (t.unref) t.unref();
+        }
         json(res, 201, { id, status: 'pending', nonce, window_seconds: windowS, expires_at: new Date(Date.now() + windowS * 1000).toISOString() });
       });
       return;
@@ -611,6 +639,7 @@ function createMock() {
     }
     const stMatch = url.pathname.match(/^\/api\/v1\/selftest\/(\d+)$/);
     if (req.method === 'GET' && stMatch) {
+      if (state.selftestStatus !== 200) return json(res, state.selftestStatus, { error: 'boom' });
       const st = state.selftests[stMatch[1]];
       if (!st) return json(res, 404, { error: 'not_found' });
       const status = st.processed ? 'passed'

@@ -216,23 +216,31 @@ async function runUpdate({
     warn(`pidge update: ${cmd} ${args.join(' ')} failed (${e.message}).\n  Install it yourself:  ${manualLine(manager, alias)}`);
     return { ok: false, ran: true, current, latest, slot: null };
   }
-  // Under an alias, read the nested copy back: on npm the in-place install is
-  // exact, but a re-added alias on another manager may keep the nested copy it
-  // already had, and "installed" must never be said over a version that did
-  // not move.
-  if (alias) {
-    const entry = resolveGlobalEntry(manager, capture, alias);
-    const got = entry ? readInstalledVersion(entry) : null;
-    if (!got || (latest && isOlder(got, latest))) {
-      warn(`pidge update: the copy under the ${alias.name} alias is still ${got || 'unknown'} after the refresh.\n  Reinstall the alias:  ${manualLine(manager, alias)}`);
-      return { ok: false, ran: true, current, latest, slot: null };
-    }
+  // Read the installed copy BACK — alias or not. An exit code 0 from a package
+  // manager is not a version on disk: a cached tarball, a half-finished
+  // install, a prefix that isn't the one on PATH all exit 0 and leave the old
+  // copy exactly where it was, and "installed 9.9.9" over that is this command
+  // lying about the single fact it exists to deliver. The alias path has always
+  // verified (a re-added alias can keep its nested copy); the plain path
+  // trusted the exit code and said "installed" either way.
+  const verifyEntry = resolveGlobalEntry(manager, capture, alias);
+  const verified = verifyEntry ? readInstalledVersion(verifyEntry) : null;
+  // A copy we READ that did not move is a failure. Under an alias an
+  // unreadable copy is one too — the nested copy is at a path we know, so not
+  // finding it there IS the known alias failure.
+  if ((verified && latest && isOlder(verified, latest)) || (alias && !verified)) {
+    warn(alias
+      ? `pidge update: the copy under the ${alias.name} alias is still ${verified || 'unknown'} after the refresh.\n  Reinstall the alias:  ${manualLine(manager, alias)}`
+      : `pidge update: ${cmd} exited 0, but the copy on disk still reads ${verified} — not ${latest}.\n  Install it yourself:  ${manualLine(manager, alias)}`);
+    return { ok: false, ran: true, current, latest, slot: null };
   }
-  const installed = latest || 'latest';
+  const installed = verified || latest || 'latest';
   const where = alias ? ` (under the ${alias.name} alias)` : '';
-  say(latest
-    ? `pidge update: installed ${PKG}@${latest} (was ${current || 'unknown'}) via ${cmd}${where}.`
-    : `pidge update: installed ${PKG}@latest (was ${current || 'unknown'}) via ${cmd}${where}.`);
+  // No entry to read (bun has no global-root verb; a manager that can't be
+  // asked) is not evidence of failure — and not proof either. Say what is
+  // known instead of announcing a version nobody read back.
+  if (verified) say(`pidge update: installed ${PKG}@${verified} (was ${current || 'unknown'}) via ${cmd}${where}.`);
+  else say(`pidge update: ran ${cmd}${where} (was ${current || 'unknown'}) — the installed copy couldn't be read back, so the version is UNCONFIRMED. Check it with \`pidge --version\`.`);
 
   // No daemon here ⇒ the update has nothing to say about one. The global copy
   // IS the whole install on this computer, and the line naming a feature this
@@ -244,7 +252,7 @@ async function runUpdate({
   // `terminal connect`. That command owns the copy into the config slot and
   // the service recycle — doing either by hand here would be a second
   // implementation of the install, free to drift from the real one.
-  const entry = resolveGlobalEntry(manager, capture, alias);
+  const entry = verifyEntry; // the same copy we just read back — resolved once
   if (!entry) {
     warn(`pidge update: the new global copy could not be located, so the daemon still runs its old vendored copy (${readSlotVersion() || 'unknown version'}).\n  Finish it by hand:  pidge terminal connect --yes`);
     return { ok: false, ran: true, current, latest, slot: readSlotVersion(), reVendored: false };
