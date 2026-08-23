@@ -3318,7 +3318,12 @@ function markAckNoticeSeen() {
 function reportDeviceReach(data) {
   const reach = data.device_reach;
   if (!reach) return false;
-  console.error(`pidge: reach — ${reach.deliverable}/${reach.total} device(s) will actually receive a push (${reach.apns_environment} APNs)`);
+  // Three counts, three meanings — name them, or the human reads two denominators
+  // in one output: `devices` (the headline above) counts PUSHABLE registrations;
+  // reach.total counts EVERY registration incl. push-disabled ones; deliverable
+  // is what a real push lands on. Say total explicitly so 3 pushable / 3-of-6
+  // deliverable stops reading as a contradiction.
+  console.error(`pidge: reach — ${reach.deliverable} of ${reach.total} registered device(s) (incl. push-disabled/old ones) will actually receive a push (${reach.apns_environment} APNs)`);
   if (reach.total > reach.deliverable)
     console.error(`pidge: WARNING — ${reach.total - reach.deliverable} registered device(s) are UNREACHABLE (disabled, or on the wrong APNs environment): a send lands on ${reach.deliverable}, not ${reach.total} ("você pensa que alcança ${reach.total}, alcança ${reach.deliverable}").`);
   return reach.total > 0 && reach.deliverable === 0;
@@ -5342,7 +5347,7 @@ The banner shows your **\`--title\`** and **\`--body\`** (plain text). **\`--bod
 
 ## Approval has two paths — know which one you're in
 
-**Path A — YOU request it (\`pidge approval\`).** You decided this needs a human sign-off. \`pidge approval\` = \`important\` + an **Approve** (Face-ID gated) / **Reject** pair + \`--wait\`. You send it, you block, and you get \`chosen_action.action_id: "grant"\` (approved) or \`"deny"\` (rejected) back. Use it for money, deletions, irreversible actions.
+**Path A — YOU request it (\`pidge approval\`).** You decided this needs a human sign-off. \`pidge approval\` = \`important\` + an **Approve** (Face-ID gated) / **Reject** pair + \`--wait\`. You send it, you block, and you get \`chosen_action.action_id: "grant"\` (approved) or \`"deny"\` (rejected) back. Use it for money, deletions, irreversible actions. **The line vs a plain \`important --actions yes,no --wait\`:** approval buys the Face-ID ceremony at the cost of a detail-only banner (the human must OPEN the app to answer). Money and destruction earn the ceremony; a risky-but-operational go/no-go the human should answer from the lock screen is better served by \`important\` + \`yes,no\` — pick by whether a mis-tap would be catastrophic, not by how nervous you are.
 
 **Path B — your HUMAN requires it (a profile knob).** In the app, the human can turn ON **"Require approval · Face ID"** on any profile (the \`ack_requires_biometric\` knob — **OFF by default everywhere**). When it's ON for, say, \`important\`, then **every ordinary send on that profile silently becomes an Approve-with-Face-ID decision** — even a plain \`pidge important\` with no buttons. The server injects a single \`approve\` action, so the send reads back \`actions:["approve"], requires_action:true, acknowledgeable:false\`, the banner is detail-only, and **the human's tap reaches you as \`chosen_action.action_id: "approve"\`** (poll / webhook / \`pidge listen --all\`). You didn't ask — they imposed it.
 
@@ -5393,7 +5398,7 @@ that's a separate \`important\` at the end.
 2. **Default to \`important\`.** \`message\` only for true no-action FYIs; \`urgent\` is a contract, not a volume knob — **<1/day**, abuse caps your channel.
 3. **There is no content-template menu.** Every send is type + markdown + optional buttons. If you're reaching for \`--template context/report/digest/sensitive\`, stop — that surface is gone (the field still parses as silent back-compat, but don't teach or rely on it).
 4. **Typed answer? \`--actions reply\` ALONE** — never a decision + \`reply\` together (the CLI refuses it, exit 1).
-5. **Trust the 201 echo over your intent** — \`degraded\`/\`render_mode\`/\`registered_devices\`. \`registered_devices:0\` ⇒ it went nowhere; ABORT a blocking \`--wait\` on it (kill it, don't let it burn its timeout) and run \`pidge doctor\`.
+5. **Trust the 201 echo over your intent** — \`degraded\`/\`render_mode\`/\`registered_devices\`/\`nobody_listening\`. \`registered_devices:0\` ⇒ it went nowhere; ABORT a blocking \`--wait\` on it (kill it, don't let it burn its timeout) and run \`pidge doctor\`. \`nobody_listening:true\` on a send that expects an answer ⇒ no consumer will hear it land — your cue to go online right after sending.
 6. **Don't spam to signal importance.** Consolidate into one markdown body; use \`--collapse-key\` for self-replacing progress, \`--thread\` only for follow-ups over time.
 7. **Be listening when the answer lands — the queue keeps it safe (at-least-once, nothing is ever lost), but nobody wakes you until something reads it. What you lose is TIME, not the message.** Ack only AFTER the work is durably done.
 8. **Write to your human in THEIR language — mirror the language they use in the channel.** Phone-friendly markdown: narrow tables (they render), no emoji-spam.
@@ -5466,6 +5471,12 @@ ${notes.map((n) => `- ${n}`).join('\n')}
 - **A pending notification's answer does NOT surface in plain \`pidge listen\`** (messages only).
   To collect the answer to a question you already sent: \`pidge wait <cid>\` (you printed the cid
   on stderr at send time) or \`pidge listen --all\` (replies + messages). Park the cid, never re-send.
+- **An answer you collected via \`--wait\` ALSO sits in the messages queue, un-acked.** The wait
+  gives you the answer; the queue keeps its mirror row until an ack closes it — your next
+  \`listen --all\` re-hands it to you (stderr calls it OLD backlog) and \`doctor\` counts it. Ack it
+  with the rest of the round; under \`--exec\` the batch ack covers it. And \`listen --timeout\` is a
+  MAX-IDLE, not a session window: any queued item returns the round immediately — "stay online
+  3 minutes" means RELAUNCH until 3 minutes have passed, never one 180 s call.
 - **\`--wait\` is still NOT "being online."** It hears the composer only WHILE it blocks; between waits nothing reads the queue. Guiding a human step-by-step? Run \`pidge listen --all\` (or \`pidge online\`) as the primary loop, or \`pidge catchup --since <cursor>\` between steps. \`pidge doctor\` counts composer messages piling up un-acked.
 - ${exits} (a \`human_message\` return is also exit 0)
 
@@ -5538,7 +5549,7 @@ On newer servers the batch may also carry a read-only \`continuity\` array — t
 
 So the human can tell ONE continuous session apart from three disposable cold ones, sign your messages with an **execution attribution run**:
 
-- **At the start of an interactive session:** \`eval "$(pidge run start --mode interactive --role main --label <your-agent-name>)"\`. This sets \`PIDGE_RUN_TOKEN\`/\`PIDGE_RUN_SEAL\` in your env; every \`pidge\` call you make afterward is stamped with that execution, so each message shows WHO spoke.
+- **At the start of an interactive session:** \`eval "$(pidge run start --mode interactive --role main --label <your-agent-name>)"\`. This sets \`PIDGE_RUN_TOKEN\`/\`PIDGE_RUN_SEAL\` in your env; every \`pidge\` call you make afterward is stamped with that execution, so each message shows WHO spoke. **Turn-based harness (shell state dies between tool calls)?** Persist it instead: \`pidge run start … > run.env\` once, then prefix every pidge call with \`. run.env &&\` — the eval-only recipe silently loses the attribution after your first tool call.
 - **Subagents / workers you spawn:** \`eval "$(pidge run start --mode interactive --role subagent --parent-seal $PIDGE_RUN_SEAL)"\` inside the child, so it signs as its own execution under yours.
 - **When you finish:** \`pidge run end\`.
 
