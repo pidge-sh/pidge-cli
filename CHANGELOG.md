@@ -46,6 +46,11 @@ Also:
   `pidge-summary:` scan, the stdout tee with backpressure, the timeout kill, the
   heartbeat and the lease renew) is now ONE implementation shared by `bridge` and
   `listen --exec`. Bridge behaviour is unchanged, line for line.
+- Realtime presence is now EARNED every 30 s: while a listen/wait holds the
+  ConversationChannel socket, the CLI sends a `beat` action the server (manifest
+  ≥112) requires to keep "listening now" lit — a frozen host (closed laptop lid,
+  suspended container) holds a socket fine but cannot beat, so its presence dies
+  in ~2 minutes (measured live: 150 s) instead of lying indefinitely. Older servers ignore the action.
 - Self-heal no longer DOWNGRADES a skill written by a newer CLI: a file whose spine
   rev outranks this binary's is left alone even when the server manifest moved
   (observed live: an old install "healed" a newer skill down a revision because the

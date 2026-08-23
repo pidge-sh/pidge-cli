@@ -1647,6 +1647,7 @@ function cableSubscribe({ channel, params = {}, onUp, onFrame, onDown, base = BA
   const die = (why) => {
     if (closed) return; closed = true;
     clearInterval(beatCheck);
+    if (appBeat) clearInterval(appBeat);
     try { ws.close(); } catch { /* already closing */ }
     onDown(why);
   };
@@ -1654,11 +1655,26 @@ function cableSubscribe({ channel, params = {}, onUp, onFrame, onDown, base = BA
     if (Date.now() - lastBeat > 15000) die('heartbeat lost (server gone?)');
   }, 5000);
   ws.onopen = () => ws.send(JSON.stringify({ command: 'subscribe', identifier }));
+  // Client-initiated liveness beat (server ≥ v112): the server refreshes
+  // "listening now" ONLY while the CLIENT proves it's alive — a frozen process
+  // (laptop lid, suspended container) keeps its TCP socket open, so the server's
+  // own timer used to keep the light on for a consumer that couldn't hear.
+  // Sent every 30 s once subscribed; an older server just logs and ignores it.
+  let appBeat = null;
+  const startAppBeat = () => {
+    if (appBeat) return;
+    appBeat = setInterval(() => {
+      if (ws.readyState === 1) {
+        try { ws.send(JSON.stringify({ command: 'message', identifier, data: JSON.stringify({ action: 'beat' }) })); } catch { /* dying socket — onclose handles it */ }
+      }
+    }, 30000);
+    if (appBeat.unref) appBeat.unref();
+  };
   ws.onmessage = (e) => {
     lastBeat = Date.now();
     let f; try { f = JSON.parse(e.data); } catch { return; }
     if (f.type === 'ping' || f.type === 'welcome') return;
-    if (f.type === 'confirm_subscription') { onUp && onUp(); return; }
+    if (f.type === 'confirm_subscription') { startAppBeat(); onUp && onUp(); return; }
     if (f.type === 'reject_subscription') { die('subscription rejected (bad token?)'); return; }
     if (f.identifier === identifier && f.message) onFrame(f.message);
   };
@@ -1667,7 +1683,7 @@ function cableSubscribe({ channel, params = {}, onUp, onFrame, onDown, base = BA
   // start with "socket" again (was "socket socket closed (1006)").
   ws.onclose = (e) => die(`closed (${e.code})`);
   return {
-    close: () => { closed = true; clearInterval(beatCheck); try { ws.close(); } catch { /* noop */ } },
+    close: () => { closed = true; clearInterval(beatCheck); if (appBeat) clearInterval(appBeat); try { ws.close(); } catch { /* noop */ } },
   };
 }
 
