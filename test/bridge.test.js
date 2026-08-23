@@ -880,3 +880,34 @@ test('bridge: the shared handler machinery still narrates as the BRIDGE', async 
   await result;
   await mock.stop();
 });
+
+// The realtime announcement used to LATCH: "realtime socket up (the human sees
+// 'ouvindo agora')" was printed once and never retracted, so a log could
+// promise live presence hours after the last socket died.
+test('bridge: a dropped realtime socket is narrated once, and a re-up re-announces', async (t) => {
+  if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
+  const mock = createMock();
+  const port = await mock.start();
+
+  const { child, result, out } = runCli(
+    ['bridge', '--exec', 'true', '--interval', '1'],
+    port, { PIDGE_BRIDGE_WS_RETRY: '300' },
+  );
+  assert.ok(await waitFor(() => /realtime socket up/.test(out.stderr)), `stderr:\n${out.stderr}`);
+
+  // the socket dies and stays dead for a beat
+  mock.state.wsMode = '1006';
+  for (const sock of [...mock.state.sockets]) { try { sock.terminate(); } catch { /* gone */ } }
+  assert.ok(await waitFor(() => /realtime socket DOWN/.test(out.stderr)), `the drop must be narrated; stderr:\n${out.stderr}`);
+  assert.match(out.stderr, /presence now rides the LONG-POLL only/);
+  assert.equal((out.stderr.match(/realtime socket DOWN/g) || []).length, 1, 'ONE line per outage, not one per socket');
+
+  // …and the recovery says so, instead of staying silent behind a stale latch
+  mock.state.wsMode = 'ok';
+  assert.ok(await waitFor(() => (out.stderr.match(/realtime socket up/g) || []).length >= 2),
+    `a re-up must re-announce; stderr:\n${out.stderr}`);
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
+});

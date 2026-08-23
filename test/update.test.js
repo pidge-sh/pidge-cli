@@ -30,6 +30,9 @@ const update = require('../src/update');
 function scenario({
   current = '0.41.0', latest = '9.9.9', manager = 'npm',
   daemon = true, slotBefore = '0.41.0', slotAfter = null, entry = '/usr/local/lib/node_modules/pidge-cli/bin/pidge.js',
+  // what the copy on disk reads back AFTER the install — the update verifies
+  // it now instead of trusting the manager's exit code (see the readback tests).
+  installedAfter = null,
   installThrows = null, revendorThrows = null,
 } = {}) {
   const runs = [];
@@ -53,6 +56,7 @@ function scenario({
     hasDaemon: () => daemon,
     readSlotVersion: () => slot,
     resolveGlobalEntry: () => entry,
+    readInstalledVersion: () => (installedAfter === null ? latest : installedAfter),
     say: (m) => said.push(m),
     warn: (m) => warned.push(m),
   };
@@ -61,7 +65,7 @@ function scenario({
 
 // --- the global install itself (no daemon in the picture) -------------------
 
-test('update: it INVOKES the package manager and reports the version it moved to', async () => {
+test('update: it INVOKES the package manager and reports the version it READ BACK', async () => {
   const runs = [];
   const said = [];
   const r = await update.runUpdate({
@@ -70,6 +74,8 @@ test('update: it INVOKES the package manager and reports the version it moved to
     current: '0.41.0',
     manager: 'npm',
     hasDaemon: () => false,
+    resolveGlobalEntry: () => '/usr/local/lib/node_modules/pidge-cli/bin/pidge.js',
+    readInstalledVersion: () => '9.9.9',
     say: (m) => said.push(m),
     warn: (m) => said.push(m),
   });
@@ -78,6 +84,40 @@ test('update: it INVOKES the package manager and reports the version it moved to
   assert.equal(r.ok, true);
   assert.equal(r.ran, true);
   assert.match(said.join('\n'), /installed pidge-cli@9\.9\.9 \(was 0\.41\.0\)/);
+});
+
+// The plain path used to claim "installed X" from the exit code alone, while
+// the alias path read the copy back. Same standard for both now: a manager
+// exiting 0 over an unmoved copy is the lie this closes.
+test('update: a plain install that did NOT move the copy on disk is not reported as installed', async () => {
+  const warns = [];
+  const said = [];
+  const r = await update.runUpdate({
+    run: () => {}, fetchLatest: async () => '9.9.9', current: '0.41.0', manager: 'npm',
+    hasDaemon: () => false,
+    resolveGlobalEntry: () => '/usr/local/lib/node_modules/pidge-cli/bin/pidge.js',
+    readInstalledVersion: () => '0.41.0', // npm exited 0; nothing moved
+    say: (m) => said.push(m), warn: (m) => warns.push(m),
+  });
+  assert.equal(r.ok, false, 'exit code 0 is not a version on disk');
+  assert.ok(!/installed pidge-cli@9\.9\.9/.test(said.join('\n')), 'it must never say "installed" over the old copy');
+  assert.match(warns.join('\n'), /still reads 0\.41\.0 — not 9\.9\.9/);
+  assert.match(warns.join('\n'), /Install it yourself/, 'and hands back the manual line');
+});
+
+test('update: a copy that cannot be read back is UNCONFIRMED, never an invented version', async () => {
+  const said = [];
+  const r = await update.runUpdate({
+    run: () => {}, fetchLatest: async () => '9.9.9', current: '0.41.0', manager: 'bun',
+    hasDaemon: () => false,
+    resolveGlobalEntry: () => null, // bun has no "print the global root" verb
+    readInstalledVersion: () => null,
+    say: (m) => said.push(m), warn: (m) => said.push(m),
+  });
+  assert.equal(r.ok, true, 'unverifiable is not the same as failed — the install may well be fine');
+  assert.match(said.join('\n'), /UNCONFIRMED/);
+  assert.match(said.join('\n'), /pidge --version/, 'it says how to check');
+  assert.ok(!/installed pidge-cli@9\.9\.9/.test(said.join('\n')), 'no version is announced that nobody read');
 });
 
 test('update: already current ⇒ no manager runs; a failed install is non-ok + the manual line', async () => {

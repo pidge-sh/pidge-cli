@@ -79,19 +79,156 @@ test('field report — a proxy DESTROYING held sockets degrades the same way (wa
   assert.match(stderr, /degraded to plain GETs/);
 });
 
-test('exit 4 — zero healthy round-trips all session must exit LOUD, with aggregated stderr', async () => {
+// The exit-4 contract is now CROSS-ROUND (the recommended loop is one round per
+// process, so a single dead 50 s window is a blip, not a verdict): a dead round
+// writes a streak file keyed by the token hash; exit 4 needs 3 dead rounds over
+// 2+ min, and the verdict names the right culprit via a GET /up probe — the
+// server answering means the CHANNEL/API path is broken; nothing answering
+// means the HOST is offline (which only escalates after ~10 min).
+function seedHealthLedger(dir, streak, firstAgoMs) {
+  const h = crypto.createHash('sha256').update('hld_test').digest('hex').slice(0, 16);
+  const file = path.join(dir, 'pidge', `health-${h}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ streak, first_at: Date.now() - firstAgoMs, last_at: Date.now() }));
+  return file;
+}
+
+test('one dead round with the host offline is a BLIP (exit 3, host-blame), not an escalation', async () => {
   const mock = createMock();
   const port = await mock.start();
-  await mock.stop(); // nothing listening — every request is a network error
+  await mock.stop(); // nothing listening — every request AND the /up probe fail
 
   const { result } = runCli(['listen', '--no-realtime', '--timeout', '4', '--interval', '1'], port);
   const { code, stderr } = await result;
 
-  assert.equal(code, 4, `stderr: ${stderr}`);
-  assert.match(stderr, /NOT ONE healthy round-trip/);
-  // Aggregation: one deafness note + one degrade note — never a line per attempt.
+  assert.equal(code, 3, `stderr: ${stderr}`);
+  assert.match(stderr, /HOST's network looks down/, 'the blame is local, not "the CHANNEL"');
+  assert.match(stderr, /dead round 1 of 3/, 'the streak is narrated');
   const deafLines = stderr.split('\n').filter((l) => /deaf for/.test(l));
   assert.ok(deafLines.length <= 2, `expected aggregated stderr, got:\n${stderr}`);
+});
+
+test('a streak of dead rounds with the server answering /up escalates: exit 4 blames the CHANNEL', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messagesStatus = 500; // the API path is broken, the server itself is up
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-health-'));
+  seedHealthLedger(dir, 2, 3 * 60000); // two prior dead rounds, first one 3 min ago
+
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '4', '--interval', '1'], port, { XDG_CONFIG_HOME: dir });
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 4, `stderr: ${stderr}`);
+  assert.match(stderr, /3 consecutive rounds/, 'the verdict counts the whole streak');
+  assert.match(stderr, /CHANNEL\/API path looks broken/, 'server up + API dead = channel blame');
+  assert.match(stderr, /Surface this to your human/);
+  const h = crypto.createHash('sha256').update('hld_test').digest('hex').slice(0, 16);
+  assert.ok(!fs.existsSync(path.join(dir, 'pidge', `health-${h}.json`)), 'an escalation resets the streak — the next one must be earned fresh');
+});
+
+test('a LONG host-offline streak still escalates, blaming the HOST — through the session, not pidge', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  await mock.stop();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-health-'));
+  seedHealthLedger(dir, 5, 11 * 60000); // dead for 11 minutes already
+
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '3', '--interval', '1'], port, { XDG_CONFIG_HOME: dir });
+  const { code, stderr } = await result;
+
+  assert.equal(code, 4, `stderr: ${stderr}`);
+  assert.match(stderr, /HOST is offline/, 'the culprit is named — never "the CHANNEL looks broken"');
+  assert.match(stderr, /through your own session/);
+});
+
+test('one healthy round-trip clears the persisted streak', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-health-'));
+  const file = seedHealthLedger(dir, 2, 3 * 60000);
+
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '2', '--interval', '1'], port, { XDG_CONFIG_HOME: dir });
+  const { code } = await result;
+  await mock.stop();
+
+  assert.equal(code, 3, 'healthy but silent = exit 3, as ever');
+  assert.ok(!fs.existsSync(file), 'the streak file is gone after a healthy round');
+});
+
+// A rotated/revoked key is a WALL, not a timeout. The 401 used to land in the
+// `else { health.ok() }` branch — the server answered, so the round counted as
+// healthy — and the session exited 3 "relaunch the listener", forever.
+test('listen — a 401 is named as a rotated key: loud, local, exit 2 (never a timeout)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messagesStatus = 401;
+
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '20', '--interval', '1'], port,
+    { PIDGE_BRIDGE_ALERT: '0' });
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 2, `a rejected key is exit 2, not 3/4; stderr: ${stderr}`);
+  assert.match(stderr, /REJECTED this channel key \(401\)/);
+  assert.match(stderr, /NOT a timeout/, 'it says what it is NOT — the confusion it exists to kill');
+  assert.match(stderr, /LOCAL ALERT/, 'only a human can fix it, so it alerts locally');
+  assert.match(stderr, /pidge setup --claim/, 'and names the fix');
+  assert.ok(!/relaunch the listener/i.test(stderr), 'never "relaunch" — relaunching hits the same wall');
+});
+
+test('wait — a 401 mid-wait is the same wall, exit 2', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.pollStatus = 403; // revoked
+
+  const { result } = runCli(['wait', 'cid-401', '--no-realtime', '--timeout', '20', '--interval', '1'], port,
+    { PIDGE_BRIDGE_ALERT: '0' });
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 2, `stderr: ${stderr}`);
+  assert.match(stderr, /REJECTED this channel key \(403\)/);
+  assert.match(stderr, /NOT a timeout/);
+});
+
+// Other 4xx answered too — but not with the round-trip the loop exists to
+// prove. They used to latch okEver and certify the channel as healthy.
+test('a non-auth 4xx never certifies the channel as healthy (no exit-3 "all fine" over it)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messagesStatus = 422;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-health4xx-'));
+  seedHealthLedger(dir, 2, 3 * 60000); // two dead rounds already
+
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '4', '--interval', '1'], port, { XDG_CONFIG_HOME: dir });
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 4, `a 4xx round is a DEAD round, not a healthy one; stderr: ${stderr}`);
+  assert.match(stderr, /CHANNEL\/API path looks broken/);
+});
+
+// "Healthy" has a shelf life: okEver was a latch, so one good round-trip at the
+// start of a long --follow window certified the channel hours later.
+test('a round-trip that is too OLD no longer certifies the channel (recency, not history)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-health-stale-'));
+  // One healthy read at the start (the queue answers 200, empty), then the API
+  // dies for the rest of the window. With a 1 ms freshness window that first
+  // round-trip is stale by the time the verdict runs, so the exit falls through
+  // to the CROSS-ROUND verdict instead of the "healthy, just quiet" line.
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '5', '--interval', '1'], port,
+    { XDG_CONFIG_HOME: dir, PIDGE_HEALTHY_WINDOW_MS: '1' });
+  setTimeout(() => { mock.state.messagesStatus = 500; }, 500);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 3, `one dead round is still a blip; stderr: ${stderr}`);
+  assert.match(stderr, /dead round 1 of 3/, 'the stale session is judged by the cross-round ledger');
+  assert.ok(!/= 'no answer yet', not a failure/.test(stderr),
+    'a round-trip from ten minutes ago must not certify the channel as healthy NOW');
 });
 
 test('exit 3 — a healthy but silent session is still just "no answer yet"', async () => {
@@ -458,6 +595,55 @@ test('doctor warns LOUD on 0 devices (sends reach nobody)', async () => {
   assert.match(stderr, /0 devices.*NOBODY/);
 });
 
+// "all good" printed over three ⚠️ lines is the doctor disagreeing with its own
+// output — and `{ok:true}` made a script agree with the summary, not the run.
+test('doctor — the verdict COUNTS the warnings it printed: never "all good" over a ⚠️', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.devices = 0;                 // warning: no_devices
+  mock.state.staleFromPriorClaim = true;  // warning: stale_prior_claim
+
+  const { result } = runCli(['doctor'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `warnings are not brokenness — still exit 0; stderr: ${stderr}`);
+  assert.match(stderr, /healthy — 2 warning\(s\) above/);
+  assert.ok(!/all good/.test(stderr), '"all good" is reserved for a run with nothing to warn about');
+  const out = JSON.parse(stdout);
+  assert.equal(out.ok, true, 'the channel is usable — ok stays true');
+  assert.equal(out.warnings, 2, 'the machine line carries the count too');
+  assert.deepEqual(out.warning_kinds.sort(), ['no_devices', 'stale_prior_claim']);
+});
+
+test('doctor — a clean run still says "all good" and reports zero warnings', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  const { result } = runCli(['doctor'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, stderr);
+  assert.match(stderr, /all good/);
+  const out = JSON.parse(stdout);
+  assert.equal(out.warnings, 0);
+  assert.deepEqual(out.warning_kinds, []);
+});
+
+test('doctor --quiet — the one-line status still says how many warnings it hid', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.devices = 0;
+
+  const { result } = runCli(['doctor', '--quiet'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, stderr);
+  assert.match(stderr, /✓ setup ok.*1 warning\(s\) above/s);
+});
+
 test('doctor probes the realtime path: reports ok when the socket confirms', async (t) => {
   if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
   const mock = createMock();
@@ -533,7 +719,7 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   // the pidge-report COMPANION lands as a sibling skill, marked + trailed like the main one.
   const report = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge-report', 'SKILL.md'), 'utf8');
   assert.match(report, /name: pidge-report/);
-  assert.match(report, /\n# pidge-skill rev=23 manifest=16\n/, 'companion carries the same marker');
+  assert.match(report, /\n# pidge-skill rev=24 manifest=16\n/, 'companion carries the same marker');
   assert.ok(report.trimEnd().endsWith('<!-- pidge-skill-end -->'), 'companion carries the trailer');
   assert.match(skill, /pidge-report/, 'the main skill points at the companion');
   // The skill is the loudest announcement this CLI makes — every future session
@@ -610,10 +796,10 @@ test('self-heal — a 0.15.2 marker-first install self-heals into the fixed in-f
   // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
   assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
   assert.ok(!/<!-- pidge-skill rev=/.test(healed), 'the old HTML-comment marker is gone (the end trailer is not it)');
-  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=24 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
   assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
   assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 23, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 24, manifest v16\)/, 'one stderr note');
 });
 
 test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
@@ -630,10 +816,10 @@ test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the loc
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
-  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=24 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 23, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 24, manifest v16\)/, 'one stderr note');
   // the heal also (re)writes the pidge-report companion — this is exactly how an
   // existing install GAINS the companion on a spine bump, with zero human action.
   const reportFile = path.join(path.dirname(path.dirname(file)), 'pidge-report', 'SKILL.md');
@@ -652,7 +838,7 @@ test('self-heal — a MANIFEST bump (server version > installed) self-heals the 
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=24 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
 });
@@ -681,7 +867,7 @@ test('self-heal — a FRESH skill (new-format marker current) is left byte-for-b
   const port = await mock.start();
   // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
   // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
-  const { dir, file } = seedNewSkill(23, 16, 'SENTINEL FRESH — keep me');
+  const { dir, file } = seedNewSkill(24, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -731,7 +917,7 @@ test('home self-heal — a STALE home skill self-heals even when there is NO pro
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(homeSkill, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'the home skill was regenerated to the current rev');
+  assert.match(healed, /\n# pidge-skill rev=24 manifest=16\n/, 'the home skill was regenerated to the current rev');
   assert.ok(!/STALE HOME DOCTRINE/.test(healed), 'the stale home doctrine was replaced by a real regeneration');
   assert.match(stderr, /refreshed your local Pidge skill/, 'the home heal narrated itself');
 });
@@ -751,8 +937,8 @@ test('home self-heal — BOTH project and home skills stale: both heal in one pa
   await mock.stop();
 
   assert.equal(code, 0, `stderr: ${stderr}`);
-  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=23 manifest=16/, 'home healed');
-  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=23 manifest=16/, 'project healed');
+  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=24 manifest=16/, 'home healed');
+  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=24 manifest=16/, 'project healed');
   assert.match(stderr, /2 locations incl\. ~\/\.claude/, 'the note reports BOTH locations were refreshed');
 });
 
@@ -761,7 +947,7 @@ test('home self-heal — a FRESH home skill is left byte-for-byte (no needless h
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homefresh-'));
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
-  seedSkillAt(homeSkill, 23, 'SENTINEL HOME — keep me'); // current rev
+  seedSkillAt(homeSkill, 24, 'SENTINEL HOME — keep me'); // current rev
   const original = fs.readFileSync(homeSkill, 'utf8');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj2-'));
 
@@ -836,7 +1022,7 @@ test('atomic self-heal — "pidge-skill" in body PROSE is not the marker: a mark
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'a real marker was written by the heal');
+  assert.match(healed, /\n# pidge-skill rev=24 manifest=16\n/, 'a real marker was written by the heal');
   assert.ok(!/rev=99/.test(healed), 'the prose decoy is gone with the regeneration');
 });
 
@@ -854,7 +1040,7 @@ test('atomic self-heal — 4 concurrent heals never tear the file (atomic tmp+re
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
   assert.equal((healed.match(/# pidge-skill rev=/g) || []).length, 1, 'exactly ONE marker — no interleaved halves');
-  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'a whole, current skill won');
+  assert.match(healed, /\n# pidge-skill rev=24 manifest=16\n/, 'a whole, current skill won');
   assert.match(healed.trimEnd(), /<!-- pidge-skill-end -->$/, 'the trailer closes the file — no torn tail');
   const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
   assert.deepEqual(leftovers, [], 'no tmp litter after concurrent heals');
@@ -1017,8 +1203,30 @@ test('hello times out NARRATED with exit 3 when the human never confirms', async
   await mock.stop();
 
   assert.equal(code, 3, `a timed-out handshake is exit 3 (no answer yet), not a hang; stderr: ${stderr}`);
-  assert.match(stderr, /no confirmation yet/, 'the timeout is narrated, not silent');
+  assert.match(stderr, /no confirmation on wow-timeout/, 'the timeout is narrated, not silent');
+  assert.match(stderr, /no answer yet/, 'and framed as waiting, not failure — the channel WAS healthy');
   assert.match(stderr, /pidge listen --all/, 'it points at where the confirmation will surface');
+});
+
+// `hello` had its OWN timeout line, which bypassed the health verdict: a debut
+// on a channel that never completed one healthy round-trip reported "your human
+// hasn't tapped yet" — the friendliest possible lie, on the first command an
+// agent ever runs.
+test('hello — a DEAF channel is blamed on the channel, not on the human (exit 4)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.pollStatus = 500; // the send lands; every poll after it fails
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-hello-health-'));
+  seedHealthLedger(dir, 2, 3 * 60000); // two dead rounds already, 3 min back
+
+  const { result } = runCli(['hello', '--no-realtime', '--correlation-id', 'wow-deaf', '--timeout', '3', '--interval', '1'],
+    port, { XDG_CONFIG_HOME: dir });
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 4, `a deaf debut must escalate, not read as "not yet"; stderr: ${stderr}`);
+  assert.match(stderr, /CHANNEL\/API path looks broken/);
+  assert.ok(!/no answer yet/.test(stderr), 'never the waiting-on-your-human framing over a broken channel');
 });
 
 // --- tails: --follow + local custom-action id validation ------------------------
@@ -1480,6 +1688,45 @@ test('ack --up-to processes (green); ack --renew heartbeats the lease', async ()
   assert.match(out.stderr, /lease renewed on 1 message/);
 });
 
+// The green ✓✓ is EARNED. Two ways it used to be given away: an ack the server
+// processed ZERO rows for, and an ack carrying no note at all (which the server
+// files as "drained" — a tick that stands for nothing the human can read).
+test('ack — 0 acked never gets the green line: it says nothing turned green', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.ackAcked = 0;
+  mock.state.ackSkipped = 2;
+
+  const out = await runCli(['ack', '--up-to', '8'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /0 acked/);
+  assert.ok(!/green ✓✓/.test(out.stderr), 'nothing was processed — nothing turned green');
+  assert.match(out.stderr, /skipped 2 message/, 'and the skipped rows are surfaced, not swallowed');
+  assert.ok(!/pidge: ✓ acked\./.test(out.stderr), 'the closing line must not claim an ack either');
+});
+
+test('ack — a note-LESS ack says the server files it as drained, instead of promising green ✓✓', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['ack', '--up-to', '8'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /processed 1 message\(s\) with NO note/);
+  assert.match(out.stderr, /DRAINED/);
+  assert.ok(!/green ✓✓/.test(out.stderr), 'a mute ack does not get the green promise');
+});
+
+test('ack --summary — the ack that CAN say what happened keeps the green ✓✓', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const out = await runCli(['ack', '--up-to', '8', '--summary', 'reiniciei o worker'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /green ✓✓/);
+  assert.match(out.stderr, /with a summary/);
+});
+
 // 0.26.0 stay-online nudges — presence is a LOOP (listen → handle → ack →
 // RELAUNCH); the CLI says so at the moments an agent decides what to do next.
 // stderr ONLY (stdout stays parseable JSON), and SUPPRESSED where the advice
@@ -1690,16 +1937,16 @@ test('ack rejects mixing --up-to and --ids (usage error, exit 1)', async () => {
   assert.match(out.stderr, /not both/);
 });
 
-test('a server newer than KNOWN_MANIFEST_VERSION nudges ONCE on stderr (KNOWN=36 baseline)', async () => {
+test('a server newer than KNOWN_MANIFEST_VERSION nudges ONCE on stderr (the CLI knows a fixed floor)', async () => {
   const mock = createMock();
   const port = await mock.start();
-  mock.state.manifestVersion = 99; // server advertises news the CLI doesn't know
+  mock.state.manifestVersion = 199; // server advertises news the CLI doesn't know
   // isolate the per-install state cache so the 24h throttle can't leak
   // across suite runs (a re-run would otherwise suppress the nag and false-fail).
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-nag-'));
   const out = await runCli(['doctor'], port, { XDG_CONFIG_HOME: home }).result;
   await mock.stop();
-  assert.match(out.stderr, /manifest v99/, 'the version nudge fires when the server is ahead');
+  assert.match(out.stderr, /manifest v199/, 'the version nudge fires when the server is ahead');
   // the nudge reframes as "new capabilities you can use NOW via --param" — a
   // thin-pipe CLI rarely needs a release on a server bump — NOT "your CLI is stale,
   // UPDATE it" as the headline action.
@@ -1807,36 +2054,83 @@ test('doctor warns when reading the SHARED legacy file (no PIDGE_AGENT, no env v
   assert.match(stderr, /PIDGE_AGENT/);
 });
 
-// Reachability self-test (round-trip over the unified queue + ack).
-test('selftest — PASS: fire a nonce, the listener acks it, the server confirms', async () => {
+// Reachability self-test. The verdict is the SERVER's, and the CLI never
+// consumes its own nonce: it fires, watches GET /selftest/:id read-only, and
+// PASSES only when something ELSE acked it. The old loop leased the queue and
+// acked the nonce itself, then reported "your listener received the nonce" on
+// channels where nothing was listening at all.
+test('selftest — PASS only when ANOTHER consumer acks the nonce inside the window', async () => {
   const mock = createMock();
   const port = await mock.start();
+  mock.state.selftestAckedAfterMs = 300; // a real listener out there picks it up
   const { result } = runCli(['selftest', '--window', '10', '--no-realtime'], port);
   const { code, stdout, stderr } = await result;
   await mock.stop();
   assert.equal(code, 0, `expected PASS exit 0, got ${code}; stderr: ${stderr}`);
   assert.match(stderr, /SELF-TEST PASSED/);
+  assert.match(stderr, /OTHER than this command/, 'the PASS says WHO proved it');
   assert.match(stdout, /"status":\s*"passed"/);
-  // it acked ONLY the nonce by id (ids:[…]), never up_to — so real pending messages aren't eaten
-  assert.ok(mock.state.acks.some((u) => /messages\/ack/.test(u)), 'it acked the nonce');
+  assert.equal(mock.state.acks.length, 0, 'the CLI itself never acks — the ack in this test is the other consumer\'s, server-side');
 });
 
-test('selftest — FAIL with cause when the listener never receives the nonce', async () => {
+test('selftest — with NOTHING listening it FAILS and says the wire is all it proved', async () => {
   const mock = createMock();
   const port = await mock.start();
-  mock.state.dropSelftest = true; // the nonce never reaches the queue (orphan / dead transport)
+  mock.state.consumers = []; // the server reports zero live consumers
   const { result } = runCli(['selftest', '--window', '5', '--no-realtime'], port);
   const { code, stdout, stderr } = await result;
   await mock.stop();
   assert.equal(code, 2, `expected FAIL exit 2, got ${code}; stderr: ${stderr}`);
   assert.match(stderr, /SELF-TEST FAILED/);
-  assert.match(stderr, /never received the nonce/);
-  assert.match(stdout, /"saw_nonce":\s*false/);
+  assert.match(stderr, /nothing is listening/, 'it names the real cause');
+  assert.match(stderr, /proved the WIRE/, 'and says exactly what the run DID prove');
+  assert.ok(!/ORPHANED/.test(stderr), 'no orphan/detached-listener story when there is no listener at all');
+  assert.match(stdout, /"consumers_live":\s*0/);
+});
+
+test('selftest — a LIVE but deaf consumer is blamed differently from an empty channel', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.consumers = [{ label: 'bridge-bot', live: true }]; // live, and never acks
+  const { result } = runCli(['selftest', '--window', '5', '--no-realtime'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 2, `stderr: ${stderr}`);
+  assert.match(stderr, /1 consumer\(s\) ARE live/, 'a live consumer that never acks is a DIFFERENT diagnosis');
+  assert.match(stderr, /READS without acking|deaf/, 'and it names the shape of the bug');
+});
+
+// The selftest is now READ-ONLY on the queue: it must never serve, lease or
+// consume a real message. The old one read `all=true&lease=60` and acked.
+test('selftest never touches the queue: no consume read, no ack, nothing leased', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.leaseMs = 600000; // the server's ~10-min visibility lease
+  mock.state.messages = [
+    { id: 42, kind: 'message', body: 'resposta real do humano', created_at: 'x' },
+    { id: 200, kind: 'message', body: 'chegou durante a janela', created_at: 'x' }, // id > the nonce (seq starts at 100)
+  ];
+  mock.state.selftestAckedAfterMs = 300;
+
+  const { result } = runCli(['selftest', '--window', '10', '--no-realtime'], port);
+  const { code, stderr } = await result;
+  assert.equal(code, 0, `the selftest itself must still PASS; stderr: ${stderr}`);
+
+  for (const id of [42, 200]) {
+    const row = mock.state.messages.find((m) => m.id === id);
+    assert.ok(row, `message ${id} is still in the queue`);
+    assert.equal(row._leasedUntil, undefined,
+      `message ${id} was never served or leased — the selftest reads the VERDICT, not the queue`);
+  }
+  assert.deepEqual(mock.state.messageReads, [], 'it never reads GET /messages at all');
+  assert.equal(mock.state.acks.length, 0, 'and it never POSTs an ack of its own');
+  await mock.stop();
 });
 
 test('selftest — a non-numeric --window falls back to the default, never a false FAIL', async () => {
   const mock = createMock();
   const port = await mock.start();
+  mock.state.selftestAckedAfterMs = 300;
   const { result } = runCli(['selftest', '--window', '30s', '--no-realtime'], port); // typo'd window
   const { code, stderr } = await result;
   await mock.stop();
@@ -1844,56 +2138,20 @@ test('selftest — a non-numeric --window falls back to the default, never a fal
   assert.match(stderr, /SELF-TEST PASSED/);
 });
 
-// Selftest read-scoping — the selftest used to read the real queue with lease=60
-// and any bystander it served went dark for ~60s from every OTHER listen. The fix
-// scopes the read to since=<nonce id − 1> so the pre-existing backlog is excluded
-// by construction, and drops the lease=60 mitigation entirely.
-test('selftest excludes the pre-existing backlog from the read (since=nonce-1) — never served, never leased', async () => {
+// A verdict we could not READ says nothing about the listener. It used to fall
+// through into FAILED and blame an "ORPHANED/detached listener" for a 500.
+test('selftest — an unreadable verdict is INCONCLUSIVE, never blamed on the listener', async () => {
   const mock = createMock();
   const port = await mock.start();
-  mock.state.leaseMs = 60000; // model the server visibility lease — a served row goes dark for 60s
-  // A real human message already in the queue, with a LOWER id than the nonce the
-  // selftest is about to mint (selftestSeq starts at 100).
-  mock.state.messages = [{ id: 42, kind: 'message', body: 'resposta real do humano', created_at: 'x' }];
-
-  const { result } = runCli(['selftest', '--window', '10', '--no-realtime'], port);
-  const { code, stderr } = await result;
-  assert.equal(code, 0, `the selftest itself must still PASS; stderr: ${stderr}`);
-
-  const real = mock.state.messages.find((m) => m.id === 42);
-  assert.ok(real, 'the real message is still in the queue (never consumed by the selftest)');
-  assert.equal(real._leasedUntil, undefined,
-    'the pre-existing backlog (id < nonce) is excluded by since= — never served, never leased');
-  const reads = mock.state.messageReads;
-  assert.ok(reads.some((u) => /[?&]since=/.test(u)), `the reachability read must carry since=; reads:\n${reads.join('\n')}`);
+  mock.state.selftestStatus = 500; // the verdict endpoint is broken
+  const { result } = runCli(['selftest', '--window', '5', '--no-realtime'], port);
+  const { code, stdout, stderr } = await result;
   await mock.stop();
-});
-
-// since= only excludes the PRE-EXISTING backlog. A message with
-// id > nonce (a real arrival during the selftest window) IS served — so lease=60
-// must ride along to cap its blackout at ~60s, never the server's ~10-min default.
-test('selftest: a served message with id > nonce gets a ~60s lease (lease=60), never the ~10-min default', async () => {
-  const mock = createMock();
-  const port = await mock.start();
-  mock.state.leaseMs = 600000; // the server's DEFAULT stamp_delivered lease = 10 min
-  // id 200 > the nonce the selftest will mint (selftestSeq starts at 100): since=
-  // does NOT exclude it, so the selftest serves it — and must bound its lease.
-  mock.state.messages = [{ id: 200, kind: 'message', body: 'chegou durante a janela', created_at: 'x' }];
-
-  const t0 = Date.now();
-  const { result } = runCli(['selftest', '--window', '10', '--no-realtime'], port);
-  const { code, stderr } = await result;
-  assert.equal(code, 0, `the selftest itself must still PASS; stderr: ${stderr}`);
-
-  const served = mock.state.messages.find((m) => m.id === 200);
-  assert.ok(served, 'the higher-id message is still in the queue (the selftest acks only the nonce)');
-  assert.ok(served._leasedUntil, 'it WAS served (since= includes id > nonce), so it carries a lease');
-  const leaseFromStart = served._leasedUntil - t0;
-  assert.ok(leaseFromStart < 120000,
-    `lease=60 must cap the blackout (~60s), never the ~10-min default; got ${Math.round(leaseFromStart / 1000)}s`);
-  assert.ok(leaseFromStart >= 55000,
-    `the ~60s lease must actually be applied; got ${Math.round(leaseFromStart / 1000)}s`);
-  await mock.stop();
+  assert.equal(code, 2, `stderr: ${stderr}`);
+  assert.match(stderr, /INCONCLUSIVE/);
+  assert.match(stderr, /couldn't be READ/);
+  assert.ok(!/SELF-TEST FAILED/.test(stderr), 'a broken read is not a failed listener');
+  assert.match(stdout, /"reason":\s*"verdict_unreadable"/);
 });
 
 test('listen exit 3 points at `pidge catchup` (a message may be under another read\'s lease)', async () => {
@@ -2028,13 +2286,13 @@ test('help — the focused helps follow the same rule (update, setup), and `term
 test('version nag — fires ONCE then is throttled: 5 runs in a row = 1 nag', async () => {
   const mock = createMock();
   const port = await mock.start();
-  mock.state.manifestVersion = 99;
+  mock.state.manifestVersion = 199;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-nag5-'));
 
   let nags = 0;
   for (let i = 0; i < 5; i++) {
     const out = await runCli(['doctor'], port, { XDG_CONFIG_HOME: home }).result;
-    if (/manifest v99/.test(out.stderr)) nags++;
+    if (/manifest v199/.test(out.stderr)) nags++;
   }
   await mock.stop();
   assert.equal(nags, 1, 'the nag must be throttled to once per 24h, not once per call');
@@ -2043,17 +2301,17 @@ test('version nag — fires ONCE then is throttled: 5 runs in a row = 1 nag', as
 test('version nag — --quiet-nag and PIDGE_QUIET_NAG=1 silence the nag entirely', async () => {
   const mock = createMock();
   const port = await mock.start();
-  mock.state.manifestVersion = 99;
+  mock.state.manifestVersion = 199;
 
   // --quiet-nag flag (fresh home so the throttle isn't what's hiding it)
   let home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-quiet-'));
   let out = await runCli(['doctor', '--quiet-nag'], port, { XDG_CONFIG_HOME: home }).result;
-  assert.doesNotMatch(out.stderr, /manifest v99/, '--quiet-nag silences the nag');
+  assert.doesNotMatch(out.stderr, /manifest v199/, '--quiet-nag silences the nag');
 
   // PIDGE_QUIET_NAG=1 env, again a fresh home
   home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-quiet2-'));
   out = await runCli(['doctor'], port, { XDG_CONFIG_HOME: home, PIDGE_QUIET_NAG: '1' }).result;
-  assert.doesNotMatch(out.stderr, /manifest v99/, 'PIDGE_QUIET_NAG=1 silences the nag');
+  assert.doesNotMatch(out.stderr, /manifest v199/, 'PIDGE_QUIET_NAG=1 silences the nag');
   await mock.stop();
 });
 
@@ -3052,6 +3310,26 @@ test('listen WITHOUT --all does not print the backlog heads-up', async () => {
   assert.doesNotMatch(out.stderr, /ALREADY queued when this listen started/, 'no --all ⇒ no backlog heads-up');
 });
 
+// --ack-on-read ignored the ack's response BODY: a 2xx that acked ZERO rows
+// still announced the whole batch as consumed. The hand `ack` path has always
+// read that number; this one now does too.
+test('listen --ack-on-read reads the ack BODY: 0 acked is said out loud, not announced as consumed', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 40, channel_id: 1, body: 'oi', created_at: 'x' }];
+  mock.state.ackAcked = 0;
+  mock.state.ackSkipped = 3;
+
+  const out = await runCli(['listen', '--ack-on-read', '--no-realtime', '--timeout', '10', '--interval', '1'], port).result;
+  await mock.stop();
+
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /acked 0 of 1 message/, 'the server\'s own count, not our optimism');
+  assert.match(out.stderr, /WILL re-serve/, 'and what that means for the reader');
+  assert.match(out.stderr, /3 message\(s\) below the cursor were SKIPPED/, 'skipped is surfaced like the hand path');
+  assert.ok(!/1 message\(s\) — acked on read/.test(out.stderr), 'never the "consumed" line over an empty ack');
+});
+
 
 // --- strict message ids on ack (a lazy parseInt acked the WRONG watermark) ---
 
@@ -3413,6 +3691,33 @@ test('catchup --digest — THREE states: handled-with-note / ✓ acked (no note)
   assert.match(byId['417'], /· ✓ acked \(no note\)$/, '(b) processed_at + no note ⇒ ✓ acked, NEVER PENDING');
   assert.ok(!/PENDING/.test(byId['417']), 'the anti-redo lie is dead: a processed row is not PENDING');
   assert.match(byId['500'], /· PENDING$/, '(c) truly un-processed ⇒ PENDING');
+});
+
+// The FOURTH shade of done: a MUTE ack (server ≥ v112 files it as `drained`) —
+// processed, no note, nothing sent afterwards. It rendered identically to a
+// quiet-but-real ack, so a successor read "someone handled this" where the
+// truth is "someone made it disappear".
+test('catchup --digest — a DRAINED row reads as a mute ack, not a plain silent one', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [
+    { id: 60, channel_id: 1, kind: 'message', body: 'silenciada', processed_at: '2026-07-06T23:00:00Z', handled_state: 'drained' },
+    { id: 61, channel_id: 1, kind: 'message', body: 'com label', processed_at: '2026-07-06T23:00:00Z', acked_by_label: 'bridge-bot', handled_state: 'drained' },
+    // handled_state ABSENT (an older server) keeps today's text, exactly
+    { id: 62, channel_id: 1, kind: 'message', body: 'server antigo', processed_at: '2026-07-06T23:00:00Z' },
+    // a note beats everything: a row with a summary is never "mute"
+    { id: 63, channel_id: 1, kind: 'message', body: 'com nota', processed_at: '2026-07-06T23:00:00Z', handled_state: 'drained', handler_summary: 'reiniciei o worker' },
+  ];
+  const { result } = runCli(['catchup', '--digest'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const byId = Object.fromEntries(stdout.trim().split('\n').map((l) => [l.split(' · ')[0], l]));
+  assert.match(byId['60'], /· ✓ acked \(mute — no note, nothing sent after\)$/);
+  assert.match(byId['61'], /· ✓ acked by bridge-bot \(mute — no note, nothing sent after\)$/);
+  assert.match(byId['62'], /· ✓ acked \(no note\)$/, 'an older server (no field) renders exactly as before');
+  assert.match(byId['63'], /· handled by another consumer: reiniciei o worker$/, 'a note is never a mute ack');
 });
 
 test('catchup --digest — a processed row with a LABEL but no note reads "✓ acked by X (no note)"', async () => {

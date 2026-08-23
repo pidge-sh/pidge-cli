@@ -7,3 +7,5 @@ scratchpad/
 test/.hygiene-private-patterns.json
 .claude/skills/pidge-report/SKILL.md
 .claude/skills/pidge-report/SKILL.md.bak*
+/AGENTS.md
+/AGENTS.md.bak*

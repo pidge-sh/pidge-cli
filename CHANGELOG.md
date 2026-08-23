@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.51.0 — 2026-08-23
+
+**A batch of commands that told you they worked when they hadn't.** The
+headline: `pidge selftest` used to grade its own homework. It polled the CONSUME
+path (`all=true&lease=60`, leasing real messages mid-window), acked the nonce
+ITSELF, and then reported "your listener received the nonce and acked it in
+time" — on channels where nothing was listening at all. It now fires the nonce
+and only WATCHES, read-only (`GET /selftest/<id>`): it never reads the queue and
+never acks, so **PASS means a real consumer did the work** and a channel with
+nobody listening FAILS and says why ("nothing is listening — this proved the
+WIRE, not your loop"), instead of inventing an orphaned listener. A live-but-deaf
+consumer gets its own diagnosis, and a verdict the CLI couldn't READ is reported
+as INCONCLUSIVE rather than blamed on your loop.
+
+**`listen --exec` no longer exits 0 over an ack that failed.** The handler exits
+0, the ack doesn't land, the batch stays queued and comes back — that round was
+green in the CLI's own words. It now prints `{"type":"ack_failed","ids":[…]}` on
+stdout (the channel you wake up on, same as `handler_failed`) and exits 2, with
+the by-hand `pidge ack --ids …` on stderr. Both machine lines are also guaranteed
+to be lines: a handler whose output ends mid-line gets a newline first, so the
+JSON never arrives glued to the tail of its own output.
+
+**A rotated key stops reading as a timeout.** 401/403 on `listen`/`wait` landed
+in the branch that counted "the server answered" as a healthy round-trip, so a
+revoked key exited 3 "relaunch the listener" — forever, into the same wall. It is
+now named for what it is (rotated/revoked, NOT a timeout), raises the same local
+alert the bridge uses, and exits 2. Other 4xx no longer certify the channel
+either. And "healthy" now has a shelf life: the exit-3 path needs a round-trip
+inside the last 10 minutes, so a long `--follow` session can't ride one good read
+from eight hours ago — past the window the cross-round verdict decides.
+
+Also:
+
+- **The consumer lock survives a Ctrl-C and a reused pid.** `listen` had no
+  signal handlers, so SIGINT/SIGTERM left a corpse lock (it only ever cleared
+  because the next starter found a dead pid); it now releases the lock and exits
+  130/143, the shell's own convention. The lock also records the holder's process
+  START TIME (Linux, `/proc/<pid>/stat`), so a REUSED pid reads as the corpse it
+  is instead of locking the channel out until someone deletes the file by hand —
+  and the pre-check refusal now carries the same `rm "<lockfile>"` escape hatch
+  the EEXIST path always had. Non-Linux keeps the pid-only behaviour.
+- **`pidge doctor` no longer says "all good" over ⚠️ lines.** It counts every
+  warning the run printed and the verdict agrees with it: "healthy — N warning(s)
+  above (kinds)". The stdout JSON carries `warnings` and `warning_kinds`; `ok`
+  still means "usable channel", so a script can gate on the warnings instead of
+  reading the summary. `--quiet` says how many it hid.
+- **The green ✓✓ is earned, everywhere.** An ack the server processed ZERO rows
+  for never prints it (it says nothing turned green, and surfaces `skipped`), and
+  an ack with NO note says what the server will file it as — DRAINED, a tick
+  `catchup` can't explain — instead of promising the human a green pair. This
+  applies to `pidge ack`, to the batch ack behind `listen --exec`/`bridge`, and
+  `--ack-on-read` now reads the ack's response body at all (it announced the
+  whole batch as consumed no matter what the server said).
+- **The bridge retracts its realtime announcement.** "realtime socket up (the
+  human sees 'ouvindo agora')" was printed once and never taken back; a drop is
+  now narrated once per outage ("presence now rides the LONG-POLL only") and a
+  re-up re-announces.
+- **`pidge hello` runs the same health verdict as `wait`/`listen`.** Its own
+  timeout line bypassed it, so a debut on a channel that never completed one
+  healthy round-trip read as "your human hasn't tapped yet" — the friendliest
+  possible lie, on the first command an agent ever runs.
+- `pidge update` reads the installed copy BACK on the plain npm path too (the
+  alias path always did): a manager that exits 0 over an unmoved copy is no
+  longer reported as "installed X", and a copy that can't be read back is called
+  UNCONFIRMED instead of announcing a version nobody looked at.
+- `catchup --digest` distinguishes a MUTE ack (`handled_state:"drained"`) from a
+  quiet-but-real one: "✓ acked (mute — no note, nothing sent after)". An older
+  server that omits the field renders exactly as before.
+- The manifest floor moved 67 → 112 — this binary already spoke v79 presence
+  renewal, v88's `skipped` and v112's `handled_state`, and nagged about news it
+  understood.
+- Exit 4 is now EARNED ACROSS ROUNDS. The recommended loop is one round per
+  process, so "not one healthy round-trip all session" meant "this 50-second
+  window": a wifi blip or a host waking from sleep read as "the CHANNEL looks
+  broken" and the one exit code that tells an agent to escalate cried wolf
+  (observed three times in one QA). The streak now lives in a token-hash file
+  (any healthy round-trip clears it) — escalation needs 3 dead rounds over 2+
+  minutes — and a `GET /up` probe at verdict time separates the diagnoses:
+  server answering = the channel/API path is broken (exit 4); nothing answering
+  = this HOST is offline (exit 3, reconnect — after ~10 min it escalates too,
+  blaming the host and telling the agent to use its own session).
+- The setup fuse writes AGENTS.md alongside the `.claude` skill (created when
+  absent, refreshed when ours, never over a project's own file) — a Codex newborn
+  was getting doctrine only Claude Code would ever load.
+- The generated skill (rev 24) documents `ack_failed`, the honest-ack rule, and
+  the host-sleep case: your machine sleeping looks like a dead round to you, and
+  the CLI now blames the right side (exit 3 reconnect vs exit 4 escalate).
+
 ## 0.50.0 — 2026-08-22
 
 **A loop that fails must fail where you wake up — and "one consumer per channel"
