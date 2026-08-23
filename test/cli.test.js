@@ -142,6 +142,24 @@ test('a LONG host-offline streak still escalates, blaming the HOST — through t
   assert.match(stderr, /through your own session/);
 });
 
+test('a dead round whose authenticated probe answers 401 is a REJECTED KEY, not a blip', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // every poll dies as a server error (dead round), but the server itself is up
+  // and whoami says the KEY is the problem — the verdict must say so (exit 2),
+  // never "transport blip, relaunch" (the realtime path can reach the verdict
+  // without ever seeing an HTTP 401: the WS handshake just closes).
+  mock.state.messagesStatus = 500;
+  mock.state.whoamiStatus = 401;
+
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '4', '--interval', '1'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 2, `stderr: ${stderr}`);
+  assert.match(stderr, /REJECTED this channel key/);
+});
+
 test('one healthy round-trip clears the persisted streak', async () => {
   const mock = createMock();
   const port = await mock.start();
