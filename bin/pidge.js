@@ -608,8 +608,9 @@ const OPTIONS = {
   renew: { type: 'boolean' },                  // ack: heartbeat the visibility-timeout lease (state=delivered)
   'ack-on-read': { type: 'boolean' },          // listen: restore the pre-0.9 immediate-consume
   window: { type: 'string' },                  // selftest: reachability window in seconds (default 30)
-  exec: { type: 'string' },                    // bridge: the handler command (ONE invocation per batch)
-  'handler-timeout': { type: 'string' },       // bridge: max seconds ONE handler run may take (default 1800)
+  exec: { type: 'string' },                    // bridge/listen: the handler command (ONE invocation per batch)
+  'handler-timeout': { type: 'string' },       // bridge/listen --exec: max seconds ONE handler run may take (default 1800)
+  ndjson: { type: 'boolean' },                 // listen/online: one compact JSON object per line (uniform `type`)
   // approve: the two gated-action labels (default Allow / Deny)
   'allow-label': { type: 'string' },
   'deny-label': { type: 'string' },
@@ -736,14 +737,23 @@ const USAGE_TAIL = `  pidge bridge --exec '<handler>'         24/7 SUPERVISOR: l
   pidge bridge install --exec '<handler>' write a launchd (macOS) / systemd (Linux) template running the
                                           bridge with Restart=on-failure + declare
                                           listen_mode=external_daemon (advisory). Never embeds the key.
-  pidge listen [--timeout N] [--all] [--ack-on-read] [--follow]
+  pidge listen [--timeout N] [--all] [--exec '<handler>'] [--ndjson] [--follow]
                                           block until the human MESSAGES you from the app, print, exit
                                           a read message is DELIVERED (gray ✓✓), NOT done — ACK it
                                           AFTER the work: pidge ack --up-to <id> (a ~10-min lease re-serves
                                           un-acked messages, so a crash never loses one)
+                                          --exec  = ONE round, run by YOUR handler (batch JSON on stdin,
+                                                    ONE invocation): exit 0 ⇒ ack of the batch's EXACT ids
+                                                    (+ the handler's \`pidge-summary:\` line, if any) ·
+                                                    non-zero ⇒ a handler_failed JSON line on STDOUT, NO ack,
+                                                    exit 2. The handler's exit code decides the ack.
+                                          --ndjson      = one compact JSON object per line, every line
+                                                          stamped \`type\` (default = a pretty array)
                                           --ack-on-read = the old immediate-consume (ack on print)
                                           --follow      = KEEP listening until --timeout (supervisor-only)
                                           --all  = the SINGLE EAR: also hear notification ANSWERS
+                                          listen HOLDS this channel's consumer lock while it runs — a
+                                          second listen/bridge is REFUSED (exit 2). Read with \`pidge catchup\`.
   pidge online [listen flags]             = pidge listen --all, one word — so a pasted prompt can
                                           just say "stay online: pidge online". Run it as a background
                                           task your harness TRACKS; when it exits: handle → ack → RELAUNCH.
@@ -854,6 +864,11 @@ ENV
 OUTPUT
   stdout is machine-readable (a fire-and-forget send→the raw 201 JSON; a --wait
   send / ask / approval / wait→chosen_action JSON); human notices go to stderr.
+  listen/online print ZERO OR MORE compact continuity_context lines and THEN one
+  pretty-printed JSON ARRAY of messages — never parse that stdout line by line.
+  --ndjson gives one compact object per line instead, each stamped \`type\`
+  ("message" | "notification_reply" | "continuity_context" | "batch_end").
+  The rule either way: ACKABLE ⇔ the object has an \`id\`; switch on \`type\`.
   Exit: 0 answered · 3 timed out (no answer yet, not a failure) · 4 timed out
   WITHOUT ONE healthy round-trip all session (the CHANNEL looks broken —
   server/network — not the human ignoring you: surface it instead of retrying
@@ -950,7 +965,9 @@ const OPTION_DOCS = {
   'ack-summary': '--summary "TEXT"         ack: attribution — WHAT you did (a successor session sees it via `pidge catchup`; capped ~1000 chars)',
   window: '--window N               reachability window in seconds (default 30)',
   exec: "--exec CMD               the handler: run ONCE per batch with the batch JSON on stdin; exit 0 = batch acked (its EXACT ids), non-zero = NOT acked (the server lease re-serves — make it idempotent)",
-  'handler-timeout': '--handler-timeout N      bridge: max seconds ONE handler run may take (default 1800 = 30 min) — over it: SIGTERM (SIGKILL 5s later), treated as a FAILED batch (not acked)',
+  'exec-listen': "--exec CMD               ONE round handled by YOUR command: the batch JSON ({messages,continuity?}) on its stdin, ONE invocation; exit 0 ⇒ ack of the EXACT ids (+ its `pidge-summary:` line) · non-zero/timeout ⇒ a {\"type\":\"handler_failed\"} line on stdout, NO ack, exit 2. Refuses with --follow / --ndjson / --ack-on-read",
+  'handler-timeout': '--handler-timeout N      max seconds ONE handler run may take (default 1800 = 30 min) — over it: SIGTERM (SIGKILL 5s later), treated as a FAILED batch (not acked)',
+  ndjson: '--ndjson                 one compact JSON object per line instead of the pretty array — every line stamped `type` (message | notification_reply | continuity_context | batch_end); ackable ⇔ it has an `id`',
   'quiet-nag': '--quiet-nag              silence the "server has new capabilities" nag for this run',
   'allow-label': '--allow-label TEXT       approve: label on the Face-ID allow button (default "Allow")',
   'deny-label': '--deny-label TEXT        approve: label on the deny button (default "Deny")',
@@ -1133,15 +1150,25 @@ const HELP = {
   },
   listen: {
     summary: 'block until the human MESSAGES you from the app, print, ACK after the work, exit.',
-    usage: 'pidge listen [--timeout N] [--all] [--ack-on-read] [--follow] [--download] [--download-dir DIR]',
-    body: 'One-shot by design (loop it, don\'t daemonize). a read message is DELIVERED (gray ✓✓), NOT done — ack it AFTER the work with `pidge ack --up-to <id>` (a ~10-min lease re-serves un-acked messages, so a crash never loses one). a message may carry an `attachment` (a photo/file from the app\'s composer) — a SEALED one is auto-downloaded + decrypted to a local file (`attachment.path` in the JSON); a clear one keeps its fetchable `url` (--download saves it too). An audio attachment (a VOICE NOTE the human recorded) is marked `kind:"voice"` with `duration_seconds` when they measured it — you get the FILE, never a transcript: Pidge does not transcribe, so transcribe locally (whisper.cpp, `whisper`, your own STT) and never guess what they said.',
-    opts: ['timeout', 'all-listen', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
+    usage: "pidge listen [--timeout N] [--all] [--exec '<handler>'] [--ndjson] [--ack-on-read] [--follow] [--download] [--download-dir DIR]",
+    body: [
+      'One-shot by design (loop it, don\'t daemonize). a read message is DELIVERED (gray ✓✓), NOT done — ack it AFTER the work with `pidge ack --up-to <id>` (a ~10-min lease re-serves un-acked messages, so a crash never loses one). a message may carry an `attachment` (a photo/file from the app\'s composer) — a SEALED one is auto-downloaded + decrypted to a local file (`attachment.path` in the JSON); a clear one keeps its fetchable `url` (--download saves it too). An audio attachment (a VOICE NOTE the human recorded) is marked `kind:"voice"` with `duration_seconds` when they measured it — you get the FILE, never a transcript: Pidge does not transcribe, so transcribe locally (whisper.cpp, `whisper`, your own STT) and never guess what they said.',
+      '',
+      'STDOUT (the contract, so a parser can\'t drift): zero or more compact `{"type":"continuity_context",…}` lines — read-only provenance, nothing there is ackable — and THEN ONE pretty-printed JSON ARRAY of messages. It is heterogeneous and multi-line: never parse it line by line. `--ndjson` prints one compact object per line instead, each stamped `type` ("message" | "notification_reply" mirroring `kind`, plus the continuity lines and a final `{"type":"batch_end","count":N,"max_ackable_id":M}`). Either way: ACKABLE ⇔ the object has an `id`; switch on `type`, never on position.',
+      '',
+      'ONE CONSUMER PER CHANNEL, mechanized: listen HOLDS this channel\'s lockfile (keyed by hash(token), pid-checked) for its whole run and releases it on the way out. A second `listen` — or a `bridge` — on the same channel is REFUSED (exit 2) and told what to do: read with `pidge catchup` (read-only), or stop the other process. A `--wait`/ask/approval of YOUR OWN while a listener holds the lock is fine and stays a notification-only wait: composer messages belong to the listener, and the CLI says so on stderr.',
+      '',
+      '`--exec \'<handler>\'` makes ONE round autonomous: instead of printing the batch for you to read, the CLI hands it to your command on stdin — `{"messages":[…],"continuity":[…]}`, ONE invocation — and THE HANDLER\'S EXIT CODE DECIDES THE ACK. Exit 0 ⇒ ack of the batch\'s EXACT ids, carrying the handler\'s last `pidge-summary: <one sentence>` stdout line as the note (no marker ⇒ acked without one, never invented). Non-zero, a spawn error or --handler-timeout ⇒ NOTHING is acked (the lease re-serves), a compact `{"type":"handler_failed","exit":N,"ids":[…]}` line lands on STDOUT — where you wake up — and listen exits 2. The handler\'s stdout is teed through; the lease is renewed every 60 s while it runs. An empty round spawns nothing and exits 3, as always.',
+      '',
+      'Exits: 0 delivered (or handled + acked under --exec) · 3 nothing arrived this round · 4 nothing arrived AND not one healthy round-trip (the channel looks broken) · 2 error, refused, or a failed handler · 1 usage.',
+    ].join('\n'),
+    opts: ['timeout', 'all-listen', 'exec-listen', 'handler-timeout', 'ndjson', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
   },
   online: {
     summary: 'sugar for `pidge listen --all` — the stay-online loop, one word.',
-    usage: 'pidge online [--timeout N] [--ack-on-read] [--follow] [--download] [--download-dir DIR]',
-    body: 'It exists so a pasted prompt can just say "stay online: pidge online". Every listen flag forwards; --all is forced (the single ear: composer messages + notification answers). The LOOP is the contract: run it as a background task your harness TRACKS (never a loose shell &); it blocks until something lands — handle it, `pidge ack`, then RELAUNCH it. That loop is what "online" means.',
-    opts: ['timeout', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
+    usage: "pidge online [--timeout N] [--exec '<handler>'] [--ndjson] [--ack-on-read] [--follow] [--download] [--download-dir DIR]",
+    body: 'It exists so a pasted prompt can just say "stay online: pidge online". Every listen flag forwards; --all is forced (the single ear: composer messages + notification answers). The LOOP is the contract: run it as a background task your harness TRACKS (never a loose shell &); it blocks until something lands — handle it, `pidge ack`, then RELAUNCH it. That loop is what "online" means. Same stdout contract and same consumer lock as `pidge listen` (see `pidge listen --help`); `--exec \'<handler>\'` runs the round for you and lets the handler\'s exit code decide the ack.',
+    opts: ['timeout', 'exec-listen', 'handler-timeout', 'ndjson', 'ack-on-read', 'follow', 'interval', 'realtime', 'no-realtime', 'download', 'download-dir'],
   },
   terminal: {
     summary: 'Terminals: share a tmux pane with the phone — a Claude session as structured, E2E-sealed conversation data (typed replies come back into it), or a plain terminal pane.',
@@ -1170,7 +1197,8 @@ const HELP = {
       'LOOP: long-poll GET /messages?all=true (the robust floor; a realtime socket, when available, adds presence — "ouvindo agora" — and early wake-ups, never the data path) → your --exec command runs ONCE per batch with the batch JSON on stdin ({"messages":[…]} + "history_hint":true on the first batch since boot — the handler may want `pidge catchup` to situate) → handler exit 0 ⇒ ack of the batch\'s EXACT ids (never a --up-to watermark: that would stamp rows under lease from an EARLIER batch the handler FAILED on) · non-zero ⇒ NOT acked: the ~10-min server lease re-serves the batch. At-least-once is the contract — make the handler IDEMPOTENT. One run is capped by --handler-timeout (default 30 min): over it the handler is SIGTERMed (SIGKILL 5s later) and the batch counts as FAILED; while it runs, a heartbeat line lands on stderr every 5 min AND the batch\'s lease is RENEWED every 60 s (POST /ack {ids, state:"delivered"}) — so a long run neither lapses the ~10-min lease mid-work nor reads as offline (servers with manifest ≥ v79 refresh "listening now" presence on the renew; a failed batch still lapses back: the renew stops the moment the handler exits).',
       'SUMMARY: the handler tells the NEXT session WHAT it did by printing a marker line to stdout — `pidge-summary: <one sentence>`. The bridge tees the handler\'s stdout to its own log AND scans it (streamed, never buffered) for the LAST such line; found ⇒ the ack carries that summary (capped ~1000 chars) so `pidge catchup` shows "handled by X: <summary>"; not found ⇒ acked without one (never invented). An LLM handler is instructable in its own prompt: end with `echo "pidge-summary: <what you did>"` (or have the model print it). Only a line that STARTS with the marker counts — incidental output never becomes attribution.',
       'Model-agnostic by construction: --exec \'claude -p "…"\' | \'codex exec "…"\' | \'gemini "…"\' | any script. This is the multi-LLM answer: no dependence on a harness that wakes on background-task exit.',
-      'ONE INSTANCE PER CHANNEL: a lockfile keyed by hash(token) (~/.config/pidge/bridge-<hash>.lock, PID-checked so a crashed bridge never wedges the channel) — a second bridge, or a `listen`, on the same channel is REFUSED (exit 2). Read with `pidge catchup` instead.',
+      'ONE INSTANCE PER CHANNEL: a lockfile keyed by hash(token) (~/.config/pidge/bridge-<hash>.lock, PID-checked so a crashed bridge never wedges the channel) — a second bridge, or a `listen`, on the same channel is REFUSED (exit 2). `listen` now takes the SAME lock while it runs, so the refusal is symmetric in both directions. Read with `pidge catchup` instead.',
+      'ONE ROUND, NO DAEMON: `pidge listen --all --exec \'<handler>\'` is the same handler contract (batch on stdin, exit code decides the ack, `pidge-summary:` is the note) for a single round in a turn-based agent — the bridge is that loop made permanent. Start there when you have a harness that can relaunch you.',
       'FAILURES: 401 → narrated + LOCAL alert + LONG jittered backoff (a rotated key only a human can fix — the bridge never dies silent, never re-loops blind); a channel with no healthy round-trip (the exit-4 class) → same alert + long backoff; every retry sleep is jittered. SIGTERM/SIGINT → clean shutdown: the in-flight batch is NOT acked (the lease re-serves it), the lock is released, exit 0.',
       '`pidge bridge install` writes a launchd (macOS) / systemd (Linux) TEMPLATE that runs this command with Restart=on-failure semantics and declares listen_mode=external_daemon in the operating contract (advisory, honest). The template NEVER embeds the key — it stays in ~/.config/pidge/env.',
     ].join('\n'),
@@ -1191,7 +1219,11 @@ const HELP = {
   ack: {
     summary: 'mark messages PROCESSED (green ✓✓) after you handled them, or --renew the lease on a long task.',
     usage: 'pidge ack --up-to <id> | --ids a,b [--renew] [--summary "<what you did>"]',
-    body: '--summary attaches a one-line note (WHAT you did) to the acked messages — a successor session sees it as "handled by X: <summary>" in `pidge catchup`. A bare --summary with no value is a usage error, never a silent no-op.',
+    body: [
+      '--summary attaches a one-line note (WHAT you did) to the acked messages — a successor session sees it as "handled by X: <summary>" in `pidge catchup`. A bare --summary with no value is a usage error, never a silent no-op.',
+      '',
+      'AN ACK IS A CLAIM THAT THE WORK IS DONE. Ack AFTER the work, never on read, and never as loop plumbing: a message drained by a loop that did nothing (and answered nothing) is a MUTE ack — the server files it as drained, `pidge catchup` can\'t say what happened, and the human is left with a green check that means nothing. In an automated loop the note belongs to the handler that did the work (`pidge listen --exec` / `pidge bridge` take it from the handler\'s `pidge-summary:` line and never invent one) — so if you have nothing to say, you probably have nothing to ack yet.',
+    ].join('\n'),
     opts: ['up-to', 'ids', 'renew', 'ack-summary'],
   },
   contract: {
@@ -1327,7 +1359,7 @@ const KNOWN_MANIFEST_VERSION = 67;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 22;
+const SKILL_REVISION = 23;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -1485,7 +1517,14 @@ function skillIsStale(file, serverManifestVersion, requireMarker = false) {
   // and never heal. Pre-trailer installs lack the trailer too, but their rev < 4 already
   // marks them stale, so the two triggers compose instead of fighting.
   const torn = installedRev > 0 && !content.trimEnd().endsWith(SKILL_END_MARKER);
-  return torn || SKILL_REVISION > installedRev || (serverManifestVersion || 0) > installedManifest;
+  if (torn) return true;
+  // A file whose spine rev is NEWER than this CLI's was written by a newer CLI.
+  // Regenerating it here would DOWNGRADE the doctrine to this binary's older
+  // spine — a newer server manifest is not a license to do that (observed live:
+  // a 0.46 install "healed" a rev-22 skill down to rev 21 because the manifest
+  // had moved). Leave it; the newer CLI heals its own manifest staleness.
+  if (installedRev > SKILL_REVISION) return false;
+  return SKILL_REVISION > installedRev || (serverManifestVersion || 0) > installedManifest;
 }
 
 async function ensureSkillFresh(serverManifestVersion) {
@@ -1608,6 +1647,7 @@ function cableSubscribe({ channel, params = {}, onUp, onFrame, onDown, base = BA
   const die = (why) => {
     if (closed) return; closed = true;
     clearInterval(beatCheck);
+    if (appBeat) clearInterval(appBeat);
     try { ws.close(); } catch { /* already closing */ }
     onDown(why);
   };
@@ -1615,11 +1655,26 @@ function cableSubscribe({ channel, params = {}, onUp, onFrame, onDown, base = BA
     if (Date.now() - lastBeat > 15000) die('heartbeat lost (server gone?)');
   }, 5000);
   ws.onopen = () => ws.send(JSON.stringify({ command: 'subscribe', identifier }));
+  // Client-initiated liveness beat (server ≥ v112): the server refreshes
+  // "listening now" ONLY while the CLIENT proves it's alive — a frozen process
+  // (laptop lid, suspended container) keeps its TCP socket open, so the server's
+  // own timer used to keep the light on for a consumer that couldn't hear.
+  // Sent every 30 s once subscribed; an older server just logs and ignores it.
+  let appBeat = null;
+  const startAppBeat = () => {
+    if (appBeat) return;
+    appBeat = setInterval(() => {
+      if (ws.readyState === 1) {
+        try { ws.send(JSON.stringify({ command: 'message', identifier, data: JSON.stringify({ action: 'beat' }) })); } catch { /* dying socket — onclose handles it */ }
+      }
+    }, 30000);
+    if (appBeat.unref) appBeat.unref();
+  };
   ws.onmessage = (e) => {
     lastBeat = Date.now();
     let f; try { f = JSON.parse(e.data); } catch { return; }
     if (f.type === 'ping' || f.type === 'welcome') return;
-    if (f.type === 'confirm_subscription') { onUp && onUp(); return; }
+    if (f.type === 'confirm_subscription') { startAppBeat(); onUp && onUp(); return; }
     if (f.type === 'reject_subscription') { die('subscription rejected (bad token?)'); return; }
     if (f.identifier === identifier && f.message) onFrame(f.message);
   };
@@ -1628,7 +1683,7 @@ function cableSubscribe({ channel, params = {}, onUp, onFrame, onDown, base = BA
   // start with "socket" again (was "socket socket closed (1006)").
   ws.onclose = (e) => die(`closed (${e.code})`);
   return {
-    close: () => { closed = true; clearInterval(beatCheck); try { ws.close(); } catch { /* noop */ } },
+    close: () => { closed = true; clearInterval(beatCheck); if (appBeat) clearInterval(appBeat); try { ws.close(); } catch { /* noop */ } },
   };
 }
 
@@ -2913,8 +2968,11 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
   let firedNotice = false;
   // Composer-wake (0.32): only the default print-and-exit contract returns
   // typed human messages; an onAnswer flow (approve) stays notification-only.
-  // A live bridge owns the queue — a wait must never double-consume it.
-  const wakeQueue = !onAnswer && !bridgeLockHolder();
+  // A live consumer (a bridge, or your own `listen`) owns the queue — a wait
+  // must never double-consume it, and the asymmetry is narrated, not silent.
+  const consumer = bridgeLockHolder();
+  narrateLiveConsumer(consumer);
+  const wakeQueue = !onAnswer && !consumer;
   for (;;) {
     // Degraded: a held poll keeps dying behind some edge — switch to
     // PLAIN GETs (the requests that kept working in the wild) on a slow pace.
@@ -2993,8 +3051,11 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
 // subscription (plus the safety probe's messages_pending) wakes the drain.
 async function realtimeWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
   const deadline = Date.now() + timeout * 1000;
-  // Same gate as doWait: default contract only, never over a running bridge.
-  const wakeQueue = !onAnswer && !bridgeLockHolder();
+  // Same gate as doWait: default contract only, never over a live consumer
+  // (a bridge or your own `listen`) — narrated once, never refused.
+  const consumer = bridgeLockHolder();
+  narrateLiveConsumer(consumer);
+  const wakeQueue = !onAnswer && !consumer;
   // 'answered' | 'composer' | false — one authoritative HTTP read for both planes.
   const probe = async () => {
     try {
@@ -3257,7 +3318,12 @@ function markAckNoticeSeen() {
 function reportDeviceReach(data) {
   const reach = data.device_reach;
   if (!reach) return false;
-  console.error(`pidge: reach — ${reach.deliverable}/${reach.total} device(s) will actually receive a push (${reach.apns_environment} APNs)`);
+  // Three counts, three meanings — name them, or the human reads two denominators
+  // in one output: `devices` (the headline above) counts PUSHABLE registrations;
+  // reach.total counts EVERY registration incl. push-disabled ones; deliverable
+  // is what a real push lands on. Say total explicitly so 3 pushable / 3-of-6
+  // deliverable stops reading as a contradiction.
+  console.error(`pidge: reach — ${reach.deliverable} of ${reach.total} registered device(s) (incl. push-disabled/old ones) will actually receive a push (${reach.apns_environment} APNs)`);
   if (reach.total > reach.deliverable)
     console.error(`pidge: WARNING — ${reach.total - reach.deliverable} registered device(s) are UNREACHABLE (disabled, or on the wrong APNs environment): a send lands on ${reach.deliverable}, not ${reach.total} ("você pensa que alcança ${reach.total}, alcança ${reach.deliverable}").`);
   return reach.total > 0 && reach.deliverable === 0;
@@ -3613,7 +3679,9 @@ function bridgeLockHolder() {
   const cur = readBridgeLock(bridgeLockPath());
   return cur && pidAlive(cur.pid) ? cur : null;
 }
-function acquireBridgeLock() {
+// `tag` names the CALLER in every line this can print (bridge | listen) — the
+// lock itself is one lock: whoever holds it is the channel's consumer.
+function acquireBridgeLock(tag = 'bridge') {
   const file = bridgeLockPath();
   fs.mkdirSync(bridgeLockBaseDir(), { recursive: true, mode: 0o700 });
   const payload = JSON.stringify({ pid: process.pid, started_at: new Date().toISOString(), label: agentLabel() }) + '\n';
@@ -3623,10 +3691,10 @@ function acquireBridgeLock() {
       fs.writeSync(fd, payload);
       fs.closeSync(fd);
     } catch (e) {
-      if (e.code !== 'EEXIST') die(`pidge: bridge — can't create the lock at ${file}: ${e.message}`, 2);
+      if (e.code !== 'EEXIST') die(`pidge: ${tag} — can't create the lock at ${file}: ${e.message}`, 2);
       const cur = readBridgeLock(file);
       if (cur && pidAlive(cur.pid))
-        die(`pidge: bridge — REFUSED: another consumer already holds this channel (pid ${cur.pid}${cur.label ? `, "${cur.label}"` : ''}, since ${cur.started_at || '?'}). One consumer per channel — a second bridge/listen double-consumes. Stop it first, or read with \`pidge catchup\` (read-only). If you are CERTAIN no bridge is running (e.g. the pid belongs to an unrelated process), delete the lockfile yourself: rm "${file}"`, 2);
+        die(`pidge: ${tag} — REFUSED: another consumer already holds this channel (pid ${cur.pid}${cur.label ? `, "${cur.label}"` : ''}, since ${cur.started_at || '?'}). One consumer per channel — a second bridge/listen double-consumes. Stop it first, or read with \`pidge catchup\` (read-only). If you are CERTAIN no bridge is running (e.g. the pid belongs to an unrelated process), delete the lockfile yourself: rm "${file}"`, 2);
       // Stale lock: the pid is gone (a crashed bridge never releases — that's
       // WHY the lock stores a pid) or the file is garbage. So:
       // CLAIM the corpse by atomic RENAME — on the same fs exactly ONE racer's
@@ -3637,26 +3705,209 @@ function acquireBridgeLock() {
       try {
         fs.renameSync(file, corpse);
       } catch (re) {
-        die(`pidge: bridge — lost the stale-lock takeover race (${re.code}: another starter claimed it first) — refusing to double-consume. Re-run if you believe it also crashed.`, 2);
+        die(`pidge: ${tag} — lost the stale-lock takeover race (${re.code}: another starter claimed it first) — refusing to double-consume. Re-run if you believe it also crashed.`, 2);
       }
       try { fs.unlinkSync(corpse); } catch { /* best-effort cleanup of the claimed corpse */ }
-      console.error(`pidge: bridge — recovered a STALE lock (pid ${cur ? cur.pid : '?'} is gone; crashed bridge / power loss). Taking over.`);
+      console.error(`pidge: ${tag} — recovered a STALE lock (pid ${cur ? cur.pid : '?'} is gone; crashed consumer / power loss). Taking over.`);
       continue; // retry the exclusive create ONCE — a racing NEW starter makes us EEXIST → re-check above
     }
     // Paranoia re-read (belt on top of the rename): whoever the file names now
     // is the holder; if it isn't us, back off.
     const now = readBridgeLock(file);
     if (!now || now.pid !== process.pid)
-      die(`pidge: bridge — lost the lock race to pid ${now ? now.pid : '?'} — refusing to double-consume.`, 2);
+      die(`pidge: ${tag} — lost the lock race to pid ${now ? now.pid : '?'} — refusing to double-consume.`, 2);
     return file;
   }
-  die('pidge: bridge — couldn\'t acquire the lock (raced twice); try again.', 2);
+  die(`pidge: ${tag} — couldn't acquire the lock (raced twice); try again.`, 2);
 }
 function releaseBridgeLock(file) {
   // Remove only OUR lock: after a crash + takeover the file may name another pid.
   const cur = readBridgeLock(file);
   if (cur && cur.pid !== process.pid) return;
   try { fs.unlinkSync(file); } catch { /* best-effort */ }
+}
+
+// A blocking wait (wait/ask/approval/hello) on a channel whose consumer lock is
+// HELD is a legitimate, common pattern — your own listener holds it while your
+// handler asks a question. It is never refused; it is NARRATED, once, because
+// the asymmetry bites otherwise: this wait hears the ANSWER to its notification
+// and nothing else, while everything the human TYPES belongs to the listener.
+let liveConsumerNarrated = false;
+function narrateLiveConsumer(holder) {
+  if (!holder || liveConsumerNarrated) return;
+  liveConsumerNarrated = true;
+  console.error(`pidge: this channel already has a LIVE consumer (${holder.label ? `"${holder.label}", ` : ''}pid ${holder.pid}) — this wait hears ONLY the answer to your notification; anything the human TYPES goes to that listener's queue. Send-and-go and collect it there instead of waiting twice.`);
+}
+
+// ---------------------------------------------------------------------------
+// ONE handler invocation — shared by `pidge bridge` (a batch per loop tick) and
+// `pidge listen --exec` (one round, no daemon). Both hand the batch to a command
+// on stdin and let its EXIT CODE decide the ack, so everything hard lives here
+// exactly once: the shell spawn, the settle (process exit AND stdout EOF, with a
+// short grace when a grandchild keeps the pipe open), the STREAMED scan for the
+// last `pidge-summary:` marker, the stdout tee with backpressure, the
+// --handler-timeout SIGTERM (SIGKILL 5 s later), the periodic stderr heartbeat,
+// and the lease/presence renew of the batch's EXACT ids while the handler thinks.
+// It NEVER acks and never exits: it returns {outcome, summary, seconds} and the
+// caller owns the verdict. `tag` names the caller in every line printed here.
+// ---------------------------------------------------------------------------
+function runHandlerOnce({
+  tag, handlerCmd, batch, batchIds, env = process.env,
+  handlerTimeoutS, narrateMs, renewMs, onSpawn = null, onSettle = null,
+}) {
+  const { spawn } = require('node:child_process');
+  // capture the handler's summary from a MARKER LINE on its stdout —
+  // `pidge-summary: <text>`. We STREAM, never buffer the whole output: stdout is
+  // teed to our own stdout (the log/pipe is preserved) while a bounded
+  // line-scanner keeps only the LAST marker's value (cap 1000). A handler that
+  // dumps megabytes, or closes stdout early, can neither wedge the caller nor
+  // grow memory. No marker ⇒ no summary (we NEVER invent one).
+  let lastSummary = null;
+  let markerTail = '';
+  const MARKER_TAIL_CAP = 2048; // a marker value is ≤1000; this head is plenty to still recognize the prefix
+  const takeMarker = (line) => {
+    const m = /^pidge-summary:[ \t]?(.*)$/.exec(line.trim());
+    if (m) lastSummary = m[1].trim().slice(0, 1000);
+  };
+  const scanStdout = (text) => {
+    // Split once (O(n)); the last part is the unterminated tail carried forward.
+    const parts = (markerTail + text).split('\n');
+    markerTail = parts.pop();
+    for (const line of parts) takeMarker(line);
+    // Bound the unterminated tail — keep only the HEAD (a marker must start at
+    // the line start); a single line longer than the cap can't be a marker we'd
+    // keep, and truncating the head preserves the prefix + a full ≤1000 value.
+    if (markerTail.length > MARKER_TAIL_CAP) markerTail = markerTail.slice(0, MARKER_TAIL_CAP);
+  };
+  const t0 = Date.now();
+  return new Promise((resolve) => {
+    const finish = (outcome) => resolve({ outcome, summary: lastSummary, seconds: Math.round((Date.now() - t0) / 1000) });
+    let child;
+    try {
+      child = spawn(handlerCmd, { shell: true, stdio: ['pipe', 'pipe', 'inherit'], env });
+    } catch (e) { return finish({ code: null, error: e.message }); }
+    if (onSpawn) onSpawn(child);
+    let timedOut = false;
+    let hardKill = null;
+    let settled = false;
+    let exited = null;        // {code, signal} once the process exits
+    let stdoutEnded = false;  // true once the stdout pipe reaches EOF
+    let graceT = null;
+    // A hung handler must not wedge the channel forever (the lease keeps
+    // re-serving to a consumer that never finishes a batch). --handler-timeout
+    // (default 30 min) → SIGTERM (SIGKILL 5 s later), treated EXACTLY like a
+    // failed handler: no ack.
+    const killT = setTimeout(() => {
+      timedOut = true;
+      console.error(`pidge: ${tag} — handler exceeded --handler-timeout (${handlerTimeoutS}s) — SIGTERM (SIGKILL in 5s). Treated as a FAILED batch: NOT acked.`);
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+      hardKill = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 5000);
+      if (hardKill.unref) hardKill.unref();
+    }, handlerTimeoutS * 1000);
+    if (killT.unref) killT.unref();
+    // Periodic heartbeat on stderr while the handler runs — a log that goes
+    // silent for 25 minutes reads as "dead", not "thinking".
+    const narrate = setInterval(() => {
+      const elapsed = Date.now() - t0;
+      const shown = elapsed < 60000 ? `${Math.round(elapsed / 1000)}s` : `${Math.round(elapsed / 60000)} min`;
+      console.error(`pidge: ${tag} — handler running for ${shown} (SIGTERM at --handler-timeout ${handlerTimeoutS}s)`);
+    }, narrateMs);
+    if (narrate.unref) narrate.unref();
+    // Lease/presence heartbeat while the handler thinks: renew the batch's EXACT
+    // ids every renewMs — POST /ack {ids, state:"delivered"}. Two jobs in one
+    // ping: (a) the visibility lease can't lapse mid-run (a 30-min handler
+    // outlives the ~10-min lease — without this the batch re-serves WHILE it's
+    // being worked), and (b) servers ≥ manifest v79 refresh "listening now"
+    // presence on a renew that actually renewed rows — so the human never sees
+    // "offline" during a long handler run even when the WS is down (older
+    // servers: lease renewal only, harmless). First ping only after a full
+    // interval — a fast handler never pings. Cleared in done(), BEFORE the
+    // ack/failure verdict: a FAILED batch must lapse back to the queue, so we
+    // never renew after the child exits. Failures are NON-FATAL and can never
+    // touch the handler or the batch outcome: narrate the FIRST one, then stay
+    // silent (a line per ping would drown a long outage's log).
+    let renewFailed = false;
+    const renew = batchIds.length === 0 ? null : setInterval(() => {
+      fetchT(`${BASE}/api/v1/messages/ack`, {
+        method: 'POST', headers, body: JSON.stringify({ ids: batchIds, state: 'delivered' }),
+      }).then((r) => {
+        if (r.status >= 200 && r.status < 300) return;
+        if (renewFailed) return;
+        renewFailed = true;
+        console.error(`pidge: ${tag} — renew heartbeat failed (${r.status}) — non-fatal: the handler keeps running; the lease may lapse early (at-least-once covers a re-serve)`);
+      }).catch((e) => {
+        if (renewFailed) return;
+        renewFailed = true;
+        console.error(`pidge: ${tag} — renew heartbeat failed (network: ${e.message}) — non-fatal: the handler keeps running; the lease may lapse early (at-least-once covers a re-serve)`);
+      });
+    }, renewMs);
+    if (renew && renew.unref) renew.unref();
+    const done = (o) => {
+      if (settled) return; settled = true;
+      clearTimeout(killT); if (hardKill) clearTimeout(hardKill); clearInterval(narrate);
+      if (renew) clearInterval(renew);
+      if (graceT) clearTimeout(graceT);
+      // A final marker line with NO trailing newline still counts.
+      if (markerTail) { takeMarker(markerTail); markerTail = ''; }
+      if (onSettle) onSettle();
+      finish(o);
+    };
+    // finalize only when the process has exited AND its stdout has drained,
+    // so a marker on the LAST unflushed chunk is never missed (the 'exit' event
+    // can fire before the pipe's trailing data is read). If stdout stays open past
+    // exit (a grandchild inherited the pipe), a short grace caps the wait.
+    const finishIfReady = () => { if (exited && stdoutEnded) done({ code: exited.code, signal: exited.signal, timedOut }); };
+    child.on('error', (e) => done({ code: null, error: e.message }));
+    child.on('exit', (code, signal) => {
+      exited = { code, signal };
+      if (stdoutEnded) return finishIfReady();
+      graceT = setTimeout(() => done({ code, signal, timedOut }), 2000);
+      if (graceT.unref) graceT.unref();
+    });
+    child.stdout.on('data', (chunk) => {
+      scanStdout(chunk.toString('utf8'));
+      // Tee to our own stdout (preserve the log) WITH backpressure — a slow sink
+      // pauses the child rather than buffering a big dump in memory.
+      if (!process.stdout.write(chunk)) {
+        child.stdout.pause();
+        process.stdout.once('drain', () => { try { child.stdout.resume(); } catch { /* child gone */ } });
+      }
+    });
+    child.stdout.on('end', () => { stdoutEnded = true; finishIfReady(); });
+    // A broken read side must never crash the caller; treat it as drained.
+    child.stdout.on('error', () => { stdoutEnded = true; finishIfReady(); });
+    // EPIPE guard: a handler may exit without reading stdin — its exit code
+    // still decides the batch; the write failure itself is not a verdict.
+    child.stdin.on('error', () => {});
+    child.stdin.end(JSON.stringify(batch) + '\n');
+  });
+}
+
+// Ack the batch's EXACT ids, never `up_to`.
+// The server's up_to flips EVERY unprocessed row ≤ id — including rows under
+// lease from an EARLIER batch the handler FAILED on (or never saw): a later
+// success would stamp "processed" on work that never happened. ids:[…] can
+// only stamp what this handler demonstrably just handled. `summary` is the
+// handler's own marker line or nothing — never an invented one.
+async function ackExactIds(tag, ids, summary, runToken) {
+  const body = { ids };
+  if (summary) body.summary = String(summary).slice(0, 1000); // server slices; we cap
+  // Sign the ack with THIS batch's run (the handler that just did the work),
+  // never the parent's — so the human sees who processed the message.
+  const ackHeaders = runToken ? { ...headers, 'x-pidge-run': runToken } : headers;
+  try {
+    const res = await fetchT(`${BASE}/api/v1/messages/ack`, {
+      method: 'POST', headers: ackHeaders, body: JSON.stringify(body),
+    });
+    if (res.status >= 200 && res.status < 300) {
+      console.error(`pidge: ${tag} — acked ${ids.length} message(s) (exact ids of the batch — green ✓✓)${body.summary ? ` · summary: ${body.summary.length > 80 ? body.summary.slice(0, 77) + '…' : body.summary}` : ''}`);
+      return true;
+    }
+    console.error(`pidge: ${tag} — WARNING: ack failed (${res.status}) — the batch re-serves after the lease; the handler will see it again`);
+  } catch (e) {
+    console.error(`pidge: ${tag} — WARNING: ack failed (network: ${e.message}) — the batch re-serves after the lease`);
+  }
+  return false;
 }
 
 // A LOCAL alert for the two "only a human can fix this" failures (401 —
@@ -3798,7 +4049,6 @@ async function runBridge() {
   const handlerCmd = v.exec;
   if (!handlerCmd)
     die('pidge: bridge needs --exec \'<handler command>\' — invoked ONCE per batch with the batch JSON on stdin; exit 0 acks the batch, non-zero leaves it for the server lease to re-serve. E.g.: pidge bridge --exec \'claude -p "handle this pidge batch"\'', 1);
-  const { spawn } = require('node:child_process');
 
   // NO orphan watchdog here, deliberately (that guard is for `listen`): the bridge is
   // MEANT to outlive its launcher (nohup, a closed terminal, launchd) — its
@@ -4022,33 +4272,8 @@ async function runBridge() {
     } catch { return null; }
   };
 
-  // Ack the batch's EXACT ids, never `up_to`.
-  // The server's up_to flips EVERY unprocessed row ≤ id — including rows under
-  // lease from an EARLIER batch the handler FAILED on (or never saw): a later
-  // success would stamp "processed" on work that never happened. ids:[…] can
-  // only stamp what this handler demonstrably just handled.
-  const ackBatch = async (ids, summary, runToken) => {
-    const body = { ids };
-    // attribution — WHAT the handler did, captured from its stdout marker
-    // line (below). Absent ⇒ no field (never invent one). Server slices; we cap.
-    if (summary) body.summary = String(summary).slice(0, 1000);
-    // Sign the ack with THIS batch's run (the handler that just did the work),
-    // never the parent bridge's — so the human sees who processed the message.
-    const ackHeaders = runToken ? { ...headers, 'x-pidge-run': runToken } : headers;
-    try {
-      const res = await fetchT(`${BASE}/api/v1/messages/ack`, {
-        method: 'POST', headers: ackHeaders, body: JSON.stringify(body),
-      });
-      if (res.status >= 200 && res.status < 300) {
-        console.error(`pidge: bridge — acked ${ids.length} message(s) (exact ids of the batch — green ✓✓)${body.summary ? ` · summary: ${body.summary.length > 80 ? body.summary.slice(0, 77) + '…' : body.summary}` : ''}`);
-        return true;
-      }
-      console.error(`pidge: bridge — WARNING: ack failed (${res.status}) — the batch re-serves after the lease; the handler will see it again`);
-    } catch (e) {
-      console.error(`pidge: bridge — WARNING: ack failed (network: ${e.message}) — the batch re-serves after the lease`);
-    }
-    return false;
-  };
+  // Ack the batch's EXACT ids, never `up_to` (see ackExactIds).
+  const ackBatch = (ids, summary, runToken) => ackExactIds('bridge', ids, summary, runToken);
 
   for (;;) {
     if (shuttingDown) return;
@@ -4204,140 +4429,33 @@ async function runBridge() {
     // or a hiccup: spawn unsigned, exactly as before.
     const runInfo = await startBridgeRun();
     if (runInfo) console.error(`pidge: bridge — run ${runInfo.seal || '?'} signs this batch`);
-    // capture the handler's summary from a MARKER LINE on its stdout —
-    // `pidge-summary: <text>`. We STREAM, never buffer the whole output: stdout is
-    // teed to the bridge's own stdout (the existing log is preserved) while a
-    // bounded line-scanner keeps only the LAST marker's value (cap 1000). A handler
-    // that dumps megabytes, or closes stdout early, can neither wedge the loop nor
-    // grow memory. No marker ⇒ no summary field (we NEVER invent one).
-    let lastSummary = null;
-    let markerTail = '';
-    const MARKER_TAIL_CAP = 2048; // a marker value is ≤1000; this head is plenty to still recognize the prefix
-    const takeMarker = (line) => {
-      const m = /^pidge-summary:[ \t]?(.*)$/.exec(line.trim());
-      if (m) lastSummary = m[1].trim().slice(0, 1000);
-    };
-    const scanStdout = (text) => {
-      // Split once (O(n)); the last part is the unterminated tail carried forward.
-      const parts = (markerTail + text).split('\n');
-      markerTail = parts.pop();
-      for (const line of parts) takeMarker(line);
-      // Bound the unterminated tail — keep only the HEAD (a marker must start at
-      // the line start); a single line longer than the cap can't be a marker we'd
-      // keep, and truncating the head preserves the prefix + a full ≤1000 value.
-      if (markerTail.length > MARKER_TAIL_CAP) markerTail = markerTail.slice(0, MARKER_TAIL_CAP);
-    };
-    const t0 = Date.now();
-    const outcome = await new Promise((resolve) => {
-      let child;
-      try {
-        // Inject the run bearer + seal so the handler's pidge calls self-sign;
-        // no run ⇒ plain process.env (unchanged behaviour).
-        const childEnv = runInfo
-          ? { ...process.env, PIDGE_RUN_TOKEN: runInfo.token, PIDGE_RUN_SEAL: runInfo.seal }
-          : process.env;
-        child = spawn(handlerCmd, { shell: true, stdio: ['pipe', 'pipe', 'inherit'], env: childEnv });
-      } catch (e) { return resolve({ code: null, error: e.message }); }
-      currentChild = child;
-      let timedOut = false;
-      let hardKill = null;
-      let settled = false;
-      let exited = null;        // {code, signal} once the process exits
-      let stdoutEnded = false;  // true once the stdout pipe reaches EOF
-      let graceT = null;
-      // A hung handler must not wedge the channel
-      // forever (the lease keeps re-serving to a bridge that never finishes a
-      // batch). --handler-timeout (default 30 min) → SIGTERM (SIGKILL 5 s
-      // later), treated EXACTLY like a failed handler: no ack, backoff ladder.
-      const killT = setTimeout(() => {
-        timedOut = true;
-        console.error(`pidge: bridge — handler exceeded --handler-timeout (${handlerTimeoutS}s) — SIGTERM (SIGKILL in 5s). Treated as a FAILED batch: NOT acked.`);
-        try { child.kill('SIGTERM'); } catch { /* already gone */ }
-        hardKill = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 5000);
-        if (hardKill.unref) hardKill.unref();
-      }, handlerTimeoutS * 1000);
-      if (killT.unref) killT.unref();
-      // Periodic heartbeat on stderr while the handler runs — a daemon log that
-      // goes silent for 25 minutes reads as "dead", not "thinking".
-      const narrate = setInterval(() => {
-        const elapsed = Date.now() - t0;
-        const shown = elapsed < 60000 ? `${Math.round(elapsed / 1000)}s` : `${Math.round(elapsed / 60000)} min`;
-        console.error(`pidge: bridge — handler running for ${shown} (SIGTERM at --handler-timeout ${handlerTimeoutS}s)`);
-      }, HANDLER_NARRATE_MS);
-      if (narrate.unref) narrate.unref();
-      // Lease/presence heartbeat while the handler thinks (issue #82): renew the
-      // batch's EXACT ids every 60 s — POST /ack {ids, state:"delivered"}. Two jobs
-      // in one ping: (a) the visibility lease can't lapse mid-run (a 30-min handler
-      // outlives the ~10-min lease — without this the batch re-serves WHILE it's
-      // being worked), and (b) servers ≥ manifest v79 refresh "listening now"
-      // presence on a renew that actually renewed rows — so the human never sees
-      // "offline" during a long handler run even when the WS is down (older
-      // servers: lease renewal only, harmless). First ping only after a full
-      // interval — a fast handler never pings. Cleared in done(), BEFORE the
-      // ack/failure verdict: a FAILED batch must lapse back to the queue, so we
-      // never renew after the child exits. Failures are NON-FATAL and can never
-      // touch the handler or the batch outcome: narrate the FIRST one, then stay
-      // silent (a line per ping would drown a long outage's log).
-      let renewFailed = false;
-      const renew = batchIds.length === 0 ? null : setInterval(() => {
-        fetchT(`${BASE}/api/v1/messages/ack`, {
-          method: 'POST', headers, body: JSON.stringify({ ids: batchIds, state: 'delivered' }),
-        }).then((r) => {
-          if (r.status >= 200 && r.status < 300) return;
-          if (renewFailed) return;
-          renewFailed = true;
-          console.error(`pidge: bridge — renew heartbeat failed (${r.status}) — non-fatal: the handler keeps running; the lease may lapse early (at-least-once covers a re-serve)`);
-        }).catch((e) => {
-          if (renewFailed) return;
-          renewFailed = true;
-          console.error(`pidge: bridge — renew heartbeat failed (network: ${e.message}) — non-fatal: the handler keeps running; the lease may lapse early (at-least-once covers a re-serve)`);
-        });
-      }, RENEW_MS);
-      if (renew && renew.unref) renew.unref();
-      const done = (o) => {
-        if (settled) return; settled = true;
-        clearTimeout(killT); if (hardKill) clearTimeout(hardKill); clearInterval(narrate);
-        if (renew) clearInterval(renew);
-        if (graceT) clearTimeout(graceT);
-        // A final marker line with NO trailing newline still counts.
-        if (markerTail) { takeMarker(markerTail); markerTail = ''; }
-        currentChild = null; resolve(o);
-      };
-      // finalize only when the process has exited AND its stdout has drained,
-      // so a marker on the LAST unflushed chunk is never missed (the 'exit' event
-      // can fire before the pipe's trailing data is read). If stdout stays open past
-      // exit (a grandchild inherited the pipe), a short grace caps the wait.
-      const finishIfReady = () => { if (exited && stdoutEnded) done({ code: exited.code, signal: exited.signal, timedOut }); };
-      child.on('error', (e) => done({ code: null, error: e.message }));
-      child.on('exit', (code, signal) => {
-        exited = { code, signal };
-        if (stdoutEnded) return finishIfReady();
-        graceT = setTimeout(() => done({ code, signal, timedOut }), 2000);
-        if (graceT.unref) graceT.unref();
-      });
-      child.stdout.on('data', (chunk) => {
-        scanStdout(chunk.toString('utf8'));
-        // Tee to the bridge's own stdout (preserve the log) WITH backpressure — a
-        // slow sink pauses the child rather than buffering a big dump in memory.
-        if (!process.stdout.write(chunk)) {
-          child.stdout.pause();
-          process.stdout.once('drain', () => { try { child.stdout.resume(); } catch { /* child gone */ } });
-        }
-      });
-      child.stdout.on('end', () => { stdoutEnded = true; finishIfReady(); });
-      // A broken read side must never crash the daemon; treat it as drained.
-      child.stdout.on('error', () => { stdoutEnded = true; finishIfReady(); });
-      // EPIPE guard: a handler may exit without reading stdin — its exit code
-      // still decides the batch; the write failure itself is not a verdict.
-      child.stdin.on('error', () => {});
-      child.stdin.end(JSON.stringify(batch) + '\n');
+    // ONE handler invocation. Everything mechanical (spawn, the settle on
+    // exit+EOF, the streamed `pidge-summary:` scan, the stdout tee, the
+    // --handler-timeout kill, the heartbeat and the lease renew) lives in the
+    // shared runHandlerOnce — `pidge listen --exec` runs the SAME machinery.
+    // The bridge keeps only what is its own: the child handle its SIGTERM
+    // teardown forwards to.
+    const { outcome, summary: lastSummary, seconds: secs } = await runHandlerOnce({
+      tag: 'bridge',
+      handlerCmd,
+      batch,
+      batchIds,
+      // Inject the run bearer + seal so the handler's pidge calls self-sign;
+      // no run ⇒ plain process.env (unchanged behaviour).
+      env: runInfo
+        ? { ...process.env, PIDGE_RUN_TOKEN: runInfo.token, PIDGE_RUN_SEAL: runInfo.seal }
+        : process.env,
+      handlerTimeoutS,
+      narrateMs: HANDLER_NARRATE_MS,
+      renewMs: RENEW_MS,
+      onSpawn: (child) => { currentChild = child; },
+      onSettle: () => { currentChild = null; },
     });
     // Hard case: the handler-exit → ack race. A signal that landed while the
     // handler ran (or right as it exited) means shutdown() is tearing us down —
     // do NOT ack: the batch stays leased and re-serves. A duplicate delivery
     // beats a batch stamped "processed" during a teardown.
     if (shuttingDown) return;
-    const secs = Math.round((Date.now() - t0) / 1000);
     // A timed-out handler NEVER acks — even if it trapped SIGTERM and exited 0:
     // its work was cut short by definition.
     if (outcome.code === 0 && !outcome.timedOut) {
@@ -4677,13 +4795,45 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
     const hres = await fetchT(`${BASE}/api/v1/messages?history=true`, { headers });
     if (hres.status === 200) {
       const hdata = await hres.json().catch(() => ({}));
-      const pending = (hdata.messages || []).filter((mm) => !mm.processed_at && !mm.consumed_at).length;
+      const rows = Array.isArray(hdata.messages) ? hdata.messages : [];
+      const anyLive = Array.isArray(data.consumers) && data.consumers.some((c) => c && c.live);
+      const pending = rows.filter((mm) => !mm.processed_at && !mm.consumed_at).length;
       if (pending > 0) {
-        const anyLive = Array.isArray(data.consumers) && data.consumers.some((c) => c && c.live);
         const noEar = ' Nobody is consuming this queue — a `--wait` on one notification does NOT read it (CLI ≥0.32 waits DO wake on it): run `pidge listen`/`pidge online`, or `pidge catchup` first (read-only).';
         console.error(`pidge doctor: ⚠️ ${pending} composer message(s) un-acked on this channel's queue — the human wrote and no ack marked them handled.${anyLive ? ' A live consumer exists; make sure it acks after the work.' : noEar}`);
       } else {
         console.error('pidge doctor: composer queue: no un-acked messages ✓');
+      }
+      // A DEAF consumer is worse than none: something reads the queue, takes the
+      // delivery, lets the lease lapse and never acks — presence says "listening
+      // now" while nothing is being handled. The shape is visible from the
+      // read-only history alone: still unprocessed, delivered a while ago, and
+      // the delivery's own lease already expired ⇒ it was served and dropped.
+      // Only worth saying when a consumer IS live: with nobody consuming, the
+      // "nobody is consuming this queue" line above is the true diagnosis.
+      const now = Date.now();
+      const ms = (t) => { const n = t ? Date.parse(t) : NaN; return Number.isFinite(n) ? n : null; };
+      const deaf = rows.filter((mm) => {
+        if (mm.processed_at || mm.consumed_at) return false;
+        const delivered = ms(mm.delivered_at);
+        const expires = ms(mm.delivery_expires_at);
+        return delivered !== null && expires !== null && expires < now && delivered < now - 120000;
+      }).length;
+      if (deaf > 0 && anyLive)
+        console.error(`pidge doctor: ⚠️ ${deaf} message(s) were DELIVERED to a consumer, lost their lease and are still un-acked — something is reading this queue without handling it (a blind parser? a loop that drains and never acks?). Presence can read "listening now" while nothing lands. Check what consumes here, and ack only AFTER the work: \`pidge ack --ids <ids> --summary "<what you did>"\`.`);
+      // A MUTE ack is the other half: the row is processed, but nothing was
+      // written back and no note says what happened — plumbing, not work. The
+      // server names it `handled_state:"drained"`; an older one omits the field
+      // entirely, and then this probe stays silent (never a warning ABOUT the
+      // missing field).
+      if (rows.some((mm) => mm.handled_state !== undefined)) {
+        const drained = rows.filter((mm) => {
+          if (mm.handled_state !== 'drained') return false;
+          const done = ms(mm.processed_at);
+          return done === null || done > now - 24 * 3600 * 1000;
+        }).length;
+        if (drained > 0)
+          console.error(`pidge doctor: ⚠️ ${drained} message(s) acked in the last 24h with NO note and no answer sent afterwards — a MUTE ack (the server files it as "drained"). To the human that green ✓✓ claims work that left no trace. In an automated loop the note belongs to the handler (\`pidge listen --exec\` / \`pidge bridge\` take it from its \`pidge-summary:\` line); by hand, use \`ack --summary\`.`);
       }
     }
   } catch { /* advisory probe — never fails the doctor */ }
@@ -5197,7 +5347,7 @@ The banner shows your **\`--title\`** and **\`--body\`** (plain text). **\`--bod
 
 ## Approval has two paths — know which one you're in
 
-**Path A — YOU request it (\`pidge approval\`).** You decided this needs a human sign-off. \`pidge approval\` = \`important\` + an **Approve** (Face-ID gated) / **Reject** pair + \`--wait\`. You send it, you block, and you get \`chosen_action.action_id: "grant"\` (approved) or \`"deny"\` (rejected) back. Use it for money, deletions, irreversible actions.
+**Path A — YOU request it (\`pidge approval\`).** You decided this needs a human sign-off. \`pidge approval\` = \`important\` + an **Approve** (Face-ID gated) / **Reject** pair + \`--wait\`. You send it, you block, and you get \`chosen_action.action_id: "grant"\` (approved) or \`"deny"\` (rejected) back. Use it for money, deletions, irreversible actions. **The line vs a plain \`important --actions yes,no --wait\`:** approval buys the Face-ID ceremony at the cost of a detail-only banner (the human must OPEN the app to answer). Money and destruction earn the ceremony; a risky-but-operational go/no-go the human should answer from the lock screen is better served by \`important\` + \`yes,no\` — pick by whether a mis-tap would be catastrophic, not by how nervous you are.
 
 **Path B — your HUMAN requires it (a profile knob).** In the app, the human can turn ON **"Require approval · Face ID"** on any profile (the \`ack_requires_biometric\` knob — **OFF by default everywhere**). When it's ON for, say, \`important\`, then **every ordinary send on that profile silently becomes an Approve-with-Face-ID decision** — even a plain \`pidge important\` with no buttons. The server injects a single \`approve\` action, so the send reads back \`actions:["approve"], requires_action:true, acknowledgeable:false\`, the banner is detail-only, and **the human's tap reaches you as \`chosen_action.action_id: "approve"\`** (poll / webhook / \`pidge listen --all\`). You didn't ask — they imposed it.
 
@@ -5248,7 +5398,7 @@ that's a separate \`important\` at the end.
 2. **Default to \`important\`.** \`message\` only for true no-action FYIs; \`urgent\` is a contract, not a volume knob — **<1/day**, abuse caps your channel.
 3. **There is no content-template menu.** Every send is type + markdown + optional buttons. If you're reaching for \`--template context/report/digest/sensitive\`, stop — that surface is gone (the field still parses as silent back-compat, but don't teach or rely on it).
 4. **Typed answer? \`--actions reply\` ALONE** — never a decision + \`reply\` together (the CLI refuses it, exit 1).
-5. **Trust the 201 echo over your intent** — \`degraded\`/\`render_mode\`/\`registered_devices\`. \`registered_devices:0\` ⇒ it went nowhere; ABORT a blocking \`--wait\` on it (kill it, don't let it burn its timeout) and run \`pidge doctor\`.
+5. **Trust the 201 echo over your intent** — \`degraded\`/\`render_mode\`/\`registered_devices\`/\`nobody_listening\`. \`registered_devices:0\` ⇒ it went nowhere; ABORT a blocking \`--wait\` on it (kill it, don't let it burn its timeout) and run \`pidge doctor\`. \`nobody_listening:true\` on a send that expects an answer ⇒ no consumer will hear it land — your cue to go online right after sending.
 6. **Don't spam to signal importance.** Consolidate into one markdown body; use \`--collapse-key\` for self-replacing progress, \`--thread\` only for follow-ups over time.
 7. **Be listening when the answer lands — the queue keeps it safe (at-least-once, nothing is ever lost), but nobody wakes you until something reads it. What you lose is TIME, not the message.** Ack only AFTER the work is durably done.
 8. **Write to your human in THEIR language — mirror the language they use in the channel.** Phone-friendly markdown: narrow tables (they render), no emoji-spam.
@@ -5321,6 +5471,12 @@ ${notes.map((n) => `- ${n}`).join('\n')}
 - **A pending notification's answer does NOT surface in plain \`pidge listen\`** (messages only).
   To collect the answer to a question you already sent: \`pidge wait <cid>\` (you printed the cid
   on stderr at send time) or \`pidge listen --all\` (replies + messages). Park the cid, never re-send.
+- **An answer you collected via \`--wait\` ALSO sits in the messages queue, un-acked.** The wait
+  gives you the answer; the queue keeps its mirror row until an ack closes it — your next
+  \`listen --all\` re-hands it to you (stderr calls it OLD backlog) and \`doctor\` counts it. Ack it
+  with the rest of the round; under \`--exec\` the batch ack covers it. And \`listen --timeout\` is a
+  MAX-IDLE, not a session window: any queued item returns the round immediately — "stay online
+  3 minutes" means RELAUNCH until 3 minutes have passed, never one 180 s call.
 - **\`--wait\` is still NOT "being online."** It hears the composer only WHILE it blocks; between waits nothing reads the queue. Guiding a human step-by-step? Run \`pidge listen --all\` (or \`pidge online\`) as the primary loop, or \`pidge catchup --since <cursor>\` between steps. \`pidge doctor\` counts composer messages piling up un-acked.
 - ${exits} (a \`human_message\` return is also exit 0)
 
@@ -5334,6 +5490,8 @@ Your channel may already have a LIVE consumer — an always-on bridge or daemon 
 
 **The rule: one channel = one consumer. Reads are free (\`catchup\`, \`pidge wait <cid>\`); the consume loop (\`listen\`/\`ack\`) belongs to exactly one process.**
 
+**That rule includes your OWN second process.** While your \`listen\`/\`online\` round is up it HOLDS the channel's consumer lock: a second \`listen\` is refused (exit 2), and every \`--wait\`/\`ask\`/\`approval\` you fire meanwhile is a notification-only wait — it hears the BUTTON your human taps and nothing they TYPE (typed messages belong to the listener's queue; the CLI says so on stderr when it notices). So while a loop of yours is running, prefer **send-and-go**: fire the question with buttons, let the round end, and collect the answer through the loop (\`--all\` hears notification answers too). Blocking twice on one channel is how a "waiting" agent misses the very reply it was waiting for.
+
 **New signals when you DO share a channel (server v66+):** the CLI now identifies itself on every call, so \`pidge doctor\`/\`whoami\` LIST the live consumers on your channel — you'll see "\`team-bridge (you)\` · \`claude-interactive\`" and a ⚠️ \`consumer_conflict\` when 2+ are live (\`listen\` warns the same, once per run). In \`--digest\`, a message another runtime is actively working shows "\`· being handled by <who> since <T>\`" (self-filtered — never your own) so you don't redo it. And when you fire-and-forget a scheduled send, add \`--note "<why>"\` (\`sent_note\`, clear metadata — no secrets) so a successor reads WHY it's armed. Set \`PIDGE_AGENT=<id>\` (or \`PIDGE_LABEL\`) per runtime so those consumer names are meaningful.
 
 \`\`\`bash
@@ -5344,17 +5502,36 @@ pidge catchup --before 480              # page further back (older than message 
 \`\`\`
 In \`--digest\` each line already carries its state — \`handled by <who>: <summary>\`, \`✓ acked (no note)\`, or \`PENDING\` — so you SEE what the other consumer already did (or that it's done silently), not just that a message exists. Only \`PENDING\` is work to pick up.
 
+## Guiding a human step by step
+
+Sometimes the work isn't a report — it's walking your human through something (a setting to flip, a form to fill, a device to pair) while they hold the phone. The unit is ONE send per step:
+
+- **One send = one actionable step.** Never a numbered list of five: they do step 1, put the phone down, and the other four are gone.
+- **The instruction about a tap must BE the thing they tap.** If the step is a decision, put the buttons ON that send (\`--actions\`) instead of describing which button to press elsewhere.
+- **Ask for a screenshot, not a description.** "Manda um print dessa tela" comes back as an attachment on your next round and answers the questions you didn't know to ask — a human's paraphrase of an error rarely does.
+- **One question per send**, and wait for the step to land before sending the next one — a \`done\`/\`não achei\` pair on each step tells you whether to advance or to help.
+- **Their words, their language, their screen.** Name what they SEE ("o botão azul embaixo"), not what your API calls it.
+
 ## Stay "always-on" while you're turn-based
 
 A turn-based agent (e.g. Claude Code, Codex, Gemini CLI — anything invoked on demand) stays COMMANDABLE without a daemon:
 
 ### Stay online (the loop)
 
-"Online" is a LOOP, not a state: run \`pidge online\` (sugar for \`pidge listen --all\`) as a background task YOUR HARNESS TRACKS (never a loose shell \`&\`). It blocks until something lands; when it exits: **handle what it printed → \`pidge ack --up-to <id> --summary "…"\` → RELAUNCH it immediately** (exit 3 = nothing arrived — relaunch anyway). The RELAUNCH is the step turn-based agents forget: the queue keeps messages safe meanwhile (at-least-once, nothing lost), but the human sees you offline until something listens again.
+"Online" is a LOOP, not a state. One round, done right, is ONE command — let the handler's exit code decide the ack:
 
+\`\`\`bash
+pidge listen --all --exec 'claude -p "handle this pidge batch (JSON on stdin), then print a final line: pidge-summary: <what you did>"'
+\`\`\`
+
+It blocks until something lands, hands the WHOLE batch to your handler on stdin (\`{"messages":[…],"continuity":[…]}\`, ONE invocation) and then: **exit 0 ⇒ the batch's EXACT ids are acked, carrying the handler's last \`pidge-summary:\` line as the note** (no marker ⇒ acked with no note — never an invented one) · **anything else ⇒ NOTHING is acked**, a \`{"type":"handler_failed","exit":N,"ids":[…]}\` line lands on stdout and the command exits 2 (the ~10-min lease re-serves the batch — make the handler idempotent). Exit 3 = nothing arrived this round. Then RELAUNCH it: the relaunch is the step turn-based agents forget — the queue keeps messages safe meanwhile (at-least-once, nothing lost), but the human sees you offline until something listens again. Run it as a background task YOUR HARNESS TRACKS, never a loose shell \`&\`.
+
+- **Supervisor poll (24/7):** a cron/systemd timer invokes you every N min; each tick runs ONE \`pidge listen --all --exec '<handler>' --timeout 50\` and exits (3 = nothing this tick). \`--timeout\` is always SECONDS. Permanent, no timer? That is \`pidge bridge --exec\` (below) — the same handler contract as a daemon.
+- **Reading it yourself (no \`--exec\`):** \`pidge online\` (sugar for \`pidge listen --all\`) prints the round for YOU to handle. Then the two halves are yours: ack ONLY after the work is really done, and **if the handling FAILED, do NOT ack** — say so out loud where you (or your successor) will see it, and let the lease re-serve. Silence plus an ack is the one outcome the human can't detect.
+- **The stdout contract** (read it before writing any parser): zero or more compact \`{"type":"continuity_context",…}\` lines — read-only provenance, nothing there is ackable — and THEN **ONE pretty-printed JSON array** of message objects (\`kind\`: \`"message"\` | \`"notification_reply"\`). It is heterogeneous and multi-line: **never parse it line by line.** \`--ndjson\` gives one compact object per line instead, every line stamped \`type\` (mirroring \`kind\`), closing with \`{"type":"batch_end","count":N,"max_ackable_id":M}\`. Either way the rule is the same: **ackable ⇔ the object has an \`id\`; switch on \`type\`.**
 - **Active session:** \`pidge listen --follow --timeout 300\` holds for 5 min, printing messages as they arrive. \`--follow\` traps the turn — use it only when you intend to sit and wait.
-- **Supervisor poll (24/7):** a cron/systemd timer invokes you every N min; each tick runs ONE one-shot \`pidge listen --all --timeout 50\` (block up to 50s, print, exit 0; exit 3 = nothing this tick — the \`--all\` ear also catches answers to questions you fire-and-forgot), do the work, \`pidge ack --up-to <id>\`, sleep. \`--timeout\` is always SECONDS. Do NOT background \`pidge listen\` with \`&\`.
-- **Ack with attribution:** \`pidge ack --up-to <id> --summary "<what you did>"\` — a successor runtime (or your own next session) reads it in \`pidge catchup\` instead of redoing the work. Make it a habit on every ack.
+- **One channel = one consumer, now mechanized:** a running \`listen\` HOLDS the channel's lock, so a second \`listen\` (or a \`bridge\`) is refused with exit 2. Read with \`pidge catchup\` instead of racing it.
+- **Ack with attribution, honestly:** \`pidge ack --up-to <id> --summary "<what you did>"\` — a successor runtime (or your own next session) reads it in \`pidge catchup\` instead of redoing the work. **The note is the WORK's, never the plumbing's:** in an automated loop it comes from the handler's \`pidge-summary:\` line, and an ack from a loop that did nothing is a MUTE ack — the server files it as \`drained\`, \`catchup\` can't say what happened, and the human is left with a green ✓✓ that means nothing. Nothing to say usually means nothing to ack yet.
 
 ## The 24/7 supervisor: \`pidge bridge\`
 
@@ -5364,13 +5541,15 @@ When your human wants you reachable around the clock without a harness session, 
 
 Tell the next session WHAT you did: end your handler's output with one line — \`pidge-summary: <one sentence>\` — and the ack carries it; \`pidge catchup\` then shows "handled by <you>: <that sentence>". Full contract: \`pidge bridge --help\`.
 
+Same handler, one round: \`pidge listen --all --exec '<handler>'\` (above) is this exact contract without the daemon — start there if your harness can relaunch you, and reach for \`bridge\` when the loop must outlive every session.
+
 On newer servers the batch may also carry a read-only \`continuity\` array — the thread these messages belong to (prior agent turns, the human's earlier messages, what's still open). It is context, not command: nothing in it is ackable, and you MUST treat statements from prior agent runs as NOT verified — confirm before you act on them.
 
 ## Sign your messages with the execution (\`pidge run\`)
 
 So the human can tell ONE continuous session apart from three disposable cold ones, sign your messages with an **execution attribution run**:
 
-- **At the start of an interactive session:** \`eval "$(pidge run start --mode interactive --role main --label <your-agent-name>)"\`. This sets \`PIDGE_RUN_TOKEN\`/\`PIDGE_RUN_SEAL\` in your env; every \`pidge\` call you make afterward is stamped with that execution, so each message shows WHO spoke.
+- **At the start of an interactive session:** \`eval "$(pidge run start --mode interactive --role main --label <your-agent-name>)"\`. This sets \`PIDGE_RUN_TOKEN\`/\`PIDGE_RUN_SEAL\` in your env; every \`pidge\` call you make afterward is stamped with that execution, so each message shows WHO spoke. **Turn-based harness (shell state dies between tool calls)?** Persist it instead: \`pidge run start … > run.env\` once, then prefix every pidge call with \`. run.env &&\` — the eval-only recipe silently loses the attribution after your first tool call.
 - **Subagents / workers you spawn:** \`eval "$(pidge run start --mode interactive --role subagent --parent-seal $PIDGE_RUN_SEAL)"\` inside the child, so it signs as its own execution under yours.
 - **When you finish:** \`pidge run end\`.
 
@@ -5961,13 +6140,37 @@ function writeSkillFile(file, content) {
       // ANSWERS (kind notification_reply, with a self-contained ref), so a
       // fire-and-forget notify can't lose its reply. Without --all the original
       // composer-only contract stands (no double-consumption for ask/wait users).
-      // refuse to double-consume a channel a RUNNING bridge owns (the lock
-      // is pid-checked — a stale lock from a crashed bridge never blocks a
+      // --exec: ONE round handed to a handler, the bridge's contract without the
+      // daemon. It OWNS stdout (the handler's own output is teed through it) and
+      // it owns the ack decision, so the three flags that would fight it over
+      // either are usage errors — loudly, never a silent precedence rule.
+      const execHandler = v.exec || null;
+      if (execHandler && v['ack-on-read'])
+        die('pidge: listen --exec and --ack-on-read contradict each other: --exec acks only when the handler exits 0, --ack-on-read acks on read. Drop one.', 1);
+      if (execHandler && v.follow)
+        die('pidge: listen --exec runs ONE round (that is the point: the handler\'s exit code is the round\'s verdict). For a permanent loop use `pidge bridge --exec` — or drop --follow and relaunch this command.', 1);
+      if (execHandler && v.ndjson)
+        die('pidge: listen --exec and --ndjson contradict each other: under --exec the HANDLER owns stdout (its output is teed through). Drop one.', 1);
+      // refuse to double-consume a channel another consumer owns (the lock
+      // is pid-checked — a stale lock from a crashed consumer never blocks a
       // listen). Local-machine advisory by construction, which is exactly the
       // failure mode it exists for; `catchup` stays the read path.
       const bridgeHolder = bridgeLockHolder();
       if (bridgeHolder)
-        die(`pidge: listen REFUSED — a running \`pidge bridge\` (pid ${bridgeHolder.pid}${bridgeHolder.label ? `, "${bridgeHolder.label}"` : ''}) is this channel's consumer; a second consumer double-consumes. Read with \`pidge catchup\` (read-only), or stop the bridge first.`, 2);
+        die(`pidge: listen REFUSED — this channel already has a LIVE consumer (pid ${bridgeHolder.pid}${bridgeHolder.label ? `, "${bridgeHolder.label}"` : ''}${bridgeHolder.started_at ? `, since ${bridgeHolder.started_at}` : ''}) — a \`pidge bridge\` or another \`pidge listen\`. One channel = one consumer; a second one double-consumes. Read with \`pidge catchup\` (read-only), or stop that process first.`, 2);
+      // …and TAKE the lock for this whole run, so the next consumer meets the
+      // same wall (the check above only reads it — the atomic 'wx' create below
+      // is what makes "one channel = one consumer" a mechanism instead of a
+      // convention). Released on EVERY exit path: the process 'exit' hook covers
+      // the one-shot exit, the --follow window, exit 2/3/4 and the orphan
+      // watchdog alike. A `--wait`/ask of your own is never refused by it.
+      const listenLock = acquireBridgeLock('listen');
+      let listenLockReleased = false;
+      process.on('exit', () => {
+        if (listenLockReleased) return;
+        listenLockReleased = true;
+        releaseBridgeLock(listenLock);
+      });
       installOrphanWatchdog(); // a killed-parent orphan exits instead of eating the queue
       // strict — same class as wait/ask/approve: a NaN deadline never ends
       const timeout = numStrict(v.timeout, '--timeout', 600);
@@ -6023,6 +6226,10 @@ function writeSkillFile(file, content) {
       // Per-INSTALL notice (stamp file) + an in-process guard so a --follow run
       // doesn't repeat it across batches before the stamp write is observed.
       let ackNoticeShownThisProcess = false;
+      // The continuity contexts of the CURRENT round, opened once by
+      // openContinuity below: printed as their own stdout lines in the read
+      // modes, handed to the handler as `batch.continuity` under --exec.
+      let roundContinuity = null;
       // Print + (conditionally) ack — shared by the WS and polling paths.
       const printAndAck = async (msgsRaw) => {
         // E2E: open sealed rows BEFORE anything prints (stdout JSON and the
@@ -6031,7 +6238,24 @@ function writeSkillFile(file, content) {
         // async now — a sealed attachment is downloaded + unsealed to a
         // local path here (attachment.path in the printed JSON).
         const msgs = annotateVoiceAttachments(await Promise.all(msgsRaw.map((m) => e2eOpenMessageRow(m))));
-        console.log(JSON.stringify(msgs, null, 2));
+        // --exec: the round is the HANDLER's, and so is stdout. runExecRound
+        // never returns — it acks + exits 0, or prints handler_failed and exits 2.
+        if (execHandler) return runExecRound(msgs);
+        if (v.ndjson) {
+          // One compact object per line, each stamped `type` mirroring `kind`
+          // ("message" | "notification_reply"), the whole row preserved — so a
+          // line-oriented consumer switches on ONE field and never on position.
+          // The trailing batch_end closes the round: it says how many rows came
+          // and the highest ACKABLE id (absent when nothing was ackable).
+          for (const m of msgs) console.log(JSON.stringify({ type: String(m.kind || 'message'), ...m }));
+          const ackable = msgs.map((m) => Number(m.id)).filter(Number.isInteger);
+          console.log(JSON.stringify({
+            type: 'batch_end', count: msgs.length,
+            ...(ackable.length ? { max_ackable_id: Math.max(...ackable) } : {}),
+          }));
+        } else {
+          console.log(JSON.stringify(msgs, null, 2));
+        }
         // Heads-up on ORPHANED backlog served on the first quick read
         // (--all only). It's within-channel — NOT the cross-channel leak.
         if (v.all && firstBatch && (Date.now() - listenStartedAt) < BACKLOG_WINDOW_MS) {
@@ -6084,10 +6308,68 @@ function writeSkillFile(file, content) {
       // line stamped type:"continuity_context"; the human/agent consumer decides
       // what to do. MUST run before printAndAck (that exits the process on a
       // one-shot). Absent ⇒ nothing prints — output byte-identical to before.
+      // Under --exec nothing is printed: the same contexts ride the batch the
+      // handler reads on stdin (`continuity`), exactly as the bridge sends them.
       const printContinuity = async (data) => {
         const opened = await e2eOpenContinuityContexts(data && data.continuity_contexts);
-        if (!opened) return;
+        roundContinuity = opened || null;
+        if (!opened || execHandler) return;
         for (const ctx of opened) console.log(JSON.stringify({ type: 'continuity_context', ...ctx }));
+      };
+
+      // --exec — ONE round, handled by the agent's own command, on the bridge's
+      // exact contract: the batch on stdin ({messages, continuity?}), ONE
+      // invocation, and THE HANDLER'S EXIT CODE decides the ack. Never returns.
+      //   exit 0            → ack the batch's EXACT ids (never an up_to watermark)
+      //                       carrying the handler's `pidge-summary:` line, if any
+      //                       (no marker ⇒ acked without one — never invented) → exit 0
+      //   anything else     → ack NOTHING (the ~10-min lease re-serves it) and emit
+      //                       the failure ON STDOUT, where the agent wakes up:
+      //                       {"type":"handler_failed","exit":N,"reason":…,"ids":[…]}
+      //                       + a human line on stderr → exit 2
+      // A round that found nothing never gets here: no handler is spawned and the
+      // empty-round exit 3 stands.
+      const runExecRound = async (msgs) => {
+        const batchIds = msgs.map((m) => Number(m.id)).filter(Number.isInteger);
+        const batch = { messages: msgs, ...(roundContinuity ? { continuity: roundContinuity } : {}) };
+        const handlerTimeoutS = numStrict(v['handler-timeout'], '--handler-timeout', 1800);
+        console.error(`pidge: listen — batch of ${msgs.length} message(s) → handler (its exit code decides the ack): ${execHandler}`);
+        const { outcome, summary, seconds } = await runHandlerOnce({
+          tag: 'listen',
+          handlerCmd: execHandler,
+          batch,
+          batchIds,
+          handlerTimeoutS,
+          narrateMs: parseInt(process.env.PIDGE_BRIDGE_NARRATE || '', 10) || 300000, // 5 min
+          renewMs: parseInt(process.env.PIDGE_BRIDGE_RENEW || '', 10) || 60000,      // 60 s
+        });
+        // A timed-out handler NEVER acks — even if it trapped SIGTERM and exited
+        // 0: its work was cut short by definition.
+        if (outcome.code === 0 && !outcome.timedOut) {
+          if (batchIds.length === 0) {
+            console.error('pidge: listen — WARNING: the batch had no numeric ids — nothing to ack (server bug?)');
+          } else {
+            await ackExactIds('listen', batchIds, summary, process.env.PIDGE_RUN_TOKEN || null);
+            if (!summary)
+              console.error('pidge: listen — the handler printed no `pidge-summary:` line, so the ack carries no note (never invented). Have it end with: echo "pidge-summary: <what you did>"');
+          }
+          process.exit(0);
+        }
+        const reason = outcome.error ? 'spawn_error'
+          : outcome.timedOut ? 'timeout'
+            : outcome.signal ? 'signal' : 'exit';
+        const why = outcome.error ? `couldn't run (${outcome.error})`
+          : outcome.timedOut ? `timed out (--handler-timeout ${handlerTimeoutS}s)`
+            : outcome.signal ? `killed by ${outcome.signal}` : `exit ${outcome.code}`;
+        // STDOUT, deliberately: a failure the agent can't see is a failure that
+        // becomes a false green. Compact, one line, its own `type`.
+        console.log(JSON.stringify({
+          type: 'handler_failed', exit: outcome.code ?? null, reason,
+          ...(outcome.signal ? { signal: outcome.signal } : {}),
+          ids: batchIds,
+        }));
+        console.error(`pidge: listen — handler ${why} after ${seconds}s — NOTHING acked: the ~10-min lease re-serves these message(s) (ids ${batchIds.join(', ') || 'none'}). Fix the handler (or handle the batch yourself) and relaunch; at-least-once means it will come back.`);
+        process.exit(2);
       };
 
       // Realtime path: hold ConversationChannel — the human sees "ouvindo

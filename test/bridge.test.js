@@ -833,3 +833,50 @@ test('bridge: below the persistence window a server-shaped streak backs off LOUD
   await result;
   await mock.stop();
 });
+
+// The lock is ONE lock and it works in BOTH directions: `listen` refuses under a
+// live bridge (above), and a bridge refuses under a live `listen` — which only
+// became true once every listen started HOLDING the lock instead of just reading
+// it. Same refusal, same way out (catchup).
+test('`bridge` REFUSES when a LIVE `listen` holds the channel lock', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = tmpDir('pidge-bridge-under-listen-');
+
+  const listener = runCli(['listen', '--no-realtime', '--timeout', '6', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg });
+  assert.ok(await waitFor(() => fs.existsSync(lockPathFor(xdg))), 'the listener must take the lock');
+
+  const r = await runCli(['bridge', '--exec', 'true', '--no-realtime'], port, { XDG_CONFIG_HOME: xdg }).result;
+  assert.equal(r.code, 2, `stderr:\n${r.stderr}`);
+  assert.match(r.stderr, /another consumer already holds this channel/);
+  assert.match(r.stderr, /catchup/);
+
+  const rl = await listener.result;
+  await mock.stop();
+  assert.equal(rl.code, 3, `the listener is untouched by the refusal; stderr:\n${rl.stderr}`);
+  assert.ok(!fs.existsSync(lockPathFor(xdg)), 'and it releases the lock on its way out');
+});
+
+// Refactor guard: the handler machinery (spawn/settle/marker/tee/timeout/renew)
+// is shared with `listen --exec` now, so every line it prints takes the caller's
+// name. On the bridge those lines must still say "bridge" — a daemon log that
+// suddenly narrates as something else is a support call.
+test('bridge: the shared handler machinery still narrates as the BRIDGE', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 91, kind: 'message', body: 'demora', created_at: 'x' }];
+  const handler = `${process.execPath} -e "require('fs').readFileSync(0); setTimeout(() => {}, 30000)"`;
+
+  const { child, result, out } = runCli(
+    ['bridge', '--exec', handler, '--no-realtime', '--interval', '1', '--handler-timeout', '2'],
+    port, { PIDGE_BRIDGE_NARRATE: '400', PIDGE_BRIDGE_RENEW: '300' },
+  );
+  assert.ok(await waitFor(() => /pidge: bridge — handler running for/.test(out.stderr)), `stderr:\n${out.stderr}`);
+  assert.ok(await waitFor(() => /pidge: bridge — handler exceeded --handler-timeout/.test(out.stderr)), `stderr:\n${out.stderr}`);
+  assert.ok(mock.state.ackBodies.some((b) => b.state === 'delivered'), 'the renew heartbeat still runs from the bridge');
+  assert.ok(!/pidge: listen —/.test(out.stderr), 'no line ever leaks the other caller\'s name');
+
+  child.kill('SIGTERM');
+  await result;
+  await mock.stop();
+});

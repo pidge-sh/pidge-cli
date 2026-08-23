@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.50.0 — 2026-08-22
+
+**A loop that fails must fail where you wake up — and "one consumer per channel"
+is now a mechanism, not a convention.** `pidge listen --exec '<handler>'` runs ONE
+round on the bridge's exact contract: the batch JSON on the handler's stdin
+(`{"messages":[…],"continuity":[…]}`, one invocation) and **the handler's exit code
+decides the ack**. Exit 0 acks the batch's EXACT ids carrying the handler's last
+`pidge-summary:` line (no marker ⇒ acked without one, never invented); anything else
+— non-zero, a spawn error, `--handler-timeout` — acks **nothing**, prints
+`{"type":"handler_failed","exit":N,"reason":…,"ids":[…]}` on **stdout** and exits 2.
+The handler's stdout is teed through and the batch's lease is renewed every 60 s
+while it thinks. An empty round spawns nothing and stays exit 3. `--exec` refuses to
+combine with `--follow`, `--ndjson` or `--ack-on-read` (exit 1) — each would fight it
+over stdout or over the ack decision.
+
+**Every `listen` now HOLDS the channel's consumer lock**, the same pid-checked
+lockfile a `bridge` takes — it used to only read it. A second `listen`, or a
+`bridge` under a live `listen`, is refused (exit 2) and told the way out (`pidge
+catchup`, read-only, or stop the other process); a crashed holder's lock is
+reclaimed by the next starter, never wedged. A `--wait`/`ask`/`approval` of your own
+under a live listener is never refused — it is narrated: that wait hears the BUTTON
+your human taps and nothing they TYPE (typed messages belong to the listener's
+queue), so send-and-go and collect through the loop.
+
+Also:
+
+- `listen --ndjson` prints one compact JSON object per line instead of the pretty
+  array — each stamped `type` ("message"/"notification_reply" mirroring `kind`, plus
+  the continuity lines and a closing
+  `{"type":"batch_end","count":N,"max_ackable_id":M}`). The DEFAULT format is
+  unchanged; both are now documented in the help, the README and the skill, with the
+  one rule that matters: **ackable ⇔ the object has an `id`; switch on `type`.**
+- `pidge doctor` reads the queue read-only and names two silent failures it can see:
+  a **deaf consumer** (messages delivered, lease lapsed, still un-acked, *while a
+  consumer is live* — something reads without handling) and **mute acks** (rows the
+  server marks `handled_state:"drained"` in the last 24 h — acked with no note and no
+  answer behind them). Advisory, exit stays 0, and silent on a server that doesn't
+  send the fields.
+- The generated skill (rev 23) leads its stay-online loop with `listen --all --exec`,
+  documents the stdout contract, states the honest-summary rule (the note belongs to
+  the handler; a plumbing ack is a mute ack), fixes the wait-under-your-own-listener
+  asymmetry, and adds a short section on guiding a human step by step.
+- Internals: the handler machinery (spawn, settle on exit+EOF, the streamed
+  `pidge-summary:` scan, the stdout tee with backpressure, the timeout kill, the
+  heartbeat and the lease renew) is now ONE implementation shared by `bridge` and
+  `listen --exec`. Bridge behaviour is unchanged, line for line.
+- Realtime presence is now EARNED every 30 s: while a listen/wait holds the
+  ConversationChannel socket, the CLI sends a `beat` action the server (manifest
+  ≥112) requires to keep "listening now" lit — a frozen host (closed laptop lid,
+  suspended container) holds a socket fine but cannot beat, so its presence dies
+  in ~2 minutes (measured live: 150 s) instead of lying indefinitely. Older servers ignore the action.
+- Self-heal no longer DOWNGRADES a skill written by a newer CLI: a file whose spine
+  rev outranks this binary's is left alone even when the server manifest moved
+  (observed live: an old install "healed" a newer skill down a revision because the
+  manifest trigger fired). A torn file still heals regardless.
+
 ## 0.49.0 — 2026-08-21
 
 **Capturing a pane from the phone now needs a grant.** `pidge terminal config
