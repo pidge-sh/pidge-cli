@@ -79,19 +79,81 @@ test('field report — a proxy DESTROYING held sockets degrades the same way (wa
   assert.match(stderr, /degraded to plain GETs/);
 });
 
-test('exit 4 — zero healthy round-trips all session must exit LOUD, with aggregated stderr', async () => {
+// The exit-4 contract is now CROSS-ROUND (the recommended loop is one round per
+// process, so a single dead 50 s window is a blip, not a verdict): a dead round
+// writes a streak file keyed by the token hash; exit 4 needs 3 dead rounds over
+// 2+ min, and the verdict names the right culprit via a GET /up probe — the
+// server answering means the CHANNEL/API path is broken; nothing answering
+// means the HOST is offline (which only escalates after ~10 min).
+function seedHealthLedger(dir, streak, firstAgoMs) {
+  const h = crypto.createHash('sha256').update('hld_test').digest('hex').slice(0, 16);
+  const file = path.join(dir, 'pidge', `health-${h}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ streak, first_at: Date.now() - firstAgoMs, last_at: Date.now() }));
+  return file;
+}
+
+test('one dead round with the host offline is a BLIP (exit 3, host-blame), not an escalation', async () => {
   const mock = createMock();
   const port = await mock.start();
-  await mock.stop(); // nothing listening — every request is a network error
+  await mock.stop(); // nothing listening — every request AND the /up probe fail
 
   const { result } = runCli(['listen', '--no-realtime', '--timeout', '4', '--interval', '1'], port);
   const { code, stderr } = await result;
 
-  assert.equal(code, 4, `stderr: ${stderr}`);
-  assert.match(stderr, /NOT ONE healthy round-trip/);
-  // Aggregation: one deafness note + one degrade note — never a line per attempt.
+  assert.equal(code, 3, `stderr: ${stderr}`);
+  assert.match(stderr, /HOST's network looks down/, 'the blame is local, not "the CHANNEL"');
+  assert.match(stderr, /dead round 1 of 3/, 'the streak is narrated');
   const deafLines = stderr.split('\n').filter((l) => /deaf for/.test(l));
   assert.ok(deafLines.length <= 2, `expected aggregated stderr, got:\n${stderr}`);
+});
+
+test('a streak of dead rounds with the server answering /up escalates: exit 4 blames the CHANNEL', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messagesStatus = 500; // the API path is broken, the server itself is up
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-health-'));
+  seedHealthLedger(dir, 2, 3 * 60000); // two prior dead rounds, first one 3 min ago
+
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '4', '--interval', '1'], port, { XDG_CONFIG_HOME: dir });
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 4, `stderr: ${stderr}`);
+  assert.match(stderr, /3 consecutive rounds/, 'the verdict counts the whole streak');
+  assert.match(stderr, /CHANNEL\/API path looks broken/, 'server up + API dead = channel blame');
+  assert.match(stderr, /Surface this to your human/);
+  const h = crypto.createHash('sha256').update('hld_test').digest('hex').slice(0, 16);
+  assert.ok(!fs.existsSync(path.join(dir, 'pidge', `health-${h}.json`)), 'an escalation resets the streak — the next one must be earned fresh');
+});
+
+test('a LONG host-offline streak still escalates, blaming the HOST — through the session, not pidge', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  await mock.stop();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-health-'));
+  seedHealthLedger(dir, 5, 11 * 60000); // dead for 11 minutes already
+
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '3', '--interval', '1'], port, { XDG_CONFIG_HOME: dir });
+  const { code, stderr } = await result;
+
+  assert.equal(code, 4, `stderr: ${stderr}`);
+  assert.match(stderr, /HOST is offline/, 'the culprit is named — never "the CHANNEL looks broken"');
+  assert.match(stderr, /through your own session/);
+});
+
+test('one healthy round-trip clears the persisted streak', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-health-'));
+  const file = seedHealthLedger(dir, 2, 3 * 60000);
+
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '2', '--interval', '1'], port, { XDG_CONFIG_HOME: dir });
+  const { code } = await result;
+  await mock.stop();
+
+  assert.equal(code, 3, 'healthy but silent = exit 3, as ever');
+  assert.ok(!fs.existsSync(file), 'the streak file is gone after a healthy round');
 });
 
 test('exit 3 — a healthy but silent session is still just "no answer yet"', async () => {

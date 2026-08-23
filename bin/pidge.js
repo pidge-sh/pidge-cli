@@ -1577,6 +1577,8 @@ const health = {
   okEver: false, fails: 0, firstFailAt: 0, lastNoteAt: 0, degraded: false,
   ok() {
     if (this.fails > 0) console.error(`pidge: channel recovered after ${this.fails} consecutive failure(s)`);
+    // one healthy round-trip clears the CROSS-ROUND streak too (once per process)
+    if (!this.okEver) clearHealthLedger();
     this.okEver = true; this.fails = 0; this.firstFailAt = 0; this.lastNoteAt = 0;
   },
   fail(what) {
@@ -1591,7 +1593,7 @@ const health = {
       console.error(`pidge: deaf for ${mins} min — ${this.fails} consecutive failure(s) (latest: ${what})`);
     }
   },
-  exitTimeout(message, hint, nudge) {
+  async exitTimeout(message, hint, nudge) {
     // REAL elapsed wall-clock — never the configured deadline (the
     // "timed out after 28800s" lie). If only seconds passed, the number says so.
     const elapsed = Math.round((performance.now() - SESSION_START_MONO) / 1000);
@@ -1608,7 +1610,37 @@ const health = {
       if (nudge) console.error(`pidge: ${nudge}`);
       process.exit(3);
     }
-    console.error(`pidge: ${message} after ${elapsed}s — and NOT ONE healthy round-trip all session: the CHANNEL looks broken (server/network), not the human ignoring you. Surface this to your human.`);
+    // ZERO healthy round-trips this round. One round is NOT a verdict: the
+    // recommended loop is one round per process, so the streak lives in a file
+    // across rounds (cleared by any healthy round-trip), and before accusing
+    // anyone we ask the ONE question that separates the two opposite diagnoses:
+    // can this host reach the server at all?
+    const prior = readHealthLedger();
+    const streak = (prior ? prior.streak : 0) + 1;
+    const firstAt = prior ? prior.first_at : Date.now();
+    writeHealthLedger({ streak, first_at: firstAt, last_at: Date.now() });
+    const spanMs = Date.now() - firstAt;
+    const spanMin = Math.max(1, Math.round(spanMs / 60000));
+    const up = await probeServerUp();
+    if (!up) {
+      // Can't reach ANYTHING — that's this host's network (lid just opened,
+      // wifi flap, VPN), not the channel. Escalating would be crying wolf...
+      if (streak < HEALTH_STREAK_ROUNDS || spanMs < HEALTH_LOCAL_SPAN_MS) {
+        console.error(`pidge: ${message} after ${elapsed}s — zero healthy round-trips this round, and the server's /up probe is unreachable too: this HOST's network looks down (laptop waking? wifi flap?), not the channel. Reconnect and relaunch — not escalating (dead round ${streak} of ${HEALTH_STREAK_ROUNDS} before this becomes one).`);
+        process.exit(3);
+      }
+      // ...until it lasts long enough that the human must hear it — through
+      // your harness/session, since pidge itself can't fly with no network.
+      clearHealthLedger();
+      console.error(`pidge: ${message} after ${elapsed}s — NO network from this host for ~${spanMin} min (${streak} dead rounds; even the /up probe fails). The channel may be fine — the HOST is offline. Surface this to your human through your own session; pidge can't carry it.`);
+      process.exit(4);
+    }
+    if (streak < HEALTH_STREAK_ROUNDS || spanMs < HEALTH_STREAK_SPAN_MS) {
+      console.error(`pidge: ${message} after ${elapsed}s — zero healthy round-trips this round, but the server answers /up: a transport blip, not a verdict (dead round ${streak} of ${HEALTH_STREAK_ROUNDS} over ${Math.round(spanMs / 1000)}s; escalation needs ${HEALTH_STREAK_ROUNDS} rounds across ${HEALTH_STREAK_SPAN_MS / 1000}s). Relaunch the listener.`);
+      process.exit(3);
+    }
+    clearHealthLedger(); // escalated once — the next escalation must earn a fresh streak
+    console.error(`pidge: ${message} after ${elapsed}s — and NOT ONE healthy round-trip in ${streak} consecutive rounds over ~${spanMin} min, while the server answers /up: the CHANNEL/API path looks broken, not the human ignoring you and not your network. Surface this to your human.`);
     process.exit(4);
   },
 };
@@ -3032,7 +3064,7 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
 
     if (Date.now() >= deadline) {
       if (onTimeout) return onTimeout();
-      health.exitTimeout(`no answer on ${cid}`);
+      await health.exitTimeout(`no answer on ${cid}`);
     }
     // A server WITH long-poll just held us for waitS — loop right back. One that
     // ignored `wait`, an error, or degraded mode returned fast: pace ourselves.
@@ -3123,7 +3155,7 @@ async function realtimeWait(cid, { timeout, interval, onAnswer, onTimeout } = {}
   // remaining budget, NOT exit lying that the full timeout elapsed.
   if (outcome === 'deadline' && Date.now() >= deadline - 1500) {
     if (onTimeout) return onTimeout();
-    health.exitTimeout(`no answer on ${cid}`);
+    await health.exitTimeout(`no answer on ${cid}`);
   }
   console.error('pidge: realtime unavailable — falling back to HTTP polling (same contract, less instant)');
   return Math.max(1, Math.ceil((deadline - Date.now()) / 1000)); // remaining budget
@@ -3660,6 +3692,49 @@ function bridgeLockBaseDir() {
 function bridgeLockPath() {
   const h = crypto.createHash('sha256').update(String(TOKEN)).digest('hex').slice(0, 16);
   return path.join(bridgeLockBaseDir(), `bridge-${h}.lock`);
+}
+
+// --- The cross-round health ledger (one-shot loops made exit 4 honest) ---
+// The recommended loop is ONE round per process, so "not one healthy round-trip
+// all session" used to mean "this 50-second window" — a wifi blip (or the host
+// waking from sleep) read as "the CHANNEL looks broken" and the ONLY exit code
+// that tells an agent to escalate fired in FALSE (observed three times in one
+// real QA). The streak now persists across rounds in a tiny file keyed by the
+// token hash (same posture as the lock: two processes wearing one key are one
+// channel). A healthy round-trip anywhere clears it.
+const HEALTH_STREAK_ROUNDS = 3;          // dead rounds before an escalation
+const HEALTH_STREAK_SPAN_MS = 120000;    // ...spread over at least this long
+const HEALTH_LEDGER_STALE_MS = 15 * 60000; // an old streak is a PAST outage, not this one
+const HEALTH_LOCAL_SPAN_MS = 10 * 60000; // local-network blame still escalates eventually
+function healthLedgerPath() {
+  const h = crypto.createHash('sha256').update(String(TOKEN)).digest('hex').slice(0, 16);
+  return path.join(bridgeLockBaseDir(), `health-${h}.json`);
+}
+function readHealthLedger() {
+  try {
+    const d = JSON.parse(fs.readFileSync(healthLedgerPath(), 'utf8'));
+    if (!d || !Number.isInteger(d.streak) || !Number.isFinite(d.first_at) || !Number.isFinite(d.last_at)) return null;
+    if (Date.now() - d.last_at > HEALTH_LEDGER_STALE_MS) return null; // a past outage
+    return d;
+  } catch { return null; }
+}
+function writeHealthLedger(d) {
+  try {
+    fs.mkdirSync(bridgeLockBaseDir(), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(healthLedgerPath(), JSON.stringify(d), { mode: 0o600 });
+  } catch { /* best-effort — a broken disk must not mask the health verdict */ }
+}
+function clearHealthLedger() {
+  try { fs.unlinkSync(healthLedgerPath()); } catch { /* absent is the goal */ }
+}
+// Can we reach the SERVER at all? Rails' bare /up answers without auth. This is
+// what separates "the channel/API is broken — escalate" from "this HOST has no
+// network (lid just opened, wifi flap) — reconnect, don't cry wolf".
+async function probeServerUp() {
+  try {
+    const r = await fetchT(`${BASE}/up`, {}, 8000);
+    return r.status >= 200 && r.status < 500; // any answer = the server is THERE
+  } catch { return false; }
 }
 function readBridgeLock(file) {
   try {
@@ -5130,6 +5205,25 @@ async function fuseSkillAndHello(base, token) {
   } catch (e) {
     console.error(`pidge: skill install skipped (${e.message}) — run \`pidge skill install\` later.`);
   }
+  // The .claude skill only reaches Claude Code. The agent being onboarded may be
+  // Codex/Gemini/anything that reads AGENTS.md instead — observed live: a Codex
+  // newborn got the .claude file and would never have loaded it. So the fuse also
+  // lays down AGENTS.md — but never over a file that isn't ours: create it when
+  // absent, refresh it when it carries our marker, and otherwise leave the
+  // project's own AGENTS.md alone with a pointer.
+  try {
+    const agentsFile = SKILL_TARGETS.agents();
+    const exists = fs.existsSync(agentsFile);
+    const ours = exists && !!findSkillMarker(fs.readFileSync(agentsFile, 'utf8'));
+    if (!exists || ours) {
+      const r2 = await installSkill(base, token, 'agents');
+      note(`pidge: AGENTS.md ${exists ? 'refreshed' : 'written'} too (${r2.file}) — non-Claude runtimes (Codex, Gemini, …) read this one`);
+    } else {
+      note('pidge: this project has its own AGENTS.md — left untouched. To add the Pidge doctrine to it: `pidge skill install --target agents` (backs it up first).');
+    }
+  } catch (e) {
+    console.error(`pidge: AGENTS.md install skipped (${e.message}) — run \`pidge skill install --target agents\` later.`);
+  }
   note('pidge: next → `pidge hello` to send your first handshake and watch it confirm on the lock screen.');
 }
 
@@ -6431,7 +6525,7 @@ function writeSkillFile(file, content) {
         // 'ws-unavailable' degrades to polling below (never an early timeout lie).
         if (outcome === 'deadline' && Date.now() >= deadline - 1500) {
           followEnd();
-          health.exitTimeout('no message from the human', LEASE_HINT, RELAUNCH_NUDGE);
+          await health.exitTimeout('no message from the human', LEASE_HINT, RELAUNCH_NUDGE);
         }
         if (outcome === 'got-messages') {
           await new Promise(() => {}); // printAndAck is in flight and exits the process
@@ -6468,7 +6562,7 @@ function writeSkillFile(file, content) {
         }
         if (Date.now() >= deadline) {
           followEnd();
-          health.exitTimeout('no message from the human', LEASE_HINT, RELAUNCH_NUDGE);
+          await health.exitTimeout('no message from the human', LEASE_HINT, RELAUNCH_NUDGE);
         }
         const pace = health.degraded ? DEGRADED_INTERVAL_S : listenInterval;
         if (Date.now() - askedAt < 2000) {
