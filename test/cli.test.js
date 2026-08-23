@@ -533,7 +533,7 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   // the pidge-report COMPANION lands as a sibling skill, marked + trailed like the main one.
   const report = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge-report', 'SKILL.md'), 'utf8');
   assert.match(report, /name: pidge-report/);
-  assert.match(report, /\n# pidge-skill rev=22 manifest=16\n/, 'companion carries the same marker');
+  assert.match(report, /\n# pidge-skill rev=23 manifest=16\n/, 'companion carries the same marker');
   assert.ok(report.trimEnd().endsWith('<!-- pidge-skill-end -->'), 'companion carries the trailer');
   assert.match(skill, /pidge-report/, 'the main skill points at the companion');
   // The skill is the loudest announcement this CLI makes — every future session
@@ -610,10 +610,10 @@ test('self-heal — a 0.15.2 marker-first install self-heals into the fixed in-f
   // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
   assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
   assert.ok(!/<!-- pidge-skill rev=/.test(healed), 'the old HTML-comment marker is gone (the end trailer is not it)');
-  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
   assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
   assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 22, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 23, manifest v16\)/, 'one stderr note');
 });
 
 test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
@@ -630,10 +630,10 @@ test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the loc
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
-  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 22, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 23, manifest v16\)/, 'one stderr note');
   // the heal also (re)writes the pidge-report companion — this is exactly how an
   // existing install GAINS the companion on a spine bump, with zero human action.
   const reportFile = path.join(path.dirname(path.dirname(file)), 'pidge-report', 'SKILL.md');
@@ -652,9 +652,28 @@ test('self-heal — a MANIFEST bump (server version > installed) self-heals the 
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
+});
+
+test('self-heal — a NEWER spine is never downgraded, even when the server manifest moved', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // Observed live: a 0.46 install (spine 21) met a rev-22 skill whose baked manifest
+  // was stale, and the manifest trigger "healed" it DOWN to rev 21. The spine a newer
+  // CLI wrote outranks this binary's regeneration: leave the file alone; the newer
+  // CLI heals its own manifest staleness.
+  const { dir, file } = seedNewSkill(99, 10, 'DOCTRINE FROM A NEWER CLI');
+  const before = fs.readFileSync(file, 'utf8');
+
+  const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.equal(fs.readFileSync(file, 'utf8'), before, 'a newer-spine skill is left byte-for-byte');
+  assert.ok(!/refreshed your local Pidge skill/.test(stderr), 'no heal note — nothing was healed');
 });
 
 test('self-heal — a FRESH skill (new-format marker current) is left byte-for-byte, no note', async () => {
@@ -662,7 +681,7 @@ test('self-heal — a FRESH skill (new-format marker current) is left byte-for-b
   const port = await mock.start();
   // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
   // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
-  const { dir, file } = seedNewSkill(22, 16, 'SENTINEL FRESH — keep me');
+  const { dir, file } = seedNewSkill(23, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -712,7 +731,7 @@ test('home self-heal — a STALE home skill self-heals even when there is NO pro
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(homeSkill, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'the home skill was regenerated to the current rev');
+  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'the home skill was regenerated to the current rev');
   assert.ok(!/STALE HOME DOCTRINE/.test(healed), 'the stale home doctrine was replaced by a real regeneration');
   assert.match(stderr, /refreshed your local Pidge skill/, 'the home heal narrated itself');
 });
@@ -732,8 +751,8 @@ test('home self-heal — BOTH project and home skills stale: both heal in one pa
   await mock.stop();
 
   assert.equal(code, 0, `stderr: ${stderr}`);
-  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=22 manifest=16/, 'home healed');
-  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=22 manifest=16/, 'project healed');
+  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=23 manifest=16/, 'home healed');
+  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=23 manifest=16/, 'project healed');
   assert.match(stderr, /2 locations incl\. ~\/\.claude/, 'the note reports BOTH locations were refreshed');
 });
 
@@ -742,7 +761,7 @@ test('home self-heal — a FRESH home skill is left byte-for-byte (no needless h
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homefresh-'));
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
-  seedSkillAt(homeSkill, 22, 'SENTINEL HOME — keep me'); // current rev
+  seedSkillAt(homeSkill, 23, 'SENTINEL HOME — keep me'); // current rev
   const original = fs.readFileSync(homeSkill, 'utf8');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj2-'));
 
@@ -817,7 +836,7 @@ test('atomic self-heal — "pidge-skill" in body PROSE is not the marker: a mark
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'a real marker was written by the heal');
+  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'a real marker was written by the heal');
   assert.ok(!/rev=99/.test(healed), 'the prose decoy is gone with the regeneration');
 });
 
@@ -835,7 +854,7 @@ test('atomic self-heal — 4 concurrent heals never tear the file (atomic tmp+re
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
   assert.equal((healed.match(/# pidge-skill rev=/g) || []).length, 1, 'exactly ONE marker — no interleaved halves');
-  assert.match(healed, /\n# pidge-skill rev=22 manifest=16\n/, 'a whole, current skill won');
+  assert.match(healed, /\n# pidge-skill rev=23 manifest=16\n/, 'a whole, current skill won');
   assert.match(healed.trimEnd(), /<!-- pidge-skill-end -->$/, 'the trailer closes the file — no torn tail');
   const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
   assert.deepEqual(leftovers, [], 'no tmp litter after concurrent heals');
@@ -2125,8 +2144,51 @@ test('skill install includes the always-on recipe for turn-based agents', async 
   assert.equal(out.code, 0, out.stderr);
   const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
   assert.match(skill, /always-on/i, 'the recipe section is present');
-  assert.match(skill, /pidge listen --follow/, 'Path 1 — interactive window');
-  assert.match(skill, /pidge listen --all --timeout 50/, 'Path 2 — supervisor poll');
+  assert.match(skill, /pidge listen --follow/, 'the interactive window is still taught');
+  assert.match(skill, /pidge listen --all --exec/, 'the loop leads with the handler form');
+  assert.match(skill, /--exec '<handler>' --timeout 50/, 'the supervisor poll runs one --exec round per tick');
+  // the exec contract, in the words an agent needs: the exit code IS the ack,
+  // and a dead handler surfaces on stdout instead of a silent green.
+  assert.match(skill, /exit code decide/i, 'the handler exit code owns the ack');
+  assert.match(skill, /handler_failed/, 'a failed handler surfaces on stdout, not in silence');
+  assert.match(skill, /pidge-summary:/, 'the marker line is the only source of the note');
+  // the stdout contract (so nobody writes a line-by-line parser for the array)
+  assert.match(skill, /never parse it line by line/i, 'the pretty-array contract is spelled out');
+  assert.match(skill, /--ndjson/, 'the line-oriented alternative is named');
+  assert.match(skill, /ackable ⇔ the object has an `id`/i, 'the one rule for what can be acked');
+  // an ack that claims work nobody did is the dishonest signal this rev exists to kill
+  assert.match(skill, /MUTE ack/, 'a note-less loop ack is named for what it is');
+  assert.match(skill, /drained/, 'and named as the server sees it');
+});
+
+// A wait is a SECOND consumer of your own channel — the skill must say so, and
+// say what to do instead (send-and-go, collect through the loop).
+test('skill teaches the wait-under-a-live-listener asymmetry + the step-by-step section', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-skill-asym-'));
+
+  const child = spawn(process.execPath, [CLI, 'skill', 'install'], {
+    cwd: dir,
+    env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-home-')) },
+  });
+  const out = await new Promise((resolve) => {
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    child.on('exit', (code) => resolve({ code, stdout, stderr }));
+  });
+  await mock.stop();
+
+  assert.equal(out.code, 0, out.stderr);
+  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  assert.match(skill, /includes your OWN second process/i, 'the asymmetry is stated as a rule, not an aside');
+  assert.match(skill, /send-and-go/, 'and the way out is named');
+  assert.match(skill, /consumer lock/, 'the mechanism (the lock) is taught, not just the etiquette');
+  // the step-by-step doctrine (one send = one actionable step; ask for a print)
+  assert.match(skill, /## Guiding a human step by step/, 'the new section is present');
+  assert.match(skill, /One send = one actionable step/i);
+  assert.match(skill, /screenshot|print/i, 'asking for a print is part of it');
 });
 
 // The skill must TEACH `pidge bridge` + `ack --summary`, carry the
@@ -3966,4 +4028,108 @@ test('doctor confirms a clean composer queue explicitly', async () => {
 
   assert.equal(code, 0, `stderr:\n${stderr}`);
   assert.match(stderr, /composer queue: no un-acked messages ✓/);
+});
+
+// --- honest signals: the two doctor probes + the wait-under-a-live-consumer line ---
+//
+// A green light nobody earned is the failure mode. `doctor` learned to name the
+// two shapes it can see from the READ-ONLY history: a consumer that takes
+// deliveries and never acks (deaf), and an ack with nothing behind it (mute).
+// Both are advisory, both degrade to silence on a server that omits the fields.
+
+const AGO = (ms) => new Date(Date.now() - ms).toISOString();
+
+test('doctor: a LIVE consumer + deliveries whose lease lapsed un-acked = a DEAF consumer, said out loud', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.consumers = [{ fingerprint: 'fp_loop', label: 'blind-loop', listening: true, live: true }];
+  mock.state.messages = [
+    // served, lease already expired, still unprocessed — it was read and dropped
+    { id: 61, kind: 'message', body: 'primeira', created_at: 'x',
+      delivered_at: AGO(600000), delivery_expires_at: AGO(60000) },
+    { id: 62, kind: 'message', body: 'segunda', created_at: 'x',
+      delivered_at: AGO(600000), delivery_expires_at: AGO(30000) },
+    // fresh delivery, lease still open — NOT evidence of anything
+    { id: 63, kind: 'message', body: 'em voo', created_at: 'x',
+      delivered_at: AGO(5000), delivery_expires_at: new Date(Date.now() + 600000).toISOString() },
+  ];
+
+  const { code, stderr } = await runCli(['doctor', '--no-realtime'], port).result;
+  await mock.stop();
+
+  assert.equal(code, 0, `the probe is advisory — never exit 2; stderr:\n${stderr}`);
+  assert.match(stderr, /2 message\(s\) were DELIVERED to a consumer/, 'only the lapsed ones count');
+  assert.match(stderr, /without handling it/, 'it names the shape (read, not handled)');
+  assert.equal(mock.state.acks.length, 0, 'the probe never consumes or acks');
+});
+
+test('doctor: the same backlog with NOBODY live stays the "nobody is consuming" story, not a deaf-consumer warning', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 64, kind: 'message', body: 'sozinha', created_at: 'x',
+    delivered_at: AGO(600000), delivery_expires_at: AGO(60000) }];
+
+  const { code, stderr } = await runCli(['doctor', '--no-realtime'], port).result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr:\n${stderr}`);
+  assert.match(stderr, /Nobody is consuming this queue/);
+  assert.ok(!/DELIVERED to a consumer/.test(stderr), 'with no consumer there is nothing deaf to report');
+});
+
+test('doctor: handled_state "drained" in the last 24h is called a MUTE ack; other states are not', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [
+    { id: 71, kind: 'message', body: 'a', created_at: 'x', processed_at: AGO(3600000), handled_state: 'drained' },
+    { id: 72, kind: 'message', body: 'b', created_at: 'x', processed_at: AGO(7200000), handled_state: 'drained' },
+    { id: 73, kind: 'message', body: 'c', created_at: 'x', processed_at: AGO(3600000), handled_state: 'responded' },
+    { id: 74, kind: 'message', body: 'd', created_at: 'x', processed_at: AGO(3600000), handled_state: 'acked_with_note' },
+    { id: 75, kind: 'message', body: 'e', created_at: 'x', processed_at: AGO(48 * 3600000), handled_state: 'drained' },
+  ];
+
+  const { code, stderr } = await runCli(['doctor', '--no-realtime'], port).result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr:\n${stderr}`);
+  assert.match(stderr, /2 message\(s\) acked in the last 24h with NO note/, 'only the recent drained rows count');
+  assert.match(stderr, /MUTE ack/);
+  assert.match(stderr, /composer queue: no un-acked messages ✓/, 'processed rows are not pending — the other line still tells the truth');
+});
+
+test('doctor: an OLD server (no handled_state field) says nothing about mute acks — silence, not a complaint', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 76, kind: 'message', body: 'a', created_at: 'x', processed_at: AGO(3600000) }];
+
+  const { code, stderr } = await runCli(['doctor', '--no-realtime'], port).result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr:\n${stderr}`);
+  assert.ok(!/MUTE ack/.test(stderr), 'a field the server does not send is not a finding');
+  assert.ok(!/handled_state/.test(stderr), 'and never a complaint ABOUT the missing field');
+});
+
+test('a wait under a LIVE consumer narrates the asymmetry (and still never drains the queue)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 81, channel_id: 1, body: 'do listener, não sua', created_at: 'x', consumed_at: null }];
+
+  // A live consumer lock for THIS token, held by our own pid — alive by construction.
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-livelock-'));
+  const h = crypto.createHash('sha256').update('hld_test').digest('hex').slice(0, 16);
+  fs.mkdirSync(path.join(xdg, 'pidge'), { recursive: true });
+  fs.writeFileSync(path.join(xdg, 'pidge', `bridge-${h}.lock`),
+    JSON.stringify({ pid: process.pid, started_at: 'x', label: 'my-listener' }) + '\n');
+
+  const { code, stderr } = await runCli(['wait', 'cid-live', '--no-realtime', '--timeout', '2', '--interval', '1'], port,
+    { XDG_CONFIG_HOME: xdg }).result;
+  await mock.stop();
+
+  assert.equal(code, 3, 'no wake — the wait rides to its timeout');
+  assert.match(stderr, /LIVE consumer/, 'the asymmetry is narrated, not silent');
+  assert.match(stderr, /"my-listener"/, 'and it names who holds the channel');
+  assert.match(stderr, /hears ONLY the answer/, 'it says what this wait can and cannot hear');
+  assert.equal(stderr.split('\n').filter((l) => /LIVE consumer/.test(l)).length, 1, 'once per process, not once per poll');
+  assert.equal(mock.state.messageReads.length, 0, 'the queue was never touched');
 });
