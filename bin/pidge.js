@@ -1641,6 +1641,16 @@ const health = {
     const spanMs = Date.now() - firstAt;
     const spanMin = Math.max(1, Math.round(spanMs / 60000));
     const up = await probeServerUp();
+    if (up) {
+      // The server is there — but is the KEY? A rejected key on the REALTIME
+      // path never reaches the polling 401 (the handshake just closes, and a
+      // short round dies before the fallback), so a rotated key read as
+      // "transport blip" rounds forever. One authenticated probe settles it.
+      try {
+        const who = await fetchT(`${BASE}/api/v1/whoami`, { headers: { authorization: `Bearer ${TOKEN}` } }, 8000);
+        if (who.status === 401 || who.status === 403) dieKeyRejected('listen/wait', who.status);
+      } catch { /* network flapped mid-verdict — the streak logic below owns it */ }
+    }
     if (!up) {
       // Can't reach ANYTHING — that's this host's network (lid just opened,
       // wifi flap, VPN), not the channel. Escalating would be crying wolf...

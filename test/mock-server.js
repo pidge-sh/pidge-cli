@@ -74,6 +74,7 @@ function createMock() {
     // All default to the older-server shape (absent):
     // a test sets them to exercise the surfacing; null ⇒ the field is omitted so
     // the CLI's present-only degradation is tested against an "old server".
+    whoamiStatus: null,         // force /whoami to answer this status (e.g. 401)
     consumers: null,            // whoami consumers[] (null ⇒ block omitted)
     consumerConflict: false,    // whoami consumer_conflict (only served WITH consumers)
     unattributedListening: false, // whoami unattributed_listening (served WITH consumers)
@@ -166,6 +167,7 @@ function createMock() {
       return json(res, 200, { code });
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/whoami') {
+      if (state.whoamiStatus) return json(res, state.whoamiStatus, { error: 'nope' });
       const auth = req.headers.authorization || '';
       // whoami is either-track — a ses_ token gets a 200 with the HUMAN view
       // (no channel block). Mirrored here so doctor's branch is testable.

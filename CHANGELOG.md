@@ -87,6 +87,10 @@ Also:
 - The generated skill (rev 24) documents `ack_failed`, the honest-ack rule, and
   the host-sleep case: your machine sleeping looks like a dead round to you, and
   the CLI now blames the right side (exit 3 reconnect vs exit 4 escalate).
+- The timeout verdict also probes the KEY when the server is up: a 401/403 on
+  whoami at verdict time is "rejected key" (loud, exit 2) — the realtime path
+  could previously burn streak rounds on a rotated key without ever seeing the
+  HTTP 401.
 
 ## 0.50.0 — 2026-08-22
 
