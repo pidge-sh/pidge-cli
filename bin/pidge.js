@@ -1360,12 +1360,12 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // cursor report (v88) and handled_state:"drained" on history rows (v112) — the
 // number lagged three surfaces behind the code and nagged on servers this CLI
 // already understood.
-const KNOWN_MANIFEST_VERSION = 112;
+const KNOWN_MANIFEST_VERSION = 114;
 // The hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 24;
+const SKILL_REVISION = 25;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -3938,11 +3938,24 @@ function runHandlerOnce({
   // this flag and writes the missing newline first.
   let teeMidLine = false;
   const t0 = Date.now();
+  // The batch ALSO rides a temp file, named to the handler as $PIDGE_BATCH_FILE.
+  // Reason (observed live): `claude -p` DISCARDS its prompt argument whenever
+  // stdin is a pipe — and under --exec stdin is ALWAYS the batch pipe — so the
+  // most natural LLM handler silently lost its instructions. With the file, the
+  // recipe becomes: prompt through stdin, batch from $PIDGE_BATCH_FILE. The
+  // stdin batch stays byte-identical (programmatic handlers keep their contract).
+  let batchFile = null;
+  try {
+    batchFile = path.join(os.tmpdir(), `pidge-batch-${process.pid}-${Math.random().toString(36).slice(2, 8)}.json`);
+    fs.writeFileSync(batchFile, JSON.stringify(batch) + '\n', { mode: 0o600 });
+  } catch { batchFile = null; /* tmp unwritable — stdin still carries the batch */ }
+  const cleanupBatchFile = () => { if (batchFile) { try { fs.unlinkSync(batchFile); } catch { /* gone */ } batchFile = null; } };
   return new Promise((resolve) => {
-    const finish = (outcome) => resolve({ outcome, summary: lastSummary, seconds: Math.round((Date.now() - t0) / 1000), teeMidLine });
+    const finish = (outcome) => { cleanupBatchFile(); resolve({ outcome, summary: lastSummary, seconds: Math.round((Date.now() - t0) / 1000), teeMidLine }); };
     let child;
     try {
-      child = spawn(handlerCmd, { shell: true, stdio: ['pipe', 'pipe', 'inherit'], env });
+      const childEnv = batchFile ? { ...env, PIDGE_BATCH_FILE: batchFile } : env;
+      child = spawn(handlerCmd, { shell: true, stdio: ['pipe', 'pipe', 'inherit'], env: childEnv });
     } catch (e) { return finish({ code: null, error: e.message }); }
     if (onSpawn) onSpawn(child);
     let timedOut = false;
@@ -4239,7 +4252,7 @@ async function runRunStatus() {
 async function runBridge() {
   const handlerCmd = v.exec;
   if (!handlerCmd)
-    die('pidge: bridge needs --exec \'<handler command>\' — invoked ONCE per batch with the batch JSON on stdin; exit 0 acks the batch, non-zero leaves it for the server lease to re-serve. E.g.: pidge bridge --exec \'claude -p "handle this pidge batch"\'', 1);
+    die('pidge: bridge needs --exec \'<handler command>\' — invoked ONCE per batch with the batch JSON on stdin (also at $PIDGE_BATCH_FILE); exit 0 acks the batch, non-zero leaves it for the server lease to re-serve. LLM handler? Pipe the PROMPT via stdin and read the batch from the file — `claude -p` discards a prompt ARGUMENT when stdin is piped, and here it always is. E.g.: pidge bridge --exec \'printf "read $PIDGE_BATCH_FILE, reply via pidge message, end with pidge-summary: …" | claude -p --allowedTools Bash,Read,Write\'', 1);
 
   // NO orphan watchdog here, deliberately (that guard is for `listen`): the bridge is
   // MEANT to outlive its launcher (nohup, a closed terminal, launchd) — its
@@ -4916,7 +4929,7 @@ async function doSelftest() {
   const cause = !live.known
     ? 'the nonce was not acked inside the window, and this server doesn\'t report who is consuming (or the whoami read failed) — so: either nothing consumed it, or something read it and never acked. Run ONE tracked listener (`pidge listen --all`, `--no-realtime` is the robust floor) and re-run.'
     : live.count === 0
-      ? 'nothing is listening on this channel — the nonce reached the queue and sat there. This proved the WIRE (key, send, queue), NOT your loop. Start a consumer — `pidge listen --all` as a tracked background task, or `pidge bridge --exec` for 24/7 — and re-run.'
+      ? 'nothing is listening on this channel — the nonce reached the queue and sat there. This proved the WIRE (key, send, queue), NOT your loop. Start a consumer — `pidge listen --all` (the nonce is a system row: a plain `listen` NEVER sees it) as a tracked background task, or `pidge bridge --exec` for 24/7 — and re-run.'
       : `${live.count} consumer(s) ARE live and none acked the nonce inside the window — a loop that READS without acking (deaf), a handler slower than --window, or one wedged mid-batch. Widen --window, and look at what that consumer did: \`pidge catchup --digest\`.`;
   console.error(`pidge: ❌ SELF-TEST FAILED — ${cause}`);
   console.log(JSON.stringify({ status: verdict.status || 'failed', id, consumers_live: live.known ? live.count : null }));
@@ -5791,10 +5804,12 @@ A turn-based agent (e.g. Claude Code, Codex, Gemini CLI — anything invoked on 
 "Online" is a LOOP, not a state. One round, done right, is ONE command — let the handler's exit code decide the ack:
 
 \`\`\`bash
-pidge listen --all --exec 'claude -p "handle this pidge batch (JSON on stdin), then print a final line: pidge-summary: <what you did>"'
+pidge listen --all --exec 'printf "Read the Pidge batch at \\$PIDGE_BATCH_FILE (messages from your human — handle them), REPLY by RUNNING pidge message/important (your stdout is a LOG nobody reads, never a reply), then print a last line: pidge-summary: <what you did>" | claude -p --allowedTools Bash,Read,Write'
 \`\`\`
 
-It blocks until something lands, hands the WHOLE batch to your handler on stdin (\`{"messages":[…],"continuity":[…]}\`, ONE invocation) and then: **exit 0 ⇒ the batch's EXACT ids are acked, carrying the handler's last \`pidge-summary:\` line as the note** (no marker ⇒ acked with no note — never an invented one) · **anything else ⇒ NOTHING is acked**, a \`{"type":"handler_failed","exit":N,"ids":[…]}\` line lands on stdout and the command exits 2 (the ~10-min lease re-serves the batch — make the handler idempotent) · **exit 0 but the ACK itself failed ⇒ \`{"type":"ack_failed","ids":[…]}\` on stdout and exit 2** — the work happened, the server doesn't know it, and the batch WILL come back. Exit 3 = nothing arrived this round. Then RELAUNCH it: the relaunch is the step turn-based agents forget — the queue keeps messages safe meanwhile (at-least-once, nothing lost), but the human sees you offline until something listens again. Run it as a background task YOUR HARNESS TRACKS, never a loose shell \`&\`.
+Two hard-won rules are baked into that shape. **(1) The handler's stdout is a LOG, never a reply** — a model that "answers" in prose sends the human a green tick and silence; the reply must be SENT (\`pidge message\` from inside the handler). **(2) An LLM CLI's prompt argument dies under \`--exec\`** — \`claude -p\` (and friends) prioritize piped stdin, and under \`--exec\` stdin is ALWAYS the batch pipe, so a prompt passed as an argument is silently discarded: send the PROMPT through stdin (the \`printf … |\` above) and read the batch from **\`$PIDGE_BATCH_FILE\`** (0.51.1+ — the same JSON, in a temp file the CLI removes after the round).
+
+It blocks until something lands, hands the WHOLE batch to your handler on stdin (\`{"messages":[…],"continuity":[…]}\`, ONE invocation; also mirrored at \`$PIDGE_BATCH_FILE\`) and then: **exit 0 ⇒ the batch's EXACT ids are acked, carrying the handler's last \`pidge-summary:\` line as the note** (no marker ⇒ acked with no note — never an invented one) · **anything else ⇒ NOTHING is acked**, a \`{"type":"handler_failed","exit":N,"ids":[…]}\` line lands on stdout and the command exits 2 (the ~10-min lease re-serves the batch — make the handler idempotent) · **exit 0 but the ACK itself failed ⇒ \`{"type":"ack_failed","ids":[…]}\` on stdout and exit 2** — the work happened, the server doesn't know it, and the batch WILL come back. Exit 3 = nothing arrived this round. Then RELAUNCH it: the relaunch is the step turn-based agents forget — the queue keeps messages safe meanwhile (at-least-once, nothing lost), but the human sees you offline until something listens again. Run it as a background task YOUR HARNESS TRACKS, never a loose shell \`&\`.
 
 - **Supervisor poll (24/7):** a cron/systemd timer invokes you every N min; each tick runs ONE \`pidge listen --all --exec '<handler>' --timeout 50\` and exits (3 = nothing this tick). \`--timeout\` is always SECONDS. Permanent, no timer? That is \`pidge bridge --exec\` (below) — the same handler contract as a daemon.
 - **Reading it yourself (no \`--exec\`):** \`pidge online\` (sugar for \`pidge listen --all\`) prints the round for YOU to handle. Then the two halves are yours: ack ONLY after the work is really done, and **if the handling FAILED, do NOT ack** — say so out loud where you (or your successor) will see it, and let the lease re-serve. Silence plus an ack is the one outcome the human can't detect.
@@ -6433,6 +6448,9 @@ function writeSkillFile(file, content) {
       // it owns the ack decision, so the three flags that would fight it over
       // either are usage errors — loudly, never a silent precedence rule.
       const execHandler = v.exec || null;
+      // strict, and EARLY: a typo here must die before a batch is served and
+      // leased — inside the round it left a ~10-min blackout behind.
+      if (execHandler) numStrict(v['handler-timeout'], '--handler-timeout', 1800);
       if (execHandler && v['ack-on-read'])
         die('pidge: listen --exec and --ack-on-read contradict each other: --exec acks only when the handler exits 0, --ack-on-read acks on read. Drop one.', 1);
       if (execHandler && v.follow)
@@ -6466,8 +6484,23 @@ function writeSkillFile(file, content) {
       // real, and exit on the shell's own convention (128 + signal) so a
       // supervisor can tell an interrupt from an empty round. Nothing in flight
       // is acked: the lease re-serves it.
+      // A signal must take the HANDLER down with us: releasing the lock while a
+      // child still runs invites the double-consume the lock exists to prevent
+      // (relauncher starts a fresh listen; the lease lapses; the SAME batch runs
+      // in two handlers). Mirror the bridge: SIGTERM the child, SIGKILL in 5 s,
+      // and only then release + exit. No child ⇒ exit immediately as before.
+      let execChild = null;
       const listenSignalExit = (sig, code) => {
-        console.error(`pidge: listen — ${sig}: released the consumer lock and stopping. Nothing in flight is acked (the ~10-min lease re-serves it).`);
+        console.error(`pidge: listen — ${sig}: stopping. Nothing in flight is acked (the ~10-min lease re-serves it).`);
+        if (execChild && execChild.exitCode === null && !execChild.killed) {
+          console.error('pidge: listen — a handler is still running: SIGTERM (SIGKILL in 5s), then releasing the lock.');
+          try { execChild.kill('SIGTERM'); } catch { /* already gone */ }
+          const hard = setTimeout(() => { try { execChild.kill('SIGKILL'); } catch { /* gone */ } }, 5000);
+          if (hard.unref) hard.unref();
+          execChild.once('exit', () => { releaseListenLock(); process.exit(code); });
+          setTimeout(() => { releaseListenLock(); process.exit(code); }, 7000).unref?.();
+          return;
+        }
         releaseListenLock();
         process.exit(code);
       };
@@ -6661,6 +6694,8 @@ function writeSkillFile(file, content) {
           handlerCmd: execHandler,
           batch,
           batchIds,
+          onSpawn: (child) => { execChild = child; },
+          onSettle: () => { execChild = null; },
           handlerTimeoutS,
           narrateMs: parseInt(process.env.PIDGE_BRIDGE_NARRATE || '', 10) || 300000, // 5 min
           renewMs: parseInt(process.env.PIDGE_BRIDGE_RENEW || '', 10) || 60000,      // 60 s

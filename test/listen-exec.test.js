@@ -69,6 +69,62 @@ async function waitFor(fn, ms = 8000, step = 50) {
 // A handler that copies its stdin (the batch JSON) to $OUT, prints a marker, exits 0.
 const CAPTURE_HANDLER = `${process.execPath} -e "require('fs').writeFileSync(process.env.OUT, require('fs').readFileSync(0)); console.log('trabalhei um pouco'); console.log('pidge-summary: reiniciei o worker')"`;
 
+test('a SIGTERM takes the RUNNING HANDLER down before releasing the lock', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 51, channel_id: 1, kind: 'message', body: 'trabalho longo' }];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-sigchild-'));
+  const pidFile = path.join(dir, 'handler.pid');
+  const handler = `echo $$ > ${JSON.stringify(pidFile)}; sleep 60`;
+
+  const { child, result } = runCli(['listen', '--all', '--exec', handler, '--timeout', '30'], port);
+  // wait for the handler to be alive
+  const t0 = Date.now();
+  while (!fs.existsSync(pidFile) && Date.now() - t0 < 10000) await new Promise((r) => setTimeout(r, 100));
+  const hpid = parseInt(fs.readFileSync(pidFile, 'utf8'), 10);
+  assert.ok(Number.isInteger(hpid), 'handler started');
+
+  child.kill('SIGTERM');
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 143, `stderr: ${stderr}`);
+  assert.match(stderr, /handler is still running: SIGTERM/);
+  // the handler must actually be dead (not orphaned): kill(0) must fail shortly
+  const t1 = Date.now();
+  let dead = false;
+  while (Date.now() - t1 < 8000) {
+    try { process.kill(hpid, 0); } catch { dead = true; break; }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  assert.ok(dead, `handler pid ${hpid} survived the listen teardown — orphaned`);
+});
+
+test('the batch also rides $PIDGE_BATCH_FILE — and the file is gone after the round', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 41, channel_id: 1, kind: 'message', body: 'oi' }];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-batchfile-'));
+  const probe = path.join(dir, 'probe.json');
+  // o handler ignora o stdin de propósito (o caso claude -p) e lê só o arquivo
+  const handler = `cp "$PIDGE_BATCH_FILE" ${JSON.stringify(probe)}; printf "pidge-summary: li do arquivo\n"`;
+
+  const { result } = runCli(['listen', '--all', '--exec', handler, '--timeout', '15'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const copied = JSON.parse(fs.readFileSync(probe, 'utf8'));
+  assert.equal(copied.messages[0].id, 41, 'the file carries the SAME batch stdin carries');
+  const leftovers = fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith(`pidge-batch-`) && f.includes('.json'));
+  // não dá para afirmar zero global (outros processos), mas o DESTA rodada não pode sobrar:
+  // o conteúdo copiado prova que existiu; nenhum arquivo restante pode conter o id 41.
+  for (const f of leftovers) {
+    let txt = ''; try { txt = fs.readFileSync(path.join(os.tmpdir(), f), 'utf8'); } catch { continue; }
+    assert.ok(!txt.includes('"id":41'), `batch temp file survived the round: ${f}`);
+  }
+});
+
 test('listen --exec: the batch reaches the handler on stdin; exit 0 acks the EXACT ids with its marker summary', async () => {
   const mock = createMock();
   const port = await mock.start();
@@ -384,7 +440,7 @@ for (const [sig, expected] of [['SIGINT', 130], ['SIGTERM', 143]]) {
     await mock.stop();
 
     assert.equal(r.code, expected, `stderr:\n${r.stderr}`);
-    assert.match(r.stderr, new RegExp(`${sig}: released the consumer lock`));
+    assert.match(r.stderr, new RegExp(`${sig}: stopping`));
     assert.ok(!fs.existsSync(lockPathFor(xdg)), 'no corpse lock left behind for the next listener to fight');
   });
 }
