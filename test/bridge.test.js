@@ -171,19 +171,26 @@ test('bridge: a STALE lock (dead pid — crashed bridge) is recovered, not fatal
   await mock.stop();
 });
 
-test('bridge: SIGTERM with a handler IN FLIGHT — batch NOT acked, handler terminated, lock released, exit 0', async () => {
+test('bridge: SIGTERM with a handler IN FLIGHT — batch NOT acked, handler AND its grandchildren terminated, lock released, exit 0', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 8, kind: 'message', body: 'oi', created_at: 'x' }];
-  const marker = path.join(tmpDir('pidge-sig-'), 'started');
-  // The handler signals "I started" then hangs far longer than the test.
-  const handler = `${process.execPath} -e "require('fs').writeFileSync(process.env.MARK, 'x'); setTimeout(() => {}, 30000)"`;
+  const dir = tmpDir('pidge-sig-');
+  const marker = path.join(dir, 'started');
+  const gpidFile = path.join(dir, 'grandchild.pid');
+  // The handler backgrounds its real work (a grandchild of the bridge, under
+  // the `sh -c` wrapper), signals "I started", then waits. Killing only the
+  // shell would leave that work alive, reparented to init.
+  const handler = `sleep 60 & echo $! > ${JSON.stringify(gpidFile)}; ${process.execPath} -e "require('fs').writeFileSync(process.env.MARK, 'x')"; wait`;
 
   const { child, result, xdg } = runCli(
     ['bridge', '--exec', handler, '--no-realtime', '--interval', '1'],
     port, { MARK: marker },
   );
-  assert.ok(await waitFor(() => fs.existsSync(marker)), 'the handler must be in flight');
+  assert.ok(await waitFor(() => fs.existsSync(marker) && fs.existsSync(gpidFile)), 'the handler must be in flight');
+  const gpid = parseInt(fs.readFileSync(gpidFile, 'utf8'), 10);
+  assert.ok(Number.isInteger(gpid), 'the grandchild started');
+  process.kill(gpid, 0); // really running before we tear anything down
 
   child.kill('SIGTERM');
   const r = await result;
@@ -192,6 +199,8 @@ test('bridge: SIGTERM with a handler IN FLIGHT — batch NOT acked, handler term
   assert.match(r.stderr, /NOT acked/);
   assert.equal(mock.state.ackBodies.length, 0, 'an in-flight batch must NOT be acked on SIGTERM');
   assert.ok(!fs.existsSync(lockPathFor(xdg)), 'the lock must be released on the way out');
+  assert.ok(await waitFor(() => { try { process.kill(gpid, 0); return false; } catch { return true; } }),
+    `the handler's GRANDCHILD (pid ${gpid}) survived the bridge shutdown — orphaned onto init, still working a batch nobody will ack`);
 });
 
 test('bridge: 401 — narrated LOCAL ALERT + LONG jittered backoff; never a hot loop, never a silent death', async () => {

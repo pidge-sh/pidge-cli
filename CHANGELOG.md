@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.51.2 — 2026-08-24
+
+**A signal killed the shell, not the work.** `--exec` runs the handler through
+`sh -c`, so the process the CLI held was the WRAPPER: a handler that backgrounds
+its real work (`foo & wait`, a pipeline, an npx launcher) survived the SIGTERM
+that was supposed to end it — measured live, a `sleep 300` still running 22
+seconds after the shutdown, reparented to init, working a batch nobody would
+ack. Worse, the SIGKILL that should have finished the job was on an `unref`'d
+timer, so the process exited before it ever fired. The handler now leads its own
+process GROUP and every teardown signals the group — `--handler-timeout`, the
+`listen` signal exit and the bridge's shutdown alike — and the escalation timer
+outlives the wait it exists for.
+
+**`selftest` stopped blaming a listener that was already gone.** A consumer row
+stays `live` for ~10 minutes after its last consume, so for ten minutes after a
+loop died the FAIL read "1 consumer live and none acked — deaf", sending you to
+debug a handler you no longer had. It now requires `listening` too: a stale live
+row is "nothing is listening on this channel", which is the truth. An older
+server that doesn't send the field is unchanged — reporting an empty channel we
+can't actually see would be the worse lie.
+
+**`setup --claim` says what it just did to your other installs.** The claim
+exchange ROTATES the channel key: the previous key is revoked on the spot, its
+sockets dropped and its sessions ended. That happened in silence, so the
+surprise landed on the OTHER install — a bridge or a cron that worked a minute
+ago and 401s now with no idea why. Setup narrates it in one line, and names the
+prior owner's generation when the ownership response already carried it.
+
+**A mute-ack finding is a warning, not trivia.** The drained-in-24h probe names
+its own `warning_kinds` entry (`mute_ack`) instead of leaving the counter to
+re-derive it from the probe's own prose — a rewrite of the wording could quietly
+demote the finding to "other", which is exactly what `warning_kinds` exists to
+prevent.
+
+
 ## 0.51.1 — 2026-08-24
 
 **The LLM-handler recipe actually works now.** Observed live, twice, with a real

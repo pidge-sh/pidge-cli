@@ -401,6 +401,35 @@ test('setup --claim INSIDE a git project writes the PROJECT-scoped env (600) and
   assert.match(stderr, /escopo DESTE projeto/, 'setup narrates the project scope');
   assert.match(stderr, /canal "mock"/);
   assert.match(stderr, /doctor: all good/);
+  assert.match(stderr, /ROTATED the channel key/, 'setup says out loud what the claim exchange just did to any other install');
+});
+
+// A claim exchange REVOKES the previous key (the server mints a new one and
+// drops the old holder's sockets and sessions). That used to happen in silence,
+// so the surprise landed on the OTHER install — a bridge or a cron that worked
+// a minute ago and 401s now with no idea why. One line, where we cause it.
+test('setup --claim says the previous key is REVOKED — and names a prior owner when the generation shows one', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // this channel was already owned by a DIFFERENT install
+  mock.state.claim = {
+    claimed_by_label: 'outro-agente', claimed_by_fingerprint: 'fp-alheio',
+    claimed_at: '2026-08-01T10:00:00Z', claim_generation: 3,
+  };
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-rotate-'));
+  const proj = makeProject();
+
+  const { code, stderr } = await runCli(
+    ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, proj,
+  ).result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stderr, /previous key is now REVOKED/, 'the consequence is named, not implied');
+  assert.match(stderr, /401/, 'and it says what the other install will actually see');
+  assert.match(stderr, /A different install owned this channel before \(generation 4\)/,
+    'the generation the ownership response already carried — no extra request');
 });
 
 // --- setup --from-computer: PIDGE_SECRET by DERIVATION (no secret travels) ---
@@ -2106,10 +2135,43 @@ test('selftest — with NOTHING listening it FAILS and says the wire is all it p
   assert.match(stdout, /"consumers_live":\s*0/);
 });
 
+// `live` outlives `listening` by ~10 minutes (the consumer row stays live for
+// that long after the last consume). So for ten minutes after a loop dies the
+// server still lists it, and the selftest used to blame "1 consumer live and
+// none acked (deaf)" when the truth was that nothing was listening at all —
+// the misdiagnosis that sends you debugging a handler you no longer have.
+test('selftest — a consumer that is live-but-NOT-listening is nothing listening, not a deaf loop', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.consumers = [{ label: 'bridge-bot', live: true, listening: false }];
+  const { result } = runCli(['selftest', '--window', '5', '--no-realtime'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 2, `stderr: ${stderr}`);
+  assert.match(stderr, /nothing is listening/, 'the stale live row is not a listener');
+  assert.ok(!/ARE live/.test(stderr), 'and it must NOT be blamed as a deaf consumer');
+  assert.match(stdout, /"consumers_live":\s*0/);
+});
+
+// An OLD server sends no `listening` field at all. There we keep today's
+// answer: a `live` row still counts. Reporting an empty channel we cannot
+// actually see would be a worse lie than the one above.
+test('selftest — an old server (no `listening` field) still counts a live consumer', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.consumers = [{ label: 'bridge-bot', live: true }];
+  const { result } = runCli(['selftest', '--window', '5', '--no-realtime'], port);
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 2, `stderr: ${stderr}`);
+  assert.match(stderr, /1 consumer\(s\) ARE live/);
+  assert.match(stdout, /"consumers_live":\s*1/);
+});
+
 test('selftest — a LIVE but deaf consumer is blamed differently from an empty channel', async () => {
   const mock = createMock();
   const port = await mock.start();
-  mock.state.consumers = [{ label: 'bridge-bot', live: true }]; // live, and never acks
+  mock.state.consumers = [{ label: 'bridge-bot', live: true, listening: true }]; // holding the queue NOW, and never acks
   const { result } = runCli(['selftest', '--window', '5', '--no-realtime'], port);
   const { code, stderr } = await result;
   await mock.stop();
@@ -4411,13 +4473,19 @@ test('doctor: handled_state "drained" in the last 24h is called a MUTE ack; othe
     { id: 75, kind: 'message', body: 'e', created_at: 'x', processed_at: AGO(48 * 3600000), handled_state: 'drained' },
   ];
 
-  const { code, stderr } = await runCli(['doctor', '--no-realtime'], port).result;
+  const { code, stdout, stderr } = await runCli(['doctor', '--no-realtime'], port).result;
   await mock.stop();
 
   assert.equal(code, 0, `stderr:\n${stderr}`);
   assert.match(stderr, /2 message\(s\) acked in the last 24h with NO note/, 'only the recent drained rows count');
   assert.match(stderr, /MUTE ack/);
   assert.match(stderr, /composer queue: no un-acked messages ✓/, 'processed rows are not pending — the other line still tells the truth');
+  // A finding a script can't see is trivia. The probe NAMES its own kind, so a
+  // rewrite of the prose above can never quietly demote it to "other".
+  const line = JSON.parse(stdout.trim().split('\n').pop());
+  assert.equal(line.warnings, 1, 'the mute-ack finding counts as a warning (one finding, however many messages)');
+  assert.deepEqual(line.warning_kinds, ['mute_ack'], 'and it is named on the machine line');
+  assert.match(stderr, /healthy — 1 warning\(s\) above \(mute_ack\)/, 'the verdict agrees with the lines above it');
 });
 
 test('doctor: an OLD server (no handled_state field) says nothing about mute acks — silence, not a complaint', async () => {

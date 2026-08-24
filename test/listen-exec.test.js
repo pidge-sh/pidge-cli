@@ -69,20 +69,33 @@ async function waitFor(fn, ms = 8000, step = 50) {
 // A handler that copies its stdin (the batch JSON) to $OUT, prints a marker, exits 0.
 const CAPTURE_HANDLER = `${process.execPath} -e "require('fs').writeFileSync(process.env.OUT, require('fs').readFileSync(0)); console.log('trabalhei um pouco'); console.log('pidge-summary: reiniciei o worker')"`;
 
-test('a SIGTERM takes the RUNNING HANDLER down before releasing the lock', async () => {
+// The handler runs under `sh -c`, so the child we hold is the SHELL: a script
+// that backgrounds its real work leaves that work alive when only the shell is
+// signalled (measured live — a `sleep 300` still running 22 s after the
+// SIGTERM, reparented to init, doing the batch nobody acked). So the handler
+// gets its own process GROUP and the teardown signals the group: the shell AND
+// its grandchildren go down together.
+test('a SIGTERM takes the RUNNING HANDLER down — grandchildren included — before releasing the lock', async () => {
   const mock = createMock();
   const port = await mock.start();
   mock.state.messages = [{ id: 51, channel_id: 1, kind: 'message', body: 'trabalho longo' }];
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-sigchild-'));
   const pidFile = path.join(dir, 'handler.pid');
-  const handler = `echo $$ > ${JSON.stringify(pidFile)}; sleep 60`;
+  const gpidFile = path.join(dir, 'grandchild.pid');
+  // `sleep 60 &` + `wait` keeps the shell alive as a REAL parent (no exec
+  // optimization), so hpid and gpid are two different processes.
+  const handler = `sleep 60 & echo $! > ${JSON.stringify(gpidFile)}; echo $$ > ${JSON.stringify(pidFile)}; wait`;
 
   const { child, result } = runCli(['listen', '--all', '--exec', handler, '--timeout', '30'], port);
-  // wait for the handler to be alive
+  // wait for the handler AND its grandchild to be alive
   const t0 = Date.now();
-  while (!fs.existsSync(pidFile) && Date.now() - t0 < 10000) await new Promise((r) => setTimeout(r, 100));
+  while ((!fs.existsSync(pidFile) || !fs.existsSync(gpidFile)) && Date.now() - t0 < 10000) await new Promise((r) => setTimeout(r, 100));
   const hpid = parseInt(fs.readFileSync(pidFile, 'utf8'), 10);
+  const gpid = parseInt(fs.readFileSync(gpidFile, 'utf8'), 10);
   assert.ok(Number.isInteger(hpid), 'handler started');
+  assert.ok(Number.isInteger(gpid), 'grandchild started');
+  assert.notEqual(gpid, hpid, 'the grandchild must be a SEPARATE process — otherwise this test proves nothing');
+  process.kill(gpid, 0); // it really is running before we tear anything down
 
   child.kill('SIGTERM');
   const { code, stderr } = await result;
@@ -90,14 +103,17 @@ test('a SIGTERM takes the RUNNING HANDLER down before releasing the lock', async
 
   assert.equal(code, 143, `stderr: ${stderr}`);
   assert.match(stderr, /handler is still running: SIGTERM/);
-  // the handler must actually be dead (not orphaned): kill(0) must fail shortly
-  const t1 = Date.now();
-  let dead = false;
-  while (Date.now() - t1 < 8000) {
-    try { process.kill(hpid, 0); } catch { dead = true; break; }
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  assert.ok(dead, `handler pid ${hpid} survived the listen teardown — orphaned`);
+  // neither the handler NOR its grandchild may survive: kill(0) must fail shortly
+  const isDead = async (pid) => {
+    const t1 = Date.now();
+    while (Date.now() - t1 < 8000) {
+      try { process.kill(pid, 0); } catch { return true; }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return false;
+  };
+  assert.ok(await isDead(hpid), `handler pid ${hpid} survived the listen teardown — orphaned`);
+  assert.ok(await isDead(gpid), `the handler's GRANDCHILD (pid ${gpid}) survived the teardown — reparented to init, still working a batch nobody will ack`);
 });
 
 test('the batch also rides $PIDGE_BATCH_FILE — and the file is gone after the round', async () => {
