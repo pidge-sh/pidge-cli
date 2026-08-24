@@ -3891,11 +3891,28 @@ function narrateLiveConsumer(holder) {
   console.error(`pidge: this channel already has a LIVE consumer (${holder.label ? `"${holder.label}", ` : ''}pid ${holder.pid}) — this wait hears ONLY the answer to your notification; anything the human TYPES goes to that listener's queue. Send-and-go and collect it there instead of waiting twice.`);
 }
 
+// Take the handler down — AND everything it started. `--exec` runs through
+// `sh -c`, so the child we hold is the SHELL: signalling only that pid leaves a
+// script's own children alive, reparented to init (measured live: a `sleep 300`
+// still running 22 s after the SIGTERM that was supposed to have ended it).
+// So the handler is spawned into its OWN process group (`detached: true`) and
+// every teardown signals the GROUP. `process.kill(-pid)` fails with ESRCH once
+// the group is gone and with EPERM where groups don't work like this — both
+// degrade to the single-pid kill, which is exactly today's behaviour.
+// Three callers: --handler-timeout, the listen signal teardown, the bridge's.
+function killHandlerGroup(child, sig) {
+  if (!child || !child.pid) return;
+  try { process.kill(-child.pid, sig); } catch {
+    try { child.kill(sig); } catch { /* already gone */ }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // ONE handler invocation — shared by `pidge bridge` (a batch per loop tick) and
 // `pidge listen --exec` (one round, no daemon). Both hand the batch to a command
 // on stdin and let its EXIT CODE decide the ack, so everything hard lives here
-// exactly once: the shell spawn, the settle (process exit AND stdout EOF, with a
+// exactly once: the shell spawn (into its own process GROUP, so a kill reaches
+// the handler's own children), the settle (process exit AND stdout EOF, with a
 // short grace when a grandchild keeps the pipe open), the STREAMED scan for the
 // last `pidge-summary:` marker, the stdout tee with backpressure, the
 // --handler-timeout SIGTERM (SIGKILL 5 s later), the periodic stderr heartbeat,
@@ -3955,7 +3972,9 @@ function runHandlerOnce({
     let child;
     try {
       const childEnv = batchFile ? { ...env, PIDGE_BATCH_FILE: batchFile } : env;
-      child = spawn(handlerCmd, { shell: true, stdio: ['pipe', 'pipe', 'inherit'], env: childEnv });
+      // detached: the handler leads its OWN process group, so every kill path
+      // below reaches its grandchildren instead of just the `sh -c` wrapper.
+      child = spawn(handlerCmd, { shell: true, stdio: ['pipe', 'pipe', 'inherit'], env: childEnv, detached: true });
     } catch (e) { return finish({ code: null, error: e.message }); }
     if (onSpawn) onSpawn(child);
     let timedOut = false;
@@ -3970,9 +3989,9 @@ function runHandlerOnce({
     // failed handler: no ack.
     const killT = setTimeout(() => {
       timedOut = true;
-      console.error(`pidge: ${tag} — handler exceeded --handler-timeout (${handlerTimeoutS}s) — SIGTERM (SIGKILL in 5s). Treated as a FAILED batch: NOT acked.`);
-      try { child.kill('SIGTERM'); } catch { /* already gone */ }
-      hardKill = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 5000);
+      console.error(`pidge: ${tag} — handler exceeded --handler-timeout (${handlerTimeoutS}s) — SIGTERM to its whole process group (SIGKILL in 5s). Treated as a FAILED batch: NOT acked.`);
+      killHandlerGroup(child, 'SIGTERM');
+      hardKill = setTimeout(() => killHandlerGroup(child, 'SIGKILL'), 5000);
       if (hardKill.unref) hardKill.unref();
     }, handlerTimeoutS * 1000);
     if (killT.unref) killT.unref();
@@ -4301,8 +4320,10 @@ async function runBridge() {
     console.error(`pidge: bridge — ${sig}: shutting down cleanly. An in-flight batch is NOT acked (the server lease re-serves it).`);
     const finish = () => { releaseOnce(); process.exit(0); };
     if (currentChild && currentChild.exitCode === null && currentChild.signalCode === null) {
-      try { currentChild.kill('SIGTERM'); } catch { /* already gone */ }
-      const hardKill = setTimeout(() => { try { currentChild.kill('SIGKILL'); } catch { /* gone */ } finish(); }, 5000);
+      // the GROUP, not just the `sh -c` wrapper — a handler's own children must
+      // not survive the shutdown as orphans still working the batch.
+      killHandlerGroup(currentChild, 'SIGTERM');
+      const hardKill = setTimeout(() => { killHandlerGroup(currentChild, 'SIGKILL'); finish(); }, 5000);
       if (hardKill.unref) hardKill.unref();
       currentChild.once('exit', () => { clearTimeout(hardKill); finish(); });
     } else {
@@ -4847,11 +4868,19 @@ WantedBy=default.target
 // consumers), degraded HONESTLY: {known:false} on an older server that doesn't
 // report them, or on a failed read — a caller must then say "I can't tell"
 // instead of naming a culprit it never saw.
+//
+// `live` alone is NOT "listening": a consumer row stays live for ~10 min after
+// its last consume, so for ten minutes after a loop dies the server still lists
+// it — and a selftest run in that window blamed "1 consumer live and none acked
+// (deaf)" when the truth was that nothing was listening at all. `listening` is
+// the field that means someone is holding the queue NOW, so require both. An
+// older server omits it entirely; there we keep today's answer rather than
+// reporting an empty channel we can't actually see.
 async function liveConsumers() {
   try {
     const { res, data } = await fetchWhoami();
     if (res.status !== 200 || !Array.isArray(data.consumers)) return { known: false, count: 0 };
-    return { known: true, count: data.consumers.filter((c) => c && c.live).length };
+    return { known: true, count: data.consumers.filter((c) => c && c.live && c.listening !== false).length };
   } catch { return { known: false, count: 0 }; }
 }
 
@@ -4956,6 +4985,16 @@ function doctorWarningKind(line) {
   for (const [re, kind] of DOCTOR_WARNING_KINDS) if (re.test(line)) return kind;
   return 'other';
 }
+// A probe that KNOWS its own kind says so, instead of leaving the counter to
+// re-derive it from the probe's own prose. Sniffing the line works until
+// somebody rewrites the wording — then the finding quietly files itself as
+// "other" and nobody notices, which is the exact failure `warning_kinds` exists
+// to prevent. Set for the duration of one console.error call.
+let doctorPendingKind = null;
+function doctorWarn(kind, line) {
+  doctorPendingKind = kind;
+  try { console.error(line); } finally { doctorPendingKind = null; }
+}
 
 // doctor: validate the setup WITHOUT exposing secrets. Narration on stderr,
 // a compact machine-readable line on stdout. Exit 0 healthy / 2 broken.
@@ -4969,7 +5008,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   const printErr = console.error;
   console.error = (...a) => {
     const line = a.map((x) => (typeof x === 'string' ? x : String(x))).join(' ');
-    if (/WARNING|⚠️/.test(line)) warnings.push(doctorWarningKind(line));
+    if (/WARNING|⚠️/.test(line)) warnings.push(doctorPendingKind || doctorWarningKind(line));
     printErr(...a);
   };
   // sourceLabel is passed by setup (it knows exactly where the key went —
@@ -5088,7 +5127,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
           return done === null || done > now - 24 * 3600 * 1000;
         }).length;
         if (drained > 0)
-          console.error(`pidge doctor: ⚠️ ${drained} message(s) acked in the last 24h with NO note and no answer sent afterwards — a MUTE ack (the server files it as "drained"). To the human that green ✓✓ claims work that left no trace. In an automated loop the note belongs to the handler (\`pidge listen --exec\` / \`pidge bridge\` take it from its \`pidge-summary:\` line); by hand, use \`ack --summary\`.`);
+          doctorWarn('mute_ack', `pidge doctor: ⚠️ ${drained} message(s) acked in the last 24h with NO note and no answer sent afterwards — a MUTE ack (the server files it as "drained"). To the human that green ✓✓ claims work that left no trace. In an automated loop the note belongs to the handler (\`pidge listen --exec\` / \`pidge bridge\` take it from its \`pidge-summary:\` line); by hand, use \`ack --summary\`.`);
       }
     }
   } catch { /* advisory probe — never fails the doctor */ }
@@ -5309,6 +5348,21 @@ async function runSetup() {
   const channelName = data.channel && data.channel.name;
   const channelId = data.channel && data.channel.id;
 
+  // The claim exchange ROTATES the channel key (server contract) — the key this
+  // setup just received is a NEW one, and the previous holder is revoked on the
+  // spot: its sockets drop, its sessions end. Nothing said so, so the surprise
+  // landed on the OTHER install — a bridge or a cron that worked a minute ago
+  // and now 401s with no idea why. One line, at the moment we cause it.
+  // `claim` is the ownership block we already hold (no extra request): a
+  // generation past the first means a DIFFERENT install owned this channel, so
+  // there is a real holder to lock out, not just a hypothetical one.
+  const narrateKeyRotation = (claim) => {
+    const gen = claim && Number(claim.claim_generation);
+    const prior = Number.isFinite(gen) && gen >= 2
+      ? ` A different install owned this channel before (generation ${gen}) — that one is who just lost the key.` : '';
+    note(`pidge: this claim ROTATED the channel key — the previous key is now REVOKED. Any OTHER install still holding it (a bridge, a cron, another machine) gets 401 from here until a human re-onboards it with a fresh code.${prior}`);
+  };
+
   // --from-computer: the derivation itself (§ the info string binds the key to
   // this channel's PUBLIC id, so the id must be known).
   let derivedSecret = null;
@@ -5340,6 +5394,7 @@ async function runSetup() {
     // Connect-screen terminal step, never from the chat prompt.)
     if (derivedSecret) console.log(`export PIDGE_SECRET=${derivedSecret}`);
     else if (process.env.PIDGE_SECRET) console.log(`export PIDGE_SECRET=${process.env.PIDGE_SECRET}`);
+    narrateKeyRotation(null); // --print never stamps ownership, so there is no generation to name
     console.error(`pidge: canal "${channelName}" — modo POR-AGENTE (nada gravado em disco). Cole as duas linhas no ambiente de lançamento DESTE agente (systemd/launcher/cron/profile). Cada agente tem a SUA chave; perdeu, é só pegar outro código no app e re-rodar (a chave do canal é a MESMA). NÃO rode --print de dentro de um agente — a chave apareceria no contexto dele.`);
     await fuseSkillAndHello(finalBase, data.key);
     await runDoctor(finalBase, data.key, 'fresh claim (per-agent env — not stored on disk)');
@@ -5375,6 +5430,7 @@ async function runSetup() {
     fs.appendFileSync(CONFIG_FILE, `PIDGE_CLAIM_GENERATION=${claim.claim_generation}\nPIDGE_FINGERPRINT=${agentFingerprint()}\n`, { mode: 0o600 });
     note(`pidge: ownership claimed as "${agentLabel()}" (generation ${claim.claim_generation}) — doctor WARNS if another agent takes this channel.`);
   }
+  narrateKeyRotation(claim);
   if (!AGENT_ID && !projectScoped)
     note('pidge: este é o arquivo COMPARTILHADO da máquina (single-agent). Vai rodar 2+ agentes aqui? Rode o setup de dentro da pasta de cada projeto (env isolado automático), ou dê a cada um PIDGE_AGENT=<id> no launch — senão eles enviam como o mesmo canal.');
   await fuseSkillAndHello(finalBase, data.key);
@@ -6493,12 +6549,18 @@ function writeSkillFile(file, content) {
       const listenSignalExit = (sig, code) => {
         console.error(`pidge: listen — ${sig}: stopping. Nothing in flight is acked (the ~10-min lease re-serves it).`);
         if (execChild && execChild.exitCode === null && !execChild.killed) {
-          console.error('pidge: listen — a handler is still running: SIGTERM (SIGKILL in 5s), then releasing the lock.');
-          try { execChild.kill('SIGTERM'); } catch { /* already gone */ }
-          const hard = setTimeout(() => { try { execChild.kill('SIGKILL'); } catch { /* gone */ } }, 5000);
-          if (hard.unref) hard.unref();
-          execChild.once('exit', () => { releaseListenLock(); process.exit(code); });
-          setTimeout(() => { releaseListenLock(); process.exit(code); }, 7000).unref?.();
+          console.error('pidge: listen — a handler is still running: SIGTERM to its whole process group (SIGKILL in 5s), then releasing the lock.');
+          killHandlerGroup(execChild, 'SIGTERM');
+          // NOT unref'd, deliberately: an unref'd escalation let the process
+          // exit before the 5 s ever elapsed, so the SIGKILL that was supposed
+          // to end a handler ignoring SIGTERM never fired at all. This timer's
+          // whole job is to OUTLIVE the wait.
+          const hard = setTimeout(() => killHandlerGroup(execChild, 'SIGKILL'), 5000);
+          const bail = setTimeout(() => { releaseListenLock(); process.exit(code); }, 7000);
+          execChild.once('exit', () => {
+            clearTimeout(hard); clearTimeout(bail);
+            releaseListenLock(); process.exit(code);
+          });
           return;
         }
         releaseListenLock();
