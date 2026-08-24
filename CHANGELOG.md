@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.51.1 — 2026-08-24
+
+**The LLM-handler recipe actually works now.** Observed live, twice, with a real
+model as the handler: `claude -p "<instructions>"` DISCARDS its prompt argument
+whenever stdin is a pipe — and under `--exec` stdin is ALWAYS the batch pipe —
+so the most natural handler chatted its answers into the log while the human
+got a green tick and silence (the plumbing was honest: the acks filed as
+drained; the recipe was the lie). Two changes:
+
+- The batch now ALSO rides a temp file named to the handler as
+  **`$PIDGE_BATCH_FILE`** (same JSON as stdin, mode 600, removed after the
+  round). The stdin contract is unchanged.
+- The skill (rev 25), the bridge usage text and the docs teach the shape that
+  works: pipe the PROMPT through stdin, read the batch from the file — and the
+  rule above it: **the handler's stdout is a LOG, never a reply**; anything the
+  human should see must be SENT (`pidge message` from inside the handler).
+
+
 ## 0.51.0 — 2026-08-23
 
 **A batch of commands that told you they worked when they hadn't.** The
