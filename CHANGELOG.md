@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.52.1 — 2026-08-25
+
+**The dots now go OUT when you stop working.** 0.52.0 raised them at the right
+moment and never lowered them: `bridge` / `listen --exec` turned the indicator on
+when your batch reached the handler, then let it coast to its 120 s TTL. So a
+handler that finished in 25 s left the human's phone saying "working on it" for
+another 95 — measured on a real device, with **no consumer alive at all**:
+
+> "nao sei se vc esta trabalhando ou nao... era pra aparecer somente se o agent
+> estiver de fato trabalhando para mim"
+
+That is the whole complaint, and it was right. An automatic signal that only ever
+turns ON isn't automatic, it's stuck.
+
+- **Cleared on every settle path** — clean exit, non-zero exit, spawn error,
+  `--handler-timeout` kill. There is no way out of a batch that leaves the dots
+  on. (A handler that REPLIED already cleared them at the source; this covers the
+  one that finished silently, failed, or died.)
+- **Renewed while the handler thinks**, on the same heartbeat that renews the
+  lease — a handler that takes longer than the TTL no longer goes dark mid-thought.
+- **The clear is actually delivered.** Fire-and-forget loses the race against a
+  prompt `process.exit()`: a FAILED handler exits fast enough to drop the write,
+  which is exactly the case that most needs it. The round now gives that one write
+  a bounded 1.2 s to leave the process — never consulted, never able to change the
+  batch's outcome, which was decided before teardown began.
+
+`PIDGE_NO_AUTO_TYPING=1` still turns the whole thing off, both halves.
+
+After this, the dots mean what they say: **a handler is running on your message**
+— never "a message arrived".
+
+
 ## 0.52.0 — 2026-08-24
 
 **`pidge typing` — the three dots, for the gap where a human decides you're

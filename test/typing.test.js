@@ -243,12 +243,15 @@ test('under --exec the nudge is silent — that path raises the dots itself', as
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   assert.doesNotMatch(stderr, /Run `pidge typing` first/, 'no advice to a loop that already did it');
-  assert.deepEqual(mock.state.typingWrites, [{ ttl_seconds: 120 }]);
+  assert.deepEqual(mock.state.typingWrites, [{ ttl_seconds: 120 }, { ttl_seconds: 0 }],
+    'the loop raised them for the handler and put them out after it');
 });
 
 // ── the automatic half ──────────────────────────────────────────────────────
 // A handler being handed a batch IS "the agent is working on your message", so
-// `bridge`/`listen --exec` raise the dots at that one point. It must never be
+// `bridge`/`listen --exec` raise the dots at that one point — and PUT THEM OUT
+// when it stops, which is what keeps the signal honest (the dots mean a handler
+// is running, never "a message arrived"). It must never be
 // anything but fire-and-forget: the round's verdict is the handler's exit code
 // and nothing else.
 const OK_HANDLER = `${process.execPath} -e "console.log('pidge-summary: fiz o trabalho')"`;
@@ -263,7 +266,11 @@ test('listen --exec raises the dots when it hands the batch to the handler', asy
   await mock.stop();
 
   assert.equal(code, 0, `stderr: ${stderr}`);
-  assert.deepEqual(mock.state.typingWrites, [{ ttl_seconds: 120 }], 'one automatic signal, the longer window');
+  assert.deepEqual(
+    mock.state.typingWrites,
+    [{ ttl_seconds: 120 }, { ttl_seconds: 0 }],
+    'raised when the batch reached the handler, and PUT OUT when the handler was done',
+  );
   assert.ok(mock.state.acks.length > 0, 'the round still acked normally');
 });
 
@@ -295,7 +302,7 @@ test('a /typing that FAILS never costs the round its handler or its ack', async 
   await mock.stop();
 
   assert.equal(code, 0, `a display-only signal must never fail a round; stderr: ${stderr}`);
-  assert.equal(mock.state.typingWrites.length, 1, 'it was attempted');
+  assert.equal(mock.state.typingWrites.length, 2, 'both halves were attempted');
   assert.ok(mock.state.acks.length > 0, 'and the batch was acked all the same');
   assert.doesNotMatch(stdout, /handler_failed/);
   // The failure is genuinely swallowed — no line of noise in an agent's log.
@@ -355,5 +362,43 @@ test('a HANGING /typing does not delay the handler by a single beat', async () =
   assert.equal(code, 0, `stderr: ${stderr}`);
   assert.ok(elapsed < 8000, `the round waited ${elapsed}ms on a signal it must not await`);
   assert.ok(mock.state.acks.length > 0);
-  assert.ok(await waitFor(() => mock.state.typingWrites.length === 1, 1000), 'it was still attempted');
+  assert.ok(await waitFor(() => mock.state.typingWrites.length === 2, 1000),
+    'both halves were still attempted — a wedged signal is dropped, never awaited');
+});
+
+// The honesty half (2026-08-25, found on a real phone): the dots must go out when
+// the handler stops, not coast to their TTL. "nao sei se vc esta trabalhando ou
+// nao... era pra aparecer somente se o agent estiver de fato trabalhando para mim"
+// — measured that day as ~50 s of dots with no consumer alive at all.
+test('the dots go OUT when the handler finishes, instead of coasting to the TTL', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 64, channel_id: 1, kind: 'message', body: 'olha isso pra mim' }];
+
+  const { result } = runCli(['listen', '--all', '--exec', OK_HANDLER, '--timeout', '20', '--no-realtime'], port);
+  const { code, stderr } = await result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  const last = mock.state.typingWrites[mock.state.typingWrites.length - 1];
+  assert.deepEqual(last, { ttl_seconds: 0 }, 'the LAST thing a finished round says is "not typing"');
+});
+
+test('a FAILED handler still puts the dots out — no way out of a batch leaves them on', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [{ id: 65, channel_id: 1, kind: 'message', body: 'e se quebrar?' }];
+
+  const { result } = runCli(
+    ['listen', '--all', '--exec', 'sh -c "cat >/dev/null; exit 3"', '--timeout', '20', '--no-realtime'],
+    port,
+  );
+  const { code, stdout } = await result;
+  await mock.stop();
+
+  assert.equal(code, 2, 'a failed handler is still a failed round');
+  assert.match(stdout, /handler_failed/, 'and it is reported as one');
+  assert.equal(mock.state.acks.length, 0, 'nothing acked — the lease re-serves');
+  const last = mock.state.typingWrites[mock.state.typingWrites.length - 1];
+  assert.deepEqual(last, { ttl_seconds: 0 }, 'but the human is NOT left staring at dots for a handler that died');
 });
