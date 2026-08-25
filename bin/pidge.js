@@ -3670,6 +3670,36 @@ function fireAutoTyping(ttlSeconds = TYPING_AUTO_TTL_S) {
   } catch { /* never let a synchronous throw reach the spawn path */ }
 }
 
+// The OTHER half of the automatic signal, and the one that makes it HONEST: the
+// handler is done, so the dots go out NOW instead of coasting to their TTL.
+// Without this the phone says "working on it" for up to TYPING_AUTO_TTL_S after
+// the work stopped — measured live 2026-08-25, ~50 s of dots with no consumer
+// alive at all ("nao sei se vc esta trabalhando ou nao... era pra aparecer
+// somente se o agent estiver de fato trabalhando para mim"). A handler that
+// REPLIED already cleared them at the source; this covers the one that finished
+// silently, failed, timed out or was killed. Same fire-and-forget contract as
+// its sibling: never awaited, never narrated, never a verdict.
+// Returns a promise that ALWAYS resolves — the caller awaits it only to be sure
+// the write LEFT the process, never to learn anything from it.
+function clearAutoTyping() {
+  if (process.env.PIDGE_NO_AUTO_TYPING === '1') return Promise.resolve();
+  if (!TOKEN) return Promise.resolve();
+  try {
+    return fetchT(`${BASE}/api/v1/typing`, {
+      method: 'POST', headers, body: JSON.stringify({ ttl_seconds: 0 }),
+    }, 5000)
+      .then((r) => r.text().catch(() => ''))
+      .then(() => {}, () => {});   // display-only signal — a failure here is not news
+  } catch { return Promise.resolve(); /* a teardown path must never throw */ }
+}
+
+// How long a round may spend making sure "not typing" actually left the process.
+// NOT a wait on a verdict — the batch's outcome is decided before we get here.
+// It exists because fire-and-forget loses the race against a prompt
+// `process.exit()`, and a dropped clear is exactly the lie being fixed: a FAILED
+// handler exits fast enough to lose it (proven by test, found on a real phone).
+const TYPING_CLEAR_GRACE_MS = 1200;
+
 // Orphan-zombie guard: when `npx pidge-cli listen` is launched as a
 // background task and the harness later kills the npx wrapper, the node LEAF can
 // orphan and keep consuming the channel forever without ever waking the agent. A
@@ -4131,6 +4161,10 @@ function runHandlerOnce({
     // silent (a line per ping would drown a long outage's log).
     let renewFailed = false;
     const renew = batchIds.length === 0 ? null : setInterval(() => {
+      // The dots ride the SAME heartbeat as the lease: a handler that thinks for
+      // longer than TYPING_AUTO_TTL_S must not go dark mid-thought, and renewing
+      // is just calling again. Fire-and-forget, like every other typing call.
+      fireAutoTyping();
       fetchT(`${BASE}/api/v1/messages/ack`, {
         method: 'POST', headers, body: JSON.stringify({ ids: batchIds, state: 'delivered' }),
       }).then((r) => {
@@ -4149,11 +4183,20 @@ function runHandlerOnce({
       if (settled) return; settled = true;
       clearTimeout(killT); if (hardKill) clearTimeout(hardKill); clearInterval(narrate);
       if (renew) clearInterval(renew);
+      // The handler stopped — so does the signal that said it was working. Every
+      // settle path lands here (clean exit, non-zero, spawn error, --handler-timeout
+      // kill), which is exactly the point: there is no way out of a batch that
+      // leaves the dots on.
+      const cleared = clearAutoTyping();
       if (graceT) clearTimeout(graceT);
       // A final marker line with NO trailing newline still counts.
       if (markerTail) { takeMarker(markerTail); markerTail = ''; }
       if (onSettle) onSettle();
-      finish(o);
+      // Give that write a BOUNDED moment to land before the round ends and the
+      // process exits under it. Capped hard and never consulted: `o` was decided
+      // above and nothing here can change it.
+      Promise.race([cleared, new Promise((r) => { const t = setTimeout(r, TYPING_CLEAR_GRACE_MS); if (t.unref) t.unref(); })])
+        .then(() => finish(o), () => finish(o));
     };
     // finalize only when the process has exited AND its stdout has drained,
     // so a marker on the LAST unflushed chunk is never missed (the 'exit' event
