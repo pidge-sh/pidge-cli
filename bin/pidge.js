@@ -761,6 +761,13 @@ const USAGE_TAIL = `  pidge bridge --exec '<handler>'         24/7 SUPERVISOR: l
   pidge ack --up-to <id> | --ids a,b [--renew]
                                           mark messages PROCESSED (green ✓✓) after you handled them;
                                           --renew heartbeats the lease on a long task (state=delivered)
+  pidge typing [SECONDS|off]              show the human the three dots while you work on a reply.
+                                          Run it when their message just landed and you'll be busy
+                                          more than ~15s before answering (\`pidge typing 120\` when
+                                          it'll be long). It SELF-EXPIRES (default 60s, server clamp
+                                          3–300), ANY real send of yours clears it, and running it
+                                          again extends it. Display-only — nothing waits on it.
+                                          Automatic under bridge / listen --exec (PIDGE_NO_AUTO_TYPING=1 opts out).
   pidge contract set <key>=<value> | contract show
                                           DECLARE how you operate: keep_connection_alive,
                                           mirror_in_origin_session,
@@ -862,6 +869,10 @@ ENV
                 answers/messages decrypt automatically; without it, sends go clear
                 and the app marks them "⚠️ sem criptografia". Validate with
                 \`pidge doctor\`.
+  PIDGE_NO_AUTO_TYPING=1
+                turn OFF the automatic typing indicator that \`bridge\`/\`listen --exec\`
+                raise when they hand a batch to your handler (\`pidge typing\` by hand
+                still works). Display-only either way — nothing downstream reads it.
 
 OUTPUT
   stdout is machine-readable (a fire-and-forget send→the raw 201 JSON; a --wait
@@ -1228,6 +1239,20 @@ const HELP = {
     ].join('\n'),
     opts: ['up-to', 'ids', 'renew', 'ack-summary'],
   },
+  typing: {
+    summary: 'show the human the three dots while you work on a reply — ephemeral, display-only, self-expiring.',
+    usage: 'pidge typing [SECONDS|off]',
+    body: [
+      'Turns ON the "…" indicator in the human\'s Pidge conversation, exactly like the three dots in a chat app. Bare = 60 s; a number sets the window (the server clamps it to 3–300 s and this command tells you when it will); `pidge typing off` (or `0`) clears it now.',
+      '',
+      'Use it when you have just received a message from your human and you will be working for more than ~15 seconds before you answer — the gap between their message and your reply is where a human decides you are broken. `pidge typing 120` when you know it will be a long one.',
+      '',
+      'Three properties make it safe to fire and forget: it SELF-EXPIRES (a crashed agent never leaves them staring at dots), ANY real send of yours clears it at the source (they see your words, not the dots), and to EXTEND it you simply run it again. It is advisory and display-only — no push, no history, nothing downstream reads it, and nothing is ever waiting on it.',
+      '',
+      'Automatic under `pidge bridge` / `pidge listen --exec`: handing a batch to your handler turns the dots on for you (opt out with PIDGE_NO_AUTO_TYPING=1). Exit 0 · 2 error (a server that predates the indicator answers 404 and says so).',
+    ].join('\n'),
+    opts: [],
+  },
   contract: {
     summary: 'DECLARE how you operate — ADVISORY, never policy (the human SEES if you honor it).',
     usage: 'pidge contract set <key>=<value> | pidge contract show',
@@ -1365,7 +1390,7 @@ const KNOWN_MANIFEST_VERSION = 114;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 25;
+const SKILL_REVISION = 26;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -3005,7 +3030,7 @@ function exitWithComposerMessages(cid, { msgs, contexts }) {
   const upTo = Math.max(...msgs.map((m) => m.id));
   console.log(JSON.stringify({
     kind: 'human_message',
-    note: `the human wrote in the channel composer while you waited — handle it FIRST. Your notification ${cid} is STILL unanswered: resume with \`pidge wait ${cid}\` afterwards (or answer the human with a new send, reusing thread_id).`,
+    note: `the human wrote in the channel composer while you waited — handle it FIRST. Your notification ${cid} is STILL unanswered: resume with \`pidge wait ${cid}\` afterwards (or answer the human with a new send, reusing thread_id). Working on it for more than ~15 s before you answer? Run \`pidge typing\` first — the human sees the three dots instead of silence.`,
     pending_notification: cid,
     messages: msgs,
   }, null, 2));
@@ -3562,6 +3587,89 @@ async function runContract() {
   process.exit(0);
 }
 
+// ---------------------------------------------------------------------------
+// `pidge typing [SECONDS|off]` — the phone's three-dot "agent is working on a
+// reply" indicator. It is EPHEMERAL, ADVISORY and DISPLAY-ONLY: nothing
+// downstream reads it, no push is sent, no history is kept. Two properties make
+// it safe to fire and forget: it SELF-EXPIRES on a server-side TTL (an agent
+// that dies never leaves the human staring at dots), and any real send on the
+// channel clears it at the source (the human sees words, not dots).
+// The range is the SERVER's rule, not ours — we warn, we never wall.
+// ---------------------------------------------------------------------------
+const TYPING_DEFAULT_TTL_S = 60;   // matches the server default; sent explicitly
+const TYPING_MIN_TTL_S = 3;
+const TYPING_MAX_TTL_S = 300;
+// The TTL the automatic bridge/--exec signal asks for (see fireAutoTyping).
+const TYPING_AUTO_TTL_S = 120;
+
+async function runTyping() {
+  const arg = parsed.positionals[1];
+  const usage = `pidge: usage: pidge typing [SECONDS|off]  — bare = ${TYPING_DEFAULT_TTL_S}s · a number = that many seconds (server range ${TYPING_MIN_TTL_S}–${TYPING_MAX_TTL_S}) · \`off\` (or 0) clears it`;
+  let ttl;
+  if (arg === undefined) ttl = TYPING_DEFAULT_TTL_S;
+  else {
+    const raw = String(arg).trim().toLowerCase();
+    if (raw === 'off') ttl = 0;
+    else if (/^\d+$/.test(raw)) ttl = parseInt(raw, 10);
+    // Strict, like every other numeric argument here: `pidge typing 2m` must
+    // not silently become 2 seconds of dots.
+    else die(`${usage}\n  got ${JSON.stringify(arg)}`, 1);
+  }
+  // Advisory about the server's clamp, never a second wall: the contract lives
+  // on the server, and a CLI that re-implements it drifts from it.
+  if (ttl > 0 && (ttl < TYPING_MIN_TTL_S || ttl > TYPING_MAX_TTL_S))
+    console.error(`pidge: typing ${ttl}s is outside the server's range (${TYPING_MIN_TTL_S}–${TYPING_MAX_TTL_S}s) — the server will CLAMP it. To hold the indicator longer, run \`pidge typing\` again before it lapses.`);
+  let res, raw;
+  try {
+    res = await fetchT(`${BASE}/api/v1/typing`, { method: 'POST', headers, body: JSON.stringify({ ttl_seconds: ttl }) });
+    raw = await res.text();
+  } catch (e) {
+    die(`pidge: typing failed (network): ${e.message}`, 2);
+  }
+  await checkManifestNews(res);
+  if (res.status === 401 || res.status === 403) dieKeyRejected('typing', res.status);
+  if (res.status === 404)
+    die('pidge: typing — this server predates the typing indicator (/typing 404). Nothing was shown and nothing broke: the signal is display-only. Update the server, or just keep sending.', 2);
+  console.log(raw);
+  if (!(res.status >= 200 && res.status < 300)) die(`pidge: typing failed (${res.status}): ${raw}`, 2);
+  let data = {};
+  try { data = JSON.parse(raw); } catch { /* leave {} */ }
+  if (ttl === 0 || data.typing === false) {
+    console.error('pidge: typing off — the indicator is cleared (it would have self-expired on its own anyway).');
+    process.exit(0);
+  }
+  // Trust the server's `typing_until` over our own arithmetic — it applied the
+  // clamp, so it is the only honest answer to "when do the dots go away?".
+  const until = data.typing_until ? new Date(data.typing_until) : null;
+  const clearsAt = until && !Number.isNaN(until.getTime())
+    ? `clears at ${until.toTimeString().slice(0, 8)}`
+    : `clears in ~${ttl}s`;
+  console.error(`pidge: typing on · ${clearsAt} or on your next send — any real send (message/important/ask/…) turns it off at the source. Run \`pidge typing\` again to extend it; it is display-only, so nothing waits on it.`);
+  process.exit(0);
+}
+
+// The AUTOMATIC half of the same signal: a batch just arrived from the human and
+// a handler is about to think about it, so the phone should show the dots
+// without anyone remembering to ask. FIRE-AND-FORGET by construction — it is
+// never awaited, its failure is never narrated and it can never delay, fail or
+// otherwise touch the round (an old server 404s, a wedged proxy hangs, and the
+// handler runs exactly the same). The TTL means a handler that crashes still
+// stops the dots on its own; the handler's own reply clears them at the source.
+// Opt out with PIDGE_NO_AUTO_TYPING=1.
+function fireAutoTyping(ttlSeconds = TYPING_AUTO_TTL_S) {
+  if (process.env.PIDGE_NO_AUTO_TYPING === '1') return;
+  if (!TOKEN) return;
+  try {
+    fetchT(`${BASE}/api/v1/typing`, {
+      method: 'POST', headers, body: JSON.stringify({ ttl_seconds: ttlSeconds }),
+    }, 5000)
+      // Drain the body so the socket can close, then swallow EVERYTHING: this
+      // call has no verdict anyone is allowed to act on.
+      .then((r) => r.text().catch(() => ''))
+      .catch(() => { /* display-only signal — a failure here is not news */ });
+  } catch { /* never let a synchronous throw reach the spawn path */ }
+}
+
 // Orphan-zombie guard: when `npx pidge-cli listen` is launched as a
 // background task and the harness later kills the npx wrapper, the node LEAF can
 // orphan and keep consuming the channel forever without ever waking the agent. A
@@ -3969,6 +4077,11 @@ function runHandlerOnce({
   const cleanupBatchFile = () => { if (batchFile) { try { fs.unlinkSync(batchFile); } catch { /* gone */ } batchFile = null; } };
   return new Promise((resolve) => {
     const finish = (outcome) => { cleanupBatchFile(); resolve({ outcome, summary: lastSummary, seconds: Math.round((Date.now() - t0) / 1000), teeMidLine }); };
+    // The ONE place both consumers (`bridge` and `listen --exec`) hand a human's
+    // batch to a handler — so it is the one place that can honestly say "the
+    // agent read you and is working on it". Fire-and-forget, before the spawn,
+    // so a slow/absent /typing can never delay the work by a millisecond.
+    fireAutoTyping();
     let child;
     try {
       const childEnv = batchFile ? { ...env, PIDGE_BATCH_FILE: batchFile } : env;
@@ -5819,6 +5932,20 @@ ${notes.map((n) => `- ${n}`).join('\n')}
 - **\`--wait\` is still NOT "being online."** It hears the composer only WHILE it blocks; between waits nothing reads the queue. Guiding a human step-by-step? Run \`pidge listen --all\` (or \`pidge online\`) as the primary loop, or \`pidge catchup --since <cursor>\` between steps. \`pidge doctor\` counts composer messages piling up un-acked.
 - ${exits} (a \`human_message\` return is also exit 0)
 
+## Tell them you're on it — \`pidge typing\`
+
+Your human just wrote to you and you are about to go read three files before you can answer. To them, that gap is indistinguishable from you being broken. Turn on the three dots:
+
+\`\`\`bash
+pidge typing          # the default 60 s window
+pidge typing 120      # you know this one will take a while (server clamps 3–300)
+pidge typing off      # you changed your mind and are answering right now
+\`\`\`
+
+**The rule: you received a message from your human and you will work more than ~15 seconds before you reply → run \`pidge typing\` first.** Then work, then answer normally.
+
+It is built so you cannot get it wrong: it **self-expires**, so an agent that crashes mid-thought never leaves a human staring at dots · **any real send of yours clears it** (they see your words, not the dots — you never "turn it off" before answering) · and to **extend** it you just run it again before it lapses. It is display-only — no push, no history, nothing downstream reads it, nothing is ever waiting on it. Under \`pidge bridge\` / \`pidge listen --exec\` it is automatic: handing the batch to your handler raises the dots for you.
+
 ## Waking up in an interactive session (multi-runtime channels)
 
 Your channel may already have a LIVE consumer — an always-on bridge or daemon (\`listen_mode: persistent\` or \`external_daemon\` in the channel contract). To the human, you and that consumer are ONE assistant. So before you offer any work in a fresh interactive session:
@@ -6252,6 +6379,13 @@ function writeSkillFile(file, content) {
       await runContract();
       break;
     }
+    case 'typing': {
+      // the three dots on the human's phone while you work on a reply.
+      // Ephemeral, advisory, display-only — and self-expiring, so forgetting to
+      // turn it off is not a failure mode.
+      await runTyping();
+      break;
+    }
     case 'run': {
       // execution attribution — start/end/status. start exits after printing
       // the eval-friendly export lines; end/status exit inside their handlers.
@@ -6623,6 +6757,8 @@ function writeSkillFile(file, content) {
       // Per-INSTALL notice (stamp file) + an in-process guard so a --follow run
       // doesn't repeat it across batches before the stamp write is observed.
       let ackNoticeShownThisProcess = false;
+      // The `pidge typing` nudge, at most once per process (see printAndAck).
+      let typingNudgeShown = false;
       // The continuity contexts of the CURRENT round, opened once by
       // openContinuity below: printed as their own stdout lines in the read
       // modes, handed to the handler as `batch.continuity` under --exec.
@@ -6668,6 +6804,17 @@ function writeSkillFile(file, content) {
             console.error(`pidge: reply to your notification ${m.ref.correlation_id} ("${m.ref.title}") — ${m.action_id || m.ref.event_kind}${said}`);
             if (m.truncated) console.error('pidge: that reply hit the server cap (truncated:true) — tell your human the tail was lost');
           }
+        }
+        // The exact instant an INTERACTIVE agent should raise the three dots:
+        // a human's message was just handed to it, and whatever it does next
+        // happens while their screen shows nothing. (`--exec` never reaches
+        // here — it returned above, and it fires the signal itself.) Gated on a
+        // real composer message: an answer to a question you asked, or a
+        // selftest nonce, is not a message you are about to reply to. Once per
+        // process, so a --follow window nudges instead of nagging.
+        if (!typingNudgeShown && msgs.some((m) => !m.kind || m.kind === 'message')) {
+          typingNudgeShown = true;
+          console.error('pidge: working on it for more than ~15 s before you answer? Run `pidge typing` first — the human sees the three dots instead of silence (it self-expires, and your reply clears it).');
         }
         const upTo = Math.max(...msgs.map((m) => m.id));
         if (ackOnRead) {

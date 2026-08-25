@@ -58,6 +58,14 @@ function createMock() {
     // a test forces a non-200 on GET /selftest/:id — the verdict READ fails,
     // which says nothing about the listener and must not be blamed on it.
     selftestStatus: 200,
+    // typing indicator (POST /typing). Every body the CLI sent, in order — so a
+    // test asserts the EXACT ttl_seconds on the wire. typingStatus forces a
+    // failure class (401 = rotated key, 404 = a server that predates it).
+    typingWrites: [],
+    typingStatus: 200,
+    // typingHangs: the request is READ and never answered — a wedged edge. The
+    // automatic signal must be unawaited enough that this costs the round nothing.
+    typingHangs: false,
     // the /live_activities wire.
     liveWrites: [],          // every {method, path, body} the CLI sent
     liveCards: {},           // cid → true (existence drives started|updated + PATCH 404)
@@ -517,6 +525,24 @@ function createMock() {
           if (t.unref) t.unref();
         }
         json(res, 201, { id, status: 'pending', nonce, window_seconds: windowS, expires_at: new Date(Date.now() + windowS * 1000).toISOString() });
+      });
+      return;
+    }
+    // typing indicator — advisory, display-only, self-expiring. Mirrors the
+    // server: clamp 3..300, ttl_seconds 0 = clear, echo {typing, typing_until}.
+    if (req.method === 'POST' && url.pathname === '/api/v1/typing') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
+        state.typingWrites.push(p);
+        if (state.typingHangs) return; // read, never answered
+        if (state.typingStatus !== 200) return json(res, state.typingStatus, { error: 'nope' });
+        const asked = p.ttl_seconds === undefined ? 60 : parseInt(p.ttl_seconds, 10) || 0;
+        const ttl = asked <= 0 ? 0 : Math.max(3, Math.min(300, asked));
+        json(res, 200, ttl === 0
+          ? { typing: false, typing_until: null }
+          : { typing: true, typing_until: new Date(Date.now() + ttl * 1000).toISOString() });
       });
       return;
     }

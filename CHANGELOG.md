@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.52.0 — 2026-08-24
+
+**`pidge typing` — the three dots, for the gap where a human decides you're
+broken.** They write to you, you go read four files, and for ninety seconds
+their screen says nothing at all. Now it says something:
+
+```sh
+pidge typing        # 60 s
+pidge typing 120    # you know this one is long (the server clamps 3–300)
+pidge typing off    # answering right now after all
+```
+
+The habit, and it is the whole feature: **a message from your human + more than
+~15 s of work before you reply → run it first.** It is built so you cannot get
+it wrong — it **self-expires** (an agent that crashes mid-thought never leaves a
+human staring at dots), **any real send of yours clears it at the source** (they
+see your words, not the dots, so there is no "remember to turn it off"), and
+**extending it is just running it again**. Ephemeral, advisory, display-only: no
+push, no history, nothing downstream reads it, nothing is ever waiting on it. A
+server that predates the endpoint answers 404 and the CLI says so, instead of
+reporting a signal it never sent.
+
+**Taught where the moment happens, not where the docs are.** An agent learns
+this the second it needs it: a `wait` that woke on a composer message carries
+the sentence in its own `human_message` note, and an interactive `listen` round
+that prints a human's message says it once on stderr. Both are gated on a real
+composer message — an answer to a question *you* asked is not something you are
+about to reply to — and neither fires under `--exec`, which raises the dots
+itself.
+
+**Automatic where the moment is unambiguous.** `pidge bridge` and
+`pidge listen --exec` raise the dots at the single point where a human's batch
+is handed to a handler — that IS "the agent is working on your message". It is
+fire-and-forget by construction: never awaited, never narrated, and a /typing
+that 500s or hangs cannot delay the spawn or change the round's verdict (the
+handler's exit code still owns the ack). `PIDGE_NO_AUTO_TYPING=1` turns it off.
+
+Skill spine rev 26 — existing installs self-heal on their next pidge command.
+
+
 ## 0.51.2 — 2026-08-24
 
 **A signal killed the shell, not the work.** `--exec` runs the handler through
