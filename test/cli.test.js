@@ -359,6 +359,25 @@ const fs = require('node:fs');
 const os = require('node:os');
 
 const crypto = require('node:crypto');
+
+// The installed skill is a TREE: a small core (SKILL.md) plus references/*.md
+// that the harness loads only when a trigger fires. A FACT must survive
+// somewhere reachable, and that is what `all` is for; WHERE it lives is a
+// separate claim, asserted against `core` or `refs[<name>]`. A test that only
+// ever looked at SKILL.md would read a moved fact as a deleted one.
+function installedSkill(dir) {
+  const skillDir = path.join(dir, '.claude', 'skills', 'pidge');
+  const core = fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8');
+  const refs = {};
+  const refDir = path.join(skillDir, 'references');
+  if (fs.existsSync(refDir)) {
+    for (const f of fs.readdirSync(refDir).sort()) refs[f.replace(/\.md$/, '')] = fs.readFileSync(path.join(refDir, f), 'utf8');
+  }
+  let report = '';
+  try { report = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge-report', 'SKILL.md'), 'utf8'); } catch { /* a single-file target has no companion */ }
+  return { core, refs, report, all: [core, ...Object.values(refs)].join('\n') };
+}
+
 // A throwaway "git project" directory (the .git DIR marks the toplevel) + the
 // project-scoped env path the CLI derives for it (hash of the REAL toplevel
 // path — the spawned process sees the symlink-resolved cwd on macOS /var→/private).
@@ -753,29 +772,45 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   await mock.stop();
 
   assert.equal(out.code, 0, `stderr: ${out.stderr}`);
-  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  const { core: skill, refs, all } = installedSkill(dir);
   assert.match(skill, /name: pidge/);
   // INVERTED assert: the dead content_template MENU is gone. The mock STILL serves
   // templates.decision_table (row text "template decision") — proof the generator now
   // IGNORES it — and the old "Pick the right send" menu heading is absent. (--template
   // now appears ONLY inside the skill's "it's gone, don't use it" warnings — that's the
   // point, so we assert the dead ROW + heading are absent, not the literal word.)
-  assert.ok(!/template decision/.test(skill), 'mock templates.decision_table row must NOT be pulled');
-  assert.ok(!/Pick the right send/.test(skill), 'the dead content_template menu heading is gone');
+  assert.ok(!/template decision/.test(all), 'mock templates.decision_table row must NOT be pulled');
+  assert.ok(!/Pick the right send/.test(all), 'the dead content_template menu heading is gone');
   assert.match(skill, /manifest v16/);
+  // The core is a CORE: it carries the picker, the handshake and an INDEX, and
+  // it points at reference files instead of inlining them.
+  assert.match(skill, /## THE PICKER/, 'the shortest path to a correct send stays in the core');
+  assert.match(skill, /## The version handshake/, 'the core says how it learns it is stale');
+  assert.match(skill, /X-Pidge-Manifest-Version/, 'and names the header that says so');
+  assert.match(skill, /## References — `references\/<name>\.md`/, 'the core carries the reference index');
+  for (const name of ['identity', 'send', 'approvals', 'contract', 'answers', 'loop', 'multi-runtime', 'live', 'typing', 'runs']) {
+    assert.ok(refs[name], `references/${name}.md was installed`);
+    assert.match(skill, new RegExp(`\\*\\*${name}\\*\\* — `), `the index names ${name} with a trigger`);
+    assert.ok(refs[name].trimEnd().endsWith('<!-- pidge-skill-end -->'), `references/${name}.md carries the trailer`);
+  }
+  // The generated appendix follows the fact into its file — the mock's `notes`
+  // land in the contract reference, its `cli.output` in the answers reference.
+  assert.match(refs.contract, /trust the echo/, 'the manifest notes are generated into the contract reference');
+  assert.match(refs.answers, /exit 0 answered · 3 timed out/, "the manifest's own exit contract lands in the answers reference");
   // the pidge-report COMPANION lands as a sibling skill, marked + trailed like the main one.
   const report = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge-report', 'SKILL.md'), 'utf8');
   assert.match(report, /name: pidge-report/);
-  assert.match(report, /\n# pidge-skill rev=26 manifest=16\n/, 'companion carries the same marker');
+  assert.match(report, /\n# pidge-skill rev=27 manifest=16\n/, 'companion carries the same marker');
   assert.ok(report.trimEnd().endsWith('<!-- pidge-skill-end -->'), 'companion carries the trailer');
   assert.match(skill, /pidge-report/, 'the main skill points at the companion');
   // The skill is the loudest announcement this CLI makes — every future session
   // on the machine reads it. This one was generated on a computer with no
   // Terminals daemon (isolated HOME/XDG above), so it teaches nothing about
   // mirroring a session that could not be mirrored here.
-  assert.ok(!/Mirror THIS session/.test(skill), 'no daemon here ⇒ no mirroring doctrine');
-  assert.ok(!/pidge terminal enable/.test(skill));
-  assert.match(skill, /## Full spec/, 'the section it replaces is the only thing that moved');
+  assert.ok(!/Mirror THIS session/.test(all), 'no daemon here ⇒ no mirroring doctrine');
+  assert.ok(!/pidge terminal enable/.test(all));
+  assert.ok(!refs['agent-sessions'], 'and no reference file for a door this machine does not have');
+  assert.match(skill, /## Full spec/, 'the core still points at the live contract');
 });
 
 test('skill install — on a computer WITH Terminals the skill carries the mirroring doctrine', async () => {
@@ -791,9 +826,14 @@ test('skill install — on a computer WITH Terminals the skill carries the mirro
   await mock.stop();
 
   assert.equal(out.code, 0, `stderr: ${out.stderr}`);
-  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
-  assert.match(skill, /## Mirror THIS session to the human's phone/);
-  assert.match(skill, /is SUCCESS/, 'including that the DENIAL is the success signal');
+  const { core, refs } = installedSkill(dir);
+  // The door lands as its own reference — named for the manifest section it
+  // mirrors (`agent_sessions`) — and the core's index names it with its trigger.
+  assert.ok(refs['agent-sessions'], 'the mirroring doctrine installs as a reference file');
+  assert.match(refs['agent-sessions'], /Mirror THIS session to the human's phone/);
+  assert.match(refs['agent-sessions'], /is SUCCESS/, 'including that the DENIAL is the success signal');
+  assert.match(refs['agent-sessions'], /pidge terminal enable/, 'and the one command to run');
+  assert.match(core, /\*\*agent-sessions\*\* — .*mirror/i, 'the core index carries its trigger');
 });
 
 // --- self-heal: the local skill self-heals (any pidge command refreshes a stale skill) ---
@@ -843,10 +883,10 @@ test('self-heal — a 0.15.2 marker-first install self-heals into the fixed in-f
   // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
   assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
   assert.ok(!/<!-- pidge-skill rev=/.test(healed), 'the old HTML-comment marker is gone (the end trailer is not it)');
-  assert.match(healed, /\n# pidge-skill rev=26 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=27 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
   assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
   assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 26, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 27, manifest v16\)/, 'one stderr note');
 });
 
 test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
@@ -863,10 +903,10 @@ test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the loc
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
-  assert.match(healed, /\n# pidge-skill rev=26 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=27 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 26, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 27, manifest v16\)/, 'one stderr note');
   // the heal also (re)writes the pidge-report companion — this is exactly how an
   // existing install GAINS the companion on a spine bump, with zero human action.
   const reportFile = path.join(path.dirname(path.dirname(file)), 'pidge-report', 'SKILL.md');
@@ -885,7 +925,7 @@ test('self-heal — a MANIFEST bump (server version > installed) self-heals the 
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=26 manifest=16\n/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=27 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
 });
@@ -914,7 +954,7 @@ test('self-heal — a FRESH skill (new-format marker current) is left byte-for-b
   const port = await mock.start();
   // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
   // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
-  const { dir, file } = seedNewSkill(26, 16, 'SENTINEL FRESH — keep me');
+  const { dir, file } = seedNewSkill(27, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -964,7 +1004,7 @@ test('home self-heal — a STALE home skill self-heals even when there is NO pro
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(homeSkill, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=26 manifest=16\n/, 'the home skill was regenerated to the current rev');
+  assert.match(healed, /\n# pidge-skill rev=27 manifest=16\n/, 'the home skill was regenerated to the current rev');
   assert.ok(!/STALE HOME DOCTRINE/.test(healed), 'the stale home doctrine was replaced by a real regeneration');
   assert.match(stderr, /refreshed your local Pidge skill/, 'the home heal narrated itself');
 });
@@ -984,8 +1024,8 @@ test('home self-heal — BOTH project and home skills stale: both heal in one pa
   await mock.stop();
 
   assert.equal(code, 0, `stderr: ${stderr}`);
-  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=26 manifest=16/, 'home healed');
-  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=26 manifest=16/, 'project healed');
+  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=27 manifest=16/, 'home healed');
+  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=27 manifest=16/, 'project healed');
   assert.match(stderr, /2 locations incl\. ~\/\.claude/, 'the note reports BOTH locations were refreshed');
 });
 
@@ -994,7 +1034,7 @@ test('home self-heal — a FRESH home skill is left byte-for-byte (no needless h
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homefresh-'));
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
-  seedSkillAt(homeSkill, 26, 'SENTINEL HOME — keep me'); // current rev
+  seedSkillAt(homeSkill, 27, 'SENTINEL HOME — keep me'); // current rev
   const original = fs.readFileSync(homeSkill, 'utf8');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj2-'));
 
@@ -1069,7 +1109,7 @@ test('atomic self-heal — "pidge-skill" in body PROSE is not the marker: a mark
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=26 manifest=16\n/, 'a real marker was written by the heal');
+  assert.match(healed, /\n# pidge-skill rev=27 manifest=16\n/, 'a real marker was written by the heal');
   assert.ok(!/rev=99/.test(healed), 'the prose decoy is gone with the regeneration');
 });
 
@@ -1087,7 +1127,7 @@ test('atomic self-heal — 4 concurrent heals never tear the file (atomic tmp+re
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
   assert.equal((healed.match(/# pidge-skill rev=/g) || []).length, 1, 'exactly ONE marker — no interleaved halves');
-  assert.match(healed, /\n# pidge-skill rev=26 manifest=16\n/, 'a whole, current skill won');
+  assert.match(healed, /\n# pidge-skill rev=27 manifest=16\n/, 'a whole, current skill won');
   assert.match(healed.trimEnd(), /<!-- pidge-skill-end -->$/, 'the trailer closes the file — no torn tail');
   const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
   assert.deepEqual(leftovers, [], 'no tmp litter after concurrent heals');
@@ -1645,9 +1685,10 @@ test('setup fuses the skill install + a `pidge hello` hint, exit 0', async () =>
   assert.equal(code, 0, `stderr: ${stderr}`);
   assert.match(stderr, /skill written/, 'the skill install ran as part of setup');
   assert.match(stderr, /pidge hello/, 'setup hints the first-contact handshake');
-  // the skill was actually written into cwd, generated from the (mock) manifest
-  const skill = fs.readFileSync(path.join(cwd, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
-  assert.match(skill, /Approval has two paths/);
+  // the skill TREE was actually written into cwd, generated from the (mock) manifest
+  const { core, all } = installedSkill(cwd);
+  assert.match(core, /## THE PICKER/);
+  assert.match(all, /Approval has two paths/);
 });
 
 test('setup fuse — a manifest failure DEGRADES (one-line skip + hello hint), setup STILL exits 0, no USAGE dump', async () => {
@@ -2480,7 +2521,7 @@ test('skill install includes the always-on recipe for turn-based agents', async 
   await mock.stop();
 
   assert.equal(out.code, 0, out.stderr);
-  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  const skill = installedSkill(dir).all; // a fact may live in the core or in a reference
   assert.match(skill, /always-on/i, 'the recipe section is present');
   assert.match(skill, /pidge listen --follow/, 'the interactive window is still taught');
   assert.match(skill, /pidge listen --all --exec/, 'the loop leads with the handler form');
@@ -2519,7 +2560,7 @@ test('skill teaches the wait-under-a-live-listener asymmetry + the step-by-step 
   await mock.stop();
 
   assert.equal(out.code, 0, out.stderr);
-  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  const skill = installedSkill(dir).all; // a fact may live in the core or in a reference
   assert.match(skill, /includes your OWN second process/i, 'the asymmetry is stated as a rule, not an aside');
   assert.match(skill, /send-and-go/, 'and the way out is named');
   assert.match(skill, /consumer lock/, 'the mechanism (the lock) is taught, not just the etiquette');
@@ -2552,7 +2593,7 @@ test('skill teaches bridge, ack --summary, the PIDGE_AGENT block + the prose fix
   await mock.stop();
 
   assert.equal(out.code, 0, out.stderr);
-  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  const skill = installedSkill(dir).all; // a fact may live in the core or in a reference
   // the bridge section (was 0 hits on rev 8)
   assert.match(skill, /pidge bridge/, 'the supervisor section names `pidge bridge`');
   assert.match(skill, /bridge --exec/, 'bridge --exec is taught');
@@ -2565,9 +2606,10 @@ test('skill teaches bridge, ack --summary, the PIDGE_AGENT block + the prose fix
   // durable-queue framing replaces the fatalist line
   assert.ok(!/or you lose it/.test(skill), 'the fatalist "or you lose it" line is gone');
   assert.match(skill, /nothing is ever lost/, 'the queue-is-durable framing is in');
-  // human's language, not English-only
+  // human's language, not English-only. This is WRITING doctrine, so it lives in
+  // the pidge-report companion — the skill an agent reads while composing.
   assert.ok(!/English only/.test(skill), 'the "English only" line is gone');
-  assert.match(skill, /mirror the language they use/, 'the human\'s-language guidance is in');
+  assert.match(installedSkill(dir).report, /mirror the language they use/, 'the human\'s-language guidance is in');
   // the turn-based example spans more than one harness
   assert.match(skill, /Claude Code, Codex, Gemini CLI/, 'the turn-based example is no longer a single harness');
 });
@@ -2592,7 +2634,7 @@ test('skill recommends `pidge catchup --digest --since <last>` as the session-st
   await mock.stop();
 
   assert.equal(out.code, 0, out.stderr);
-  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  const skill = installedSkill(dir).all; // a fact may live in the core or in a reference
   assert.match(skill, /pidge catchup --digest --since <last>/, 'the session-start ritual uses the incremental digest read');
   assert.match(skill, /pidge catchup --digest --since 480/, 'a concrete --since example is shown');
 });
@@ -2888,7 +2930,7 @@ test('skill install includes the "Choose the right type" catalog table', async (
   await mock.stop();
 
   assert.equal(out.code, 0, out.stderr);
-  const skill = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge', 'SKILL.md'), 'utf8');
+  const skill = installedSkill(dir).all; // a fact may live in the core or in a reference
   // The "Two axes" heading is GONE — the spine now leads with the
   // two-approval-paths distinction.
   assert.match(skill, /Approval has two paths/, 'the two-approval-paths section is present');
@@ -3962,8 +4004,18 @@ test('skill install --target agents|gemini writes root files = the claude spine 
   assert.match(agentsMd, /# Pidge Report — write for the feed, not the archive/);
   assert.match(agentsMd, /Five shapes, five budgets/);
   assert.ok(!/Five shapes, five budgets/.test(claudeMd), 'the claude skill points at the companion instead of inlining it');
-  // the new spine section rode along into every target.
-  assert.match(agentsMd, /Waking up in an interactive session/);
+  // A root-file target has nowhere to put a reference TREE either, so the
+  // references are inlined the same way. Choosing a target must never cost a fact:
+  // every reference the claude target wrote is reachable inside AGENTS.md.
+  assert.ok(!fs.existsSync(path.join(dir, 'references')), 'a root-file target grows no reference dir');
+  const refs = installedSkill(dir).refs;
+  assert.ok(Object.keys(refs).length >= 8, 'the claude install did produce references to compare against');
+  for (const [name, body] of Object.entries(refs)) {
+    const heading = body.split('\n')[0].replace(/^# /, '');
+    assert.ok(agentsMd.includes(heading), `references/${name}.md rode into AGENTS.md`);
+  }
+  // the spine sections rode along into every target.
+  assert.match(agentsMd, /a fresh interactive session/);
   assert.match(agentsMd, /Only then speak/);
   assert.match(agentsMd, /pidge catchup/);
   // the JSON echo names the resolved target + destination.

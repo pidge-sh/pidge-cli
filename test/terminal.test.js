@@ -710,9 +710,14 @@ test('connect: it refreshes the Pidge skill — the agent-side half of the door'
   try {
     const out = await runConnect(port);
     assert.equal(out.code, 0, out.stderr);
-    const skill = path.join(process.env.HOME, '.claude', 'skills', 'pidge', 'SKILL.md');
+    const skillDir = path.join(process.env.HOME, '.claude', 'skills', 'pidge');
+    const skill = path.join(skillDir, 'SKILL.md');
     assert.ok(fs.existsSync(skill), `connect must leave a HOME skill (stdout: ${out.stdout})`);
-    const text = fs.readFileSync(skill, 'utf8');
+    // The mirroring doctrine is its own reference file now — named for the
+    // manifest section it mirrors — and the core carries its trigger in the index.
+    const door = path.join(skillDir, 'references', 'agent-sessions.md');
+    assert.ok(fs.existsSync(door), 'connect installs the agent-side door as a reference');
+    const text = `${fs.readFileSync(skill, 'utf8')}\n${fs.readFileSync(door, 'utf8')}`;
     assert.match(text, /pidge terminal enable/, 'the installed skill knows the sentinel command');
     assert.match(text, /is SUCCESS/, 'and that the DENIAL is the success signal');
     assert.ok(!text.includes('hld_minted_by_claim'), 'the generated skill never bakes a token');
