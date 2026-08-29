@@ -99,6 +99,7 @@ function createMock() {
     // a test sets them to exercise the surfacing; null ⇒ the field is omitted so
     // the CLI's present-only degradation is tested against an "old server".
     whoamiStatus: null,         // force /whoami to answer this status (e.g. 401)
+    listeningState: null,       // whoami listening_state (null ⇒ omitted, older server)
     consumers: null,            // whoami consumers[] (null ⇒ block omitted)
     consumerConflict: false,    // whoami consumer_conflict (only served WITH consumers)
     unattributedListening: false, // whoami unattributed_listening (served WITH consumers)
@@ -227,6 +228,9 @@ function createMock() {
           unattributed_listening: !!state.unattributedListening,
         } : {}),
         ...(state.provenance != null ? { provenance: state.provenance } : {}),
+        // Present-only like the blocks above: null omits it (an older server),
+        // so the ack-line presence probe's degradation is testable.
+        ...(state.listeningState != null ? { listening_state: state.listeningState } : {}),
         manifest_version: 16,
       });
     }

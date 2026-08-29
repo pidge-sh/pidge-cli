@@ -1779,6 +1779,49 @@ test('ack --up-to processes (green); ack --renew heartbeats the lease', async ()
   assert.match(out.stderr, /lease renewed on 1 message/);
 });
 
+// 0.53.3 (the round-3 zero-agent retest): the ack's "what next" line carries the server-MEASURED
+// presence and the selftest proof — the round-3 agent read the old advice line,
+// said "Relaunching now", ran nothing, and told its human a listener was live.
+test('ack — the closing line prints the MEASURED presence and offers the selftest proof', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.listeningState = 'offline';
+
+  const out = await runCli(['ack', '--up-to', '8', '--summary', 'done'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /Server-measured presence right now: OFFLINE\./, 'the truth, not advice');
+  assert.match(out.stderr, /`pidge selftest` PROVES it/, 'the proof step rides the last line the agent reads');
+  assert.match(out.stderr, /Never claim online from memory/, 'and the honesty rule is spelled out');
+});
+
+test('ack — an older server without listening_state degrades to the plain line (present-only probe)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  const out = await runCli(['ack', '--up-to', '8', '--summary', 'done'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /pidge: ✓ acked\. Relaunch your listener/, 'no phantom fragment on an old server');
+  assert.ok(!/Server-measured/.test(out.stderr), 'the probe stays silent when the server does not answer it');
+  assert.match(out.stderr, /`pidge selftest` PROVES it/, 'the proof offer does not depend on the probe');
+});
+
+// The OTHER round-3 path: hello ended by TIMEOUT (the human tapped late), and
+// the old narration never mentioned the proof — the selftest word had zero
+// occurrences in the whole transcript. The timeout is exactly when the agent
+// decides what "online" means next, so the proof rides that narration too.
+test('hello — the timeout narration launches the loop AND offers the selftest proof', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+
+  const out = await runCli(['hello', '--timeout', '1', '--interval', '1'], port).result;
+  await mock.stop();
+  assert.equal(out.code, 3, `timeout is "no answer yet", not a failure: ${out.stderr}`);
+  assert.match(out.stderr, /handshake is DURABLE/, 'the durable framing stays');
+  assert.match(out.stderr, /`pidge selftest` PROVES you are reachable/, 'the proof offer rides the timeout path');
+});
+
 // The green ✓✓ is EARNED. Two ways it used to be given away: an ack the server
 // processed ZERO rows for, and an ack carrying no note at all (which the server
 // files as "drained" — a tick that stands for nothing the human can read).
