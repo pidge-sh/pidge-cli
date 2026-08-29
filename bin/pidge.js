@@ -1434,7 +1434,7 @@ const KNOWN_MANIFEST_VERSION = 124;
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
 // onboarded agent always runs the latest skill without any human action.
-const SKILL_REVISION = 27;
+const SKILL_REVISION = 28;
 // the LAST line of every generated skill. A file that carries the frontmatter
 // marker but not this trailer was torn mid-write (partial write / full disk) —
 // ensureSkillFresh treats it as stale and re-heals instead of trusting its rev.
@@ -3938,7 +3938,13 @@ function reportProvenance(data) {
 // stderr ONLY (stdout stays parseable JSON for agents), and SUPPRESSED when the
 // channel already has a live consumer: nudging `listen` next to a live
 // bridge/daemon would bait the exact double-consume the lockfile exists to stop.
-const STAY_ONLINE_NUDGE = 'pidge: NEXT — stay online: run `npx -y pidge-cli@latest listen --all` (or its alias `pidge online`) as a background task YOUR HARNESS TRACKS (never a loose shell &). It blocks until a message lands: handle it, ack, RELAUNCH it. That loop is what "online" means.';
+// 0.53.2 (the Codex zero-test finding): an agent with no relaunching harness
+// ran ONE synchronous listen, exited, and told its human "currently online" —
+// while the server measured offline. Prose alone demonstrably does not stop
+// that (the loop reference already carried the bridge fork and was read). What
+// bites is a PROOF STEP: selftest turns "I think I'm online" into a measured
+// FAIL the agent must confront, and whoami is the state the human actually sees.
+const STAY_ONLINE_NUDGE = 'pidge: NEXT — stay online: run `npx -y pidge-cli@latest listen --all` (or its alias `pidge online`) as a background task YOUR HARNESS TRACKS (never a loose shell &). It blocks until a message lands: handle it, ack, RELAUNCH it. That loop is what "online" means. Then PROVE it: `pidge selftest` FAILS unless a live listener answers — never claim online from memory; `pidge whoami` shows the listening state your human sees. No harness that relaunches you on exit? The loop is not yours to promise: run `pidge bridge` (the daemon), or declare listen_mode=turn_based and say so.';
 async function nudgeStayOnline(data = null) {
   try {
     if (!data) data = (await fetchWhoami()).data; // hello has no whoami in hand — best-effort
@@ -6058,20 +6064,21 @@ pidge listen --all --exec 'printf "Read the Pidge batch at \\$PIDGE_BATCH_FILE (
 
 Two hard-won rules are baked into that shape. **(1) The handler's stdout is a LOG, never a reply** — a model that "answers" in prose sends the human a green tick and silence; the reply must be SENT (\`pidge message\` from inside the handler). **(2) An LLM CLI's prompt argument dies under \`--exec\`** — \`claude -p\` (and friends) prioritize piped stdin, and under \`--exec\` stdin is ALWAYS the batch pipe, so a prompt passed as an argument is silently discarded: send the PROMPT through stdin (the \`printf … |\` above) and read the batch from **\`$PIDGE_BATCH_FILE\`** (the same JSON, in a temp file the CLI removes after the round).
 
-It blocks until something lands, hands the WHOLE batch to your handler on stdin (\`{"messages":[…],"continuity":[…]}\`, ONE invocation; also mirrored at \`$PIDGE_BATCH_FILE\`) and then: **exit 0 ⇒ the batch's EXACT ids are acked, carrying the handler's last \`pidge-summary:\` line as the note** (no marker ⇒ acked with no note — never an invented one) · **anything else ⇒ NOTHING is acked**, a \`{"type":"handler_failed","exit":N,"ids":[…]}\` line lands on stdout and the command exits 2 (the ~10-min lease re-serves the batch — make the handler idempotent) · **exit 0 but the ACK itself failed ⇒ \`{"type":"ack_failed","ids":[…]}\` on stdout and exit 2** — the work happened, the server doesn't know it, and the batch WILL come back. Exit 3 = nothing arrived this round. Then RELAUNCH it: the relaunch is the step turn-based agents forget — the queue keeps messages safe meanwhile (at-least-once, nothing is ever lost), but nobody wakes you until something reads it and the human sees you offline until something listens again. **What you lose is TIME, not the message.** Run it as a background task YOUR HARNESS TRACKS, never a loose shell \`&\`.
+It blocks until something lands, hands the WHOLE batch to your handler on stdin (\`{"messages":[…],"continuity":[…]}\`, ONE invocation; also mirrored at \`$PIDGE_BATCH_FILE\`) and then: **exit 0 ⇒ the batch's EXACT ids are acked, carrying the handler's last \`pidge-summary:\` line as the note** (no marker ⇒ acked with no note — never an invented one) · **anything else ⇒ NOTHING is acked**, a \`{"type":"handler_failed","exit":N,"ids":[…]}\` line lands on stdout and the command exits 2 (the ~10-min lease re-serves the batch — make the handler idempotent) · **exit 0 but the ACK itself failed ⇒ \`{"type":"ack_failed","ids":[…]}\` on stdout and exit 2** — the work happened, the server doesn't know it, and the batch WILL come back. Exit 3 = nothing arrived this round. Then RELAUNCH it: the relaunch is the step turn-based agents forget — the queue keeps messages safe meanwhile (at-least-once), but nobody wakes you and the human sees you offline until something listens again: **what you lose is TIME, not the message.** Run it as a background task YOUR HARNESS TRACKS, never a loose shell \`&\`.
 
+- **Prove it, never claim it:** \`pidge selftest\` FAILS (exit 2) unless a LIVE listener answers — run it once after wiring the loop; \`pidge whoami\` → \`listening_state\` is what your human sees. No harness that relaunches you on exit? That's \`pidge bridge\` (below), or declare \`listen_mode: turn_based\` and stop promising.
 - **Supervisor poll (24/7):** a cron/systemd timer invokes you every N min; each tick runs ONE \`pidge listen --all --exec '<handler>' --timeout 50\` and exits (3 = nothing this tick). \`--timeout\` is always SECONDS.
 - **Reading it yourself (no \`--exec\`):** \`pidge online\` (sugar for \`pidge listen --all\`) prints the round for YOU to handle. Then the two halves are yours: ack ONLY after the work is really done, and **if the handling FAILED, do NOT ack** — say so out loud where you (or your successor) will see it, and let the lease re-serve. Silence plus an ack is the one outcome the human can't detect.
 - **The stdout contract** (read it before writing any parser): zero or more compact \`{"type":"continuity_context",…}\` lines — read-only provenance, nothing there is ackable — and THEN **ONE pretty-printed JSON array** of message objects (\`kind\`: \`"message"\` | \`"notification_reply"\`). It is heterogeneous and multi-line: **never parse it line by line.** \`--ndjson\` gives one compact object per line, every line stamped \`type\` (mirroring \`kind\`), closing with \`{"type":"batch_end","count":N,"max_ackable_id":M}\`. Under \`--exec\` the handler owns stdout and the only lines the CLI adds are the two failure ones: \`handler_failed\` and \`ack_failed\`. Either way the rule is the same: **ackable ⇔ the object has an \`id\`; switch on \`type\`.**
 - **Active session:** \`pidge listen --follow --timeout 300\` holds for 5 min, printing messages as they arrive. \`--follow\` traps the turn — use it only when you intend to sit and wait.
 - **One channel = one consumer, mechanized:** a running \`listen\` HOLDS the channel's lock, so a second \`listen\` (or a \`bridge\`) is refused with exit 2. Read with \`pidge catchup\` instead of racing it.
-- **Your host sleeping/waking looks like a dead round to you** — the lid closes mid-listen, the poll dies, and the round comes back empty. The CLI blames the right side: exit 3 = reconnect and relaunch (a blip, or your own network), exit 4 = escalate (the channel really is broken, proven across rounds). Just relaunch the listener on wake.
+- **Your host sleeping/waking looks like a dead round to you** — the round comes back empty. The CLI blames the right side: exit 3 = reconnect and relaunch (a blip, or your own network), exit 4 = escalate (the channel really is broken, proven across rounds).
 
 ## The 24/7 supervisor: \`pidge bridge\`
 
 When your human wants you reachable around the clock without a harness session, run the built-in supervisor instead of hand-rolling a loop:
 
-\`pidge bridge --exec '<your handler>'\` — it long-polls the queue, runs your handler ONCE per batch (batch JSON on stdin), and acks the batch's exact ids only when the handler exits 0. A lockfile enforces ONE consumer per channel (a second bridge or \`listen\` is refused). While your handler runs (up to 30 min), the bridge automatically RENEWS the batch's lease every 60 s — the lease never lapses mid-run and the human keeps seeing "listening now"; you do nothing for it. \`pidge bridge install\` writes a launchd/systemd template and declares \`listen_mode: external_daemon\` for you.
+\`pidge bridge --exec '<your handler>'\` — it long-polls the queue, runs your handler ONCE per batch (batch JSON on stdin), and acks the batch's exact ids only when the handler exits 0. A lockfile enforces ONE consumer per channel (a second bridge or \`listen\` is refused). While your handler runs (up to 30 min) the bridge RENEWS the batch's lease every 60 s — it never lapses mid-run and the human keeps seeing "listening now". \`pidge bridge install\` writes a launchd/systemd template and declares \`listen_mode: external_daemon\` for you.
 
 Tell the next session WHAT you did: end your handler's output with one line — \`pidge-summary: <one sentence>\` — and the ack carries it; \`pidge catchup\` then shows "handled by <you>: <that sentence>". Full contract: \`pidge bridge --help\`.
 
@@ -7089,7 +7096,7 @@ function writeSkillFile(file, content, backup = true) {
       // isn't relaunched is an agent that quietly went offline — say so every
       // empty round. Suppressed under --follow (a supervisor window ending is
       // its own contract, not a lapse in the loop).
-      const RELAUNCH_NUDGE = v.follow ? null : 'Nothing arrived this round. Relaunch the listener now — the loop (listen → handle → ack → relaunch) is what keeps you online.';
+      const RELAUNCH_NUDGE = v.follow ? null : 'Nothing arrived this round. Relaunch the listener now — the loop (listen → handle → ack → relaunch) is what keeps you online. Unsure your loop is real? `pidge selftest` proves it (FAILS when nothing is listening).';
       // The FIRST batch that comes back QUICKLY was already sitting in
       // the queue when this listen started — with --all that includes answers to
       // EARLIER notifications, which read as "new" if we don't say otherwise. A

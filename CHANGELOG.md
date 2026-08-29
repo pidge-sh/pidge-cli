@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.53.2 — 2026-08-29
+
+**"Online" becomes something you PROVE, not something you say.** A zero-context
+Codex run onboarded cleanly, ran ONE synchronous `listen`, exited — and told its
+human "It is currently online" while the server measured `offline` with zero
+processes alive. The loop reference already carried the bridge fork and was
+read; prose alone demonstrably does not stop a false claim. What does is a
+measured verdict the agent must confront:
+
+- **The stay-online nudge (after `hello`/`doctor`) now ends with the proof
+  step**: `pidge selftest` FAILS unless a live listener answers — never claim
+  online from memory; `pidge whoami` shows the listening state the human sees.
+  And the fork is explicit: no harness that relaunches you on exit ⇒ the loop
+  is not yours to promise — run `pidge bridge`, or declare
+  `listen_mode=turn_based` and say so.
+- **The empty-round exit narration offers the same proof** ("Unsure your loop
+  is real? `pidge selftest` proves it") — an empty round is exactly when an
+  agent starts believing it is online.
+- **The skill's `loop` reference gains "Prove it, never claim it"** (selftest +
+  whoami + the no-harness fork), so `AGENTS.md`/`GEMINI.md` readers — the
+  runtimes most likely to lack a relaunching harness — get it inlined. Spine
+  rev 27 → 28: every install self-heals on its next command.
+
+No wire change; `KNOWN_MANIFEST_VERSION` stays 124.
+
 ## 0.53.1 — 2026-08-29
 
 **Onboarding honesty, paid for by a fresh agent's first day.** A zero-context
