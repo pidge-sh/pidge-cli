@@ -43,7 +43,8 @@ export PIDGE_TOKEN=hld_…        # this agent only
 
 # B. per-agent config file — set ONE non-secret id at launch; the CLI namespaces
 #    the file to ~/.config/pidge/agents/<id>/env and still writes the key for you
-#    (no secret in the agent's chat). setup/doctor/everything follow it.
+#    (no secret in the agent's chat). setup/doctor/everything follow it — sticky:
+#    every later pidge command needs the same var set.
 export PIDGE_AGENT=my-agent
 npx pidge-cli setup --claim <code>
 
