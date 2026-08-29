@@ -7,7 +7,20 @@
 //   'destroy' — a proxy with a short response-timeout drops the held socket
 // stop()/start() on the same port simulate a server deploy/restart.
 const http = require('node:http');
+const crypto = require('node:crypto');
 const { WebSocketServer } = require('ws');
+
+// The default manifest body: the tiny legacy shape, from a server far older than
+// the sectioned one. A test that needs a realistic document installs a recorded
+// body into `state.manifestBody` (test/manifest_fixtures.json).
+const LEGACY_MANIFEST = {
+  manifest_version: 16,
+  // The dead content_template menu is STILL served — the generator must IGNORE it.
+  templates: { decision_table: ['need a decision → template decision'] },
+  profiles: { decision_table: ['no answer needed → profile omitted'] },
+  notes: ['trust the echo'],
+  cli: { output: 'exit 0 answered · 3 timed out' },
+};
 
 function createMock() {
   const state = {
@@ -48,6 +61,9 @@ function createMock() {
     operatingContract: {},   // PATCH /channels/:id merges into this
     manifestVersion: 16,     // X-Pidge-Manifest-Version header — a test bumps it to fire the news nudge
     manifestStatus: 200,     // a test sets 500 to force a manifest read failure (skill fuse degrades)
+    manifestBody: null,      // null ⇒ LEGACY_MANIFEST; a test installs a recorded body
+    manifestEtag: true,      // false models a server too old to answer If-None-Match
+    manifestReads: [],       // {url, if_none_match, status} per /manifest GET — assert revalidation
     notifyStatus: 201,       // a test forces a non-2xx to exercise approve's fail-closed send
     selftests: {},           // id → {nonce, window_seconds, created, processed}
     selftestSeq: 100,        // next selftest/message id
@@ -258,14 +274,43 @@ function createMock() {
     if (req.method === 'GET' && url.pathname === '/api/v1/manifest') {
       // a test can force a manifest read failure (the skill fuse must degrade).
       if (state.manifestStatus && state.manifestStatus !== 200) return json(res, state.manifestStatus, { error: 'boom' });
-      return json(res, 200, {
-        manifest_version: 16,
-        // The dead content_template menu is STILL served — the generator must IGNORE it.
-        templates: { decision_table: ['need a decision → template decision'] },
-        profiles: { decision_table: ['no answer needed → profile omitted'] },
-        notes: ['trust the echo'],
-        cli: { output: 'exit 0 answered · 3 timed out' },
-      });
+      const body = JSON.parse(JSON.stringify(state.manifestBody || LEGACY_MANIFEST));
+      const version = body.manifest_version;
+      // `?sections=` is understood ONLY by a sectioned server (it carries the
+      // `sections` index). An older one ignores the query string entirely and
+      // its body already inlines every section at the top level.
+      const asked = (url.searchParams.get('sections') || '').split(',').map((s) => s.trim()).filter(Boolean);
+      if (body.sections) {
+        const available = body.sections.available || {};
+        const known = Object.keys(available);
+        const served = asked.includes('all') ? known.slice() : asked.filter((n) => known.includes(n));
+        for (const n of served) { body[n] = { doc: `the ${n} section, served on demand` }; delete available[n]; }
+        body.sections.served = served;
+        // An unrecognized name is NEVER an error: ignored, and echoed here. A
+        // seeded value survives, so a test can model a server that echoes one
+        // without the CLI having to send a typo.
+        body.sections.not_recognized = asked
+          .filter((n) => n !== 'all' && !known.includes(n) && !(n in body))
+          .concat(body.sections.not_recognized || []);
+      }
+      const payload = JSON.stringify(body);
+      // A STRONG validator over the exact served bytes — so it moves with
+      // `?sections=` and with the body, never with the version number.
+      const etag = state.manifestEtag === false
+        ? null
+        : `"${crypto.createHash('sha256').update(payload).digest('hex').slice(0, 32)}"`;
+      const inm = req.headers['if-none-match'] || null;
+      const headers = { 'content-type': 'application/json', 'x-pidge-manifest-version': String(version) };
+      if (etag) {
+        headers.etag = etag;
+        headers.vary = 'Accept, Authorization';
+        headers['cache-control'] = 'max-age=0, private, must-revalidate';
+      }
+      const hit = !!etag && String(inm || '').split(',').map((s) => s.trim()).includes(etag);
+      state.manifestReads.push({ url: req.url, if_none_match: inm, status: hit ? 304 : 200 });
+      if (hit) { res.writeHead(304, headers); return res.end(); }
+      res.writeHead(200, headers);
+      return res.end(payload);
     }
     if (req.method === 'GET' && url.pathname === '/api/v1/messages') {
       // record every read so a test can assert catchup's query (history/all).

@@ -3,6 +3,8 @@ node_modules/
 .DS_Store
 .claude/skills/pidge/SKILL.md
 .claude/skills/pidge/SKILL.md.bak*
+# the generated reference tree — same artifact as the SKILL.md above
+.claude/skills/pidge/references/
 scratchpad/
 test/.hygiene-private-patterns.json
 .claude/skills/pidge-report/SKILL.md

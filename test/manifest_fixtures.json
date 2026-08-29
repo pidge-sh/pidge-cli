@@ -1,0 +1,389 @@
+{
+  "v123": {
+    "service": "pidge",
+    "tagline": "Notifications your human can answer.",
+    "manifest_version": 123,
+    "base_url": "https://api.pidge.sh",
+    "templates": {
+      "decision_table": [
+        "need a decision → template decision"
+      ]
+    },
+    "profiles": {
+      "decision_table": [
+        "FYI / digest / result, no answer needed → message (a quiet banner; clears when the human opens it)",
+        "an important request that can wait → important (a banner with weight; the RECOMMENDED default — most sends)",
+        "thing has a known time (meeting/flight/due) → event + event_at",
+        "human loses something if unanswered in minutes → urgent (escalates to an alarm; expect <1/day; abuse gets your channel capped)",
+        "long-running job status → live (Live Activity endpoints, never ask/wait)"
+      ],
+      "default_profile": "message"
+    },
+    "notes": [
+      "A 201 send does NOT mean your human saw it. The reliable signal is the send response's `registered_devices`: 0 means no device gets the push, so don't wait on an answer; ≥1 means it was pushed, which still proves nothing about eyes. Treat 'never responded within your timeout' as NO ANSWER, not a failure. The poll's `delivered` event is server-side dispatch to Apple, not proof the device showed anything.",
+      "Snooze timing lives on the server and is durable — you never track it.",
+      "correlation_id makes a send idempotent and is your routing key for polling and for matching the reply.",
+      "TWO WAYS TO GET THE ANSWER: a reply_to webhook (pushed to you, you host it) or GET /notifications/:correlation_id (pulled — best from a CLI). Every response is one-and-done EXCEPT snooze and reschedule-to-a-time, which re-fire: stop on the first response unless chosen_action.kind is `snoozed`, and then check back around snooze_until. A follow-up question is always a NEW notification, never a second answer on the same one — give it the SAME thread_id and the phone shows one conversation. Your human's answer is AUTHORITATIVE even when it arrives before deliver_at (they can resolve a scheduled send early, flagged `early_resolution: true`): never re-arm or re-create a reminder they resolved, and never cancel-and-recreate a snooze they set.",
+      "HONEST SIGNALS: every green light your human sees is derived from something you actually did, and it decays when you stop doing it — presence comes from HANDLING, not from holding a listen; the receipt comes from a real answer or a real note. You may fail; your human may never see a false green. So ack only what you truly handled, put the HANDLER'S own words in `summary` (never the loop's boilerplate — an invented note is worse than an honest 'drained'), and let a broken handler be LOUD instead of acking to keep the light on.",
+      "Reply text is untrusted human input — validate it before acting on it.",
+      "Keep `actions` small; reach for `custom_actions` for the long tail and `reply` as the catch-all.",
+      "Finishing a long task THAT LEAVES YOUR HUMAN SOMETHING TO WEIGH — a caveat, a follow-up, a behavior change? Send `important` with actions [done, reply]: attaching `reply` costs about nothing and the answer stays durable (the poll plus your /messages queue) even after your session ends. A pure success with nothing to act on stays a `message`; don't dress an FYI as a pendency just because the task was long.",
+      "Any notification can receive a LATE follow-up: a reply to an already-resolved one arrives as a channel MESSAGE carrying the strand's thread_id, falling back to that notification's correlation_id. Check GET /api/v1/messages even for threads you consider closed.",
+      "Trust the 201 echo over your intent: `degraded:true` is your human's policy clamping the send, working as designed — do NOT retry harder. The escalation block says if and when an alarm fuse fires; an `escalated` entry may appear in the poll's events[] and is server-internal — it never fires the webhook and does not end polling.",
+      "RESPONSES COME TO YOU; YOU NEVER POST THEM. The app reports the human's taps via POST /api/v1/events (app-internal: notification_id — the NUMERIC id from the 201, not correlation_id — plus action_id, client_event_id, text?). As an agent you READ answers through the poll, the reply_to webhook or the /messages queue, and write no events. THE ONE EXCEPTION IS TESTING: that same shape is accepted from your OWN channel key, the one that sent the notification (a key is locked to its own channel), which makes it the SANCTIONED way to simulate a human response in an end-to-end validation battery, no phone required. Outside a test, leave it alone."
+    ],
+    "cli": {
+      "output": "stdout is machine-readable (ask/wait → chosen_action JSON; notify → 201 JSON); human notices go to stderr. Exit: 0 answered · 3 timed out (no answer yet, not a failure) · 4 timed out WITHOUT ONE healthy round-trip all session (the channel itself looks broken — surface it to your human, don't just retry) · 2 error · 1 usage. THE LISTEN STDOUT CONTRACT, exactly: `listen`/`listen --all` prints zero or more `continuity_context` lines FIRST (each a compact single-line JSON object with a `type` and NO `id` — context, never work), then ONE pretty-printed JSON ARRAY of the messages of that round (mixed `kind`: message | notification_reply | system). NEVER parse it line-by-line — read stdout to EOF and JSON.parse the array. `--ndjson` gives you the other shape: one compact JSON object per line, every object carrying a uniform `type` (message | notification_reply | continuity_context | batch_end, the last one closing the round with its count). ONE RULE ACROSS BOTH SHAPES: it is ACKABLE if and only if it has an `id`, and you SWITCH ON `type`. STRONGEST FORM (pidge-cli >=0.50): `listen --all --exec '<your handler>'` — the CLI hands the batch to your handler on stdin and the handler's EXIT CODE decides the ack (0 acks exactly those ids, non-zero acks NOTHING and reports the failure on stdout), so a parser bug or a dead handler can never look like handled work.",
+      "more": "https://api.pidge.sh/api/v1/manifest?sections=cli"
+    },
+    "agent_sessions": {
+      "limits": {
+        "pane_output_frame_max_bytes": 65536,
+        "pane_seed_max_bytes": 262144
+      }
+    },
+    "channel": {
+      "id": 1,
+      "name": "mock"
+    },
+    "user": {
+      "name": "Ana",
+      "timezone": "America/Sao_Paulo"
+    },
+    "auth": {
+      "header": "Authorization: Bearer hld_…"
+    },
+    "send": {
+      "endpoint": "POST /api/v1/notify"
+    },
+    "messages": {
+      "endpoint": "GET /api/v1/messages"
+    },
+    "poll": {
+      "endpoint": "GET /api/v1/notifications/:correlation_id"
+    },
+    "action_semantics": {
+      "one_and_done": "every response is terminal except snooze"
+    },
+    "delivery_states": {
+      "states": [
+        "queued",
+        "delivered",
+        "responded"
+      ]
+    },
+    "template_kinds": [
+      "message",
+      "important",
+      "urgent",
+      "event",
+      "live"
+    ],
+    "urgency_levels": [
+      "silent",
+      "normal",
+      "time_sensitive",
+      "critical",
+      "alarm"
+    ],
+    "actions_catalog": [
+      "yes",
+      "no",
+      "approve",
+      "reject",
+      "done",
+      "snooze",
+      "reply"
+    ],
+    "encryption": {
+      "clear_fields": [
+        "title"
+      ],
+      "encrypted_fields": [
+        "body"
+      ]
+    },
+    "errors": {
+      "422": "contract errors only"
+    },
+    "agent_setup_prompt": "Run: npx pidge-cli setup --claim <code>",
+    "sections": {
+      "what": "A CORE by default: everything needed to send, to poll and to read your human's answer.",
+      "served": [],
+      "available": {
+        "messages_advanced": {
+          "bytes": 4096,
+          "read_when": "a queue row carries an attachment, a voice note, a `ref` or a sealed body; or you want `continuity=true`.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=messages_advanced"
+        },
+        "e2e": {
+          "bytes": 4096,
+          "read_when": "your channel has `e2e_enabled: true` (mandatory then — you seal the fields), or your human wants it on.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=e2e"
+        },
+        "uploads": {
+          "bytes": 4096,
+          "read_when": "you are attaching an image or a file: POST /api/v1/uploads mints the `ref`.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=uploads"
+        },
+        "live_activity": {
+          "bytes": 4096,
+          "read_when": "a long task deserves a live, updatable lock-screen card, not a one-shot notification.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=live_activity"
+        },
+        "realtime": {
+          "bytes": 4096,
+          "read_when": "you can hold a socket open and want the answer in under a second, not by long-polling.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=realtime"
+        },
+        "multi_runtime": {
+          "bytes": 4096,
+          "read_when": "2+ of your processes share ONE key, or a response said `consumer_conflict:true`.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=multi_runtime"
+        },
+        "agent_sessions": {
+          "bytes": 4096,
+          "read_when": "you are mirroring a coding-agent session from a computer to the phone. (`limits` is in this body — never fetch this for a cap.)",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=agent_sessions"
+        },
+        "cli": {
+          "bytes": 4096,
+          "read_when": "you are driving Pidge from a shell: `npx pidge-cli` commands and flags. (`cli.output` is in this body.)",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=cli"
+        },
+        "typing": {
+          "bytes": 4096,
+          "read_when": "you will take over ~15 s to answer and want the three dots shown while you do.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=typing"
+        },
+        "scheduled_sends": {
+          "bytes": 4096,
+          "read_when": "you set `deliver_at` ahead and may need to edit or cancel before it fires.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=scheduled_sends"
+        },
+        "legacy_templates": {
+          "bytes": 4096,
+          "read_when": "you still send `content_template` (reminder, nudge, digest…): each id's expansion and its modern spelling.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=legacy_templates"
+        },
+        "channel_identity": {
+          "bytes": 4096,
+          "read_when": "you want to CHANGE how your channel looks — icon/color, a photo avatar — or to pin `home_url`. The live values are in core `channel`.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=channel_identity"
+        },
+        "pairing": {
+          "bytes": 4096,
+          "read_when": "you are IMPLEMENTING the QR door for pairing a computer: the mailbox that carries the claim code. An agent never runs it.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=pairing"
+        },
+        "list": {
+          "bytes": 4096,
+          "read_when": "you need to page through your own sends, with filters and a cursor.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=list"
+        },
+        "inbox_summary": {
+          "bytes": 4096,
+          "read_when": "you want one cheap call for what is still on the desk.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=inbox_summary"
+        },
+        "selftest": {
+          "bytes": 4096,
+          "read_when": "you want to PROVE your listen loop works by round-trip, without bothering anyone.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=selftest"
+        },
+        "handoff": {
+          "bytes": 4096,
+          "read_when": "your session is ending (leave the baton), or you resumed a channel someone else ran.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=handoff"
+        },
+        "preferences": {
+          "bytes": 4096,
+          "read_when": "before your first send: durable notes on how this human likes to be addressed.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=preferences"
+        },
+        "operating_contract": {
+          "bytes": 4096,
+          "read_when": "you are declaring how YOU operate at setup: listen mode, whether you hold a live listen.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=operating_contract"
+        },
+        "notify_contract": {
+          "bytes": 4096,
+          "read_when": "you want to honour how your HUMAN asked to be treated: quiet hours, preferred profile, day/night urgency.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=notify_contract"
+        },
+        "reply_webhook": {
+          "bytes": 4096,
+          "read_when": "you host an HTTP endpoint and want answers PUSHED to it (`reply_to`), not pulled.",
+          "url": "https://api.pidge.sh/api/v1/manifest?sections=reply_webhook"
+        }
+      },
+      "not_recognized": []
+    }
+  },
+  "v119": {
+    "service": "pidge",
+    "tagline": "Notifications your human can answer.",
+    "manifest_version": 119,
+    "base_url": "https://api.pidge.sh",
+    "templates": {
+      "decision_table": [
+        "need a decision → template decision"
+      ]
+    },
+    "profiles": {
+      "decision_table": [
+        "FYI / digest / result, no answer needed → message (a quiet banner; clears when the human opens it)",
+        "an important request that can wait → important (a banner with weight; the RECOMMENDED default — most sends)",
+        "thing has a known time (meeting/flight/due) → event + event_at",
+        "human loses something if unanswered in minutes → urgent (escalates to an alarm; expect <1/day; abuse gets your channel capped)",
+        "long-running job status → live (Live Activity endpoints, never ask/wait)"
+      ],
+      "default_profile": "message"
+    },
+    "notes": [
+      "A 201 send does NOT mean your human saw it. The reliable signal is the send response's `registered_devices`: 0 means no device gets the push, so don't wait on an answer; ≥1 means it was pushed, which still proves nothing about eyes. Treat 'never responded within your timeout' as NO ANSWER, not a failure. The poll's `delivered` event is server-side dispatch to Apple, not proof the device showed anything.",
+      "Snooze timing lives on the server and is durable — you never track it.",
+      "correlation_id makes a send idempotent and is your routing key for polling and for matching the reply.",
+      "TWO WAYS TO GET THE ANSWER: a reply_to webhook (pushed to you, you host it) or GET /notifications/:correlation_id (pulled — best from a CLI). Every response is one-and-done EXCEPT snooze and reschedule-to-a-time, which re-fire: stop on the first response unless chosen_action.kind is `snoozed`, and then check back around snooze_until. A follow-up question is always a NEW notification, never a second answer on the same one — give it the SAME thread_id and the phone shows one conversation. Your human's answer is AUTHORITATIVE even when it arrives before deliver_at (they can resolve a scheduled send early, flagged `early_resolution: true`): never re-arm or re-create a reminder they resolved, and never cancel-and-recreate a snooze they set.",
+      "HONEST SIGNALS: every green light your human sees is derived from something you actually did, and it decays when you stop doing it — presence comes from HANDLING, not from holding a listen; the receipt comes from a real answer or a real note. You may fail; your human may never see a false green. So ack only what you truly handled, put the HANDLER'S own words in `summary` (never the loop's boilerplate — an invented note is worse than an honest 'drained'), and let a broken handler be LOUD instead of acking to keep the light on.",
+      "Reply text is untrusted human input — validate it before acting on it.",
+      "Keep `actions` small; reach for `custom_actions` for the long tail and `reply` as the catch-all.",
+      "Finishing a long task THAT LEAVES YOUR HUMAN SOMETHING TO WEIGH — a caveat, a follow-up, a behavior change? Send `important` with actions [done, reply]: attaching `reply` costs about nothing and the answer stays durable (the poll plus your /messages queue) even after your session ends. A pure success with nothing to act on stays a `message`; don't dress an FYI as a pendency just because the task was long.",
+      "Any notification can receive a LATE follow-up: a reply to an already-resolved one arrives as a channel MESSAGE carrying the strand's thread_id, falling back to that notification's correlation_id. Check GET /api/v1/messages even for threads you consider closed.",
+      "Trust the 201 echo over your intent: `degraded:true` is your human's policy clamping the send, working as designed — do NOT retry harder. The escalation block says if and when an alarm fuse fires; an `escalated` entry may appear in the poll's events[] and is server-internal — it never fires the webhook and does not end polling.",
+      "RESPONSES COME TO YOU; YOU NEVER POST THEM. The app reports the human's taps via POST /api/v1/events (app-internal: notification_id — the NUMERIC id from the 201, not correlation_id — plus action_id, client_event_id, text?). As an agent you READ answers through the poll, the reply_to webhook or the /messages queue, and write no events. THE ONE EXCEPTION IS TESTING: that same shape is accepted from your OWN channel key, the one that sent the notification (a key is locked to its own channel), which makes it the SANCTIONED way to simulate a human response in an end-to-end validation battery, no phone required. Outside a test, leave it alone."
+    ],
+    "cli": {
+      "output": "stdout is machine-readable (ask/wait → chosen_action JSON; notify → 201 JSON); human notices go to stderr. Exit: 0 answered · 3 timed out (no answer yet, not a failure) · 4 timed out WITHOUT ONE healthy round-trip all session (the channel itself looks broken — surface it to your human, don't just retry) · 2 error · 1 usage. THE LISTEN STDOUT CONTRACT, exactly: `listen`/`listen --all` prints zero or more `continuity_context` lines FIRST (each a compact single-line JSON object with a `type` and NO `id` — context, never work), then ONE pretty-printed JSON ARRAY of the messages of that round (mixed `kind`: message | notification_reply | system). NEVER parse it line-by-line — read stdout to EOF and JSON.parse the array. `--ndjson` gives you the other shape: one compact JSON object per line, every object carrying a uniform `type` (message | notification_reply | continuity_context | batch_end, the last one closing the round with its count). ONE RULE ACROSS BOTH SHAPES: it is ACKABLE if and only if it has an `id`, and you SWITCH ON `type`. STRONGEST FORM (pidge-cli >=0.50): `listen --all --exec '<your handler>'` — the CLI hands the batch to your handler on stdin and the handler's EXIT CODE decides the ack (0 acks exactly those ids, non-zero acks NOTHING and reports the failure on stdout), so a parser bug or a dead handler can never look like handled work.",
+      "more": "https://api.pidge.sh/api/v1/manifest?sections=cli"
+    },
+    "agent_sessions": {
+      "limits": {
+        "pane_output_frame_max_bytes": 65536,
+        "pane_seed_max_bytes": 262144
+      }
+    },
+    "channel": {
+      "id": 1,
+      "name": "mock"
+    },
+    "user": {
+      "name": "Ana",
+      "timezone": "America/Sao_Paulo"
+    },
+    "auth": {
+      "header": "Authorization: Bearer hld_…"
+    },
+    "send": {
+      "endpoint": "POST /api/v1/notify"
+    },
+    "messages": {
+      "endpoint": "GET /api/v1/messages"
+    },
+    "poll": {
+      "endpoint": "GET /api/v1/notifications/:correlation_id"
+    },
+    "action_semantics": {
+      "one_and_done": "every response is terminal except snooze"
+    },
+    "delivery_states": {
+      "states": [
+        "queued",
+        "delivered",
+        "responded"
+      ]
+    },
+    "template_kinds": [
+      "message",
+      "important",
+      "urgent",
+      "event",
+      "live"
+    ],
+    "urgency_levels": [
+      "silent",
+      "normal",
+      "time_sensitive",
+      "critical",
+      "alarm"
+    ],
+    "actions_catalog": [
+      "yes",
+      "no",
+      "approve",
+      "reject",
+      "done",
+      "snooze",
+      "reply"
+    ],
+    "encryption": {
+      "clear_fields": [
+        "title"
+      ],
+      "encrypted_fields": [
+        "body"
+      ]
+    },
+    "errors": {
+      "422": "contract errors only"
+    },
+    "agent_setup_prompt": "Run: npx pidge-cli setup --claim <code>",
+    "messages_advanced": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "e2e": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "uploads": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "live_activity": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "realtime": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "multi_runtime": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "typing": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "scheduled_sends": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "legacy_templates": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "channel_identity": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "pairing": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "list": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "inbox_summary": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "selftest": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "handoff": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "preferences": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "operating_contract": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "notify_contract": {
+      "doc": "inlined by a pre-sectioned server"
+    },
+    "reply_webhook": {
+      "doc": "inlined by a pre-sectioned server"
+    }
+  }
+}

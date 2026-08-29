@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.53.0 — 2026-08-28
+
+**The installed skill goes on the same diet the manifest went on: a small CORE
+plus references loaded on a trigger.** Two costs, and they are not the same cost.
+The manifest is ACUTE — paid once, when an agent fetches it. `SKILL.md` is
+RECURRING: read in full every session the skill triggers, by every agent on the
+machine. It had grown from 18 KB to **38 159 B (~9k tokens)** with nothing
+watching it, which made it the larger of the two for anyone who sends more than
+one notification a day.
+
+- **`SKILL.md` is now 6 031 B** — everything on the shortest path from "the skill
+  just triggered" to "a correct send, and the answer read back": the picker, the
+  response axis, the profile table, the minimum for collecting an answer, the
+  version handshake, and an INDEX of the references with a trigger for each.
+  **−84% on the cost an agent pays every session.**
+- **The depth moved into `references/<name>.md`**, each named after the manifest
+  section it mirrors (`send`, `action_semantics`, `notes`, `operating_contract`,
+  `multi_runtime`, `live_activity`, `typing`, `auth`, `agent_sessions`) and each
+  carrying a footer that says exactly which call documents it server-side. The
+  harness loads one only when its trigger fires. **Zero facts were deleted** — a
+  new byte ratchet (`test/skill-budget.test.js`) exists to keep it that way, and
+  it says so in its own header.
+- **Every index line is written from the AGENT'S SITUATION**, never from a
+  feature's name: "a wait woke on something you did not expect, a queue row
+  carries an attachment or a voice note" is a condition a model can check
+  against what it is about to do.
+- **The root-file targets lose nothing.** `AGENTS.md` / `GEMINI.md` have no
+  reference directory, so they carry every reference inlined, exactly as they
+  already carried the report doctrine.
+- **The generator's own reads fail LOUDLY.** `profiles.decision_table`, `notes`,
+  `cli.output` and `manifest_version` are the four fields it branches on; an
+  absent key does not raise in JavaScript, it reads as "feature off". Missing one
+  now refuses the install by name and leaves the existing skill untouched — an
+  old complete skill beats a fresh hollow one. (The caps read on
+  `terminal connect` is deliberately NOT part of that: its silent fallback is the
+  correct behaviour for a long-lived client against an unknown server.)
+- **Older servers keep working, and say so.** The generator branches on
+  `manifest_version`, never on the presence of a key: a server that predates
+  sectioning gets ONE fetch and no `?sections=`, and a reference whose section
+  that server does not document says so in one honest line instead of shipping
+  an empty file.
+
+**Re-reading the contract is now free.** Every manifest fetch the generator makes
+carries `If-None-Match` against a stored validator, and a **304** rebuilds the
+skill from the cached body — zero bytes. The cache lives next to the CLI's state
+file and is keyed by base URL **and** credential, because a keyed manifest body is
+channel-scoped (that is what `Vary: Authorization` is on the wire for). A server
+that sends no validator behaves exactly as before: no header goes out, no cache
+file is created. And a 304 never suppresses a regeneration driven by this CLI's
+own spine revision — the server knows nothing about that, so the two staleness
+triggers stay independent.
+
+`KNOWN_MANIFEST_VERSION` moves to 123: the "server has NEW capabilities" nag was
+permanently on against any current server, shouting about sectioning and
+conditional GETs this version now speaks natively.
+
+**The picker now says that `approval` is a RECIPE, not a sixth type.** It sat in
+the same column as the five types with nothing marking it as the one row that
+already carries its own gated Approve/Reject pair and its own `--wait`. A fresh
+agent reading only the core, asked for a go/no-go on an irreversible production
+change, composed `approval --actions approve,reject --wait` — correct-looking, and
+`--actions` REPLACES the default pair, so it silently dropped the Face ID gate off
+the very approval that exists to have one. The row now says so in the row itself,
+where the composition is decided (80 B of the core's remaining headroom).
+
+**Backups are bounded at two, so a refresh stops littering your repo.** Replacing
+a file whose content differs still parks the old one — but the rule now
+distinguishes the two cases it always conflated. A file with no pidge marker is
+YOURS and unregenerable: it goes to `<dest>.bak` and is never overwritten, exactly
+as before. A file that carries the marker is our OWN previous output, and one of
+those was minted on every manifest bump, forever — a checkout that followed this
+diet through its six phases held 78 `SKILL.md.bak.*` and 45 `AGENTS.md.bak.*`.
+Ours now roll through a single `<dest>.bak.prev`, which keeps the LAST version (the
+only one that can still hold a hand-edit) and drops the rest. The version bump that
+ships this is itself a re-install for every existing skill, so it is also the last
+bump that leaves a timestamped file behind.
+
 ## 0.52.1 — 2026-08-25
 
 **The dots now go OUT when you stop working.** 0.52.0 raised them at the right
