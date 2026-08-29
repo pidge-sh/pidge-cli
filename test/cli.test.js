@@ -4082,6 +4082,43 @@ test('skill install: a re-install NEVER clobbers an existing .bak — the user o
   assert.match(second.stderr, /saved to .*AGENTS\.md\.bak\.\d+/);
 });
 
+test('skill install: OUR OWN prior output rolls through ONE .bak.prev — a manifest bump never litters the repo', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-target-'));
+  const dest = path.join(dir, 'AGENTS.md');
+  const ORIGINAL = 'THE USER\'S OWN AGENTS.md — irreplaceable\n';
+  fs.writeFileSync(dest, ORIGINAL);
+
+  // First install parks the user's original at .bak — it carries NO pidge marker,
+  // so it is theirs and must survive everything that follows.
+  const first = await runSkillInstall(['--target', 'agents'], port, dir);
+  assert.equal(first.code, 0, first.stderr);
+  assert.equal(fs.readFileSync(`${dest}.bak`, 'utf8'), ORIGINAL);
+
+  // Now five successive refreshes. Each time the file on disk is OUR generated
+  // skill (frontmatter marker intact) that has drifted from what the next install
+  // writes — exactly the shape of a manifest bump, five releases in a row.
+  for (let i = 0; i < 5; i++) {
+    fs.writeFileSync(dest, `${fs.readFileSync(dest, 'utf8')}\n<!-- drift ${i} -->\n`);
+    const r = await runSkillInstall(['--target', 'agents'], port, dir);
+    assert.equal(r.code, 0, r.stderr);
+  }
+  await mock.stop();
+
+  // Their irreplaceable file is exactly where the first install put it.
+  assert.equal(fs.readFileSync(`${dest}.bak`, 'utf8'), ORIGINAL, 'the user original must survive every refresh');
+  // Ours never minted a timestamped sibling — five bumps, zero litter.
+  const tsBaks = fs.readdirSync(dir).filter((f) => /^AGENTS\.md\.bak\.\d+$/.test(f));
+  assert.deepEqual(tsBaks, [], `a generated skill must never mint a timestamped backup, got ${tsBaks.join(', ')}`);
+  // And the ONE rolling copy holds the LAST version, not the first — a hand-edit
+  // made just before the bump is still recoverable.
+  assert.match(fs.readFileSync(`${dest}.bak.prev`, 'utf8'), /drift 4/, '.bak.prev must hold the most recent version');
+  // Two backups, forever: theirs and our previous.
+  const allBaks = fs.readdirSync(dir).filter((f) => f.startsWith('AGENTS.md.bak'));
+  assert.equal(allBaks.length, 2, `backups must stay bounded at 2, got ${allBaks.join(', ')}`);
+});
+
 // ===========================================================================
 // Multi-runtime v2 — identity headers, consumers/provenance
 // surfacing, being_handled_by self-filter, conflict warning, --note.

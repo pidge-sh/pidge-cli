@@ -56,6 +56,18 @@ triggers stay independent.
 permanently on against any current server, shouting about sectioning and
 conditional GETs this version now speaks natively.
 
+**Backups are bounded at two, so a refresh stops littering your repo.** Replacing
+a file whose content differs still parks the old one — but the rule now
+distinguishes the two cases it always conflated. A file with no pidge marker is
+YOURS and unregenerable: it goes to `<dest>.bak` and is never overwritten, exactly
+as before. A file that carries the marker is our OWN previous output, and one of
+those was minted on every manifest bump, forever — a checkout that followed this
+diet through its six phases held 78 `SKILL.md.bak.*` and 45 `AGENTS.md.bak.*`.
+Ours now roll through a single `<dest>.bak.prev`, which keeps the LAST version (the
+only one that can still hold a hand-edit) and drops the rest. The version bump that
+ships this is itself a re-install for every existing skill, so it is also the last
+bump that leaves a timestamped file behind.
+
 ## 0.52.1 — 2026-08-25
 
 **The dots now go OUT when you stop working.** 0.52.0 raised them at the right

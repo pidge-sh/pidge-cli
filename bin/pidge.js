@@ -1268,7 +1268,7 @@ const HELP = {
   skill: {
     summary: 'write the generated Pidge skill from the live manifest (persistent Pidge knowledge for an AI agent).',
     usage: 'pidge skill install [--target claude|agents|gemini]',
-    body: 'Content is the same for every target — only the destination changes: --target claude (default) → .claude/skills/pidge/SKILL.md (a Claude Code skill) · --target agents → AGENTS.md · --target gemini → GEMINI.md (both at the repo root). An existing file whose content differs is backed up to <dest>.bak (or <dest>.bak.<timestamp> if that is taken) first. NOTE: only the claude target SELF-HEALS — any pidge command silently refreshes a stale .claude skill, but AGENTS.md/GEMINI.md do NOT auto-update; re-run `pidge skill install --target agents|gemini` yourself to refresh them.',
+    body: 'Content is the same for every target — only the destination changes: --target claude (default) → .claude/skills/pidge/SKILL.md (a Claude Code skill) · --target agents → AGENTS.md · --target gemini → GEMINI.md (both at the repo root). An existing file whose content differs is backed up first: a file that is NOT a generated pidge skill is irreplaceable, so it goes to <dest>.bak and is never overwritten (<dest>.bak.<timestamp> if that name is taken); a previous GENERATED skill rolls through a single <dest>.bak.prev, so a manifest bump can never litter your repo. NOTE: only the claude target SELF-HEALS — any pidge command silently refreshes a stale .claude skill, but AGENTS.md/GEMINI.md do NOT auto-update; re-run `pidge skill install --target agents|gemini` yourself to refresh them.',
     opts: ['target'],
   },
   catchup: {
@@ -6372,11 +6372,22 @@ function writeSkillFile(file, content, backup = true) {
     // to a shared target (agents/gemini) parks the user's ORIGINAL file (e.g. their
     // hand-written AGENTS.md) at <dest>.bak; a later re-install whose generated
     // content changed would otherwise overwrite that .bak with our now-stale skill,
-    // destroying the only copy of their work. If .bak is taken, use a timestamped
-    // sibling so every prior version survives. (Date is fine here — the CLI process,
+    // destroying the only copy of their work.
+    //
+    // But there are TWO kinds of "previous", and only one of them is irreplaceable.
+    // NO pidge marker ⇒ the file is THEIRS and unregenerable, so every one of them
+    // survives under a timestamped sibling. A pidge marker ⇒ it is OUR OWN prior
+    // output, and one of those is minted on EVERY manifest bump, forever: keeping
+    // each turned a routine doctrine refresh into unbounded litter in the user's
+    // repo (a single dev checkout accumulated 78 SKILL.md.bak.* and 45
+    // AGENTS.md.bak.*). Exactly one of ours is worth keeping — the LAST, the only
+    // one that can still hold a hand-edit — so ours roll through a single fixed
+    // <dest>.bak.prev once <dest>.bak is occupied. Backups are bounded at two:
+    // their original, and our previous. (Date is fine here — the CLI process,
     // not a workflow script.)
+    const ours = findSkillMarker(previous) !== '';
     let bak = `${file}.bak`;
-    if (fs.existsSync(bak)) bak = `${file}.bak.${Date.now()}`;
+    if (fs.existsSync(bak)) bak = ours ? `${file}.bak.prev` : `${file}.bak.${Date.now()}`;
     fs.writeFileSync(bak, previous);
     // Name the ACTUAL destination file, not a hardcoded "SKILL.md"
     // (a --target agents/gemini install writes AGENTS.md/GEMINI.md).
