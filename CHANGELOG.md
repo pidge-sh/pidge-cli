@@ -56,6 +56,15 @@ triggers stay independent.
 permanently on against any current server, shouting about sectioning and
 conditional GETs this version now speaks natively.
 
+**The picker now says that `approval` is a RECIPE, not a sixth type.** It sat in
+the same column as the five types with nothing marking it as the one row that
+already carries its own gated Approve/Reject pair and its own `--wait`. A fresh
+agent reading only the core, asked for a go/no-go on an irreversible production
+change, composed `approval --actions approve,reject --wait` — correct-looking, and
+`--actions` REPLACES the default pair, so it silently dropped the Face ID gate off
+the very approval that exists to have one. The row now says so in the row itself,
+where the composition is decided (80 B of the core's remaining headroom).
+
 **Backups are bounded at two, so a refresh stops littering your repo.** Replacing
 a file whose content differs still parks the old one — but the rule now
 distinguishes the two cases it always conflated. A file with no pidge marker is

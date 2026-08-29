@@ -6248,7 +6248,7 @@ Every send is **a TYPE + a markdown body + an OPTIONAL response**. The TYPE (one
 | Just inform — a result/log, no action needed | \`pidge message\` |
 | A pendency they should act on (can wait) ⭐ DEFAULT | \`pidge important\` |
 | You need a decision and CAN'T proceed without it | \`pidge important --actions yes,no --wait\` |
-| YOU are asking for a formal go/no-go (money/risk) | \`pidge approval\` |
+| YOU are asking for a formal go/no-go (money/risk) | \`pidge approval\` — a RECIPE: gated Approve/Reject + \`--wait\` baked in; \`--actions\` un-gates it |
 | Gate your OWN risky tool behind a human OK (a hook) | \`pidge approve "<question>"\` (exit 0 = allow) |
 | A thing with a known TIME | \`pidge event --event-at <ISO8601>\` |
 | A live status you'll keep updating | \`pidge live <id> --status "…"\` |
