@@ -4613,3 +4613,65 @@ test('a wait under a LIVE consumer narrates the asymmetry (and still never drain
   assert.equal(stderr.split('\n').filter((l) => /LIVE consumer/.test(l)).length, 1, 'once per process, not once per poll');
   assert.equal(mock.state.messageReads.length, 0, 'the queue was never touched');
 });
+
+// ---------------------------------------------------------------------------
+// 0.53.1 — the no-token exit recovers, it doesn't just restart (a fresh-agent
+// live test, 2026-08-29): with the identity ON DISK under agents/<id>/env and
+// only PIDGE_AGENT missing from the environment, the old message pointed at
+// `setup --claim <code>` — a single-use code the agent had already burned.
+
+test('no token + per-agent envs on disk: the exit names PIDGE_AGENT=<id> BEFORE suggesting re-onboarding', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-notoken-'));
+  for (const id of ['oldie', 'newbie']) {
+    fs.mkdirSync(path.join(home, 'pidge', 'agents', id), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(home, 'pidge', 'agents', id, 'env'), 'PIDGE_TOKEN=hld_parked\n', { mode: 0o600 });
+  }
+  // a project-scoped env exists too, and this run is OUTSIDE any git project —
+  // both recovery paths must be named before the claim-code last resort
+  fs.mkdirSync(path.join(home, 'pidge', 'projects', 'abcd1234'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(home, 'pidge', 'projects', 'abcd1234', 'env'), 'PIDGE_TOKEN=hld_proj\n', { mode: 0o600 });
+
+  const { code, stderr } = await runCli(['whoami'], 9, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, nonGitCwd()).result;
+
+  assert.equal(code, 1);
+  assert.match(stderr, /PIDGE_AGENT=newbie/, 'every id with an env file is listed');
+  assert.match(stderr, /PIDGE_AGENT=oldie/);
+  assert.match(stderr, /EVERY pidge command needs it/, 'the stickiness rides the recovery hint');
+  assert.match(stderr, /1 project-scoped config/, 'the project path is offered too');
+  assert.ok(stderr.indexOf('PIDGE_AGENT=') < stderr.indexOf('setup --claim'),
+    're-onboarding is the LAST resort, never the first suggestion');
+});
+
+test('no token + nothing on disk: the exit still leads with PIDGE_TOKEN/setup (no phantom hints)', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-notoken-bare-'));
+  const { code, stderr } = await runCli(['whoami'], 9, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, nonGitCwd()).result;
+  assert.equal(code, 1);
+  assert.match(stderr, /set PIDGE_TOKEN/);
+  assert.match(stderr, /setup --claim/);
+  assert.ok(!/PIDGE_AGENT=/.test(stderr), 'no ids to name — no hint invented');
+});
+
+test('setup heals a config dir that PRE-EXISTS group-writable to 0700 (the mkdir mode cannot)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-perm-'));
+  // the trap: the dir chain exists ALREADY, looser than the CLI would mint it
+  // (observed live: born 0775 under a shared-group umask, outside the CLI)
+  const agentDir = path.join(home, 'pidge', 'agents', 'perm-heal');
+  fs.mkdirSync(agentDir, { recursive: true });
+  for (const d of [path.join(home, 'pidge'), path.join(home, 'pidge', 'agents'), agentDir]) fs.chmodSync(d, 0o775);
+
+  const { code, stderr } = await runCli(
+    ['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`],
+    port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, PIDGE_AGENT: 'perm-heal' }, nonGitCwd(),
+  ).result;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  for (const d of [path.join(home, 'pidge'), path.join(home, 'pidge', 'agents'), agentDir]) {
+    assert.equal(fs.statSync(d).mode & 0o777, 0o700, `${d} must be healed to 0700`);
+  }
+  assert.equal(fs.statSync(path.join(agentDir, 'env')).mode & 0o777, 0o600);
+  assert.match(stderr, /escopo do agente "perm-heal"/, 'the scope note names the agent');
+  assert.match(stderr, /PIDGE_AGENT=perm-heal no ambiente/, 'and says the var is needed on every later command');
+});

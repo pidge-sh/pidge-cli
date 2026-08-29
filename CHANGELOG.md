@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.53.1 — 2026-08-29
+
+**Onboarding honesty, paid for by a fresh agent's first day.** A zero-context
+agent onboarded from the verbatim setup prompt; it made it through, and the
+places where a less careful one would have parked forever are now fixed.
+
+- **The no-token exit names EXISTING identities before suggesting re-onboarding.**
+  It used to point straight at `pidge setup --claim <code>` — a single-use code
+  the agent no longer has — even when the identity sat on disk under
+  `~/.config/pidge/agents/<id>/env` and the only missing piece was
+  `PIDGE_AGENT=<id>` in the environment. Now, when per-agent envs exist, the
+  message lists them first (`PIDGE_AGENT=<id> · …`, with the reminder that every
+  pidge command needs the var); project-scoped envs get a "run it from inside
+  the project folder" hint when you're outside any project. `pidge doctor`'s
+  NO TOKEN line says the same. Re-onboarding stays the last resort.
+- **`PIDGE_AGENT` is called STICKY everywhere it is suggested** — setup's scope
+  note, the collision guidance, the foreign-claim warning and `--help` all now
+  say that setting it at setup means every later command needs the same var.
+  (The server's setup prompt and `/agent-setup` guide say it too, manifest v124.)
+- **`setup` heals config-dir permissions to 0700.** Every CLI `mkdir` already
+  passes `mode: 0o700` (umask-immune), but a dir that pre-exists looser is kept
+  as-is — observed live: an `agents/<id>` dir born 0775 on a box whose group is
+  shared across users. The key file was never exposed (env is 0600); the dir now
+  gets an explicit best-effort `chmod 0700` at the moment the key lands, along
+  with the `agents`/`projects` intermediate and `~/.config/pidge` itself.
+- `KNOWN_MANIFEST_VERSION` → 124 (the server release is copy-only; this CLI
+  already speaks it).
+
 ## 0.53.0 — 2026-08-28
 
 **The installed skill goes on the same diet the manifest went on: a small CORE

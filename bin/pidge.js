@@ -853,7 +853,8 @@ ENV
                 env var always wins over any file.
   PIDGE_AGENT   <id> namespacing the config file to ~/.config/pidge/agents/<id>/env —
                 for 2+ agents sharing ONE directory (the CLI still writes the
-                key — no secret in the agent's chat). Unset ⇒ project scope when
+                key — no secret in the agent's chat). STICKY: set at setup, every
+                later pidge command needs the same var. Unset ⇒ project scope when
                 setup ran inside a git project (~/.config/pidge/projects/<hash>/env,
                 resolved by walking up to the toplevel), else the legacy shared
                 ~/.config/pidge/env (single-agent machines and daemons).
@@ -1353,8 +1354,42 @@ if (!command) { console.error(usageText()); process.exit(1); }
 // `setup` is the command that CREATES the token config — it must run without one.
 // `terminal` (Agent Sessions) has its OWN machine-scoped identity slot at
 // ~/.config/pidge/terminal/env — never the per-project token resolution.
+//
+// The no-token message names EXISTING identities BEFORE suggesting re-onboarding.
+// Observed live (2026-08-29, a fresh agent's first day): the identity sat on
+// disk under agents/<id>/env, the only missing piece was PIDGE_AGENT=<id> in
+// the environment — and this exit pointed at `setup --claim <code>`, a
+// single-use code the agent had already burned. The real fix costs one env
+// var; say so first, and keep re-onboarding as the LAST resort.
+function knownAgentEnvIds() {
+  const agentsDir = path.join(pidgeBaseDir(), 'agents');
+  try {
+    return fs.readdirSync(agentsDir)
+      .filter((id) => { try { return fs.existsSync(path.join(agentsDir, id, 'env')); } catch { return false; } })
+      .sort();
+  } catch { return []; }
+}
+function projectEnvCount() {
+  const projectsDir = path.join(pidgeBaseDir(), 'projects');
+  try {
+    return fs.readdirSync(projectsDir)
+      .filter((h) => { try { return fs.existsSync(path.join(projectsDir, h, 'env')); } catch { return false; } })
+      .length;
+  } catch { return 0; }
+}
+function noTokenMessage(prefix) {
+  const ids = knownAgentEnvIds();
+  const projects = projectEnvCount();
+  const hints = [];
+  if (ids.length)
+    hints.push(`this machine HAS per-agent Pidge config(s) — if one is yours, set the env var (EVERY pidge command needs it): ${ids.map((id) => `PIDGE_AGENT=${id}`).join(' · ')}`);
+  if (projects && !PROJECT_ROOT)
+    hints.push(`${projects} project-scoped config(s) exist — if you onboarded inside a project folder, run pidge from inside it`);
+  const recover = hints.length ? `${hints.join('; ')}. Otherwise: ` : '';
+  return `${prefix} ${recover}set PIDGE_TOKEN (env var, or PIDGE_TOKEN=… in ~/.config/pidge/env), or onboard with: pidge setup --claim <code> (ask your human for the code: Pidge app → Canais → o canal → copiar prompt de setup)`;
+}
 if (!TOKEN && command !== 'setup' && command !== 'terminal')
-  die('pidge: set PIDGE_TOKEN (env var, or put PIDGE_TOKEN=… in ~/.config/pidge/env) — or onboard with: pidge setup --claim <code> (ask your human for the code: Pidge app → Canais → o canal → copiar prompt de setup)');
+  die(noTokenMessage('pidge: no identity in this environment.'));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // The shared header set for every channel-key call — carries the per-request
@@ -1391,7 +1426,10 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // reads the `sections` index, and every generator fetch revalidates with
 // If-None-Match), so the "server has NEW capabilities" nag would be shouting
 // about work this version already does.
-const KNOWN_MANIFEST_VERSION = 123;
+// v124 is onboarding-copy honesty (PIDGE_AGENT stickiness, hello's block, the
+// idle-loop wording) — 0.53.1 ships the CLI half of the same finding set, so
+// there is nothing new to nag about.
+const KNOWN_MANIFEST_VERSION = 124;
 // The hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
@@ -3523,7 +3561,7 @@ function reportClaimMismatch(data) {
   const srvGen = data.claim.claim_generation;
   const srvFp = data.claim.claimed_by_fingerprint;
   if (srvFp && srvFp !== ourFp && Number.isFinite(localGen) && srvGen > localGen) {
-    console.error(`pidge: ⚠️  ANOTHER AGENT CLAIMED THIS CHANNEL — server generation ${srvGen} > yours ${localGen}, now owned by "${data.claim.claimed_by_label}". Your sends may go out as a DIFFERENT identity. If that's not intended, give THIS agent its own PIDGE_AGENT=<id> (isolated config) or PIDGE_TOKEN, then re-run setup.`);
+    console.error(`pidge: ⚠️  ANOTHER AGENT CLAIMED THIS CHANNEL — server generation ${srvGen} > yours ${localGen}, now owned by "${data.claim.claimed_by_label}". Your sends may go out as a DIFFERENT identity. If that's not intended, give THIS agent its own PIDGE_AGENT=<id> (isolated config — keep the var set on every later command) or PIDGE_TOKEN, then re-run setup.`);
     return 'hard';
   }
   if (srvFp && srvFp !== ourFp && !Number.isFinite(localGen)) {
@@ -5259,7 +5297,7 @@ async function runDoctor(base = BASE, token = TOKEN, sourceLabel = null) {
   // `doctor` command computes it from the env/file precedence.
   const source = sourceLabel || (token === TOKEN ? tokenSource() : CONFIG_FILE);
   if (!token) {
-    console.error('pidge doctor: NO TOKEN — set PIDGE_TOKEN, or onboard with `pidge setup --claim <code>` (the human copies the code from the Pidge app)');
+    console.error(noTokenMessage('pidge doctor: NO TOKEN.'));
     process.exit(2);
   }
   note(`pidge doctor: token found (${source || 'passed in'}) — never displayed`);
@@ -5566,8 +5604,8 @@ async function runSetup() {
       // running --print would land the key in its own context.
       const suggestion = (path.basename(process.cwd()).replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 32) || 'meu-agente');
       const exits = projectScoped
-        ? `Este PROJETO já fala como esse canal. Se a intenção é REAPONTAR o projeto para o canal novo, re-rode com --force. Se você é um SEGUNDO agente convivendo neste mesmo diretório, re-rode com PIDGE_AGENT=<seu-id> na frente (env isolado por agente): PIDGE_AGENT=${suggestion} npx -y pidge-cli@latest setup --claim ${code}`
-        : `Como conectar SEM colidir: rode este MESMO comando de dentro da pasta do seu projeto (git) — cada projeto ganha um env isolado automaticamente. Sem projeto? Re-rode com PIDGE_AGENT=<seu-id> na frente: PIDGE_AGENT=${suggestion} npx -y pidge-cli@latest setup --claim ${code}. Substituir o arquivo compartilhado mesmo assim (você sabe que nenhum outro processo lê ele)? --force.`;
+        ? `Este PROJETO já fala como esse canal. Se a intenção é REAPONTAR o projeto para o canal novo, re-rode com --force. Se você é um SEGUNDO agente convivendo neste mesmo diretório, re-rode com PIDGE_AGENT=<seu-id> na frente (env isolado por agente — e TODO comando seguinte precisa da mesma var): PIDGE_AGENT=${suggestion} npx -y pidge-cli@latest setup --claim ${code}`
+        : `Como conectar SEM colidir: rode este MESMO comando de dentro da pasta do seu projeto (git) — cada projeto ganha um env isolado automaticamente. Sem projeto? Re-rode com PIDGE_AGENT=<seu-id> na frente (e mantenha a var em TODO comando seguinte): PIDGE_AGENT=${suggestion} npx -y pidge-cli@latest setup --claim ${code}. Substituir o arquivo compartilhado mesmo assim (você sabe que nenhum outro processo lê ele)? --force.`;
       die(`pidge: ${CONFIG_FILE} já guarda a chave de "${owner}". Sobrescrever faria qualquer processo que lê esse arquivo enviar como o canal novo (incidente real: um cron foi sequestrado assim). ${exits} (o claim code continua válido — nada foi consumido; num servidor v84+ até um retry pós-exchange funciona dentro do TTL de 15 min).`, 2);
     }
   }
@@ -5656,13 +5694,25 @@ async function runSetup() {
   // into a new channel's file (it belongs to another channel's E2E).
   const e2eSecret = derivedSecret || process.env.PIDGE_SECRET || targetEnv.PIDGE_SECRET || null;
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  // Heal permissions the mkdir can't: every CLI mkdir passes mode 0o700 (which
+  // is umask-immune), but a dir that PRE-EXISTS looser is kept as-is by
+  // mkdirSync — observed live: an agents/<id> dir born 0775 on a box whose
+  // group is shared across users. chmod at the moment the key lands, config
+  // dirs only (never ~/.config itself). Best-effort per dir.
+  {
+    const base = pidgeBaseDir();
+    const dirs = new Set([base, CONFIG_DIR]);
+    const parent = path.dirname(CONFIG_DIR); // agents/ or projects/ intermediate
+    if (parent.startsWith(base + path.sep)) dirs.add(parent);
+    for (const dir of dirs) { try { fs.chmodSync(dir, 0o700); } catch { /* e.g. not the owner */ } }
+  }
   fs.writeFileSync(CONFIG_FILE,
     `PIDGE_URL=${finalBase}\nPIDGE_TOKEN=${data.key}\n${e2eSecret ? `PIDGE_SECRET=${e2eSecret}\n` : ''}`,
     { mode: 0o600 });
   try { fs.chmodSync(CONFIG_FILE, 0o600); } catch { /* mode set on create */ }
   const scopeNote = projectScoped
     ? ` — escopo DESTE projeto (${PROJECT_ROOT}): qualquer sessão futura rodando dentro dele me encontra sozinha`
-    : AGENT_ID ? ` — escopo do agente "${AGENT_ID}"` : '';
+    : AGENT_ID ? ` — escopo do agente "${AGENT_ID}": TODO comando pidge daqui em diante precisa de PIDGE_AGENT=${AGENT_ID} no ambiente` : '';
   note(`pidge: canal "${channelName}" configurado — chave em ${CONFIG_FILE} (chmod 600, nunca exibida)${scopeNote}`);
   if (e2eSecret) note('pidge: PIDGE_SECRET stored next to the token (the {TOKEN, SECRET} pair travels together) — E2E sends seal automatically when the channel is E2E');
   // claim ownership of the channel for THIS install and record the
