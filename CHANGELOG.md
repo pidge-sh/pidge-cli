@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.53.3 — 2026-08-29
+
+**The proof reaches the two paths round 3 actually took — and the ack line now
+prints the server-MEASURED presence, not advice.** The 0.53.2 retest (a fresh
+Codex run) measured the gap precisely: "selftest" had ZERO occurrences in the
+transcript, because the post-`hello` nudge only fires when the hello is
+ANSWERED (this one timed out — the human tapped late) and the relaunch
+narration only fires on an EMPTY round (this listen exited with a batch). The
+agent then read "Relaunch your listener…", said "Relaunching now", ran
+nothing, and told its human a listener was live.
+
+- **The agent-driven `ack`'s closing line probes `whoami` (best-effort,
+  read-only, never the bridge path) and prints the truth**: "Server-measured
+  presence right now: OFFLINE." — followed by the relaunch instruction, the
+  selftest proof, and "Never claim online from memory." Advice is ignorable; a
+  measured OFFLINE sitting in the agent's own transcript is a lie it has to
+  author over. Present-only: an older server without `listening_state` gets
+  the plain line.
+- **`hello`'s timeout narration carries the proof too**: launch the listener
+  now, then `pidge selftest` PROVES you are reachable (it FAILS when nothing
+  is listening).
+
+No wire change; the probe is one extra read on the agent-driven ack only.
+
 ## 0.53.2 — 2026-08-29
 
 **"Online" becomes something you PROVE, not something you say.** A zero-context

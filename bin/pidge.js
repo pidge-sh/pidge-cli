@@ -6623,7 +6623,7 @@ function writeSkillFile(file, content, backup = true) {
         onTimeout: async () => {
           await health.exitTimeout(
             `no confirmation on ${cid}`,
-            'the handshake is DURABLE: it stays in your queue (at-least-once, nothing lost) — `pidge listen --all` collects the tap whenever it comes.',
+            'the handshake is DURABLE: it stays in your queue (at-least-once, nothing lost) — `pidge listen --all` collects the tap whenever it comes. Launch it now; then `pidge selftest` PROVES you are reachable (it FAILS when nothing is listening) — never claim online from memory.',
           );
         },
       });
@@ -6741,10 +6741,27 @@ function writeSkillFile(file, content, backup = true) {
       // ack (work done) — a --renew is a mid-task heartbeat, the listener is
       // deliberately NOT running then. The bridge never takes this path (its
       // internal ackBatch above owns that loop), so no suppression needed here.
-      if (!av.renew)
+      //
+      // 0.53.3 (the round-3 zero-agent retest): the line carries the server-MEASURED presence,
+      // not just advice. The round-3 agent read "Relaunch your listener…",
+      // said "Relaunching now", ran nothing, and told its human a listener
+      // was live — advice is ignorable, a measured "server sees you: OFFLINE"
+      // sitting in its own transcript is a lie it has to author over.
+      // Best-effort + read-only (whoami never mints presence; present-only on
+      // older servers), and only on this agent-driven path — never the bridge.
+      if (!av.renew) {
+        let seen = '';
+        try {
+          const w = await fetchT(`${BASE}/api/v1/whoami`, { headers }, 6000);
+          if (w.ok) {
+            const wd = await w.json();
+            if (wd && wd.listening_state) seen = ` Server-measured presence right now: ${String(wd.listening_state).toUpperCase()}.`;
+          }
+        } catch { /* best-effort — the line still reads without the probe */ }
         console.error(ackedN > 0
-          ? 'pidge: ✓ acked. Relaunch your listener (`pidge listen --all`) to stay online.'
-          : 'pidge: nothing was acked — but the loop still needs you: relaunch your listener (`pidge listen --all`) to stay online.');
+          ? `pidge: ✓ acked.${seen} Relaunch your listener (\`pidge listen --all\`) to stay online — then \`pidge selftest\` PROVES it. Never claim online from memory.`
+          : `pidge: nothing was acked — but the loop still needs you: relaunch your listener (\`pidge listen --all\`) to stay online.${seen}`);
+      }
       process.exit(0);
       break;
     }
