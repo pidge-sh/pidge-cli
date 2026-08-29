@@ -98,6 +98,14 @@ test('generator: a sectioned manifest yields a CORE plus references, one per man
   // On a sectioned server the reference footers point at the exact `?sections=`
   // call — and never ask for a section that is already in the core.
   assert.match(refs.live, /\?sections=live_activity/, 'an on-demand mirror is fetched by name');
+
+  // 0.53.2 (the Codex zero-test): the loop reference must carry the PROOF step
+  // and the no-harness fork — a runtime that cannot relaunch itself declared
+  // "currently online" with zero processes; selftest is what turns that claim
+  // into a measured FAIL, and whoami is the state the human actually sees.
+  assert.match(refs.loop, /Prove it, never claim it/, 'the loop teaches proof over self-report');
+  assert.match(refs.loop, /pidge selftest/, 'selftest is the proof mechanism');
+  assert.match(refs.loop, /turn_based`? and stop promising/, 'the honest fallback for a harness that cannot hold the loop');
   assert.match(refs['multi-runtime'], /\?sections=multi_runtime,handoff/, 'two sections ride ONE call');
   assert.ok(!/\?sections=/.test(refs.contract), '`notes` is core — never spend a call on it');
   assert.ok(!/sections=all/.test(tree(dir).all), 'the generator never asks for everything');
