@@ -3889,10 +3889,13 @@ function ancestry(maxDepth = 12) {
     const { spawnSync } = require('node:child_process');
     let pid = process.ppid;
     for (let i = 0; i < maxDepth && pid > 1; i++) {
-      const r = spawnSync('ps', ['-o', 'ppid=,comm=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 });
+      // args, not comm: on some builds node's main thread is named "MainThread"
+      // and comm reports THAT (measured on a CI runner — the harness went unpinned).
+      const r = spawnSync('ps', ['-o', 'ppid=,args=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 });
       const m = /^\s*(\d+)\s+(.*)$/.exec((r.stdout || '').trim());
       if (!m) break;
-      out.push({ pid, comm: m[2].trim() });
+      const argv0 = (m[2].trim().split(/\s+/)[0] || '');
+      out.push({ pid, comm: path.basename(argv0) });
       pid = Number(m[1]);
     }
   } catch { /* no ps — pid-only guard below */ }
@@ -7112,15 +7115,6 @@ function writeSkillFile(file, content, backup = true) {
     // their original, and our previous. (Date is fine here — the CLI process,
     // not a workflow script.)
     const ours = findSkillMarker(previous) !== '';
-    // Sweep the litter older CLIs left: OUR timestamped backups (a pidge marker
-    // inside) — 45 of them in one vault, versioned in git. Theirs stay.
-    try {
-      for (const f of fs.readdirSync(dir)) {
-        if (!f.startsWith(`${path.basename(file)}.bak.`) || !/\.bak\.\d+$/.test(f)) continue;
-        const full = path.join(dir, f);
-        if (findSkillMarker(fs.readFileSync(full, 'utf8')) !== '') fs.unlinkSync(full);
-      }
-    } catch { /* best-effort */ }
     let bak = `${file}.bak`;
     if (fs.existsSync(bak)) bak = ours ? `${file}.bak.prev` : `${file}.bak.${Date.now()}`;
     fs.writeFileSync(bak, previous);
@@ -7128,6 +7122,18 @@ function writeSkillFile(file, content, backup = true) {
     // (a --target agents/gemini install writes AGENTS.md/GEMINI.md).
     console.error(`pidge: the previous ${path.basename(file)} differed from the regenerated one — saved to ${bak}`);
   }
+  // Sweep the litter older CLIs left on EVERY install (measured: 45 before, 45
+  // after, when the sweep only ran inside the "content differed" branch): OUR
+  // timestamped backups — a pidge marker inside. The human's own stay.
+  let pruned = 0;
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.startsWith(`${path.basename(file)}.bak.`) || !/\.bak\.\d+$/.test(f)) continue;
+      const full = path.join(dir, f);
+      if (findSkillMarker(fs.readFileSync(full, 'utf8')) !== '') { fs.unlinkSync(full); pruned++; }
+    }
+  } catch { /* best-effort */ }
+  if (pruned) console.error(`pidge: swept ${pruned} old skill backup(s) this CLI had left in ${dir}`);
   // ATOMIC replace — write a per-process tmp, then rename. A killed process or
   // a full disk leaves the OLD skill intact instead of a torn file whose surviving
   // marker reads as "fresh" (the 0.15.2→0.15.3 corruption class, one version on);
