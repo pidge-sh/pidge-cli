@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.54.2 — 2026-09-02
+
+**`presence` trusts the measured presence, not a lingering consumer row.** Right
+after a session dies the server still lists its consumer for ~35 s while
+`listening_state` already reads offline; the hook line printed "offline — X
+holds the queue", a contradiction a fresh session must never open with.
+Measured live against production. The line now says OFFLINE — start the watch.
+
 ## 0.54.1 — 2026-09-02
 
 **The handoff waits for the listener to take the lock.** 0.54.0's publish run
