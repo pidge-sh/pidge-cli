@@ -3908,6 +3908,10 @@ function installOrphanWatchdog() {
   // like an agent runtime at start and exit the moment it is gone.
   const chain = ancestry();
   const harness = chain.find((a) => HARNESS_COMM.test(a.comm) && a.pid !== process.ppid) || chain.find((a) => HARNESS_COMM.test(a.comm)) || null;
+  // Say what was pinned (once, stderr): a watchdog that silently pinned nothing
+  // is indistinguishable from one that works — until a session dies.
+  if (process.env.PIDGE_WATCHDOG_TRACE === '1' || v.follow)
+    console.error(`pidge: watchdog — ${harness ? `pinned harness ${harness.comm} (pid ${harness.pid})` : 'no agent-runtime ancestor found'}; ancestry: ${chain.map((a) => `${a.comm}:${a.pid}`).join(' ← ') || '(ps unavailable)'}`);
   const t = setInterval(() => {
     if (process.ppid === 1) {
       console.error('pidge: parent process died — exiting so I stop consuming the channel (orphan-zombie guard). Relaunch from your harness.');
