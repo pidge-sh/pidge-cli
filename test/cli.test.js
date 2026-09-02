@@ -4773,7 +4773,11 @@ test('presence — ONE line for a SessionStart hook: OFFLINE tells the agent to 
   mock.state.consumers = [{ fingerprint: 'fp', label: 'my-watch', listening: true, live: true }];
   mock.state.listeningState = 'listening';
   const on = await runCli(['presence'], port).result;
+  // a consumer row that lingers after the session died: the MEASURED presence wins
+  mock.state.listeningState = 'offline';
+  const stale = await runCli(['presence'], port).result;
   await mock.stop();
+  assert.match(stale.stdout, /OFFLINE — nobody is listening/, 'a lingering consumer row never contradicts a measured offline');
   assert.equal(on.code, 0, on.stderr);
   assert.match(on.stdout, /listening — my-watch holds the queue/);
   assert.match(on.stdout, /never start a second listener/);

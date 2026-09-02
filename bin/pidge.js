@@ -5557,8 +5557,12 @@ async function runPresence() {
   }
   const d = who.data;
   const live = Array.isArray(d.consumers) ? d.consumers.filter((c) => c && c.live) : [];
+  // The server's measured presence decides; the consumer list only names who.
+  // Right after a session dies the consumer row lingers for ~35 s while the
+  // presence already reads offline — printing "offline — X holds the queue"
+  // was measured, and it is exactly the contradiction a fresh session must not read.
   const state = d.listening_state || (live.length ? 'listening' : 'offline');
-  if (live.length || state === 'listening') {
+  if (state === 'listening') {
     console.log(`Pidge (channel "${d.channel.name}"): ${state} — ${live.map((c) => c.label || 'a consumer').join(', ') || 'a consumer'} holds the queue. Read with \`pidge catchup --digest\`; never start a second listener.`);
   } else {
     console.log(`Pidge (channel "${d.channel.name}"): OFFLINE — nobody is listening, your human cannot reach you. Start the watch now: Monitor({command:'pidge online --follow --ndjson --timeout 0', description:'Pidge: messages from my human', persistent:true}) — then answer through \`pidge message\` and \`pidge ack\`.`);
