@@ -4789,7 +4789,8 @@ test('hook install writes a tagged SessionStart entry into the PROJECT .claude/s
   const proj = makeProject();
   fs.mkdirSync(path.join(proj, '.claude'), { recursive: true });
   fs.writeFileSync(path.join(proj, '.claude', 'settings.json'), JSON.stringify({ permissions: { allow: ['Bash(ls:*)'] }, hooks: { SessionStart: [{ matcher: 'startup', hooks: [{ type: 'command', command: 'echo theirs' }] }] } }));
-  const a = await runCli(['hook', 'install'], port, {}, proj).result;
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-hook-xdg-')); // one identity for both runs — the command embeds it
+  const a = await runCli(['hook', 'install'], port, { XDG_CONFIG_HOME: xdg }, proj).result;
   assert.equal(a.code, 0, a.stderr);
   const s1 = JSON.parse(fs.readFileSync(path.join(proj, '.claude', 'settings.json'), 'utf8'));
   assert.deepEqual(s1.permissions, { allow: ['Bash(ls:*)'] }, 'unrelated settings survive');
@@ -4797,10 +4798,10 @@ test('hook install writes a tagged SessionStart entry into the PROJECT .claude/s
   assert.equal(s1.hooks.SessionStart[0].hooks[0].command, 'echo theirs');
   assert.match(s1.hooks.SessionStart[1].hooks[0].command, /pidge\.js' presence$/, 'ours runs THIS CLI\'s presence');
   assert.equal(JSON.parse(a.stdout).changed, true);
-  const b = await runCli(['hook', 'install'], port, {}, proj).result;
+  const b = await runCli(['hook', 'install'], port, { XDG_CONFIG_HOME: xdg }, proj).result;
   assert.equal(JSON.parse(b.stdout).changed, false, 'idempotent');
   assert.equal(JSON.parse(fs.readFileSync(path.join(proj, '.claude', 'settings.json'), 'utf8')).hooks.SessionStart.length, 2, 'no duplicate');
-  const c = await runCli(['hook', 'uninstall'], port, {}, proj).result;
+  const c = await runCli(['hook', 'uninstall'], port, { XDG_CONFIG_HOME: xdg }, proj).result;
   await mock.stop();
   assert.equal(JSON.parse(c.stdout).removed, true);
   const s3 = JSON.parse(fs.readFileSync(path.join(proj, '.claude', 'settings.json'), 'utf8'));
@@ -4871,7 +4872,7 @@ test('hook install from a real install path writes `pidge presence` when a pidge
   fs.writeFileSync(path.join(bin, 'pidge'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   const a = await runCli(['hook', 'install'], port, { PATH: `${bin}${path.delimiter}${path.dirname(process.execPath)}${path.delimiter}/usr/bin${path.delimiter}/bin` }, proj).result;
   assert.equal(a.code, 0, a.stderr);
-  assert.equal(JSON.parse(a.stdout).command, 'pidge presence', 'a global pidge is the durable choice');
+  assert.match(JSON.parse(a.stdout).command, /(^| )pidge presence$/, 'a global pidge is the durable choice');
   const b = await runCli(['hook', 'install'], port, { PATH: `${path.dirname(process.execPath)}${path.delimiter}/usr/bin${path.delimiter}/bin` }, proj).result;
   await mock.stop();
   assert.match(JSON.parse(b.stdout).command, /pidge\.js' presence$/, 'no global pidge: this CLI\'s path');
