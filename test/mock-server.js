@@ -558,7 +558,7 @@ function createMock() {
       req.on('end', () => {
         let p = {}; try { p = JSON.parse(body); } catch { /* keep {} */ }
         const id = state.selftestSeq++;
-        const windowS = Math.max(5, Math.min(120, parseInt(p.window_seconds, 10) || 30));
+        const windowS = Math.max(5, Math.min(600, parseInt(p.window_seconds, 10) || 30)); // 5..600 since manifest v125 (was 120)
         const nonce = `nonce-${id}`;
         state.selftests[id] = { id, nonce, window_seconds: windowS, created: Date.now(), processed: false };
         // dropSelftest: the nonce never reaches the queue (simulates an orphaned/

@@ -803,7 +803,7 @@ test('skill install writes .claude/skills/pidge/SKILL.md from the manifest', asy
   // the pidge-report COMPANION lands as a sibling skill, marked + trailed like the main one.
   const report = fs.readFileSync(path.join(dir, '.claude', 'skills', 'pidge-report', 'SKILL.md'), 'utf8');
   assert.match(report, /name: pidge-report/);
-  assert.match(report, /\n# pidge-skill rev=28 manifest=16\n/, 'companion carries the same marker');
+  assert.match(report, /\n# pidge-skill rev=29 manifest=16\n/, 'companion carries the same marker');
   assert.ok(report.trimEnd().endsWith('<!-- pidge-skill-end -->'), 'companion carries the trailer');
   assert.match(skill, /pidge-report/, 'the main skill points at the companion');
   // The skill is the loudest announcement this CLI makes — every future session
@@ -886,10 +886,10 @@ test('self-heal — a 0.15.2 marker-first install self-heals into the fixed in-f
   // THE regression guard: the frontmatter must open on line 1, or the YAML parse fails.
   assert.equal(healed.split('\n', 1)[0], '---', 'first line must be `---` (valid frontmatter)');
   assert.ok(!/<!-- pidge-skill rev=/.test(healed), 'the old HTML-comment marker is gone (the end trailer is not it)');
-  assert.match(healed, /\n# pidge-skill rev=28 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=29 manifest=16\n/, 'marker now a YAML comment inside the frontmatter');
   assert.match(healed, /^---\nname: pidge\ndescription: Send rich/, 'real name + description survive the frontmatter');
   assert.ok(!/BROKEN 0\.15\.2 SKILL/.test(healed), 'the broken skill was replaced by a real regeneration');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 28, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 29, manifest v16\)/, 'one stderr note');
 });
 
 test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the local skill', async () => {
@@ -906,10 +906,10 @@ test('self-heal — a SPINE bump (SKILL_REVISION > installed) self-heals the loc
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
-  assert.match(healed, /\n# pidge-skill rev=28 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
+  assert.match(healed, /\n# pidge-skill rev=29 manifest=16\n/, 'marker rewritten to the current rev, in the frontmatter');
   assert.ok(!/STALE SPINE/.test(healed), 'the stale spine was replaced by a real regeneration');
   assert.match(healed, /name: pidge/, 'a genuine skill was written');
-  assert.match(stderr, /refreshed your local Pidge skill \(rev 28, manifest v16\)/, 'one stderr note');
+  assert.match(stderr, /refreshed your local Pidge skill \(rev 29, manifest v16\)/, 'one stderr note');
   // the heal also (re)writes the pidge-report companion — this is exactly how an
   // existing install GAINS the companion on a spine bump, with zero human action.
   const reportFile = path.join(path.dirname(path.dirname(file)), 'pidge-report', 'SKILL.md');
@@ -928,7 +928,7 @@ test('self-heal — a MANIFEST bump (server version > installed) self-heals the 
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=28 manifest=16\n/, 'marker rewritten to the current manifest');
+  assert.match(healed, /\n# pidge-skill rev=29 manifest=16\n/, 'marker rewritten to the current manifest');
   assert.ok(!/STALE BY MANIFEST/.test(healed), 'the stale skill was regenerated');
   assert.match(stderr, /refreshed your local Pidge skill/, 'one stderr note');
 });
@@ -957,7 +957,7 @@ test('self-heal — a FRESH skill (new-format marker current) is left byte-for-b
   const port = await mock.start();
   // Proves the reader FINDS the marker in its new in-frontmatter position: if it couldn't,
   // it would read rev=0 and needlessly regenerate, failing the byte-for-byte assertion.
-  const { dir, file } = seedNewSkill(28, 16, 'SENTINEL FRESH — keep me');
+  const { dir, file } = seedNewSkill(29, 16, 'SENTINEL FRESH — keep me');
   const original = fs.readFileSync(file, 'utf8');
 
   const { result } = runCli(['whoami'], port, { XDG_CONFIG_HOME: dir }, dir);
@@ -1007,7 +1007,7 @@ test('home self-heal — a STALE home skill self-heals even when there is NO pro
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(homeSkill, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=28 manifest=16\n/, 'the home skill was regenerated to the current rev');
+  assert.match(healed, /\n# pidge-skill rev=29 manifest=16\n/, 'the home skill was regenerated to the current rev');
   assert.ok(!/STALE HOME DOCTRINE/.test(healed), 'the stale home doctrine was replaced by a real regeneration');
   assert.match(stderr, /refreshed your local Pidge skill/, 'the home heal narrated itself');
 });
@@ -1027,8 +1027,8 @@ test('home self-heal — BOTH project and home skills stale: both heal in one pa
   await mock.stop();
 
   assert.equal(code, 0, `stderr: ${stderr}`);
-  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=28 manifest=16/, 'home healed');
-  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=28 manifest=16/, 'project healed');
+  assert.match(fs.readFileSync(homeSkill, 'utf8'), /rev=29 manifest=16/, 'home healed');
+  assert.match(fs.readFileSync(projSkill, 'utf8'), /rev=29 manifest=16/, 'project healed');
   assert.match(stderr, /2 locations incl\. ~\/\.claude/, 'the note reports BOTH locations were refreshed');
 });
 
@@ -1037,7 +1037,7 @@ test('home self-heal — a FRESH home skill is left byte-for-byte (no needless h
   const port = await mock.start();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-homefresh-'));
   const homeSkill = path.join(home, '.claude', 'skills', 'pidge', 'SKILL.md');
-  seedSkillAt(homeSkill, 28, 'SENTINEL HOME — keep me'); // current rev
+  seedSkillAt(homeSkill, 29, 'SENTINEL HOME — keep me'); // current rev
   const original = fs.readFileSync(homeSkill, 'utf8');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-cleanproj2-'));
 
@@ -1112,7 +1112,7 @@ test('atomic self-heal — "pidge-skill" in body PROSE is not the marker: a mark
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   const healed = fs.readFileSync(file, 'utf8');
-  assert.match(healed, /\n# pidge-skill rev=28 manifest=16\n/, 'a real marker was written by the heal');
+  assert.match(healed, /\n# pidge-skill rev=29 manifest=16\n/, 'a real marker was written by the heal');
   assert.ok(!/rev=99/.test(healed), 'the prose decoy is gone with the regeneration');
 });
 
@@ -1130,7 +1130,7 @@ test('atomic self-heal — 4 concurrent heals never tear the file (atomic tmp+re
   const healed = fs.readFileSync(file, 'utf8');
   assert.equal(healed.split('\n', 1)[0], '---', 'first line stays `---`');
   assert.equal((healed.match(/# pidge-skill rev=/g) || []).length, 1, 'exactly ONE marker — no interleaved halves');
-  assert.match(healed, /\n# pidge-skill rev=28 manifest=16\n/, 'a whole, current skill won');
+  assert.match(healed, /\n# pidge-skill rev=29 manifest=16\n/, 'a whole, current skill won');
   assert.match(healed.trimEnd(), /<!-- pidge-skill-end -->$/, 'the trailer closes the file — no torn tail');
   const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
   assert.deepEqual(leftovers, [], 'no tmp litter after concurrent heals');
@@ -4720,4 +4720,111 @@ test('setup heals a config dir that PRE-EXISTS group-writable to 0700 (the mkdir
   assert.equal(fs.statSync(path.join(agentDir, 'env')).mode & 0o777, 0o600);
   assert.match(stderr, /escopo do agente "perm-heal"/, 'the scope note names the agent');
   assert.match(stderr, /PIDGE_AGENT=perm-heal no ambiente/, 'and says the var is needed on every later command');
+});
+
+// ── 0.54: the write probe, the follow gate, presence + the SessionStart hook ──
+
+test('setup refuses BEFORE spending the claim code when the config dir is not writable (a Codex-sandbox shape)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-setup-ro-'));
+  fs.chmodSync(home, 0o500); // read-only: mkdir/write under it fails for a non-root user
+  const proj = makeProject();
+  const { result } = runCli(['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`], port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home }, proj);
+  const { code, stderr } = await result;
+  await mock.stop();
+  fs.chmodSync(home, 0o700);
+  assert.equal(code, 2, `stderr: ${stderr}`);
+  assert.match(stderr, /NOT writable/);
+  assert.match(stderr, /claim code was NOT consumed/);
+  assert.match(stderr, /XDG_CONFIG_HOME="\$PWD\/\.pidge"/, 'the fix is named: config inside the workspace');
+  assert.equal(mock.state.claimCode, 'claim-ok', 'the single-use code is still valid — nothing was exchanged');
+});
+
+test('online --follow --timeout 0 (the forever watch) refuses outside Claude Code — a background run there would be a DEAF consumer', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const denied = await runCli(['online', '--follow', '--timeout', '0', '--no-realtime'], port, { CLAUDECODE: '' }).result;
+  assert.equal(denied.code, 1, `stderr: ${denied.stderr}`);
+  assert.match(denied.stderr, /DEAF consumer/);
+  assert.match(denied.stderr, /FOREGROUND/);
+  assert.match(denied.stderr, /PIDGE_EVENT_STREAM=1/);
+  // an explicit event-stream declaration lets any harness run it; Claude Code sets CLAUDECODE itself
+  for (const env of [{ CLAUDECODE: '', PIDGE_EVENT_STREAM: '1' }, { CLAUDECODE: '1' }]) {
+    const r = runCli(['online', '--follow', '--timeout', '0', '--no-realtime', '--interval', '1'], port, env);
+    await new Promise((res) => setTimeout(res, 2500));
+    assert.equal(r.child.exitCode, null, `the forever watch must still be running under ${JSON.stringify(env)}`);
+    r.child.kill('SIGTERM');
+    await r.result;
+  }
+  await mock.stop();
+});
+
+test('presence — ONE line for a SessionStart hook: OFFLINE tells the agent to start the watch; a live consumer tells it to read, never listen', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.consumers = [];
+  mock.state.listeningState = 'offline';
+  const off = await runCli(['presence'], port).result;
+  assert.equal(off.code, 0, off.stderr);
+  assert.equal(off.stdout.trim().split('\n').length, 1, 'exactly one line — it lands in the agent\'s context at every session start');
+  assert.match(off.stdout, /OFFLINE/);
+  assert.match(off.stdout, /Monitor\(\{command:'pidge online --follow --ndjson --timeout 0'/);
+  mock.state.consumers = [{ fingerprint: 'fp', label: 'my-watch', listening: true, live: true }];
+  mock.state.listeningState = 'listening';
+  const on = await runCli(['presence'], port).result;
+  await mock.stop();
+  assert.equal(on.code, 0, on.stderr);
+  assert.match(on.stdout, /listening — my-watch holds the queue/);
+  assert.match(on.stdout, /never start a second listener/);
+});
+
+test('hook install writes a tagged SessionStart entry into the PROJECT .claude/settings.json, keeps other hooks, is idempotent, and uninstall removes only ours', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const proj = makeProject();
+  fs.mkdirSync(path.join(proj, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(proj, '.claude', 'settings.json'), JSON.stringify({ permissions: { allow: ['Bash(ls:*)'] }, hooks: { SessionStart: [{ matcher: 'startup', hooks: [{ type: 'command', command: 'echo theirs' }] }] } }));
+  const a = await runCli(['hook', 'install'], port, {}, proj).result;
+  assert.equal(a.code, 0, a.stderr);
+  const s1 = JSON.parse(fs.readFileSync(path.join(proj, '.claude', 'settings.json'), 'utf8'));
+  assert.deepEqual(s1.permissions, { allow: ['Bash(ls:*)'] }, 'unrelated settings survive');
+  assert.equal(s1.hooks.SessionStart.length, 2, 'theirs + ours');
+  assert.equal(s1.hooks.SessionStart[0].hooks[0].command, 'echo theirs');
+  assert.match(s1.hooks.SessionStart[1].hooks[0].command, /pidge\.js' presence$/, 'ours runs THIS CLI\'s presence');
+  assert.equal(JSON.parse(a.stdout).changed, true);
+  const b = await runCli(['hook', 'install'], port, {}, proj).result;
+  assert.equal(JSON.parse(b.stdout).changed, false, 'idempotent');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(proj, '.claude', 'settings.json'), 'utf8')).hooks.SessionStart.length, 2, 'no duplicate');
+  const c = await runCli(['hook', 'uninstall'], port, {}, proj).result;
+  await mock.stop();
+  assert.equal(JSON.parse(c.stdout).removed, true);
+  const s3 = JSON.parse(fs.readFileSync(path.join(proj, '.claude', 'settings.json'), 'utf8'));
+  assert.equal(s3.hooks.SessionStart.length, 1, 'only ours is gone');
+  assert.equal(s3.hooks.SessionStart[0].hooks[0].command, 'echo theirs');
+});
+
+test('setup under Claude Code installs the SessionStart hook; --no-hook skips it; outside Claude Code nothing is written', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-setup-hook-'));
+  const proj = makeProject();
+  const r = await runCli(['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`], port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: home, CLAUDECODE: '1' }, proj).result;
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /SessionStart hook installed/);
+  const s = JSON.parse(fs.readFileSync(path.join(proj, '.claude', 'settings.json'), 'utf8'));
+  assert.match(s.hooks.SessionStart[0].hooks[0].command, /presence$/);
+
+  mock.state.claimCode = 'claim-ok';
+  const proj2 = makeProject();
+  const r2 = await runCli(['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`, '--no-hook'], port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-setup-hook2-')), CLAUDECODE: '1' }, proj2).result;
+  assert.equal(r2.code, 0, r2.stderr);
+  assert.ok(!fs.existsSync(path.join(proj2, '.claude', 'settings.json')), '--no-hook writes nothing');
+
+  mock.state.claimCode = 'claim-ok';
+  const proj3 = makeProject();
+  const r3 = await runCli(['setup', '--claim', 'claim-ok', '--url', `http://127.0.0.1:${port}`], port, { PIDGE_TOKEN: '', PIDGE_URL: '', XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-setup-hook3-')), CLAUDECODE: '' }, proj3).result;
+  await mock.stop();
+  assert.equal(r3.code, 0, r3.stderr);
+  assert.ok(!fs.existsSync(path.join(proj3, '.claude', 'settings.json')), 'not Claude Code: no hook');
 });

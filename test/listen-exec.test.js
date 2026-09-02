@@ -412,14 +412,20 @@ test('listen HOLDS the channel lock while it runs and releases it on the way out
   assert.match(b.stderr, new RegExp(`rm "${lockPathFor(xdg).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`),
     'the pre-check refusal carries the same rm escape hatch as the EEXIST one');
 
-  // …and a BRIDGE under a live listen is refused the same way (symmetry)
-  const c = await runCli(['bridge', '--exec', 'true', '--no-realtime'], port, { XDG_CONFIG_HOME: xdg }).result;
-  assert.equal(c.code, 2, `a bridge under a live listen must refuse; stderr:\n${c.stderr}`);
-  assert.match(c.stderr, /another consumer already holds this channel/);
+  // …and a BRIDGE under a live listen STANDS BY (0.54 — the handoff: the live
+  // agent wins the channel; a dying daemon would flap-restart under systemd)
+  const c = runCli(['bridge', '--exec', 'true', '--no-realtime', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg, PIDGE_BRIDGE_STANDBY_POLL: '300' });
+  assert.ok(await waitFor(() => /STANDING BY: an interactive listener holds this channel/.test(c.out.stderr)), `stderr:\n${c.out.stderr}`);
+  assert.equal(c.out.code, null, 'the bridge does not die');
 
   const ra = await a.result;
-  await mock.stop();
   assert.equal(ra.code, 3, `the listener itself is untouched (empty round); stderr:\n${ra.stderr}`);
+  // the listener's lock went away — and the bridge takes the channel
+  assert.ok(await waitFor(() => /taking the channel back/.test(c.out.stderr)), `stderr:\n${c.out.stderr}`);
+  assert.ok(await waitFor(() => { try { return JSON.parse(fs.readFileSync(lockPathFor(xdg), 'utf8')).pid === c.child.pid; } catch { return false; } }), 'the bridge holds the lock now');
+  c.child.kill('SIGTERM');
+  await c.result;
+  await mock.stop();
   assert.ok(!fs.existsSync(lockPathFor(xdg)), 'the lock is released on the way out — every exit path');
 });
 
