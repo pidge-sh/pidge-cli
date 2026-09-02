@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.54.4 — 2026-09-02
+
+**The second migration's findings, same day.**
+
+- **The SessionStart hook carries the identity.** `hook install` wrote `pidge
+  presence` bare; under a per-agent install (`PIDGE_AGENT`) or a relocated
+  config (`XDG_CONFIG_HOME`) the hook read "channel state UNKNOWN" — born mute.
+  The command now embeds both when set. Re-run `pidge hook install`.
+- **A stale global is named.** When the `pidge` on PATH is behind this CLI, the
+  hook installer says so (`pidge update` brings it up).
+- **`hook` and `presence` have their own `--help`** and appear in the usage.
+- **Old skill backups are swept.** Older CLIs minted one `SKILL.md.bak.<ts>` per
+  manifest bump; 45 sat in one vault, versioned. An install now removes OUR
+  timestamped backups (a pidge marker inside); the human's own stay.
+- **`other_units` matches `bridge` as the pidge SUBCOMMAND**, not the word —
+  ritual timers living in a `bridge/` folder were listed as bridges.
+- **The lock speaks the same vocabulary as whoami** (`kind: watch | listen |
+  bridge`); a bridge stands by under a watch exactly as under a listen.
+
 ## 0.54.3 — 2026-09-02
 
 **The first migration's feedback, paid back.** A secretary agent moved from a

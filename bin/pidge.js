@@ -745,6 +745,8 @@ const USAGE_TAIL = `  pidge bridge --exec '<handler>'         24/7 SUPERVISOR: l
                                           and PROVES it with a selftest (exit 0 = measured). Yields the
                                           channel to a live listen. Never embeds the key.
   pidge bridge status | uninstall         measured ONLINE/OFFLINE (service · lock · server) | stop + remove
+  pidge presence                          ONE line: is anyone listening? (built for a SessionStart hook)
+  pidge hook install | uninstall          the Claude Code SessionStart hook that runs pidge presence
   pidge listen [--timeout N] [--all] [--exec '<handler>'] [--ndjson] [--follow]
                                           block until the human MESSAGES you from the app, print, exit
                                           a read message is DELIVERED (gray ✓✓), NOT done — ACK it
@@ -1046,6 +1048,18 @@ const HELP = {
   doctor: {
     summary: 'validate the setup WITHOUT exposing secrets (env source, server, key, device reach, realtime probe).',
     usage: 'pidge doctor',
+    opts: [],
+  },
+  presence: {
+    summary: 'ONE line for a session-start hook: is anyone listening on this channel right now?',
+    usage: 'pidge presence',
+    body: '"OFFLINE — nobody is listening; start the watch: Monitor(…)" or "listening — <label> [kind] holds the queue; read with catchup, never start a second listener". Exit 0 always (a hook must never break a session). The server\'s measured presence decides; a lingering consumer row never contradicts it.',
+    opts: [],
+  },
+  hook: {
+    summary: 'install/remove the Claude Code SessionStart hook that runs `pidge presence` at every session start, resume, /clear and /compact.',
+    usage: 'pidge hook install  ·  pidge hook uninstall',
+    body: 'Writes ONE tagged entry into the PROJECT\'s .claude/settings.json (other hooks untouched; idempotent; uninstall removes only ours). The command carries your identity (PIDGE_AGENT / XDG_CONFIG_HOME when set) and follows @latest from the npx cache, or a `pidge` on PATH. `pidge setup` installs it for you under Claude Code (--no-hook skips).',
     opts: [],
   },
   whoami: {
@@ -4140,7 +4154,7 @@ function acquireBridgeLock(tag = 'bridge') {
     ...(procStarted ? { proc_started_at: procStarted } : {}),
     started_at: new Date().toISOString(),
     label: agentLabel(),
-    kind: tag, // bridge | listen — the handoff below reads it
+    kind: consumerKind() || tag, // watch | listen | bridge — the same vocabulary whoami serves
   }) + '\n';
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -4622,7 +4636,7 @@ async function runBridge() {
     let announced = false;
     for (;;) {
       const cur = readBridgeLock(bridgeLockPath());
-      if (cur && lockHolderAlive(cur) && cur.kind === 'listen') {
+      if (cur && lockHolderAlive(cur) && (cur.kind === 'listen' || cur.kind === 'watch')) {
         if (!announced) {
           announced = true;
           console.error(`pidge: bridge — STANDING BY: an interactive listener holds this channel (pid ${cur.pid}${cur.label ? `, "${cur.label}"` : ''}, since ${cur.started_at || '?'}) — your human is talking to that session. The bridge takes over the moment it exits.`);
@@ -4899,7 +4913,7 @@ async function runBridge() {
       const grace = Date.now() + (parseInt(process.env.PIDGE_BRIDGE_YIELD_GRACE || '', 10) || 10000);
       while (Date.now() < grace) {
         const cur = readBridgeLock(bridgeLockPath());
-        if (cur && lockHolderAlive(cur) && cur.kind === 'listen') break;
+        if (cur && lockHolderAlive(cur) && (cur.kind === 'listen' || cur.kind === 'watch')) break;
         await sleepInterruptible(200);
         if (shuttingDown) return;
       }
@@ -5598,16 +5612,38 @@ function presenceHookCommand() {
   // Durable across upgrades: a `pidge` on PATH (a global install) is preferred;
   // from the npx cache the hook follows @latest rather than pinning the version
   // that happened to install it (a hook pinned to a worktree path was measured).
+  // The IDENTITY rides along: a per-agent install (PIDGE_AGENT) or a relocated
+  // config (XDG_CONFIG_HOME) is invisible to a hook that inherits a bare env —
+  // measured: "channel state UNKNOWN", exit 0, a hook born mute.
   const inv = durableCliInvocation();
-  if (inv.via === 'npx') return `${shQuote(inv.argv[0])} -y pidge-cli@latest presence`;
+  const envPrefix = [
+    process.env.PIDGE_AGENT ? `PIDGE_AGENT=${shQuote(process.env.PIDGE_AGENT)}` : null,
+    process.env.XDG_CONFIG_HOME ? `XDG_CONFIG_HOME=${shQuote(process.env.XDG_CONFIG_HOME)}` : null,
+  ].filter(Boolean).map((e) => `${e} `).join('');
+  if (inv.via === 'npx') return `${envPrefix}${shQuote(inv.argv[0])} -y pidge-cli@latest presence`;
   const onPath = whichOnPath('pidge');
-  if (onPath) return 'pidge presence';
-  return `${inv.argv.map(shQuote).join(' ')} presence`;
+  if (onPath) return `${envPrefix}pidge presence`;
+  return `${envPrefix}${inv.argv.map(shQuote).join(' ')} presence`;
+}
+// A global `pidge` older than this CLI is what a human typing `pidge` gets —
+// say so once, where the hook is written (measured: global 0.54.2 behind npx 0.54.3).
+function warnStaleGlobalPidge() {
+  const onPath = whichOnPath('pidge');
+  if (!onPath || onPath === __filename) return;
+  try {
+    const { spawnSync } = require('node:child_process');
+    const r = spawnSync(onPath, ['--version'], { encoding: 'utf8', timeout: 5000 });
+    const mine = require(path.join(__dirname, '..', 'package.json')).version;
+    const theirs = (r.stdout || '').trim();
+    if (/^\d+\.\d+\.\d+$/.test(theirs) && theirs !== mine && theirs.split('.').map(Number).some((n, i) => n !== Number(mine.split('.')[i])) && theirs.localeCompare(mine, undefined, { numeric: true }) < 0)
+      console.error(`pidge: note — the \`pidge\` on your PATH (${onPath}) is ${theirs}, behind this ${mine}; \`pidge update\` brings it up (a shell typing \`pidge\` gets the old one until then).`);
+  } catch { /* best-effort */ }
 }
 function isPidgePresenceHook(entry) {
   return entry && Array.isArray(entry.hooks) && entry.hooks.some((h) => h && typeof h.command === 'string' && /\bpresence$/.test(h.command.trim()) && /pidge/.test(h.command));
 }
 function installSessionStartHook() {
+  warnStaleGlobalPidge();
   const file = projectClaudeSettingsPath();
   let settings = {};
   try { settings = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw new Error(`${file} is not valid JSON — fix it by hand first (${e.message})`); }
@@ -5697,7 +5733,7 @@ async function runBridgeStatus() {
       const names = (r.stdout || '').split('\n').map((l) => l.trim().split(/\s+/)[0]).filter((n) => n && n.endsWith('.service') && n !== unit);
       for (const n of names) {
         const show = spawnSync('systemctl', ['--user', 'show', n, '-p', 'ExecStart', '-p', 'ActiveState'], { encoding: 'utf8' });
-        if (/pidge[^\n]*bridge/.test(show.stdout || '')) other_units.push({ unit: n, active: /ActiveState=active/.test(show.stdout || '') });
+        if (/pidge\S*\s+(?:\S+\s+)*?bridge\b/.test(show.stdout || '')) other_units.push({ unit: n, active: /ActiveState=active/.test(show.stdout || '') });
       }
     } catch { /* no systemd — nothing to scan */ }
   }
@@ -7043,6 +7079,15 @@ function writeSkillFile(file, content, backup = true) {
     // their original, and our previous. (Date is fine here — the CLI process,
     // not a workflow script.)
     const ours = findSkillMarker(previous) !== '';
+    // Sweep the litter older CLIs left: OUR timestamped backups (a pidge marker
+    // inside) — 45 of them in one vault, versioned in git. Theirs stay.
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.startsWith(`${path.basename(file)}.bak.`) || !/\.bak\.\d+$/.test(f)) continue;
+        const full = path.join(dir, f);
+        if (findSkillMarker(fs.readFileSync(full, 'utf8')) !== '') fs.unlinkSync(full);
+      }
+    } catch { /* best-effort */ }
     let bak = `${file}.bak`;
     if (fs.existsSync(bak)) bak = ours ? `${file}.bak.prev` : `${file}.bak.${Date.now()}`;
     fs.writeFileSync(bak, previous);
