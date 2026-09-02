@@ -4873,10 +4873,18 @@ async function runBridge() {
       yieldRequested = false;
       releaseOnce();
       console.error('pidge: bridge — channel handed to the interactive listener; standing by');
-      // Give the listener a moment to take the lock before we look — otherwise
-      // an empty instant re-acquires it from under the very listen that asked.
-      await sleepInterruptible(Math.min(STANDBY_POLL_MS, 3000));
-      if (shuttingDown) return;
+      // Wait for the listener to actually TAKE the lock before looking again: a
+      // fixed nap raced the listen's own poll (it looks every 500 ms) and this
+      // bridge re-took its own lock from under the very listen that asked —
+      // measured in CI, twice. A listen that never shows up within the grace
+      // period gets the channel handed back (nobody else is consuming).
+      const grace = Date.now() + (parseInt(process.env.PIDGE_BRIDGE_YIELD_GRACE || '', 10) || 10000);
+      while (Date.now() < grace) {
+        const cur = readBridgeLock(bridgeLockPath());
+        if (cur && lockHolderAlive(cur) && cur.kind === 'listen') break;
+        await sleepInterruptible(200);
+        if (shuttingDown) return;
+      }
       if (!(await acquireOrStandby())) return;
       continue;
     }
