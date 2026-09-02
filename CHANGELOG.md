@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.54.5 — 2026-09-02
+
+**A watch dies with its harness — not with the shell between them.** Measured:
+three watches outlived their dead Claude Code sessions for hours because the
+`bash -c` / `sh -c` wrappers survived, so the server stayed green while nobody
+read a line — deaf consumers, the one state worse than offline. The orphan
+watchdog now pins the nearest ancestor that is an agent runtime (claude, codex,
+gemini, node) at start and exits the moment it is gone, so presence reads
+OFFLINE within a minute of the session's death.
+
+- **The session-length watch is no longer scolded.** `--follow --timeout 0`
+  under a recognised harness IS the blessed shape; the "a TURN-BASED agent must
+  NOT use --follow" warning fired on every boot of the recommended invocation.
+- `KNOWN_MANIFEST_VERSION` → 127 (`answered_unseen`, `filters_ignored`,
+  `has_events`, the `scheduled_sends.outage` clause).
+
 ## 0.54.4 — 2026-09-02
 
 **The second migration's findings, same day.**
