@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.54.1 — 2026-09-02
+
+**The handoff waits for the listener to take the lock.** 0.54.0's publish run
+failed on its own handoff test: after yielding, the bridge napped a fixed
+300 ms and then re-took its own lock — the listen polls every 500 ms, so it
+often found the channel held again and gave up. The bridge now waits (up to
+10 s) for a `listen` lock to appear before it looks again; a listen that never
+shows up gets the channel handed back. The v0.54.0 tag stays as it is (a tag
+is never moved); this is the release that publishes.
+
 ## 0.54.0 — 2026-09-02
 
 **"Stay online" means the agent the human is talking to — or honestly
