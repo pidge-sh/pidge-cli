@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.54.7 — 2026-09-02
+
+- **The harness watchdog matches the command line, not the thread name.** On
+  some node builds `ps -o comm=` reports "MainThread" for the main thread — the
+  0.54.5/0.54.6 watchdog pinned nothing there and both publish runs failed on
+  their own test (the tags stay; this is the release that publishes). It now
+  reads `args` and takes the basename of argv[0].
+- **Old skill backups are swept on every install**, not only when the skill
+  changed (measured: 45 before, 45 after). The count is narrated.
+
 ## 0.54.6 — 2026-09-02
 
 The 0.54.5 publish run failed on its own harness-watchdog test; the tag stays,
