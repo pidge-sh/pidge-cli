@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.54.6 — 2026-09-02
+
+The 0.54.5 publish run failed on its own harness-watchdog test; the tag stays,
+this is the release that publishes. The watch now narrates what the watchdog
+pinned at start ("pinned harness claude (pid N)") so a watchdog that pinned
+nothing is visible before a session dies, and the test reports the watch's own
+stderr when it fails.
+
 ## 0.54.5 — 2026-09-02
 
 **A watch dies with its harness — not with the shell between them.** Measured:

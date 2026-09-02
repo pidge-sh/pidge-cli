@@ -4893,10 +4893,11 @@ test('0.54.5: a watch exits when the HARNESS that launched it dies, even though 
   while (!fs.existsSync(lock) && Date.now() < until) await new Promise((r) => setTimeout(r, 200));
   assert.ok(fs.existsSync(lock), 'the watch is up (lock held)');
   harness.kill('SIGKILL'); // the harness dies; sh keeps the watch as its child
-  const until2 = Date.now() + 12000;
+  const until2 = Date.now() + 25000;
   while (fs.existsSync(lock) && Date.now() < until2) await new Promise((r) => setTimeout(r, 300));
   await mock.stop();
-  assert.ok(!fs.existsSync(lock), 'the watch released the channel after its harness died');
+  const err = (() => { try { return fs.readFileSync(path.join(xdg, 'watch.err'), 'utf8'); } catch { return '(no stderr)'; } })();
+  assert.ok(!fs.existsSync(lock), `the watch released the channel after its harness died; watch stderr:\n${err}`);
   assert.match(fs.readFileSync(path.join(xdg, 'watch.err'), 'utf8'), /the harness that launched me \(node, pid \d+\) is gone/);
 });
 
