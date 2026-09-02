@@ -370,16 +370,224 @@ test('bridge install: systemd template — Restart=on-failure, quoted ExecStart,
   assert.ok(!unit.includes('hld_test'), 'the template must NEVER embed the key');
 });
 
-test('bridge install without --exec is a usage error (exit 1)', async () => {
+test('bridge install without --exec and with NO model CLI on PATH is a usage error (exit 1)', async () => {
   const mock = createMock();
   const port = await mock.start();
-  const r = await runCli(['bridge', 'install'], port, { PIDGE_BRIDGE_PLATFORM: 'linux' }).result;
+  // a PATH with nothing on it: no claude/codex/gemini to generate a handler for
+  const r = await runCli(['bridge', 'install'], port, { PIDGE_BRIDGE_PLATFORM: 'linux', PATH: tmpDir('pidge-empty-path-') }).result;
   const r2 = await runCli(['bridge'], port).result;
   await mock.stop();
-  assert.equal(r.code, 1);
+  assert.equal(r.code, 1, `stderr:\n${r.stderr}`);
+  assert.match(r.stderr, /--handler/);
   assert.match(r.stderr, /--exec/);
   assert.equal(r2.code, 1, 'bare `pidge bridge` without --exec is usage too');
   assert.match(r2.stderr, /--exec/);
+});
+
+// A fake model CLI + a fake service manager on a private PATH: `bridge install`
+// must generate a handler for the CLI it finds, and `--enable` must drive the
+// supervisor through PATH (never a hardcoded path) — so both are observable.
+function fakeBinDir({ claudeScript, systemctlExit = 0 } = {}) {
+  const dir = tmpDir('pidge-fake-bin-');
+  const log = path.join(dir, 'systemctl.log');
+  fs.writeFileSync(path.join(dir, 'claude'), claudeScript || '#!/bin/sh\ncat > /dev/null\necho "pidge-summary: fake claude handled it"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(dir, 'systemctl'), `#!/bin/sh\necho "$@" >> ${JSON.stringify(log)}\nexit ${systemctlExit}\n`, { mode: 0o755 });
+  return { dir, log, pathEnv: `${dir}${path.delimiter}${path.dirname(process.execPath)}${path.delimiter}/usr/bin${path.delimiter}/bin` };
+}
+
+test('bridge install --handler claude: generates handler + prompt + pidge shim, the unit carries WorkingDirectory + PATH, and the handler RUNS', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const fake = fakeBinDir();
+  const run = runCli(['bridge', 'install', '--handler', 'claude'], port, { PIDGE_BRIDGE_PLATFORM: 'linux', PATH: fake.pathEnv });
+  const r = await run.result;
+  await mock.stop();
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+  const info = JSON.parse(r.stdout);
+  assert.equal(info.handler.kind, 'claude');
+  assert.equal(info.enabled, null, 'without --enable nothing is started');
+  assert.equal(info.workdir, process.cwd(), 'the daemon works where the install ran (the project)');
+  const unit = fs.readFileSync(info.file, 'utf8');
+  assert.match(unit, new RegExp(`^WorkingDirectory=${process.cwd().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'), 'the project-scoped key resolves by cwd — the unit must set it');
+  assert.ok(unit.includes(`bridge --exec "${info.handler.script}"`), `ExecStart runs the generated handler: ${unit}`);
+  assert.ok(unit.includes(path.dirname(process.execPath)), 'the daemon PATH carries node\'s own dir');
+  assert.ok(!unit.includes('hld_test'), 'never the key');
+  assert.match(r.stderr, /enable it with:\s+systemctl --user daemon-reload && systemctl --user enable --now pidge-bridge\.service/);
+
+  const script = fs.readFileSync(info.handler.script, 'utf8');
+  assert.match(script, /^#!\/usr\/bin\/env bash/, 'a runnable script');
+  assert.match(script, /claude -p "\$\{RESUME\[@\]\}" --allowedTools "\$TOOLS"/, 'the claude preset, resuming its own session');
+  assert.match(script, /pidge-summary:/, 'the attribution marker is part of the recipe');
+  assert.ok((fs.statSync(info.handler.script).mode & 0o111) !== 0, 'executable');
+  const prompt = fs.readFileSync(info.handler.prompt, 'utf8');
+  assert.match(prompt, /pidge message --title/, 'the prompt tells the model to REPLY through pidge, not stdout');
+  assert.match(prompt, /Never run pidge setup, listen, online, bridge, or ack/, 'the bridge owns the queue');
+  assert.match(fs.readFileSync(info.handler.shim, 'utf8'), /exec .*pidge\.js.* "\$@"/, 'the shim runs THIS CLI');
+
+  // The handler really runs — with the fake claude on PATH.
+  const { execFileSync } = require('node:child_process');
+  const env = { ...process.env, PATH: fake.pathEnv };
+  // (1) a system-only batch: no model call, a summary, exit 0
+  const sys = execFileSync(info.handler.script, { input: JSON.stringify({ messages: [{ id: 1, kind: 'system', body: 'selftest nonce=x' }] }), env, encoding: 'utf8' });
+  assert.match(sys, /^pidge-summary: system-only batch/m);
+  // (2) a human batch: the prompt reaches the model on stdin, the batch file is named, the model's summary is kept
+  const seen = path.join(fake.dir, 'seen-prompt.txt');
+  fs.writeFileSync(path.join(fake.dir, 'claude'), `#!/bin/sh\ncat > ${JSON.stringify(seen)}\necho "pidge-summary: fake claude handled it"\n`, { mode: 0o755 });
+  const human = execFileSync(info.handler.script, { input: JSON.stringify({ messages: [{ id: 2, kind: 'message', body: 'oi' }] }), env, encoding: 'utf8' });
+  assert.match(human, /^pidge-summary: fake claude handled it$/m);
+  assert.doesNotMatch(human, /\(auto\)/, 'the fallback must not overwrite the model\'s own summary');
+  const got = fs.readFileSync(seen, 'utf8');
+  assert.match(got, /REPLY THROUGH PIDGE/, 'the prompt file rode stdin');
+  assert.match(got, /The batch file to read now: \S+/, 'the batch is named at the end of the prompt');
+  // (2b) session continuity: the first batch minted a session id; the next one RESUMES it
+  const sessionFile = path.join(path.dirname(info.handler.script), 'bridge-session-id');
+  const stamp = fs.readFileSync(sessionFile, 'utf8');
+  assert.match(stamp, /^\d{4}-\d{2}-\d{2} [0-9a-f-]{36}$/, 'a UUID session id, dated: one resumed session per day');
+  const sid = stamp.slice(11);
+  const argsFile = path.join(fake.dir, 'seen-args.txt');
+  fs.writeFileSync(path.join(fake.dir, 'claude'), `#!/bin/sh\necho "$@" > ${JSON.stringify(argsFile)}\ncat > /dev/null\necho "pidge-summary: resumed"\n`, { mode: 0o755 });
+  execFileSync(info.handler.script, { input: JSON.stringify({ messages: [{ id: 5, kind: 'message', body: 'e aí' }] }), env, encoding: 'utf8' });
+  assert.match(fs.readFileSync(argsFile, 'utf8'), new RegExp(`--resume ${sid}`), 'the second batch resumes the first batch\'s session');
+  assert.equal(fs.readFileSync(sessionFile, 'utf8'), stamp, 'the id is stable within the day');
+  // (3) a model that prints no marker: the generic fallback, only then
+  fs.writeFileSync(path.join(fake.dir, 'claude'), '#!/bin/sh\ncat > /dev/null\necho "done"\n', { mode: 0o755 });
+  const silent = execFileSync(info.handler.script, { input: JSON.stringify({ messages: [{ id: 3, kind: 'message', body: 'oi' }] }), env, encoding: 'utf8' });
+  assert.match(silent, /^pidge-summary: \(auto\) .*done/m, 'the fallback is synthesized from the TAIL of the model output, so a successor reads what happened');
+  // (4) the model fails: exit propagates, no fallback summary
+  fs.writeFileSync(path.join(fake.dir, 'claude'), '#!/bin/sh\ncat > /dev/null\nexit 7\n', { mode: 0o755 });
+  const { spawnSync } = require('node:child_process');
+  const failed = spawnSync(info.handler.script, { input: JSON.stringify({ messages: [{ id: 4, kind: 'message', body: 'oi' }] }), env, encoding: 'utf8' });
+  assert.equal(failed.status, 7, 'a failed model = a failed batch (not acked)');
+  assert.doesNotMatch(failed.stdout, /pidge-summary:/);
+  assert.ok(!fs.existsSync(sessionFile), 'a failed RESUMED run drops the session id — the next batch starts fresh');
+});
+
+test('bridge install auto-detects the model CLI on PATH when neither --handler nor --exec is given', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const fake = fakeBinDir();
+  const r = await runCli(['bridge', 'install'], port, { PIDGE_BRIDGE_PLATFORM: 'darwin', HOME: tmpDir('pidge-home-'), PATH: fake.pathEnv }).result;
+  await mock.stop();
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+  const info = JSON.parse(r.stdout);
+  assert.equal(info.handler.kind, 'claude');
+  const plist = fs.readFileSync(info.file, 'utf8');
+  assert.match(plist, /<key>WorkingDirectory<\/key><string>/, 'launchd gets the working directory too');
+  assert.ok(plist.includes(info.handler.script));
+});
+
+test('bridge install --enable: drives systemctl, waits for a live consumer, and PROVES the round-trip (exit 0 only on selftest PASS)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.consumers = [{ fingerprint: 'fp_bridge', label: 'bridge', listening: true, live: true }];
+  mock.state.selftestAckedAfterMs = 50;
+  const fake = fakeBinDir();
+  const r = await runCli(['bridge', 'install', '--handler', 'claude', '--enable'], port, { PIDGE_BRIDGE_PLATFORM: 'linux', PATH: fake.pathEnv, PIDGE_BRIDGE_UP_WAIT: '3000' }).result;
+  await mock.stop();
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+  const info = JSON.parse(r.stdout);
+  assert.equal(info.enabled, true);
+  assert.equal(info.selftest.status, 'passed');
+  assert.equal(info.ok, true);
+  const log = fs.readFileSync(fake.log, 'utf8');
+  assert.match(log, /--user daemon-reload/);
+  assert.match(log, /--user enable --now pidge-bridge\.service/);
+  assert.match(r.stderr, /✅ STAND-IN ONLINE/, "online, but named for what it is: another agent");
+  assert.match(r.stderr, /never `listen`\/`online` here/);
+});
+
+test('bridge install --enable: a selftest that FAILS makes the command fail (exit 2) — online is measured, not declared', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.consumers = [{ fingerprint: 'fp_bridge', label: 'bridge', listening: true, live: true }];
+  // nobody acks the nonce → the server's verdict fails at the window — use a tiny window
+  const fake = fakeBinDir();
+  const r = await runCli(['bridge', 'install', '--handler', 'claude', '--enable'], port, { PIDGE_BRIDGE_PLATFORM: 'linux', PATH: fake.pathEnv, PIDGE_BRIDGE_UP_WAIT: '3000', PIDGE_SELFTEST_WINDOW: '5' }).result;
+  await mock.stop();
+  assert.equal(r.code, 2, `stderr:\n${r.stderr}`);
+  const info = JSON.parse(r.stdout);
+  assert.equal(info.enabled, true);
+  assert.equal(info.ok, false);
+  assert.notEqual(info.selftest.status, 'passed');
+  assert.doesNotMatch(r.stderr, /✅ ONLINE/);
+});
+
+test('bridge install --enable: a failing service manager is reported (exit 2) with the manual enable line', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const fake = fakeBinDir({ systemctlExit: 1 });
+  const r = await runCli(['bridge', 'install', '--handler', 'claude', '--enable'], port, { PIDGE_BRIDGE_PLATFORM: 'linux', PATH: fake.pathEnv }).result;
+  await mock.stop();
+  assert.equal(r.code, 2, `stderr:\n${r.stderr}`);
+  const info = JSON.parse(r.stdout);
+  assert.equal(info.enabled, false);
+  assert.match(r.stderr, /enabling FAILED/);
+  assert.match(r.stderr, /systemctl --user daemon-reload && systemctl --user enable --now/);
+});
+
+test('bridge install: --handler and --exec together is a usage error; an unknown --handler too', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const r = await runCli(['bridge', 'install', '--handler', 'claude', '--exec', 'true'], port, { PIDGE_BRIDGE_PLATFORM: 'linux' }).result;
+  const r2 = await runCli(['bridge', 'install', '--handler', 'llama'], port, { PIDGE_BRIDGE_PLATFORM: 'linux' }).result;
+  await mock.stop();
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /EITHER --handler/);
+  assert.equal(r2.code, 1);
+  assert.match(r2.stderr, /unknown --handler "llama"/);
+});
+
+test('bridge status + uninstall: measured verdict, then the service is stopped, removed and turn_based re-declared', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const fake = fakeBinDir();
+  const env = { PIDGE_BRIDGE_PLATFORM: 'linux', PATH: fake.pathEnv };
+  const inst = runCli(['bridge', 'install', '--handler', 'claude'], port, env);
+  const ri = await inst.result;
+  assert.equal(ri.code, 0, ri.stderr);
+  const file = JSON.parse(ri.stdout).file;
+  const shared = { ...env, XDG_CONFIG_HOME: inst.xdg };
+
+  mock.state.consumers = [];
+  mock.state.listeningState = 'offline';
+  const st = await runCli(['bridge', 'status'], port, shared).result;
+  assert.equal(st.code, 3, `offline exits 3; stderr:\n${st.stderr}`);
+  const s = JSON.parse(st.stdout);
+  assert.equal(s.installed, true);
+  assert.equal(s.active, true, 'the fake systemctl says active (exit 0)');
+  assert.equal(s.verdict, 'OFFLINE');
+  assert.deepEqual(s.server.live_consumers, []);
+
+  mock.state.consumers = [{ fingerprint: 'fp_bridge', label: 'bridge', listening: true, live: true }];
+  mock.state.listeningState = 'listening';
+  const st2 = await runCli(['bridge', 'status'], port, shared).result;
+  assert.equal(st2.code, 0);
+  assert.equal(JSON.parse(st2.stdout).verdict, 'ONLINE');
+
+  const un = await runCli(['bridge', 'uninstall'], port, shared).result;
+  await mock.stop();
+  assert.equal(un.code, 0, un.stderr);
+  const u = JSON.parse(un.stdout);
+  assert.equal(u.existed, true);
+  assert.equal(u.stopped, true);
+  assert.ok(!fs.existsSync(file), 'the unit is removed');
+  assert.match(fs.readFileSync(fake.log, 'utf8'), /--user disable --now pidge-bridge\.service/);
+  assert.equal(mock.state.operatingContract.listen_mode.value, 'turn_based', 'an honest contract says what runs');
+  assert.equal(u.listen_mode_declared, true);
+});
+
+test('selftest --window accepts up to 600 s (a model-backed handler needs minutes) and the CLI watches the window the server GRANTED', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.selftestAckedAfterMs = 50;
+  const r = await runCli(['selftest', '--window', '600'], port).result;
+  await mock.stop();
+  assert.equal(r.code, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.status, 'passed');
+  assert.equal(out.window_seconds, 600);
+  const st = Object.values(mock.state.selftests)[0];
+  assert.equal(st.window_seconds, 600, 'the CLI asked for the full window');
 });
 
 test('stale_from_prior_claim — warned ONCE on the listen header, on catchup, on doctor, and at bridge boot', async () => {
@@ -847,23 +1055,52 @@ test('bridge: below the persistence window a server-shaped streak backs off LOUD
 // live bridge (above), and a bridge refuses under a live `listen` — which only
 // became true once every listen started HOLDING the lock instead of just reading
 // it. Same refusal, same way out (catchup).
-test('`bridge` REFUSES when a LIVE `listen` holds the channel lock', async () => {
+test('THE HANDOFF (boot): a bridge started while a LIVE `listen` holds the channel STANDS BY, then takes over when it exits', async () => {
   const mock = createMock();
   const port = await mock.start();
   const xdg = tmpDir('pidge-bridge-under-listen-');
 
-  const listener = runCli(['listen', '--no-realtime', '--timeout', '6', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg });
+  const listener = runCli(['listen', '--no-realtime', '--timeout', '4', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg });
   assert.ok(await waitFor(() => fs.existsSync(lockPathFor(xdg))), 'the listener must take the lock');
 
-  const r = await runCli(['bridge', '--exec', 'true', '--no-realtime'], port, { XDG_CONFIG_HOME: xdg }).result;
-  assert.equal(r.code, 2, `stderr:\n${r.stderr}`);
-  assert.match(r.stderr, /another consumer already holds this channel/);
-  assert.match(r.stderr, /catchup/);
+  const b = runCli(['bridge', '--exec', 'true', '--no-realtime', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg, PIDGE_BRIDGE_STANDBY_POLL: '300' });
+  assert.ok(await waitFor(() => /STANDING BY: an interactive listener holds this channel/.test(b.out.stderr)), `stderr:\n${b.out.stderr}`);
+  assert.equal(b.out.code, null, 'the bridge does NOT die (a dying daemon flap-restarts under systemd)');
 
   const rl = await listener.result;
+  assert.equal(rl.code, 3, `the listener is untouched; stderr:\n${rl.stderr}`);
+  assert.ok(await waitFor(() => /taking the channel back/.test(b.out.stderr)), `stderr:\n${b.out.stderr}`);
+  assert.ok(await waitFor(() => { const l = JSON.parse(fs.readFileSync(lockPathFor(xdg), 'utf8')); return l.kind === 'bridge' && l.pid === b.child.pid; }), 'the bridge now holds the lock');
+
+  b.child.kill('SIGTERM');
+  await b.result;
   await mock.stop();
-  assert.equal(rl.code, 3, `the listener is untouched by the refusal; stderr:\n${rl.stderr}`);
-  assert.ok(!fs.existsSync(lockPathFor(xdg)), 'and it releases the lock on its way out');
+});
+
+test('THE HANDOFF (yield): a `listen` started while the bridge holds the channel asks it to YIELD, gets the lock, and the bridge takes it back after', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = tmpDir('pidge-listen-over-bridge-');
+
+  const b = runCli(['bridge', '--exec', 'true', '--no-realtime', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg, PIDGE_BRIDGE_STANDBY_POLL: '300' });
+  assert.ok(await waitFor(() => /pidge: bridge — up/.test(b.out.stderr)), `stderr:\n${b.out.stderr}`);
+  const before = JSON.parse(fs.readFileSync(lockPathFor(xdg), 'utf8'));
+  assert.equal(before.kind, 'bridge');
+
+  const l = runCli(['listen', '--all', '--no-realtime', '--timeout', '3', '--interval', '1'], port, { XDG_CONFIG_HOME: xdg, PIDGE_LISTEN_TAKEOVER_MS: '20000' });
+  const rl = await l.result;
+  assert.equal(rl.code, 3, `an empty round after the takeover; stderr:\n${rl.stderr}`);
+  assert.match(rl.stderr, /asked it to yield/);
+  assert.match(rl.stderr, /the bridge yielded: this session is the channel's consumer now/);
+  assert.match(b.out.stderr, /asked for the channel — yielding/);
+  assert.match(b.out.stderr, /channel handed to the interactive listener; standing by/);
+  assert.ok(await waitFor(() => /taking the channel back/.test(b.out.stderr)), `stderr:\n${b.out.stderr}`);
+  assert.ok(await waitFor(() => { try { const c = JSON.parse(fs.readFileSync(lockPathFor(xdg), 'utf8')); return c.kind === 'bridge' && c.pid === b.child.pid; } catch { return false; } }), 'the bridge re-took the lock');
+
+  b.child.kill('SIGTERM');
+  const rb = await b.result;
+  await mock.stop();
+  assert.equal(rb.code, 0, 'SIGTERM is still a clean exit');
 });
 
 // Refactor guard: the handler machinery (spawn/settle/marker/tee/timeout/renew)

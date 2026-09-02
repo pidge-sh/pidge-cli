@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.54.0 — 2026-09-02
+
+**"Stay online" means the agent the human is talking to — or honestly
+offline.** Three fresh-agent runs in a row ended the same way: the pasted
+prompt said "run `listen --all` as a background task your harness tracks", the
+harness killed that task the moment the turn ended with nothing else to do, the
+human saw "offline", and the agent either relaunched forever or went quiet. The
+agent that finally "fixed" it hand-built a bridge daemon — and the human's
+reaction was the real finding: a bridge is *another agent* answering in their
+chat. They wanted a chat with **their** agent; if it is gone, show it gone.
+
+- **The session-length watch is the stay-online command.** `pidge online
+  --follow --ndjson --timeout 0`: `--timeout 0` under `--follow` now means NO
+  deadline, so a harness that streams a process's stdout to the agent as events
+  (Claude Code: `Monitor({command: 'pidge online --follow --ndjson --timeout
+  0', persistent: true})`) delivers every message to the session the human is
+  talking to, for as long as that session lives. When it ends, the human sees
+  OFFLINE — like a contact who closed the app; the queue keeps their messages.
+  The stay-online nudge, `online --help`, the `hello` timeout line, the
+  agent-driven `ack` line and the skill's `loop` reference all say this now,
+  and name the bridge as a stand-in, opt-in only.
+- **A bridge and a live listen no longer fight — the live agent wins.** A
+  bridge started while a `listen` holds the channel STANDS BY instead of dying
+  (a dying daemon flap-restarts under systemd every 10 s); a `listen` started
+  while the bridge holds the channel asks it to YIELD (SIGUSR2, sent only to a
+  lock that names itself a bridge — an older bridge would read the signal as
+  termination), waits up to 90 s, and the bridge hands over at once when idle (a held
+  long-poll is cut short) or after a running handler finishes and is acked,
+  then takes the channel back the moment that listen exits. The lock file now records the holder's
+  `kind`.
+- **`bridge install` became one command, for those who DO want a stand-in.**
+  `--handler claude|codex|gemini` (default: the first on PATH) GENERATES the
+  handler script + an editable prompt + a `pidge` shim in the identity's config
+  dir — the ~60 lines every agent was rewriting by hand: batch to a file, the
+  prompt through stdin (a model CLI's prompt argument is unreliable once stdin
+  is a pipe), `claude` as ONE resumed session across batches (`--session-id`,
+  then `--resume`; a failed resumed run drops the id), a system-only batch
+  (selftest nonce, contract change) answered WITHOUT a model call after checking
+  the model CLI resolves under the daemon, a generic `pidge-summary:` only when
+  the model printed none, and a prompt that tells the model it is the stand-in.
+  The service carries `WorkingDirectory` = the project (a project-scoped key
+  resolves by cwd — the daemon used to start in `$HOME` and find no key) and
+  node's own dir in PATH; from the npx cache it pins `npx -y pidge-cli@<this
+  version>` instead of the cache path. `--enable` runs the enable commands,
+  waits for a live consumer and runs a selftest — **exit 0 only on PASS**.
+  New: `bridge status` (measured: service · lock · server, exit 0/3) and
+  `bridge uninstall` (stop, remove, re-declare `turn_based`).
+- **`selftest --window` up to 600 s** (server manifest ≥ v125; older servers
+  clamp to 120 and the CLI watches the window the server GRANTED). A consumer
+  whose handler runs a model on every batch acks only when the model returns —
+  a healthy bridge used to report FAILED at 30 s.
+
+- **Where the harness does NOT wake you, the forever watch refuses.** Measured on
+  a fresh Codex run: it put `pidge online --follow --timeout 0` in its
+  "background terminal", the server showed a live consumer, and a phone message
+  sat unread for minutes — a DEAF consumer, the one state worse than offline.
+  `--follow --timeout 0` now runs only where `CLAUDECODE` is set (Claude Code's
+  Monitor) or `PIDGE_EVENT_STREAM=1` declares a real event stream; elsewhere it
+  exits 1 with the honest recipe: one FOREGROUND round per turn, offline between
+  turns. The prompt, guide, nudge and skill say the same.
+- **`setup` proves the config dir is writable BEFORE spending the claim code.**
+  Same Codex run: its workspace-write sandbox cannot touch `~/.config`, the
+  exchange succeeded server-side, the write failed, and the retry was refused —
+  the single-use code was burned. A write probe now fails first, with the fix
+  (`XDG_CONFIG_HOME="$PWD/.pidge"`) and the code intact.
+- **`pidge presence` + a SessionStart hook.** One line — "OFFLINE — nobody is
+  listening; start the watch: Monitor(…)" or "listening — X holds the queue;
+  read with catchup, never listen" — built for Claude Code's `SessionStart`
+  hook, which fires on startup, resume, `/clear` and `/compact`: exactly the
+  moments an agent born from zero forgets it was supposed to be reachable.
+  `setup` installs it into the project's `.claude/settings.json` under Claude
+  Code (`--no-hook` to skip; `pidge hook install|uninstall` by hand), tagged
+  and removable, other hooks untouched.
+- **Measured live, twice:** with the watch under Claude Code the Monitor
+  survived `/compact` AND `/clear` (messages after both were answered and
+  acked, "1 monitor still running"), and presence flipped to offline ~35 s
+  after the session was killed.
+
+`KNOWN_MANIFEST_VERSION` → 125. Spine rev 28 → 29: every installed skill
+self-heals on its next command.
+
 ## 0.53.3 — 2026-08-29
 
 **The proof reaches the two paths round 3 actually took — and the ack line now
