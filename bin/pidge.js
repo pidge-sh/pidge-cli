@@ -1461,7 +1461,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // v124 is onboarding-copy honesty (PIDGE_AGENT stickiness, hello's block, the
 // idle-loop wording) — 0.53.1 ships the CLI half of the same finding set, so
 // there is nothing new to nag about.
-const KNOWN_MANIFEST_VERSION = 126;
+const KNOWN_MANIFEST_VERSION = 127;
 // The hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
@@ -3881,11 +3881,40 @@ const TYPING_CLEAR_GRACE_MS = 1200;
 // long-running listen polls its parent: if it had a real parent at startup and that
 // parent dies (re-parented to pid 1), it exits so it stops eating the queue. Skipped
 // when started detached (ppid 1 already — e.g. an external_daemon under systemd).
+// The ancestry this process was launched under, oldest last: [{pid, comm}].
+// `ps` works on Linux and macOS alike; a missing ps yields [] (pid-only guard).
+function ancestry(maxDepth = 12) {
+  const out = [];
+  try {
+    const { spawnSync } = require('node:child_process');
+    let pid = process.ppid;
+    for (let i = 0; i < maxDepth && pid > 1; i++) {
+      const r = spawnSync('ps', ['-o', 'ppid=,comm=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 });
+      const m = /^\s*(\d+)\s+(.*)$/.exec((r.stdout || '').trim());
+      if (!m) break;
+      out.push({ pid, comm: m[2].trim() });
+      pid = Number(m[1]);
+    }
+  } catch { /* no ps — pid-only guard below */ }
+  return out;
+}
+const HARNESS_COMM = /^(claude|codex|gemini|node)$/; // the agent runtimes that own a watch
 function installOrphanWatchdog() {
   if (process.ppid === 1) return; // already detached — nothing to orphan from
+  // The HARNESS is what must stay alive, not the shell between us. Measured:
+  // three watches outlived their dead Claude Code sessions for hours because
+  // the `bash -c`/`sh -c` wrappers survived — the server stayed green while
+  // nobody read a line (deaf consumers). Pin the nearest ancestor that looks
+  // like an agent runtime at start and exit the moment it is gone.
+  const chain = ancestry();
+  const harness = chain.find((a) => HARNESS_COMM.test(a.comm) && a.pid !== process.ppid) || chain.find((a) => HARNESS_COMM.test(a.comm)) || null;
   const t = setInterval(() => {
     if (process.ppid === 1) {
       console.error('pidge: parent process died — exiting so I stop consuming the channel (orphan-zombie guard). Relaunch from your harness.');
+      process.exit(0);
+    }
+    if (harness && !pidAlive(harness.pid)) {
+      console.error(`pidge: the harness that launched me (${harness.comm}, pid ${harness.pid}) is gone — exiting so the channel reads OFFLINE instead of a deaf consumer. Relaunch the watch from a live session.`);
       process.exit(0);
     }
   }, 2000);
@@ -7810,7 +7839,10 @@ function writeSkillFile(file, content, backup = true) {
       // --follow is SUPERVISOR-ONLY — warn LOUDLY at startup. A turn-based
       // agent that uses it traps its turn (the process keeps listening); the
       // default one-shot, looped from the supervisor, is what almost everyone wants.
-      if (v.follow) {
+      // The session-length watch (--timeout 0 under a harness that streams
+      // stdout) IS the blessed shape — never scold it (measured: the warning
+      // fired on every boot of the recommended invocation).
+      if (v.follow && !followForever) {
         console.error('pidge: --follow keeps this process listening until --timeout (supervisor mode).');
         console.error('pidge: a TURN-BASED agent must NOT use --follow — it traps the turn. Use the');
         console.error('pidge: default one-shot (loop the command from your supervisor) instead.');

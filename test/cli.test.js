@@ -4877,3 +4877,36 @@ test('hook install from a real install path writes `pidge presence` when a pidge
   await mock.stop();
   assert.match(JSON.parse(b.stdout).command, /pidge\.js' presence$/, 'no global pidge: this CLI\'s path');
 });
+
+test('0.54.5: a watch exits when the HARNESS that launched it dies, even though its shell parent survives (no deaf consumer)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-orphan-'));
+  // harness (node) → sh (survives) → the watch. Kill the harness; the shell keeps living.
+  const harness = spawn(process.execPath, ['-e', `
+    const { spawn } = require('child_process');
+    const sh = spawn('sh', ['-c', ${JSON.stringify(`${process.execPath} ${CLI} online --follow --ndjson --timeout 0 --no-realtime --interval 1 2>"${xdg}/watch.err"; sleep 30`)}], { stdio: 'ignore' });
+    setInterval(() => {}, 1000);
+  `], { env: { ...process.env, PIDGE_URL: `http://127.0.0.1:${port}`, PIDGE_TOKEN: 'hld_test', XDG_CONFIG_HOME: xdg, HOME: xdg, CLAUDECODE: '1' }, stdio: 'ignore' });
+  const lock = path.join(xdg, 'pidge', `bridge-${crypto.createHash('sha256').update('hld_test').digest('hex').slice(0, 16)}.lock`);
+  const until = Date.now() + 15000;
+  while (!fs.existsSync(lock) && Date.now() < until) await new Promise((r) => setTimeout(r, 200));
+  assert.ok(fs.existsSync(lock), 'the watch is up (lock held)');
+  harness.kill('SIGKILL'); // the harness dies; sh keeps the watch as its child
+  const until2 = Date.now() + 12000;
+  while (fs.existsSync(lock) && Date.now() < until2) await new Promise((r) => setTimeout(r, 300));
+  await mock.stop();
+  assert.ok(!fs.existsSync(lock), 'the watch released the channel after its harness died');
+  assert.match(fs.readFileSync(path.join(xdg, 'watch.err'), 'utf8'), /the harness that launched me \(node, pid \d+\) is gone/);
+});
+
+test('0.54.5: the session-length watch is not scolded as "TURN-BASED must NOT use --follow"', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  const w = runCli(['online', '--follow', '--timeout', '0', '--no-realtime', '--interval', '1'], port, { CLAUDECODE: '1' });
+  await new Promise((r) => setTimeout(r, 2000));
+  w.child.kill('SIGTERM');
+  const r = await w.result;
+  await mock.stop();
+  assert.doesNotMatch(r.stderr, /must NOT use --follow/, `stderr:\n${r.stderr}`);
+});
