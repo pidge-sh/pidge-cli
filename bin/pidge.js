@@ -1417,6 +1417,13 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
   const ms = parseInt(process.env.PIDGE_FETCH_TIMEOUT || '', 10) || timeoutMs; // test/ops hook
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(new Error(`timeout after ${ms}ms`)), ms);
+  // An external signal (the bridge cutting a held long-poll short to YIELD the
+  // channel) aborts the same controller — the timeout stays the outer bound.
+  const outer = opts.signal;
+  if (outer) {
+    if (outer.aborted) ctl.abort(outer.reason);
+    else outer.addEventListener('abort', () => ctl.abort(outer.reason), { once: true });
+  }
   return fetch(url, { ...opts, signal: ctl.signal }).finally(() => clearTimeout(t));
 }
 
@@ -4636,6 +4643,7 @@ async function runBridge() {
   let shuttingDown = false;
   let currentChild = null;
   let wake = null; // resolves the current sleep early (realtime frame / shutdown)
+  let pollAbort = null; // the in-flight long-poll's controller — a yield cuts it short
   const sleepInterruptible = (ms) => new Promise((resolve) => {
     const t = setTimeout(() => { wake = null; resolve(); }, ms);
     wake = () => { clearTimeout(t); wake = null; resolve(); };
@@ -4671,6 +4679,9 @@ async function runBridge() {
     if (!yieldRequested) console.error('pidge: bridge — an interactive listener asked for the channel — yielding after the current cycle (a running handler finishes and is acked first)');
     yieldRequested = true;
     if (wake) wake();
+    // A held long-poll (up to 25 s) must not delay the handoff: abort it. The
+    // loop treats that abort as "yield now", never as a transport failure.
+    if (pollAbort) pollAbort.abort(new Error('yield'));
   });
 
   if (!(await acquireOrStandby())) return;
@@ -4902,13 +4913,19 @@ async function runBridge() {
       // already holds (gotcha #51 — read-only provenance, not messages). Unknown
       // to an old server ⇒ ignored, behaviour identical.
       const qs = new URLSearchParams({ all: 'true', wait: String(waitS), continuity: 'true' });
-      res = await fetchT(`${BASE}/api/v1/messages?${qs}`, { headers }, (waitS + 10) * 1000);
+      pollAbort = new AbortController();
+      res = await fetchT(`${BASE}/api/v1/messages?${qs}`, { headers, signal: pollAbort.signal }, (waitS + 10) * 1000);
       await checkManifestNews(res);
     } catch (e) {
       failWhat = `network: ${e.message}`;
       failCode = (e && (e.code || (e.cause && e.cause.code))) || null; // undici rides the errno on cause
+    } finally {
+      pollAbort = null;
     }
     if (shuttingDown) return;
+    // The poll was cut short by a yield request: hand the channel over NOW —
+    // no failure streak, no backoff (the top of the loop does the handoff).
+    if (failWhat && yieldRequested) continue;
 
     if (res && res.status === 200) {
       data = await res.json().catch(() => null);

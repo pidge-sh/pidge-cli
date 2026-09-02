@@ -26,9 +26,9 @@ chat. They wanted a chat with **their** agent; if it is gone, show it gone.
   (a dying daemon flap-restarts under systemd every 10 s); a `listen` started
   while the bridge holds the channel asks it to YIELD (SIGUSR2, sent only to a
   lock that names itself a bridge — an older bridge would read the signal as
-  termination), waits up to 90 s, and the bridge hands over after its current
-  cycle (a running handler finishes and is acked first), then takes the channel
-  back the moment that listen exits. The lock file now records the holder's
+  termination), waits up to 90 s, and the bridge hands over at once when idle (a held
+  long-poll is cut short) or after a running handler finishes and is acked,
+  then takes the channel back the moment that listen exits. The lock file now records the holder's
   `kind`.
 - **`bridge install` became one command, for those who DO want a stand-in.**
   `--handler claude|codex|gemini` (default: the first on PATH) GENERATES the
