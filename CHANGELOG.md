@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.54.3 — 2026-09-02
+
+**The first migration's feedback, paid back.** A secretary agent moved from a
+bridge to the watch and filed six findings in one afternoon; five land here
+(the sixth, the no-op upsert echo, is server manifest v126 — this CLI knows it).
+
+- **Consumers say what they are.** Every consuming call carries
+  `X-Pidge-Consumer-Kind: watch | listen | bridge` (WS param `kind`), and a
+  server ≥ v126 serves it back as `consumers[].kind`. The bridge and the live
+  watch share one fingerprint; whoami could not tell the stand-in from the
+  agent — the one distinction 0.54 exists to make. `presence` and
+  `bridge status` show it as `label [kind]`.
+- **`bridge status` gives ONE answer.** The server's measured presence decides
+  (a lingering consumer row or a local lock never overrules it), and a unit
+  made by hand — any name whose ExecStart runs `pidge bridge` — is listed as
+  `other_units`, so `installed:false` no longer reads as "nothing holds the
+  channel" while a hand-made bridge is active.
+- **`--follow --timeout 0` no longer warns.** The far-future deadline overflowed
+  Node's timer (`TimeoutOverflowWarning`, twice per watch); the guard is clamped.
+- **The realtime fallback says why and that it retries** ("realtime unavailable
+  (ws-unavailable) — polling for this round; the socket is tried again on the
+  next").
+- **The SessionStart hook is durable across upgrades.** From the npx cache it
+  runs `npx -y pidge-cli@latest presence`; a `pidge` on PATH is preferred; only
+  a real install path is written verbatim. Re-run `pidge hook install` to
+  refresh one written by 0.54.0–0.54.2.
+
+`KNOWN_MANIFEST_VERSION` → 126.
+
 ## 0.54.2 — 2026-09-02
 
 **`presence` trusts the measured presence, not a lingering consumer row.** Right

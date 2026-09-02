@@ -563,6 +563,12 @@ test('bridge status + uninstall: measured verdict, then the service is stopped, 
   const st2 = await runCli(['bridge', 'status'], port, shared).result;
   assert.equal(st2.code, 0);
   assert.equal(JSON.parse(st2.stdout).verdict, 'ONLINE');
+  // the MEASURED presence decides: a lingering consumer row never makes an OFFLINE channel ONLINE
+  mock.state.listeningState = 'offline';
+  const st3 = await runCli(['bridge', 'status'], port, shared).result;
+  assert.equal(st3.code, 3);
+  assert.equal(JSON.parse(st3.stdout).verdict, 'OFFLINE', 'one answer, the server\'s');
+  mock.state.listeningState = 'listening';
 
   const un = await runCli(['bridge', 'uninstall'], port, shared).result;
   await mock.stop();

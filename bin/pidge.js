@@ -1447,7 +1447,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // v124 is onboarding-copy honesty (PIDGE_AGENT stickiness, hello's block, the
 // idle-loop wording) — 0.53.1 ships the CLI half of the same finding set, so
 // there is nothing new to nag about.
-const KNOWN_MANIFEST_VERSION = 125;
+const KNOWN_MANIFEST_VERSION = 126;
 // The hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
@@ -1934,7 +1934,9 @@ async function cableSession({ channel, params = {}, deadline, onUp, onFrame }) {
         if (sub) sub.close();
         resolve(reason);
       };
-      const guard = setTimeout(() => finish('deadline'), Math.max(0, deadline - Date.now()));
+      // Clamp: --follow --timeout 0 sets a far-future deadline, and a delay past
+      // 2^31-1 ms makes Node fire the timer at once with a TimeoutOverflowWarning.
+      const guard = setTimeout(() => finish('deadline'), Math.min(2147483647, Math.max(0, deadline - Date.now())));
       sub = cableSubscribe({
         channel,
         params,
@@ -3359,7 +3361,7 @@ async function realtimeWait(cid, { timeout, interval, onAnswer, onTimeout } = {}
     if (onTimeout) return onTimeout();
     await health.exitTimeout(`no answer on ${cid}`);
   }
-  console.error('pidge: realtime unavailable — falling back to HTTP polling (same contract, less instant)');
+  console.error(`pidge: realtime unavailable (${outcome}) — falling back to HTTP polling for this wait (same contract, less instant); the socket is tried again on the next command`);
   return Math.max(1, Math.ceil((deadline - Date.now()) / 1000)); // remaining budget
 }
 
@@ -3510,10 +3512,25 @@ function agentLabel() {
 // holder can wear any identity). An OLDER server ignores
 // unknown headers, so this is harmless against an older server (release is gated
 // on S1+S2 only so the PRINTED features exist, not because headers need lockstep).
+// v126 (a live migration's finding): the bridge and the interactive watch share
+// one fingerprint, so whoami could not tell "the stand-in answered" from "the
+// live agent answered". The consumer says what it IS: watch (a harness-owned
+// session-length watch), listen (one interactive round), bridge (the daemon).
+// Sent only by the consuming commands; a send/whoami/doctor carries none.
+function consumerKind() {
+  if (command === 'bridge' && parsed.positionals[1] === undefined) return 'bridge';
+  if (command === 'listen' || command === 'online') {
+    const t = v.timeout === undefined ? NaN : Number(v.timeout);
+    return v.follow && t === 0 ? 'watch' : 'listen';
+  }
+  return null;
+}
 function identityHeaders() {
+  const kind = consumerKind();
   return {
     'x-pidge-fingerprint': agentFingerprint(),
     'x-pidge-label': encodeURIComponent(agentLabel()),
+    ...(kind ? { 'x-pidge-consumer-kind': kind } : {}),
     // SIGN the call with the execution when a run bearer is in the env — so the
     // human sees which run spoke. Present-only: no run ⇒ unsigned (identical to
     // before). Advisory (never auth) and rides EVERY channel-key call because
@@ -3526,7 +3543,8 @@ function identityHeaders() {
 // the REAL consume subscribes (listen/wait/bridge), never the doctor realtime
 // probe — a read-only diagnosis must not mint a phantom consumer.
 function wsIdentityParams() {
-  return { fingerprint: agentFingerprint(), label: agentLabel() };
+  const kind = consumerKind();
+  return { fingerprint: agentFingerprint(), label: agentLabel(), ...(kind ? { kind } : {}) };
 }
 
 // first-run notice: show the ack-after-work BREAKING-flip contract ONCE PER
@@ -5563,7 +5581,7 @@ async function runPresence() {
   // was measured, and it is exactly the contradiction a fresh session must not read.
   const state = d.listening_state || (live.length ? 'listening' : 'offline');
   if (state === 'listening') {
-    console.log(`Pidge (channel "${d.channel.name}"): ${state} — ${live.map((c) => c.label || 'a consumer').join(', ') || 'a consumer'} holds the queue. Read with \`pidge catchup --digest\`; never start a second listener.`);
+    console.log(`Pidge (channel "${d.channel.name}"): ${state} — ${live.map((c) => `${c.label || 'a consumer'}${c.kind ? ` [${c.kind}]` : ''}`).join(', ') || 'a consumer'} holds the queue. Read with \`pidge catchup --digest\`; never start a second listener.`);
   } else {
     console.log(`Pidge (channel "${d.channel.name}"): OFFLINE — nobody is listening, your human cannot reach you. Start the watch now: Monitor({command:'pidge online --follow --ndjson --timeout 0', description:'Pidge: messages from my human', persistent:true}) — then answer through \`pidge message\` and \`pidge ack\`.`);
   }
@@ -5577,7 +5595,13 @@ function projectClaudeSettingsPath() {
   return path.join(PROJECT_ROOT || process.cwd(), '.claude', 'settings.json');
 }
 function presenceHookCommand() {
+  // Durable across upgrades: a `pidge` on PATH (a global install) is preferred;
+  // from the npx cache the hook follows @latest rather than pinning the version
+  // that happened to install it (a hook pinned to a worktree path was measured).
   const inv = durableCliInvocation();
+  if (inv.via === 'npx') return `${shQuote(inv.argv[0])} -y pidge-cli@latest presence`;
+  const onPath = whichOnPath('pidge');
+  if (onPath) return 'pidge presence';
   return `${inv.argv.map(shQuote).join(' ')} presence`;
 }
 function isPidgePresenceHook(entry) {
@@ -5661,20 +5685,41 @@ async function runBridgeStatus() {
     active = !r.error && r.status === 0;
   }
   const cur = readBridgeLock(bridgeLockPath());
-  const lock = cur && lockHolderAlive(cur) ? { pid: cur.pid, since: cur.started_at || null, label: cur.label || null } : null;
+  const lock = cur && lockHolderAlive(cur) ? { pid: cur.pid, since: cur.started_at || null, label: cur.label || null, kind: cur.kind || null } : null;
+  // A unit made by hand (any name) that runs `pidge bridge` is a bridge too —
+  // `installed:false` used to read as "nothing holds the channel" during a
+  // migration whose hand-made unit was very much active (measured).
+  let other_units = [];
+  if (platform !== 'darwin') {
+    try {
+      const { spawnSync } = require('node:child_process');
+      const r = spawnSync('systemctl', ['--user', 'list-units', '--type=service', '--all', '--plain', '--no-legend'], { encoding: 'utf8' });
+      const names = (r.stdout || '').split('\n').map((l) => l.trim().split(/\s+/)[0]).filter((n) => n && n.endsWith('.service') && n !== unit);
+      for (const n of names) {
+        const show = spawnSync('systemctl', ['--user', 'show', n, '-p', 'ExecStart', '-p', 'ActiveState'], { encoding: 'utf8' });
+        if (/pidge[^\n]*bridge/.test(show.stdout || '')) other_units.push({ unit: n, active: /ActiveState=active/.test(show.stdout || '') });
+      }
+    } catch { /* no systemd — nothing to scan */ }
+  }
   let server = null;
   try {
     const { res, data } = await fetchWhoami();
     if (res.status === 200) {
       server = {
         listening_state: data.listening_state || null,
-        live_consumers: Array.isArray(data.consumers) ? data.consumers.filter((c) => c && c.live).map((c) => c.label || c.fingerprint || '?') : null,
+        live_consumers: Array.isArray(data.consumers) ? data.consumers.filter((c) => c && c.live).map((c) => `${c.label || c.fingerprint || '?'}${c.kind ? ` [${c.kind}]` : ''}`) : null,
       };
     }
   } catch { /* unknown */ }
-  const verdict = lock || (server && server.live_consumers && server.live_consumers.length) ? 'ONLINE' : 'OFFLINE';
-  console.error(`pidge: bridge status — service ${installed ? `installed (${active ? 'active' : 'NOT active'})` : 'not installed'} · local lock ${lock ? `held by pid ${lock.pid}` : 'none'} · server ${server ? `${server.listening_state || '?'}, live consumers: ${server.live_consumers ? server.live_consumers.join(', ') || 'none' : 'not reported'}` : 'unreachable'} → ${verdict}`);
-  console.log(JSON.stringify({ file, installed, active, lock, server, verdict }, null, 2));
+  // ONE answer: the server's MEASURED presence when it reports one (a lingering
+  // consumer row or a local lock never overrules it); the local lock only when
+  // the server cannot say.
+  const verdict = server && server.listening_state
+    ? (server.listening_state === 'listening' ? 'ONLINE' : 'OFFLINE')
+    : (lock || (server && server.live_consumers && server.live_consumers.length) ? 'ONLINE' : 'OFFLINE');
+  const units = other_units.length ? ` · other bridge unit(s): ${other_units.map((u) => `${u.unit}${u.active ? ' (active)' : ''}`).join(', ')}` : '';
+  console.error(`pidge: bridge status — service ${installed ? `installed (${active ? 'active' : 'NOT active'})` : 'not installed'}${units} · local lock ${lock ? `held by pid ${lock.pid}${lock.kind ? ` (${lock.kind})` : ''}` : 'none'} · server ${server ? `${server.listening_state || '?'}, live consumers: ${server.live_consumers ? server.live_consumers.join(', ') || 'none' : 'not reported'}` : 'unreachable'} → ${verdict}`);
+  console.log(JSON.stringify({ file, installed, active, other_units, lock, server, verdict }, null, 2));
   process.exit(verdict === 'ONLINE' ? 0 : 3);
 }
 
@@ -8007,7 +8052,7 @@ function writeSkillFile(file, content, backup = true) {
         if (outcome === 'got-messages') {
           await new Promise(() => {}); // printAndAck is in flight and exits the process
         }
-        console.error('pidge: realtime unavailable — falling back to HTTP polling (same contract, less instant)');
+        console.error(`pidge: realtime unavailable (${outcome}) — falling back to HTTP polling for the rest of this round (same contract, less instant); the socket is tried again on the next round`);
       }
 
       for (;;) {
