@@ -585,3 +585,57 @@ test('the DEFAULT listen stdout is unchanged: continuity lines, then ONE pretty 
   assert.ok(Array.isArray(arr) && arr[0].body === 'sem ndjson', 'and the messages are ONE pretty-printed array');
   assert.ok(!/batch_end/.test(r.stdout), 'batch_end belongs to --ndjson only — the default format is untouched');
 });
+
+// ── gate hygiene on the WATCH (0.54.8) ──────────────────────────────────────
+// The bridge has acked Face-ID gate answers without spawning a handler since
+// the incident that named the rule; the listen/online watch is younger and
+// never got it ported. Consequence in the field: a gated money decision (sent
+// as a custom action, answered with Face ID) landed in the queue and the watch
+// surfaced it as if it were a fresh command — a consumer had to hand-write an
+// arbiter rule so the order wasn't executed twice. Same rule, same wording,
+// one implementation (siftGatedReplies). Old servers never set ref.gated, so
+// the filter matches nothing there — a no-op, exactly as on the bridge.
+test('listen --all: a GATED reply is acked and NEVER surfaced; the real rows still flow', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [
+    { id: 61, kind: 'notification_reply', body: 'Submit', created_at: 'x',
+      ref: { correlation_id: 'gate-9', title: 'Approve: wire the order?', event_kind: 'acted', gated: true } },
+    { id: 62, kind: 'message', body: 'trabalho real', created_at: 'x' },
+    { id: 63, kind: 'notification_reply', body: 'Sim', created_at: 'x',
+      ref: { correlation_id: 'q-1', title: 'Deploy?', event_kind: 'acted' } },
+  ];
+
+  const r = await runCli(['listen', '--all', '--ndjson', '--no-realtime', '--timeout', '10', '--interval', '1'], port).result;
+  await mock.stop();
+
+  assert.equal(r.code, 0, `stderr:\n${r.stderr}`);
+  const lines = r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+  assert.ok(!/Submit/.test(r.stdout), 'no gate label ever reaches the consumer as a row');
+  assert.deepEqual(lines.filter((l) => l.id !== undefined).map((l) => l.id), [62, 63],
+    'the composer message and the NORMAL (ungated) answer both flow through — no over-filtering');
+  assert.equal(lines[lines.length - 1].max_ackable_id, 63, 'batch_end never counts the gated row');
+  // acked, never eaten silently: by its EXACT id, with the WHY on the summary.
+  const gatedAck = mock.state.ackBodies.find((b) => Array.isArray(b.ids) && b.ids.includes(61));
+  assert.ok(gatedAck, 'the gated row is acked by the watch itself');
+  assert.match(gatedAck.summary || '', /gate answer/i, 'the ack summary says WHY (provenance, not silence)');
+  assert.match(r.stderr, /gate answer\(s\) acked WITHOUT/, 'loud on stderr, mirroring the bridge');
+  // the read-receipt split is untouched: nothing else was acked this round.
+  assert.equal(mock.state.ackBodies.length, 1, 'the ungated rows stay DELIVERED (the agent acks after the work)');
+});
+
+test('listen --all: a round of NOTHING BUT gate answers is an EMPTY round (prints nothing, keeps listening)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = [
+    { id: 71, kind: 'notification_reply', body: 'Submit', created_at: 'x',
+      ref: { correlation_id: 'gate-10', title: 'Approve: delete the vault?', event_kind: 'acted', gated: true } },
+  ];
+
+  const r = await runCli(['listen', '--all', '--ndjson', '--no-realtime', '--timeout', '5', '--interval', '1'], port).result;
+  await mock.stop();
+
+  assert.equal(r.code, 3, `an empty round, not a delivery; stderr:\n${r.stderr}`);
+  assert.equal(r.stdout.trim(), '', 'stdout stays empty — a gate outcome is not a row');
+  assert.ok(mock.state.ackBodies.some((b) => (b.ids || []).includes(71)), 'it was still acked, not left to re-serve forever');
+});

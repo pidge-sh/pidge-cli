@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.54.8 — 2026-09-03
+
+**A printed body is drained before the process exits.** stdout on a PIPE is
+async: `inbox`, `catchup`, `listen`/`online`, `whoami`, `ack`, `wait` and the
+`--exec` tee printed their body and called `process.exit()` on the next tick,
+so a consumer reading through a subprocess got whatever the ~64 KB pipe buffer
+had taken and no more. Measured: a 466 KB `pidge inbox --limit 200` arrived cut
+mid-string ("Unterminated string" in the agent that parsed it) while the same
+command redirected to a file was whole — and a half-read inbox produced a false
+"receipt not found" inside a money gate. Those exits now flush first.
+
+- **The watch filters Face-ID gate answers, like the bridge always has.** A
+  `notification_reply` whose `ref.gated` is true is acked with a loud note and
+  never surfaced as a row: a gate outcome is not a command, and its bare label
+  ("Submit") reached `listen`/`online` looking like a fresh money order. One
+  implementation now serves both loops; a round of nothing but gate answers is
+  an empty round. No-op against servers that don't set the flag.
+
 ## 0.54.7 — 2026-09-02
 
 - **The harness watchdog matches the command line, not the thread name.** On
