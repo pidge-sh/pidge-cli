@@ -17,6 +17,8 @@ command redirected to a file was whole — and a half-read inbox produced a fals
   ("Submit") reached `listen`/`online` looking like a fresh money order. One
   implementation now serves both loops; a round of nothing but gate answers is
   an empty round. No-op against servers that don't set the flag.
+- The CLI knows manifest **v128** (a `detail_only` answer stamps `seen_at` itself), so a
+  fresh install no longer nags about a server it already understands.
 
 ## 0.54.7 — 2026-09-02
 

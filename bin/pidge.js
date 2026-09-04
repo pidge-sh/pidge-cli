@@ -1483,7 +1483,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // v124 is onboarding-copy honesty (PIDGE_AGENT stickiness, hello's block, the
 // idle-loop wording) — 0.53.1 ships the CLI half of the same finding set, so
 // there is nothing new to nag about.
-const KNOWN_MANIFEST_VERSION = 127;
+const KNOWN_MANIFEST_VERSION = 128;
 // The hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
