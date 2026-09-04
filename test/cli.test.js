@@ -4911,3 +4911,87 @@ test('0.54.5: the session-length watch is not scolded as "TURN-BASED must NOT us
   await mock.stop();
   assert.doesNotMatch(r.stderr, /must NOT use --follow/, `stderr:\n${r.stderr}`);
 });
+
+// ── 0.54.8: a printed body must survive the pipe ────────────────────────────
+// The field bug: `pidge inbox --limit 200` read by an agent through a
+// subprocess arrived cut at ~64 KB ("Unterminated string" when it parsed it),
+// while the SAME command redirected to a FILE was whole (466 KB) — and the
+// half-read inbox produced a false "receipt not found" inside a money gate.
+// Cause: stdout on a PIPE is async, so `console.log(big)` + `process.exit(0)`
+// on the next tick drops whatever the pipe buffer hadn't taken. The consumer
+// here is DELIBERATELY slow (it attaches its reader a second late, exactly the
+// shape of a subprocess that collects output after the child is gone) — the
+// unfixed CLI loses the tail there, and a pipe is the CANONICAL way an agent
+// reads this CLI.
+test('0.54.8: a big `inbox` body reaches a SLOW pipe consumer WHOLE (no 64 KB cut)', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  // ~460 KB — the size the field report measured.
+  mock.state.inboxNotifications = Array.from({ length: 400 }, (_, i) => ({
+    id: i + 1, correlation_id: `cid-${i}`, title: `t${i}`.padEnd(120, '·'),
+    body: 'conteúdo do relatório '.repeat(40), status: 'delivered', responded: false,
+  }));
+
+  const child = spawn(process.execPath, [CLI, 'inbox', '--limit', '200'], {
+    env: {
+      ...process.env,
+      PIDGE_URL: `http://127.0.0.1:${port}`,
+      PIDGE_TOKEN: 'hld_test',
+      XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-flush-')),
+      HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-flush-home-')),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stderr.on('data', (c) => { stderr += c; });
+  // stdout is left UNREAD on purpose: no 'data' handler ⇒ the stream never
+  // flows and the OS pipe fills at 64 KB while the CLI prints.
+  const closed = new Promise((resolve) => child.on('close', (code) => resolve(code)));
+  await sleep(1200); // the CLI has printed (and, unfixed, exited) by now
+  child.stdout.on('data', (c) => { stdout += c; });
+  const code = await closed;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr:\n${stderr}`);
+  assert.ok(stdout.length > 65536,
+    `the body was truncated at the pipe buffer: ${stdout.length} bytes (65536 = the classic cut); stderr:\n${stderr}`);
+  const data = JSON.parse(stdout); // the assertion that matters: it still PARSES
+  assert.equal(data.notifications.length, 400, 'every row arrived, not just the first pipe-full');
+});
+
+// The same cut, on the path an agent lives in: a `listen`/`online` round prints
+// the whole batch and exits. A watch whose batch is truncated hands its agent
+// half a message — worse than none, because it parses.
+test('0.54.8: a big `listen` batch reaches a SLOW pipe consumer WHOLE', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.messages = Array.from({ length: 60 }, (_, i) => ({
+    id: i + 1, kind: 'message', created_at: 'x',
+    body: `mensagem ${i}: ` + 'texto longo do humano '.repeat(300),
+  }));
+
+  const child = spawn(process.execPath, [CLI, 'listen', '--all', '--no-realtime', '--timeout', '10', '--interval', '1'], {
+    env: {
+      ...process.env,
+      PIDGE_URL: `http://127.0.0.1:${port}`,
+      PIDGE_TOKEN: 'hld_test',
+      XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-flush2-')),
+      HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'pidge-flush2-home-')),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stderr.on('data', (c) => { stderr += c; });
+  const closed = new Promise((resolve) => child.on('close', (code) => resolve(code)));
+  await sleep(1500);
+  child.stdout.on('data', (c) => { stdout += c; });
+  const code = await closed;
+  await mock.stop();
+
+  assert.equal(code, 0, `stderr:\n${stderr}`);
+  assert.ok(stdout.length > 65536, `truncated batch: ${stdout.length} bytes; stderr:\n${stderr}`);
+  const rows = JSON.parse(stdout);
+  assert.equal(rows.length, 60, 'the whole batch parses — every row is there');
+});

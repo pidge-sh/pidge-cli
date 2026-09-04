@@ -180,6 +180,28 @@ const TOKEN = process.env.PIDGE_TOKEN || process.env.HERALD_TOKEN || FILE_ENV.PI
 const RUN_TOKEN = process.env.PIDGE_RUN_TOKEN || null;
 
 function die(msg, code = 1) { console.error(msg); process.exit(code); }
+// stdout on a PIPE is ASYNC (to a file or a TTY it is not): `console.log(body)`
+// only QUEUES the bytes, and a `process.exit()` on the next tick kills the drain
+// wherever the pipe buffer ended. Measured: a 486 KB body printed then exited
+// reached a slow reader as 64 KB — or as NOTHING — while the SAME command
+// redirected to a file was whole. That is exactly how `pidge inbox --limit 200`
+// read through a subprocess arrived cut at ~64 KB ("Unterminated string" in the
+// agent that parsed it), and a pipe IS the canonical way an agent reads this
+// CLI. So every exit that FOLLOWS a printed body goes through here instead: the
+// zero-length write's callback fires only after the bytes already queued reached
+// the OS. stderr drains too — the narration is the provenance of that body.
+//   ALWAYS `await exitFlushed(code)` (or `return exitFlushed(code)`): the
+// promise never resolves, so nothing after the call runs — the same "this line
+// ends the process" reading `process.exit()` had. Dropping the await would let
+// the next statements execute in the tick before the exit lands.
+function exitFlushed(code = 0) {
+  return new Promise(() => {
+    let pending = 2;
+    const bye = () => { if (--pending === 0) process.exit(code); };
+    try { process.stdout.write('', bye); } catch { bye(); }
+    try { process.stderr.write('', bye); } catch { bye(); }
+  });
+}
 // NB: the TOKEN requirement is enforced AFTER help/usage handling (below) — a
 // first-time `npx pidge-cli --help` must work without any setup.
 
@@ -1461,7 +1483,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // v124 is onboarding-copy honesty (PIDGE_AGENT stickiness, hello's block, the
 // idle-loop wording) — 0.53.1 ships the CLI half of the same finding set, so
 // there is nothing new to nag about.
-const KNOWN_MANIFEST_VERSION = 127;
+const KNOWN_MANIFEST_VERSION = 128;
 // The hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
@@ -3127,15 +3149,15 @@ async function doApprove() {
       console.log(JSON.stringify(chosen, null, 2)); // machine output on stdout
       if (chosen && chosen.action_id === 'allow') {
         console.error('pidge: ALLOWED — the human approved (Face ID). exit 0');
-        process.exit(0);
+        return exitFlushed(0); // return: nothing below may run before the exit
       }
       console.error(`pidge: DENIED — the human chose "${(chosen && chosen.action_id) || '?'}" (deny-default: only an explicit allow is exit 0). exit 1`);
-      process.exit(1);
+      return exitFlushed(1);
     },
     onTimeout: () => {
       console.log(JSON.stringify({ decision: 'deny', reason: 'timeout', correlation_id: cid }));
       console.error('pidge: no answer before the timeout — DENIED (deny-default; a gate must fail closed). exit 1');
-      process.exit(1);
+      return exitFlushed(1);
     },
   });
 }
@@ -3184,7 +3206,7 @@ async function drainComposerQueue() {
 // kind:"human_message" is the discriminator — a chosen_action parser switching
 // on kind sees a NEW kind, never a mis-shaped answer. The notification stays
 // unanswered: the note says so, and says how to resume.
-function exitWithComposerMessages(cid, { msgs, contexts }) {
+async function exitWithComposerMessages(cid, { msgs, contexts }) {
   for (const ctx of contexts || []) console.log(JSON.stringify({ type: 'continuity_context', ...ctx }));
   const upTo = Math.max(...msgs.map((m) => m.id));
   console.log(JSON.stringify({
@@ -3194,7 +3216,9 @@ function exitWithComposerMessages(cid, { msgs, contexts }) {
     messages: msgs,
   }, null, 2));
   console.error(`pidge: ${msgs.length} composer message(s) DELIVERED (gray ✓✓), NOT done — ACK AFTER you handle them: \`pidge ack --up-to ${upTo}\` (the ~10-min lease re-serves un-acked rows).`);
-  process.exit(0);
+  // the drained messages are on stdout — drain the PIPE before exiting, or a
+  // slow reader gets a truncated batch (see exitFlushed). Callers must await.
+  return exitFlushed(0);
 }
 
 // Poll GET /notifications/:cid until a TERMINAL answer, print chosen_action JSON to
@@ -3249,11 +3273,11 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
             return onAnswer(chosen);
           } else {
             console.log(JSON.stringify(chosen, null, 2));
-            process.exit(0);
+            await exitFlushed(0); // the answer is on stdout — drain the pipe first
           }
         } else if (wakeQueue && data.messages_pending) {
           const drained = await drainComposerQueue();
-          if (drained) exitWithComposerMessages(cid, drained);
+          if (drained) await exitWithComposerMessages(cid, drained);
           // raced empty (another consumer took the rows) — keep waiting
         } else if (!firedNotice && data.escalation && data.escalation.state === 'fired') {
           firedNotice = true;
@@ -3357,7 +3381,7 @@ async function realtimeWait(cid, { timeout, interval, onAnswer, onTimeout } = {}
   clearInterval(safety);
   if (outcome === 'composer') {
     const drained = await drainComposerQueue();
-    if (drained) exitWithComposerMessages(cid, drained);
+    if (drained) await exitWithComposerMessages(cid, drained);
     // raced empty (another consumer took the rows) — hand the remaining budget
     // to the poller, which re-holds with the wake armed. Not a WS failure, so
     // no "realtime unavailable" line.
@@ -4489,6 +4513,27 @@ async function ackExactIds(tag, ids, summary, runToken) {
   return false;
 }
 
+// Gate hygiene (server ≥ manifest v83) — the ONE implementation, shared by the
+// `bridge` loop and the `listen`/`online` watch (they consume the same queue;
+// only one of them used to know this rule, and a Face-ID answer surfaced by the
+// watch read as a fresh imperative command — a money order nearly executed
+// twice). A notification_reply whose `ref` carries gated:true is the outcome of
+// a Face-ID gate (`pidge approve` / `approval grant` / `--gated` confirm): the
+// asker already heard it on its own wait/webhook, and its bare label ("Submit")
+// must never reach an autonomous consumer looking like work. So: ack it HERE
+// (loudly, with a summary so provenance says WHY) and return only the rows that
+// ARE work. Old servers never set ref.gated ⇒ nothing matches, behavior
+// unchanged. `what` names what did NOT happen, in the caller's own vocabulary.
+async function siftGatedReplies(tag, msgs, { what = 'spawning a handler', runToken = null } = {}) {
+  const gated = msgs.filter((m) => m && m.kind === 'notification_reply' && m.ref && m.ref.gated === true);
+  if (!gated.length) return msgs;
+  console.error(`pidge: ${tag} — ${gated.length} Face-ID gate answer(s) acked WITHOUT ${what} (a gate outcome is not a command; the asker already heard it — canonical answer stays on the notification)`);
+  const gatedIds = gated.map((m) => Number(m.id)).filter(Number.isInteger);
+  if (gatedIds.length)
+    await ackExactIds(tag, gatedIds, `Face-ID gate answer — auto-acked by the ${tag}, no handler spawned`, runToken);
+  return msgs.filter((m) => !gated.includes(m));
+}
+
 // A LOCAL alert for the two "only a human can fix this" failures (401 —
 // rotated key? — and a channel with no healthy round-trip). We can't pidge —
 // that's exactly what's broken — so local is all there is: the stderr line is
@@ -5072,20 +5117,10 @@ async function runBridge() {
     warnConsumerConflict(data); // the consume GET flags a live sibling
 
     const allMsgs = Array.isArray(data.messages) ? data.messages : [];
-    // Gate hygiene (server ≥ manifest v83): a notification_reply whose ref
-    // carries gated:true is the outcome of a Face-ID gate (pidge approve /
-    // approval grant / --gated confirm) — the asker already heard it on its own
-    // wait/webhook, and its bare label ("Submit") must never reach an
-    // autonomous handler looking like a fresh command. Ack it here (loudly,
-    // with a summary so provenance says WHY) and spawn nothing for it. Old
-    // servers never set ref.gated ⇒ this filter is a no-op, behavior unchanged.
-    const gatedRows = allMsgs.filter((m) => m && m.kind === 'notification_reply' && m.ref && m.ref.gated === true);
-    if (gatedRows.length) {
-      console.error(`pidge: bridge — ${gatedRows.length} Face-ID gate answer(s) acked WITHOUT spawning a handler (a gate outcome is not a command; the asker already heard it — canonical answer stays on the notification)`);
-      const gatedIds = gatedRows.map((m) => Number(m.id)).filter(Number.isInteger);
-      if (gatedIds.length) await ackBatch(gatedIds, 'Face-ID gate answer — auto-acked by the bridge, no handler spawned', null);
-    }
-    const msgs = allMsgs.filter((m) => !gatedRows.includes(m));
+    // Gate hygiene — a Face-ID gate answer is acked here and NEVER spawns a
+    // handler. The rule and the reasoning live in siftGatedReplies (shared with
+    // the listen/online watch, which consumes this same queue).
+    const msgs = await siftGatedReplies('bridge', allMsgs);
     if (msgs.length === 0) {
       // The long-poll hold IS the pacing; only a fast empty return sleeps (a
       // server that doesn't hold ?wait= must not become a hot loop). The
@@ -7178,7 +7213,7 @@ function writeSkillFile(file, content, backup = true) {
       // live consumers + predecessor provenance (present-only).
       reportConsumers(data);
       reportProvenance(data);
-      process.exit(0);
+      await exitFlushed(0); // the whoami body is on stdout — drain it (gotcha: pipes)
       break;
     }
     case 'skill': {
@@ -7302,7 +7337,7 @@ function writeSkillFile(file, content, backup = true) {
         onAnswer: async (chosen) => {
           console.log(JSON.stringify(chosen, null, 2));
           await nudgeStayOnline();
-          process.exit(0);
+          await exitFlushed(0);
         },
         // The debut goes through the SAME health verdict as wait/listen. Its
         // own exit-3 line bypassed it, so a hello on a channel that never had
@@ -7453,7 +7488,7 @@ function writeSkillFile(file, content, backup = true) {
           ? `pidge: ✓ acked.${seen} Relaunch your listener for the next round — or keep a session-length watch up (\`pidge online --follow --ndjson --timeout 0\` under a monitor your harness owns) — then \`pidge selftest\` PROVES it. Never claim online from memory.`
           : `pidge: nothing was acked — but the loop still needs you: relaunch your listener (\`pidge listen --all\`) to stay online.${seen}`);
       }
-      process.exit(0);
+      await exitFlushed(0); // the server body is on stdout — drain it
       break;
     }
     case 'contract': {
@@ -7553,7 +7588,9 @@ function writeSkillFile(file, content, backup = true) {
         if (sealed)
           console.error(`pidge: ${sealed} of them are E2E-sealed — the index echoes your envelopes as stored (ciphertext); \`pidge wait <cid>\` decrypts an answer, the app shows plaintext`);
       }
-      process.exit(0);
+      // the whole server body went to stdout above — drain it before exiting
+      // (a `--limit 200` inbox is hundreds of KB; a bare exit cuts it at the pipe).
+      await exitFlushed(0);
       break;
     }
     case 'catchup': {
@@ -7695,7 +7732,8 @@ function writeSkillFile(file, content, backup = true) {
         }
         console.error(`pidge: cursor — newest message is id ${highestId}${newerNote}. Next session: \`pidge catchup --digest --since ${highestId}\` shows only what arrives after.`);
       }
-      process.exit(0);
+      // the whole thread went to stdout above — drain it before exiting.
+      await exitFlushed(0);
       break;
     }
     case 'online':
@@ -7860,10 +7898,12 @@ function writeSkillFile(file, content, backup = true) {
       // --follow: print+ack a batch and KEEP listening until the
       // timeout — the supervisor loop without re-spawning a process per batch.
       let gotAny = false;
-      const followEnd = () => {
+      const followEnd = async () => {
         if (v.follow && gotAny) {
           console.error(`pidge: --follow window ended after ${timeout}s — batches were delivered`);
-          process.exit(0);
+          // batches were printed during this window: drain stdout before exiting
+          // (the last one is still queued for a slow reader). Callers must await.
+          await exitFlushed(0);
         }
         return false;
       };
@@ -7882,6 +7922,18 @@ function writeSkillFile(file, content, backup = true) {
       // openContinuity below: printed as their own stdout lines in the read
       // modes, handed to the handler as `batch.continuity` under --exec.
       let roundContinuity = null;
+      // Gate hygiene, the SAME rule the bridge applies (siftGatedReplies): a
+      // Face-ID gate answer is acked here and never surfaced as a row. The watch
+      // is younger than the bridge and never got the rule ported — so a gated
+      // money/deletion decision reached the agent as if it were a fresh command,
+      // and a consumer had to hand-write its own guard against acting twice.
+      // Applied to EVERY round (WS drain and poll alike) BEFORE the "did we get
+      // anything?" check: a round of nothing-but-gate-answers is an EMPTY round —
+      // it prints nothing, exits nothing, and keeps listening.
+      const siftGated = (rows) => siftGatedReplies('listen', rows, {
+        what: execHandler ? 'spawning a handler' : 'surfacing them as fresh rows',
+        runToken: process.env.PIDGE_RUN_TOKEN || null,
+      });
       // Print + (conditionally) ack — shared by the WS and polling paths.
       const printAndAck = async (msgsRaw) => {
         // E2E: open sealed rows BEFORE anything prints (stdout JSON and the
@@ -7973,7 +8025,12 @@ function writeSkillFile(file, content, backup = true) {
           console.error(`pidge: NEW in 0.9.x — ${msgs.length} message(s) DELIVERED (gray ✓✓), NOT done. ACK AFTER you handle them: \`pidge ack --up-to ${upTo}\` (a ~10-min lease re-serves un-acked messages, so a crash between "I have it" and "I'm done" never loses one). Use --ack-on-read for the old immediate-consume.`);
         }
         gotAny = true;
-        if (!v.follow) process.exit(0);
+        // The whole batch (a --ndjson round, or the pretty JSON array with its
+        // opened attachments) is on stdout — drain the pipe BEFORE exiting, or a
+        // consumer reading this process's output through a subprocess gets it cut
+        // at the pipe buffer. `await`/`return`, never a bare call: the --follow
+        // line below must not print on a round that is exiting (see exitFlushed).
+        if (!v.follow) return exitFlushed(0);
         console.error('pidge: --follow — still listening');
       };
 
@@ -8049,12 +8106,14 @@ function writeSkillFile(file, content, backup = true) {
               // green one, whatever the handler thought.
               machineLine({ type: 'ack_failed', ids: batchIds });
               console.error(`pidge: listen — the handler exited 0 but the ACK did NOT land: the work happened and the server doesn't know it. The batch re-serves after the lease and your handler will see it AGAIN — make it idempotent, and ack by hand if it must not repeat: \`pidge ack --ids ${batchIds.join(',')} --summary "<what you did>"\`.`);
-              process.exit(2);
+              await exitFlushed(2);
             }
             if (!summary)
               console.error('pidge: listen — the handler printed no `pidge-summary:` line, so the ack carries no note (never invented). Have it end with: echo "pidge-summary: <what you did>"');
           }
-          process.exit(0);
+          // the handler's whole stdout was TEED through ours — drain it (a long
+          // handler transcript is exactly the body a bare exit would cut).
+          await exitFlushed(0);
         }
         const reason = outcome.error ? 'spawn_error'
           : outcome.timedOut ? 'timeout'
@@ -8070,7 +8129,7 @@ function writeSkillFile(file, content, backup = true) {
           ids: batchIds,
         });
         console.error(`pidge: listen — handler ${why} after ${seconds}s — NOTHING acked: the ~10-min lease re-serves these message(s) (ids ${batchIds.join(', ') || 'none'}). Fix the handler (or handle the batch yourself) and relaunch; at-least-once means it will come back.`);
-        process.exit(2);
+        await exitFlushed(2); // the teed handler output + this verdict line are on stdout
       };
 
       // Realtime path: hold ConversationChannel — the human sees "ouvindo
@@ -8089,7 +8148,7 @@ function writeSkillFile(file, content, backup = true) {
               const data = await res.json().catch(() => ({}));
               warnStalePriorClaim(data); // session-header warning, once
               warnConsumerConflict(data); // the consume GET flags a live sibling
-              const msgs = data.messages || [];
+              const msgs = await siftGated(data.messages || []);
               await printContinuity(data); // read-only provenance, before the exiting printAndAck
               if (msgs.length) {
                 if (!v.follow) finish('got-messages');
@@ -8133,7 +8192,7 @@ function writeSkillFile(file, content, backup = true) {
         // Only a GENUINE deadline exits; an early/spurious 'deadline' or
         // 'ws-unavailable' degrades to polling below (never an early timeout lie).
         if (outcome === 'deadline' && Date.now() >= deadline - 1500) {
-          followEnd();
+          await followEnd();
           await health.exitTimeout('no message from the human', LEASE_HINT, RELAUNCH_NUDGE);
         }
         if (outcome === 'got-messages') {
@@ -8157,7 +8216,7 @@ function writeSkillFile(file, content, backup = true) {
             const data = await res.json().catch(() => ({}));
             warnStalePriorClaim(data); // session-header warning, once
             warnConsumerConflict(data); // the consume GET flags a live sibling
-            const msgs = data.messages || [];
+            const msgs = await siftGated(data.messages || []);
             await printContinuity(data); // read-only provenance, before the exiting printAndAck
             if (msgs.length) await printAndAck(msgs);
           } else if (res.status === 401 || res.status === 403) {
@@ -8174,7 +8233,7 @@ function writeSkillFile(file, content, backup = true) {
           health.fail(`network: ${e.message}`);
         }
         if (Date.now() >= deadline) {
-          followEnd();
+          await followEnd();
           await health.exitTimeout('no message from the human', LEASE_HINT, RELAUNCH_NUDGE);
         }
         const pace = health.degraded ? DEGRADED_INTERVAL_S : listenInterval;
