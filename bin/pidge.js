@@ -826,9 +826,10 @@ REALTIME
   --realtime      force WS (warns + falls back to polling if unavailable)
   --no-realtime   polling only (the ?wait= long-poll, capped 25 s server-side)
   Degrade ladder, narrated on stderr: WS → ?wait= long-poll → plain GETs every
-  ~45 s after 3 consecutive failures on held polls. Degrade is STICKY for
-  the session (we can't probe held-poll health without re-paying the failure) —
-  re-invoke the command to retry the fast path.
+  ~45 s after 3 consecutive failures on held polls. Neither step is a latch:
+  a degraded session probes ONE held poll again after ~5 min (doubling to a
+  60 min cap while the edge keeps killing them), and a --follow watch that lost
+  the socket tries it again after a polling stint of the same shape.
 
 OPTIONS (notify / ask)
   --title TEXT             (required) the headline
@@ -1483,7 +1484,7 @@ function fetchT(url, opts = {}, timeoutMs = 30000) {
 // v124 is onboarding-copy honesty (PIDGE_AGENT stickiness, hello's block, the
 // idle-loop wording) — 0.53.1 ships the CLI half of the same finding set, so
 // there is nothing new to nag about.
-const KNOWN_MANIFEST_VERSION = 128;
+const KNOWN_MANIFEST_VERSION = 129;
 // The hand-authored skill SPINE version. BUMP whenever the SKILL.md spine
 // (the non-generated prose in installSkill) changes — an existing install whose
 // baked marker is older than this self-heals on its next pidge command, so an
@@ -1775,6 +1776,19 @@ async function ensureSkillFresh(serverManifestVersion) {
 const DEGRADE_AFTER = 3;
 // env override = a test/ops hook, not a documented knob
 const DEGRADED_INTERVAL_S = parseInt(process.env.PIDGE_DEGRADED_INTERVAL || '45', 10);
+// The degrade is a BOX, never a latch (0.54.10). It was written for a round of
+// minutes: "plain GETs for the rest of the session" cost a one-shot listen
+// nothing. The session-length watch (0.54) turned that sentence into DAYS —
+// measured on the fleet 2026-09-05→07: a ~60 s network blip at the host failed
+// three held polls in a row, and every watch on the box then polled plain
+// GETs every 45 s for two days, its presence marker never renewed (a plain
+// GET renews nothing on servers < v129), the human's app painting OFFLINE
+// over an agent that was reading its queue. So a degraded session now
+// retries ONE held poll after a box, and the box doubles while the edge
+// keeps killing held responses (5 → 10 → 20 → 40 → 60 min cap); one healthy
+// held poll ends the degrade and resets the box. env = test/ops hooks.
+const DEGRADE_RETRY_MS = parseInt(process.env.PIDGE_DEGRADE_RETRY_MS || '', 10) || 5 * 60000;
+const DEGRADE_RETRY_MAX_MS = parseInt(process.env.PIDGE_DEGRADE_RETRY_MAX_MS || '', 10) || 60 * 60000;
 // "healthy" has a SHELF LIFE. okEver was a LATCH: inside a long --follow
 // session one good round-trip at 09:00 still certified the channel at 17:00, so
 // a loop that had been deaf since lunch exited 3 ("relaunch the listener") over
@@ -1791,8 +1805,25 @@ const HEALTHY_WINDOW_MS = parseInt(process.env.PIDGE_HEALTHY_WINDOW_MS || '', 10
 const SESSION_START_MONO = performance.now();
 const health = {
   okEver: false, lastOkAt: 0, fails: 0, firstFailAt: 0, lastNoteAt: 0, degraded: false,
-  ok() {
+  degradedUntil: 0, degradeRetryMs: DEGRADE_RETRY_MS, probingHeld: false,
+  // Should the NEXT poll be held (?wait=)? Plain GETs only inside the box;
+  // when it lapses, ONE held poll probes the edge (probingHeld), and ok()/
+  // fail() on that probe decide between recovery and a longer box.
+  useHeld() {
+    if (!this.degraded) return true;
+    if (Date.now() < this.degradedUntil) return false;
+    this.probingHeld = true;
+    return true;
+  },
+  // `held` = the round-trip that succeeded was a held poll. Only a HELD
+  // success ends a degrade — plain GETs succeeding is what "degraded" means.
+  ok(held = false) {
     if (this.fails > 0) console.error(`pidge: channel recovered after ${this.fails} consecutive failure(s)`);
+    if (this.degraded && held) {
+      this.degraded = false; this.probingHeld = false; this.degradedUntil = 0;
+      this.degradeRetryMs = DEGRADE_RETRY_MS;
+      console.error('pidge: held polls work again — back on the instant path (the degrade to plain GETs is over)');
+    }
     // one healthy round-trip clears the CROSS-ROUND streak too (once per process)
     if (!this.okEver) clearHealthLedger();
     // MONOTONIC (same reason as SESSION_START_MONO): an NTP step must never
@@ -1806,9 +1837,16 @@ const health = {
   fail(what) {
     this.fails++;
     if (!this.firstFailAt) { this.firstFailAt = Date.now(); this.lastNoteAt = Date.now(); }
-    if (!this.degraded && this.fails >= DEGRADE_AFTER) {
+    if (this.degraded && this.probingHeld) {
+      // the probe died: stay on plain GETs, and wait LONGER before the next try
+      this.probingHeld = false;
+      this.degradeRetryMs = Math.min(this.degradeRetryMs * 2, DEGRADE_RETRY_MAX_MS);
+      this.degradedUntil = Date.now() + this.degradeRetryMs;
+      console.error(`pidge: a held poll still dies behind the edge (${what}) — staying on plain GETs every ~${DEGRADED_INTERVAL_S}s; next try in ~${Math.round(this.degradeRetryMs / 60000)} min`);
+    } else if (!this.degraded && this.fails >= DEGRADE_AFTER) {
       this.degraded = true;
-      console.error(`pidge: ${this.fails} consecutive failures on held polls — degraded to plain GETs every ~${DEGRADED_INTERVAL_S}s (channel stays ALIVE, just less instant). Latest: ${what}`);
+      this.degradedUntil = Date.now() + this.degradeRetryMs;
+      console.error(`pidge: ${this.fails} consecutive failures on held polls — degraded to plain GETs every ~${DEGRADED_INTERVAL_S}s (channel stays ALIVE, just less instant); a held poll is tried again in ~${Math.round(this.degradeRetryMs / 60000)} min. Latest: ${what}`);
     } else if (this.fails === 1 || Date.now() - this.lastNoteAt >= 60000) {
       this.lastNoteAt = Date.now();
       const mins = Math.round((Date.now() - this.firstFailAt) / 60000);
@@ -1958,19 +1996,27 @@ function cableSubscribe({ channel, params = {}, onUp, onFrame, onDown, base = BA
 // criterion: hours-long listens must SURVIVE it). onUp/onFrame get a
 // `finish(reason)` to end the session (e.g. when the answer landed over HTTP).
 // Resolves 'deadline' | 'ws-unavailable'.
-async function cableSession({ channel, params = {}, deadline, onUp, onFrame }) {
+// `signal` (AbortSignal, optional): the caller can END the session — the
+// watch races two subscriptions (Conversation + Inbox) and, since 0.54.10,
+// retries the socket after a polling stint; without a way to close the loser,
+// each stint would leak one live subscription for the life of a days-long watch.
+async function cableSession({ channel, params = {}, deadline, onUp, onFrame, signal = null }) {
   let wsFails = 0;      // consecutive drops SINCE the last healthy connect — the degrade gate
   let wsReconnects = 0; // monotonic total this session — what we DISPLAY (never reset)
   while (Date.now() < deadline) {
+    if (signal && signal.aborted) return 'aborted';
     const outcome = await new Promise((resolve) => {
       let sub = null;
       let settled = false;
+      const onAbort = () => finish('aborted');
       const finish = (reason) => {
         if (settled) return; settled = true;
         clearTimeout(guard);
+        if (signal) signal.removeEventListener('abort', onAbort);
         if (sub) sub.close();
         resolve(reason);
       };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
       // Clamp: --follow --timeout 0 sets a far-future deadline, and a delay past
       // 2^31-1 ms makes Node fire the timer at once with a TimeoutOverflowWarning.
       const guard = setTimeout(() => finish('deadline'), Math.min(2147483647, Math.max(0, deadline - Date.now())));
@@ -1987,7 +2033,7 @@ async function cableSession({ channel, params = {}, deadline, onUp, onFrame }) {
     if (!outcome.startsWith('down: ')) return outcome; // caller-driven finish (e.g. 'answered')
     wsFails++;
     wsReconnects++;
-    const MAX_WS_FAILS = 4; // then fall back to polling for the rest of the session
+    const MAX_WS_FAILS = 4; // then fall back to polling — a round polls to its end; a --follow watch retries the socket after a stint (0.54.10)
     if (wsFails >= MAX_WS_FAILS) return 'ws-unavailable';
     // env override = a test/ops hook (keeps the forced-1006 degrade test fast)
     const base = parseInt(process.env.PIDGE_WS_BACKOFF_MS || '2000', 10) || 2000;
@@ -3246,7 +3292,7 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
   for (;;) {
     // Degraded: a held poll keeps dying behind some edge — switch to
     // PLAIN GETs (the requests that kept working in the wild) on a slow pace.
-    const waitS = health.degraded ? 0 : Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
+    const waitS = health.useHeld() ? Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000))) : 0;
     // wake_on_message rides even the degraded plain GETs — the flag is
     // computed on any read; only the HOLD needs ?wait=.
     const qs = new URLSearchParams();
@@ -3258,7 +3304,7 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
       const res = await fetchT(url, { headers }, (waitS + 10) * 1000);
       await checkManifestNews(res);
       if (res.status === 200) {
-        health.ok();
+        health.ok(waitS > 0);
         const data = await res.json().catch(() => ({}));
         if (data.responded) {
           await e2eOpenChosen(data); // sealed answer → plaintext (gated on data.enc)
@@ -3287,7 +3333,7 @@ async function doWait(cid, { timeout, interval, onAnswer, onTimeout } = {}) {
           console.error('pidge: the escalation alarm FIRED and there is still no answer — seen_at tells you if the human at least silenced it; keep waiting or back off');
         }
       } else if (res.status === 404) {
-        health.ok(); // the server ANSWERED an AUTHORIZED read — the channel is fine, the cid isn't known (yet)
+        health.ok(waitS > 0); // the server ANSWERED an AUTHORIZED read — the channel is fine, the cid isn't known (yet)
         console.error(`pidge: no notification for correlation_id=${cid}`);
         // keep polling — the agent may call wait/ask before the send round-trips
       } else if (res.status === 401 || res.status === 403) {
@@ -8133,6 +8179,21 @@ function writeSkillFile(file, content, backup = true) {
         await exitFlushed(2); // the teed handler output + this verdict line are on stdout
       };
 
+      // 0.54.10 — polling is a FALLBACK, never a destination. `cableSession`
+      // gives the socket up after 4 consecutive drops, and this loop then
+      // polled "for the rest of the session": right for a round of minutes,
+      // wrong for the session-length watch, where one ~60 s network blip at
+      // the host (measured 2026-09-05 04:00Z, every socket on the box gone at
+      // once) left every watch polling for two days with the socket never
+      // tried again. Under --follow the polling stint is now BOXED: after
+      // WS_RETRY_MS the socket is tried again (doubling to a 60 min cap while
+      // it keeps failing, reset by a healthy connect). A one-shot round keeps
+      // the old shape — its next process retries anyway. env = test/ops hooks.
+      const WS_RETRY_MS = parseInt(process.env.PIDGE_WS_RETRY_MS || '', 10) || 5 * 60000;
+      const WS_RETRY_MAX_MS = parseInt(process.env.PIDGE_WS_RETRY_MAX_MS || '', 10) || 60 * 60000;
+      let wsRetryMs = WS_RETRY_MS;
+      let wsEverUp = false;
+      for (;;) {
       // Realtime path: hold ConversationChannel — the human sees "ouvindo
       // agora" — and treat frames as wake-ups: the BACKLOG is always re-read over
       // a plain GET (at-least-once; also catches messages sent while offline).
@@ -8167,29 +8228,41 @@ function writeSkillFile(file, content, backup = true) {
           }
         };
         let announced = false;
+        // one controller per stint: the race's loser (and, on a retry, both
+        // sessions of the stint that failed) is CLOSED, never left to leak.
+        const stint = new AbortController();
         const sessions = [cableSession({
           channel: 'ConversationChannel',
           params: wsIdentityParams(),
           deadline,
+          signal: stint.signal,
           onUp: (finish) => {
-            if (!announced) { announced = true; console.error(`pidge: listening over the realtime socket${v.all ? ' — single ear: composer + notification answers' : ''} (the human sees "ouvindo agora")`); }
+            wsRetryMs = WS_RETRY_MS; // a healthy connect resets the retry box
+            if (!announced) {
+              announced = true;
+              console.error(wsEverUp
+                ? 'pidge: the realtime socket is BACK — instant delivery again (the human sees "ouvindo agora")'
+                : `pidge: listening over the realtime socket${v.all ? ' — single ear: composer + notification answers' : ''} (the human sees "ouvindo agora")`);
+              wsEverUp = true;
+            }
             drain(finish);
           },
           onFrame: (m, finish) => { if (m.type === 'message') drain(finish); },
         })];
         // --all: answers broadcast on InboxChannel, not Conversation — a
-        // second subscription wakes the same HTTP drain (the queue is the ledger;
-        // the loser session leaks until exit, harmless in a one-shot process).
+        // second subscription wakes the same HTTP drain (the queue is the ledger).
         if (v.all) {
           sessions.push(cableSession({
             channel: 'InboxChannel',
             params: wsIdentityParams(),
             deadline,
+            signal: stint.signal,
             onUp: (finish) => drain(finish),
             onFrame: (m, finish) => { if (m.type === 'event' && m.responded) drain(finish); },
           }));
         }
         const outcome = await Promise.race(sessions);
+        stint.abort();
         // Only a GENUINE deadline exits; an early/spurious 'deadline' or
         // 'ws-unavailable' degrades to polling below (never an early timeout lie).
         if (outcome === 'deadline' && Date.now() >= deadline - 1500) {
@@ -8199,11 +8272,19 @@ function writeSkillFile(file, content, backup = true) {
         if (outcome === 'got-messages') {
           await new Promise(() => {}); // printAndAck is in flight and exits the process
         }
-        console.error(`pidge: realtime unavailable (${outcome}) — falling back to HTTP polling for the rest of this round (same contract, less instant); the socket is tried again on the next round`);
+        if (v.follow) {
+          console.error(`pidge: realtime unavailable (${outcome}) — falling back to HTTP polling for ~${Math.round(wsRetryMs / 60000)} min (same contract, less instant); the socket is tried again after that`);
+        } else {
+          console.error(`pidge: realtime unavailable (${outcome}) — falling back to HTTP polling for the rest of this round (same contract, less instant); the socket is tried again on the next round`);
+        }
       }
 
+      // The polling stint. Under --follow with realtime wanted it is boxed
+      // (pollUntil) and the outer loop goes back to the socket; otherwise it
+      // runs to the deadline exactly as before.
+      const pollUntil = v.follow && wantRealtime() ? Date.now() + wsRetryMs : Infinity;
       for (;;) {
-        const waitS = health.degraded ? 0 : Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
+        const waitS = health.useHeld() ? Math.max(0, Math.min(25, Math.ceil((deadline - Date.now()) / 1000))) : 0;
         const askedAt = Date.now();
         try {
           const qs = new URLSearchParams();
@@ -8213,7 +8294,7 @@ function writeSkillFile(file, content, backup = true) {
           const res = await fetchT(`${BASE}/api/v1/messages${qs.size ? `?${qs}` : ''}`, { headers }, (waitS + 10) * 1000);
           await checkManifestNews(res);
           if (res.status === 200) {
-            health.ok();
+            health.ok(waitS > 0);
             const data = await res.json().catch(() => ({}));
             warnStalePriorClaim(data); // session-header warning, once
             warnConsumerConflict(data); // the consume GET flags a live sibling
@@ -8237,10 +8318,13 @@ function writeSkillFile(file, content, backup = true) {
           await followEnd();
           await health.exitTimeout('no message from the human', LEASE_HINT, RELAUNCH_NUDGE);
         }
+        if (Date.now() >= pollUntil) break; // the stint is over — back to the socket
         const pace = health.degraded ? DEGRADED_INTERVAL_S : listenInterval;
         if (Date.now() - askedAt < 2000) {
           await sleep(Math.min(pace, Math.max(1, Math.ceil((deadline - Date.now()) / 1000))) * 1000);
         }
+      }
+      wsRetryMs = Math.min(wsRetryMs * 2, WS_RETRY_MAX_MS); // the socket failed a whole stint ago — try, but wait longer next time
       }
       break;
     }

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.54.10 — 2026-09-07
+
+**A watch climbs back up the degrade ladder; polling is a fallback, never a
+destination.** Both fallbacks were written for a round of minutes and said
+"for the rest of the session" — a sentence the session-length watch (0.54)
+turned into days. Measured on the fleet 2026-09-05 04:00Z: one ~60 s network
+blip at the host closed every socket on the box at once; four WebSocket
+attempts failed, three held polls failed, and every watch then polled PLAIN
+GETs every 45 s for two days — consuming normally, socket never tried again,
+held polls never tried again, and (on servers < v129) its presence marker
+never renewed, so the human's app painted OFFLINE over an agent that was
+reading its queue, and the session-start hook prescribed a second watch.
+
+- **The degrade to plain GETs is a box, not a latch.** After ~5 min ONE held
+  poll probes the edge; a healthy one ends the degrade, a dead one doubles the
+  box (5 → 10 → 20 → 40 → 60 min cap). Narrated on stderr both ways.
+- **Under `--follow`, the socket is retried after a polling stint** of the same
+  shape (5 min, doubling to 60, reset by a healthy connect); the stint's
+  subscriptions are closed, never leaked. A one-shot round keeps its shape —
+  its next process retries anyway.
+- The CLI knows manifest **v129** (a plain consume GET lights presence for
+  60 s server-side — the same failure seen from the other end).
+
 ## 0.54.9 — 2026-09-05
 
 - Send application presence beats only on ConversationChannel, avoiding

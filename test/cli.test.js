@@ -162,6 +162,85 @@ test('field report — a proxy DESTROYING held sockets degrades the same way (wa
   assert.match(stderr, /degraded to plain GETs/);
 });
 
+// 0.54.10 — the two fallbacks are BOXES, not latches. Field measurement
+// (2026-09-05→07): a ~60 s host blip demoted every session-length watch on the
+// box to plain GETs for two days — held polls and the socket were never tried
+// again, presence never renewed, the app showed OFFLINE over a live agent.
+test('0.54.10 — a degraded session PROBES a held poll again after the box, and climbs back when the edge healed', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.waitMode = '502'; // held polls die → degrade after 3
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '20', '--interval', '1'], port,
+    { PIDGE_DEGRADE_RETRY_MS: '1500' });
+  // let it degrade, then heal the edge and hand it a message ONLY a held poll can see
+  await sleep(2500);
+  mock.state.waitMode = 'ok';
+  await sleep(2500); // past the 1.5 s box: the probe runs against the healed edge
+  mock.state.messages = [{ id: 21, channel_id: 1, body: 'voltou pelo held', created_at: 'x', consumed_at: null }];
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stdout, /voltou pelo held/);
+  assert.match(stderr, /degraded to plain GETs/);
+  assert.match(stderr, /held polls work again/, 'the recovery must be narrated');
+  const polls = mock.state.reqLog.filter((r) => r.pathname === '/api/v1/messages');
+  const firstDegradedPlain = polls.findIndex((r, i) => !r.held && i >= 3);
+  assert.ok(firstDegradedPlain > 0, 'expected plain GETs after the degrade');
+  assert.ok(polls.slice(firstDegradedPlain).some((r) => r.held), 'a HELD poll must be issued again after the box');
+  // and the one that delivered was held (the message arrived via the instant path)
+  assert.ok(polls[polls.length - 1].held, 'the delivering poll was a held one');
+});
+
+test('0.54.10 — a degraded session whose probe still dies stays on plain GETs and DOUBLES the box', async () => {
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.waitMode = '502';
+  const { result } = runCli(['listen', '--no-realtime', '--timeout', '10', '--interval', '1'], port,
+    { PIDGE_DEGRADE_RETRY_MS: '1000', PIDGE_DEGRADE_RETRY_MAX_MS: '4000' });
+  const { code, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 3, `stderr: ${stderr}`);
+  assert.match(stderr, /degraded to plain GETs/);
+  assert.match(stderr, /still dies behind the edge/, 'a failed probe is narrated');
+  const polls = mock.state.reqLog.filter((r) => r.pathname === '/api/v1/messages');
+  const heldAfterDegrade = polls.slice(3).filter((r) => r.held).length;
+  assert.ok(heldAfterDegrade >= 1 && heldAfterDegrade <= 3, `probes are RARE (1 per box, boxes 1 s → 2 s → 4 s over a 10 s round), got ${heldAfterDegrade} held after degrade`);
+  assert.ok(polls.slice(3).filter((r) => !r.held).length >= 3, 'the plain GETs carried the session between probes');
+});
+
+test('0.54.10 — under --follow the socket is TRIED AGAIN after a polling stint (never "for the rest of the session")', async (t) => {
+  if (typeof WebSocket !== 'function') return t.skip('needs Node ≥22');
+  const mock = createMock();
+  const port = await mock.start();
+  mock.state.wsMode = '1006'; // every socket drops → ws-unavailable after 4
+  const { result } = runCli(['online', '--follow', '--realtime', '--timeout', '12', '--interval', '1'], port,
+    { PIDGE_WS_BACKOFF_MS: '50', PIDGE_WS_RETRY_MS: '1500' });
+  await sleep(2500); // the first stint gave the socket up and is polling
+  mock.state.wsMode = 'ok'; // the edge heals
+  await sleep(3500); // past the 1.5 s stint: the socket is retried
+  mock.state.messages = [{ id: 31, channel_id: 1, body: 'chegou pelo socket de volta', created_at: 'x', consumed_at: null }];
+  // the wake-up frame, as the server would push it — on the identifier the
+  // retried subscribe actually used (it carries the identity params)
+  const convo = mock.state.subscribeRaw.filter((raw) => raw.includes('ConversationChannel'));
+  assert.ok(convo.length >= 1, 'the retry must have SUBSCRIBED to ConversationChannel');
+  for (const sock of mock.state.sockets) {
+    if (sock.readyState === 1) sock.send(JSON.stringify({ identifier: convo[convo.length - 1], message: { type: 'message' } }));
+  }
+  const { code, stdout, stderr } = await result;
+  await mock.stop();
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  assert.match(stdout, /chegou pelo socket de volta/);
+  const gaveUp = stderr.indexOf('realtime unavailable');
+  // the first stint never got a socket up, so the retry announces a FIRST
+  // connect ("listening over the realtime socket"); a stint that had been up
+  // before says "is BACK" — either is the socket returning after the fallback.
+  const back = Math.max(stderr.indexOf('realtime socket is BACK'), stderr.indexOf('listening over the realtime socket'));
+  assert.ok(gaveUp >= 0, `expected the fallback line, got: ${stderr}`);
+  assert.ok(back > gaveUp, `expected the socket to come back AFTER the fallback, got: ${stderr}`);
+  assert.match(stderr, /falling back to HTTP polling for ~\d+ min/, 'under --follow the stint is named as a box, not "the rest of this round"');
+  assert.ok(mock.state.subscriptions.includes('ConversationChannel'), 'a real subscribe happened on the retry');
+});
+
 // The exit-4 contract is now CROSS-ROUND (the recommended loop is one round per
 // process, so a single dead 50 s window is a blip, not a verdict): a dead round
 // writes a streak file keyed by the token hash; exit 4 needs 3 dead rounds over
