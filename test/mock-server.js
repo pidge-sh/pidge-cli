@@ -149,6 +149,7 @@ function createMock() {
       label: req.headers['x-pidge-label'] || null,
       run: req.headers['x-pidge-run'] || null, // execution attribution signature
       kind: req.headers['x-pidge-consumer-kind'] || null, // v126: watch | listen | bridge
+      held: url.searchParams.has('wait'), // 0.54.10: a test watches the degrade ladder climb back
     });
     const held = url.searchParams.has('wait');
     if (held && state.waitMode === '502') return json(res, 502, { error: 'bad gateway' });
